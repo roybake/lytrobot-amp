@@ -1,0 +1,956 @@
+"""GPU batched MuJoCo environment powered by MuJoCo Warp."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import mujoco
+import numpy as np
+import torch
+
+from .env import LytRobotEnvCfg
+from .motion import CONTACT_GEOM_NAMES, MotionReference, resolve_contact_geom_ids
+
+WARP_NCONMAX = 256
+WARP_NJMAX = 128
+
+try:
+    import mujoco_warp as mjwarp
+    import warp as wp
+except ImportError as exc:  # pragma: no cover - exercised only without optional deps.
+    mjwarp = None
+    wp = None
+    _WARP_IMPORT_ERROR = exc
+else:
+    _WARP_IMPORT_ERROR = None
+
+
+def _canonical_quat(quat: torch.Tensor) -> torch.Tensor:
+    quat = torch.where(quat[..., :1] < 0.0, -quat, quat)
+    return quat / torch.linalg.norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+
+class LytRobotWarpAmpEnv:
+    """Batched CUDA MuJoCo environment.
+
+    This keeps the current task/AMP observation design, but moves simulation,
+    observation assembly, and reward computation to tensors on ``device``.
+    """
+
+    is_torch_env = True
+
+    def __init__(self, cfg: LytRobotEnvCfg, device: str = "cuda") -> None:
+        if _WARP_IMPORT_ERROR is not None:
+            raise RuntimeError("mujoco-warp and warp-lang are required for the warp backend.") from _WARP_IMPORT_ERROR
+        if device == "cuda":
+            device = "cuda:0"
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise RuntimeError("The warp backend requires a CUDA device.")
+
+        self.cfg = cfg
+        self.model_path = Path(cfg.model_xml).expanduser().resolve()
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model XML not found: {self.model_path}")
+
+        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        self.model.opt.timestep = float(cfg.timestep)
+        # MuJoCo Warp rejects non-zero contact margins with CCD enabled. The LYT
+        # MJCF defaults geom margin to 0.001, so disable CCD for this backend.
+        self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD.value
+        self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD.value
+        self.base_body_mass_np = np.asarray(self.model.body_mass, dtype=np.float32).copy()
+        self.base_body_inertia_np = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
+        self.base_geom_friction_np = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
+        self.base_gravity_np = np.asarray(self.model.opt.gravity, dtype=np.float32).copy()
+
+        self.motion = MotionReference(cfg.motion_file, self.model)
+        self.rng = np.random.default_rng(cfg.seed)
+        self.num_envs = int(cfg.num_envs)
+        self.action_dim = int(self.model.nu)
+
+        self.ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
+        self.ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.ctrl_low = torch.as_tensor(self.ctrl_low_np, dtype=torch.float32, device=self.device)
+        self.ctrl_high = torch.as_tensor(self.ctrl_high_np, dtype=torch.float32, device=self.device)
+        self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
+        self.ctrl_half_range = torch.clamp(0.5 * (self.ctrl_high - self.ctrl_low), min=1.0e-6)
+        self.actuator_tendon_ids = torch.as_tensor(
+            np.asarray(self.model.actuator_trnid[:, 0], dtype=np.int64),
+            dtype=torch.long,
+            device=self.device,
+        )
+        distal_action_mask_np = self._build_distal_action_mask()
+        action_scale_np = self._build_action_scale(distal_action_mask_np)
+        self.action_scale = torch.as_tensor(action_scale_np, dtype=torch.float32, device=self.device)
+        self.distal_action_mask = torch.as_tensor(distal_action_mask_np, dtype=torch.bool, device=self.device)
+        self.has_distal_action = bool(np.any(distal_action_mask_np))
+        right_action_indices_np, left_action_indices_np = self._build_side_action_indices()
+        self.right_action_indices = torch.as_tensor(right_action_indices_np, dtype=torch.long, device=self.device)
+        self.left_action_indices = torch.as_tensor(left_action_indices_np, dtype=torch.long, device=self.device)
+
+        nonroot_qpos_adrs, nonroot_qvel_adrs = self._get_nonroot_joint_adrs()
+        self.nonroot_qpos_adrs = torch.as_tensor(nonroot_qpos_adrs, dtype=torch.long, device=self.device)
+        self.nonroot_qvel_adrs = torch.as_tensor(nonroot_qvel_adrs, dtype=torch.long, device=self.device)
+        self.robot_qpos_adrs = torch.as_tensor(self.motion.robot_qpos_adrs, dtype=torch.long, device=self.device)
+        self.robot_qvel_adrs = torch.as_tensor(self.motion.robot_qvel_adrs, dtype=torch.long, device=self.device)
+
+        self.pelvis_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+        if self.pelvis_body_id < 0:
+            raise RuntimeError("Body 'pelvis' not found in robot model.")
+        self.floor_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        contact_geom_ids_np = resolve_contact_geom_ids(self.model).astype(np.int64)
+        if self.floor_geom_id < 0:
+            raise RuntimeError("Expected floor and foot contact geoms were not found in robot model.")
+        self.contact_geom_ids = torch.as_tensor(contact_geom_ids_np, dtype=torch.long, device=self.device)
+        self.right_contact_geom_ids = self.contact_geom_ids[:2]
+        self.left_contact_geom_ids = self.contact_geom_ids[2:]
+
+        self.joint_reward_weights = torch.as_tensor(
+            self._build_joint_reward_weights(), dtype=torch.float32, device=self.device
+        )
+        self.distal_joint_indices = torch.as_tensor(
+            np.asarray(
+                [
+                    joint_id
+                    for joint_id, name in enumerate(self.motion.common_joint_names)
+                    if "ankle" in name or "subtalar" in name or "mtp" in name
+                ],
+                dtype=np.int64,
+            ),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._build_reference_tensors()
+        self._build_reset_helpers()
+        self._init_warp_data()
+
+        self.episode_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.episode_timeout_step = torch.full(
+            (self.num_envs,),
+            int(cfg.episode_steps),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.motion_phase = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.last_action = torch.zeros((self.num_envs, self.action_dim), dtype=torch.float32, device=self.device)
+        self.last_foot_pos = torch.zeros(
+            (self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device
+        )
+        self.foot_stride_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.foot_x_min = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.foot_x_max = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.contact_balance_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.action_energy_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.last_obs = torch.zeros((self.num_envs, self.obs_dim), dtype=torch.float32, device=self.device)
+        self._init_domain_randomization()
+        self.reset()
+
+    @property
+    def dt(self) -> float:
+        return float(self.model.opt.timestep * self.cfg.decimation)
+
+    @property
+    def obs_dim(self) -> int:
+        current_state_dim = 1 + 4 + 6 + 2 * len(self.nonroot_qpos_adrs) + self.action_dim + 3
+        tracking_dim = (
+            1
+            + 4
+            + 6
+            + 2 * len(self.motion.common_joint_names)
+            + self.action_dim
+            + self.motion.foot_pos_dim
+            + self.motion.contact_dim
+        )
+        return int(current_state_dim + tracking_dim)
+
+    @property
+    def amp_obs_dim(self) -> int:
+        return self.motion.feature_dim
+
+    def _get_nonroot_joint_adrs(self) -> tuple[np.ndarray, np.ndarray]:
+        qpos_adrs: list[int] = []
+        qvel_adrs: list[int] = []
+        for joint_id in range(self.model.njnt):
+            if self.model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            qpos_adrs.append(int(self.model.jnt_qposadr[joint_id]))
+            qvel_adrs.append(int(self.model.jnt_dofadr[joint_id]))
+        return np.asarray(qpos_adrs, dtype=np.int64), np.asarray(qvel_adrs, dtype=np.int64)
+
+    def _build_joint_reward_weights(self) -> np.ndarray:
+        weights = []
+        for name in self.motion.common_joint_names:
+            if "knee" in name:
+                weights.append(1.35)
+            elif "ankle" in name:
+                weights.append(1.60)
+            elif "subtalar" in name:
+                weights.append(0.80)
+            elif "mtp" in name:
+                weights.append(0.60)
+            else:
+                weights.append(1.0)
+        return np.asarray(weights, dtype=np.float32)
+
+    def _build_action_scale(self, distal_action_mask: np.ndarray) -> np.ndarray:
+        scale = np.ones(self.action_dim, dtype=np.float32)
+        distal_scale = float(np.clip(self.cfg.distal_action_scale, 0.05, 1.0))
+        scale[distal_action_mask] = distal_scale
+        return scale
+
+    def _build_distal_action_mask(self) -> np.ndarray:
+        mask = np.zeros(self.action_dim, dtype=bool)
+        for actuator_id in range(self.action_dim):
+            actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
+            tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
+            tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
+            if "ankle" in actuator_name or "ankle" in tendon_name:
+                mask[actuator_id] = True
+        return mask
+
+    def _build_side_action_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        right: list[int] = []
+        left: list[int] = []
+        for actuator_id in range(self.action_dim):
+            actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
+            tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
+            tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
+            name = f"{actuator_name} {tendon_name}"
+            if "_r" in name:
+                right.append(actuator_id)
+            elif "_l" in name:
+                left.append(actuator_id)
+        return np.asarray(right, dtype=np.int64), np.asarray(left, dtype=np.int64)
+
+    def _build_reference_tensors(self) -> None:
+        def tensor(value: np.ndarray) -> torch.Tensor:
+            return torch.as_tensor(value, dtype=torch.float32, device=self.device)
+
+        self.ref_root_height = tensor(self.motion.reference_root_height)
+        self.ref_root_quat = tensor(self.motion.reference_root_quat)
+        self.ref_root_lin_vel = tensor(self.motion.reference_root_lin_vel)
+        self.ref_root_ang_vel = tensor(self.motion.reference_root_ang_vel)
+        self.ref_joint_pos = tensor(self.motion.reference_joint_pos)
+        self.ref_joint_vel = tensor(self.motion.reference_joint_vel)
+        self.ref_tendon_ctrl = tensor(self.motion.reference_tendon_ctrl)
+        self.ref_foot_pos = tensor(self.motion.reference_foot_pos)
+        self.ref_foot_vel = tensor(self.motion.reference_foot_vel)
+        self.ref_foot_contact = tensor(self.motion.reference_foot_contact)
+        self.feature_mean = tensor(self.motion.feature_mean)
+        self.feature_std = tensor(self.motion.feature_std)
+
+    def _build_reset_helpers(self) -> None:
+        limited_qpos_adrs: list[int] = []
+        limited_qvel_adrs: list[int] = []
+        joint_ranges: list[tuple[float, float]] = []
+        for joint_id in range(self.model.njnt):
+            if self.model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            if not self.model.jnt_limited[joint_id]:
+                continue
+            limited_qpos_adrs.append(int(self.model.jnt_qposadr[joint_id]))
+            limited_qvel_adrs.append(int(self.model.jnt_dofadr[joint_id]))
+            low, high = self.model.jnt_range[joint_id]
+            joint_ranges.append((float(low), float(high)))
+        self._limited_qpos_adrs_np = np.asarray(limited_qpos_adrs, dtype=np.int64)
+        self._limited_qvel_adrs_np = np.asarray(limited_qvel_adrs, dtype=np.int64)
+        self._joint_ranges_np = np.asarray(joint_ranges, dtype=np.float32)
+
+    def _init_warp_data(self) -> None:
+        assert wp is not None and mjwarp is not None
+        cpu_data = mujoco.MjData(self.model)
+        mujoco.mj_forward(self.model, cpu_data)
+
+        wp.init()
+        self.wp_device = wp.get_device(f"cuda:{self.device.index or 0}")
+        with wp.ScopedDevice(self.wp_device):
+            self.wp_model = mjwarp.put_model(self.model)
+            self.wp_data = mjwarp.put_data(
+                self.model,
+                cpu_data,
+                nworld=self.num_envs,
+                nconmax=WARP_NCONMAX,
+                njmax=WARP_NJMAX,
+            )
+            mjwarp.forward(self.wp_model, self.wp_data)
+
+        self.qpos = wp.to_torch(self.wp_data.qpos)
+        self.qvel = wp.to_torch(self.wp_data.qvel)
+        self.ctrl = wp.to_torch(self.wp_data.ctrl)
+        self.xpos = wp.to_torch(self.wp_data.xpos)
+        self.xmat = wp.to_torch(self.wp_data.xmat)
+        self.geom_xpos = wp.to_torch(self.wp_data.geom_xpos)
+        self.ten_length = wp.to_torch(self.wp_data.ten_length)
+        self.xfrc_applied = wp.to_torch(self.wp_data.xfrc_applied)
+        self.wp_body_mass = wp.to_torch(self.wp_model.body_mass)
+        self.wp_body_inertia = wp.to_torch(self.wp_model.body_inertia)
+        self.wp_body_subtreemass = wp.to_torch(self.wp_model.body_subtreemass)
+        self.wp_geom_friction = wp.to_torch(self.wp_model.geom_friction)
+        self.wp_gravity = wp.to_torch(self.wp_model.opt.gravity)
+        self.contact_geom = wp.to_torch(self.wp_data.contact.geom).long()
+        self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid).long()
+        self.contact_dim = wp.to_torch(self.wp_data.contact.dim).long()
+
+    def _init_domain_randomization(self) -> None:
+        self.domain_randomization = bool(self.cfg.domain_randomization)
+        max_delay_s = max(float(self.cfg.action_delay_min_ms), float(self.cfg.action_delay_max_ms), 0.0) / 1000.0
+        self.max_action_delay_ticks = int(np.ceil(max_delay_s / max(float(self.cfg.timestep), 1.0e-9)))
+        history_len = max(1, self.max_action_delay_ticks + 1)
+        self.delay_env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+        self.action_delay_history = torch.zeros(
+            (self.num_envs, history_len, self.action_dim), dtype=torch.float32, device=self.device
+        )
+        self.action_delay_ticks = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.action_delay_cursor = 0
+        self.env_tendon_length_scale = torch.ones(
+            (self.num_envs, self.action_dim), dtype=torch.float32, device=self.device
+        )
+        self.push_force = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=self.device)
+        self.push_time_left = np.zeros(self.num_envs, dtype=np.int32)
+        self.push_time_to_next = self._sample_push_interval(self.num_envs)
+        self.base_body_mass = torch.as_tensor(self.base_body_mass_np, dtype=torch.float32, device=self.device)
+        self.base_body_inertia = torch.as_tensor(self.base_body_inertia_np, dtype=torch.float32, device=self.device)
+        self.base_body_subtreemass = torch.as_tensor(
+            np.asarray(self.model.body_subtreemass, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.base_geom_friction = torch.as_tensor(self.base_geom_friction_np, dtype=torch.float32, device=self.device)
+        self.base_gravity = torch.as_tensor(self.base_gravity_np, dtype=torch.float32, device=self.device)
+
+    def _uniform_np(self, low: float, high: float, size: int | tuple[int, ...] | None = None) -> np.ndarray:
+        low_f = float(low)
+        high_f = float(high)
+        if high_f < low_f:
+            low_f, high_f = high_f, low_f
+        if high_f == low_f:
+            return np.full(size or (), low_f, dtype=np.float32)
+        return np.asarray(self.rng.uniform(low_f, high_f, size=size), dtype=np.float32)
+
+    def _sample_push_interval(self, size: int) -> np.ndarray:
+        low = max(1, int(self.cfg.push_interval_min_steps))
+        high = max(low + 1, int(self.cfg.push_interval_max_steps) + 1)
+        return self.rng.integers(low, high, size=size, dtype=np.int32)
+
+    def _sample_push_duration(self, size: int) -> np.ndarray:
+        low = max(1, int(self.cfg.push_duration_min_steps))
+        high = max(low + 1, int(self.cfg.push_duration_max_steps) + 1)
+        return self.rng.integers(low, high, size=size, dtype=np.int32)
+
+    def _sample_domain_randomization(self, ids_np: np.ndarray) -> None:
+        if not self.domain_randomization or ids_np.size == 0:
+            return
+        tendon_scale = self._uniform_np(
+            self.cfg.tendon_length_scale_min,
+            self.cfg.tendon_length_scale_max,
+            (len(ids_np), self.action_dim),
+        )
+        ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
+        self.env_tendon_length_scale[ids] = torch.as_tensor(tendon_scale, dtype=torch.float32, device=self.device)
+        min_delay = max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
+        max_delay = max(min_delay, float(self.cfg.action_delay_max_ms) / 1000.0)
+        delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids_np))
+        delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int64)
+        self.action_delay_ticks[ids] = torch.as_tensor(
+            np.clip(delay_ticks, 0, self.max_action_delay_ticks),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.action_delay_history[ids] = 0.0
+        self.push_force[ids] = 0.0
+        self.push_time_left[ids_np] = 0
+        self.push_time_to_next[ids_np] = self._sample_push_interval(len(ids_np))
+        self._apply_global_domain_randomization()
+
+    def _apply_global_domain_randomization(self) -> None:
+        if not self.domain_randomization:
+            return
+        body_scale = torch.as_tensor(
+            self._uniform_np(self.cfg.body_mass_scale_min, self.cfg.body_mass_scale_max, self.model.nbody),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        body_scale[0] = 1.0
+        body_mass = self.base_body_mass * body_scale
+        if self.pelvis_body_id >= 0:
+            payload_mass = float(self._uniform_np(self.cfg.payload_mass_min, self.cfg.payload_mass_max))
+            body_mass[self.pelvis_body_id] += payload_mass
+        self.wp_body_mass[0] = body_mass
+        self.wp_body_inertia[0] = self.base_body_inertia * body_scale[:, None]
+        self.wp_body_inertia[0, 0] = self.base_body_inertia[0]
+        self.wp_body_subtreemass[0] = self.base_body_subtreemass
+        self.wp_geom_friction[0] = self.base_geom_friction
+        self.wp_geom_friction[0, self.floor_geom_id, 0] = float(
+            self._uniform_np(self.cfg.ground_friction_min, self.cfg.ground_friction_max)
+        )
+        self.wp_gravity[0] = self.base_gravity
+        self.wp_gravity[0, 2] = -float(self._uniform_np(self.cfg.gravity_min, self.cfg.gravity_max))
+
+    def _apply_tendon_length_randomization(self, ctrl: torch.Tensor) -> torch.Tensor:
+        if not self.domain_randomization:
+            return ctrl
+        scaled = self.ctrl_mid + (ctrl - self.ctrl_mid) * self.env_tendon_length_scale
+        return torch.clamp(scaled, min=self.ctrl_low, max=self.ctrl_high)
+
+    def _apply_action_noise(self, action: torch.Tensor) -> torch.Tensor:
+        if not self.domain_randomization or self.cfg.action_noise_std <= 0.0:
+            return action
+        return torch.clamp(action + float(self.cfg.action_noise_std) * torch.randn_like(action), -1.0, 1.0)
+
+    def _startup_action_ramp(self) -> torch.Tensor:
+        ramp_steps = max(0, int(self.cfg.startup_action_ramp_steps))
+        if ramp_steps <= 0:
+            return torch.ones((self.num_envs, 1), dtype=torch.float32, device=self.device)
+        ramp = (self.episode_step.to(torch.float32) + 1.0) / float(ramp_steps)
+        return torch.clamp(ramp, 0.0, 1.0)[:, None]
+
+    def _delayed_action(self, commanded_action: torch.Tensor) -> torch.Tensor:
+        if not self.domain_randomization or self.max_action_delay_ticks <= 0:
+            return commanded_action
+        history_len = self.action_delay_history.shape[1]
+        self.action_delay_history[:, self.action_delay_cursor] = commanded_action
+        read_index = (self.action_delay_cursor - self.action_delay_ticks) % history_len
+        delayed = self.action_delay_history[self.delay_env_ids, read_index]
+        self.action_delay_cursor = (self.action_delay_cursor + 1) % history_len
+        return delayed
+
+    def _update_push_forces(self) -> None:
+        self.xfrc_applied.zero_()
+        if not self.domain_randomization:
+            return
+        active = self.push_time_left > 0
+        self.push_time_left[active] -= 1
+        ended = active & (self.push_time_left <= 0)
+        if np.any(ended):
+            self.push_time_to_next[ended] = self._sample_push_interval(int(np.count_nonzero(ended)))
+            ended_ids = torch.as_tensor(np.nonzero(ended)[0], dtype=torch.long, device=self.device)
+            self.push_force[ended_ids] = 0.0
+
+        idle = self.push_time_left <= 0
+        self.push_time_to_next[idle] -= 1
+        start = idle & (self.push_time_to_next <= 0)
+        if np.any(start):
+            start_np = np.nonzero(start)[0]
+            directions = self.rng.normal(0.0, 1.0, size=(len(start_np), 3)).astype(np.float32)
+            directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1.0e-6)
+            magnitudes = self._uniform_np(self.cfg.push_force_min, self.cfg.push_force_max, (len(start_np), 1))
+            force = np.concatenate((directions * magnitudes, np.zeros((len(start_np), 3), dtype=np.float32)), axis=1)
+            ids = torch.as_tensor(start_np, dtype=torch.long, device=self.device)
+            self.push_force[ids] = torch.as_tensor(force, dtype=torch.float32, device=self.device)
+            self.push_time_left[start_np] = self._sample_push_duration(len(start_np))
+
+        self.xfrc_applied[:, self.pelvis_body_id] = self.push_force
+
+    def _targets_at_phase(self, phase: torch.Tensor) -> dict[str, torch.Tensor]:
+        low = torch.floor(phase).long() % self.motion.frame_count
+        high = (low + 1) % self.motion.frame_count
+        blend = (phase - torch.floor(phase)).to(torch.float32)
+
+        def interp(values: torch.Tensor) -> torch.Tensor:
+            low_values = values[low]
+            high_values = values[high]
+            shape = (blend.shape[0],) + (1,) * (low_values.ndim - 1)
+            b = blend.reshape(shape)
+            return (1.0 - b) * low_values + b * high_values
+
+        return {
+            "root_height": interp(self.ref_root_height),
+            "root_quat": _canonical_quat(interp(self.ref_root_quat)),
+            "root_lin_vel": interp(self.ref_root_lin_vel),
+            "root_ang_vel": interp(self.ref_root_ang_vel),
+            "joint_pos": interp(self.ref_joint_pos),
+            "joint_vel": interp(self.ref_joint_vel),
+            "tendon_ctrl": interp(self.ref_tendon_ctrl),
+            "foot_pos": interp(self.ref_foot_pos),
+            "foot_vel": interp(self.ref_foot_vel),
+            "foot_contact": interp(self.ref_foot_contact),
+        }
+
+    def _clip_joint_ranges_batch(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
+        if len(self._limited_qpos_adrs_np) == 0:
+            return
+        qadr = self._limited_qpos_adrs_np
+        dadr = self._limited_qvel_adrs_np
+        low = self._joint_ranges_np[:, 0]
+        high = self._joint_ranges_np[:, 1]
+        values = qpos[:, qadr].copy()
+        clipped = np.clip(values, low, high)
+        qpos[:, qadr] = clipped
+        crossed_low = (values < low) & (qvel[:, dadr] < 0.0)
+        crossed_high = (values > high) & (qvel[:, dadr] > 0.0)
+        qvel[:, dadr] = np.where(crossed_low | crossed_high, 0.0, qvel[:, dadr])
+
+    def action_to_ctrl(self, action: torch.Tensor, base_ctrl: torch.Tensor | None = None) -> torch.Tensor:
+        clipped = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
+        base = self.ctrl_mid if base_ctrl is None else base_ctrl
+        ctrl = base + (
+            clipped * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
+        )
+        ctrl = torch.clamp(ctrl, min=self.ctrl_low, max=self.ctrl_high)
+        return self._apply_tendon_length_randomization(ctrl)
+
+    def ctrl_to_action(self, ctrl: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((ctrl - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
+
+    def _current_tendon_ctrl(self) -> torch.Tensor:
+        ctrl = self.ten_length[:, self.actuator_tendon_ids]
+        return torch.clamp(ctrl, min=self.ctrl_low, max=self.ctrl_high)
+
+    def _reference_base_ctrl(self, reference_ctrl: torch.Tensor) -> torch.Tensor:
+        blend = float(np.clip(self.cfg.reference_ctrl_blend, 0.0, 1.0))
+        current = self._current_tendon_ctrl()
+        if blend <= 0.0:
+            return current
+        return torch.clamp((1.0 - blend) * current + blend * reference_ctrl, min=self.ctrl_low, max=self.ctrl_high)
+
+    def _foot_positions_local(self) -> torch.Tensor:
+        root_pos = self.xpos[:, self.pelvis_body_id]
+        root_mat = self.xmat[:, self.pelvis_body_id]
+        foot_world = self.geom_xpos[:, self.contact_geom_ids]
+        return torch.matmul(foot_world - root_pos[:, None, :], root_mat)
+
+    def _foot_contacts(self) -> torch.Tensor:
+        contact = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        g1 = self.contact_geom[:, 0]
+        g2 = self.contact_geom[:, 1]
+        world = self.contact_worldid
+        valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
+
+        r0, r1 = self.right_contact_geom_ids
+        l0, l1 = self.left_contact_geom_ids
+        floor = int(self.floor_geom_id)
+        right = valid & (((g1 == floor) & ((g2 == r0) | (g2 == r1))) | ((g2 == floor) & ((g1 == r0) | (g1 == r1))))
+        left = valid & (((g1 == floor) & ((g2 == l0) | (g2 == l1))) | ((g2 == floor) & ((g1 == l0) | (g1 == l1))))
+        if right.any():
+            contact[world[right], 0] = 1.0
+        if left.any():
+            contact[world[left], 1] = 1.0
+        return contact
+
+    def reset(self, env_ids: np.ndarray | list[int] | torch.Tensor | None = None) -> torch.Tensor:
+        if env_ids is None:
+            ids_np = np.arange(self.num_envs, dtype=np.int64)
+        elif torch.is_tensor(env_ids):
+            ids_np = env_ids.detach().cpu().numpy().astype(np.int64)
+        else:
+            ids_np = np.asarray(env_ids, dtype=np.int64)
+        if ids_np.size == 0:
+            return self.last_obs
+
+        states = self.motion.sample_states(len(ids_np), self.rng)
+        use_motion_reset = self.rng.random(len(ids_np)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+        self._sample_domain_randomization(ids_np)
+        qpos = np.repeat(self.motion.model_qpos0[None, :], len(ids_np), axis=0).astype(np.float32)
+        qvel = np.zeros((len(ids_np), self.model.nv), dtype=np.float32)
+        phase = np.zeros(len(ids_np), dtype=np.float32)
+        qpos[use_motion_reset] = states.qpos[use_motion_reset]
+        qvel[use_motion_reset] = states.qvel[use_motion_reset]
+        phase[use_motion_reset] = states.indices[use_motion_reset].astype(np.float32)
+
+        if self.cfg.reset_noise_scale > 0.0:
+            qpos[:, self.motion.robot_qpos_adrs] += self.rng.normal(
+                0.0, self.cfg.reset_noise_scale, size=(len(ids_np), len(self.motion.robot_qpos_adrs))
+            ).astype(np.float32)
+            qvel[:, self.motion.robot_qvel_adrs] += self.rng.normal(
+                0.0, 2.0 * self.cfg.reset_noise_scale, size=(len(ids_np), len(self.motion.robot_qvel_adrs))
+            ).astype(np.float32)
+            self._clip_joint_ranges_batch(qpos, qvel)
+
+        ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
+        self.qpos[ids] = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        self.qvel[ids] = torch.as_tensor(qvel, dtype=torch.float32, device=self.device)
+        self.motion_phase[ids] = torch.as_tensor(phase, dtype=torch.float32, device=self.device)
+        self.ctrl[ids] = 0.0
+        with wp.ScopedDevice(self.wp_device):
+            mjwarp.forward(self.wp_model, self.wp_data)
+
+        targets = self._targets_at_phase(self.motion_phase)
+        self.ctrl[ids] = self._apply_tendon_length_randomization(self._reference_base_ctrl(targets["tendon_ctrl"]))[ids]
+        self.last_action[ids] = 0.0
+        foot_pos = self._foot_positions_local()[ids]
+        self.last_foot_pos[ids] = foot_pos
+        side_x = torch.stack(
+            (
+                torch.mean(foot_pos[:, 0:2, 0], dim=1),
+                torch.mean(foot_pos[:, 2:4, 0], dim=1),
+            ),
+            dim=1,
+        )
+        self.foot_x_min[ids] = side_x
+        self.foot_x_max[ids] = side_x
+        self.foot_stride_ema[ids] = 0.0
+        self.contact_balance_ema[ids] = 0.0
+        self.action_energy_ema[ids] = 0.0
+        self.episode_step[ids] = 0
+        self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
+        self.last_obs = self.observe()
+        return self.last_obs
+
+    def _sample_timeout_steps(self, batch_size: int) -> torch.Tensor:
+        base_steps = int(self.cfg.episode_steps)
+        jitter = int(max(self.cfg.episode_timeout_jitter_steps, 0))
+        if jitter <= 0:
+            values = np.full(batch_size, base_steps, dtype=np.int64)
+        else:
+            low = max(1, base_steps - jitter)
+            high = max(low + 1, base_steps + jitter + 1)
+            values = self.rng.integers(low, high, size=batch_size, dtype=np.int64)
+        return torch.as_tensor(values, dtype=torch.long, device=self.device)
+
+    def observe(self) -> torch.Tensor:
+        targets = self._targets_at_phase(self.motion_phase)
+        quat = _canonical_quat(self.qpos[:, 3:7])
+        up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
+        phase = 2.0 * torch.pi * self.motion_phase / float(self.motion.frame_count)
+        joint_pos = self.qpos[:, self.robot_qpos_adrs]
+        joint_vel = self.qvel[:, self.robot_qvel_adrs]
+        foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
+        ref_foot_pos = targets["foot_pos"].reshape(self.num_envs, -1)
+        ref_ctrl_action = self.ctrl_to_action(targets["tendon_ctrl"])
+        root_vel_error = self.qvel[:, :6] - torch.cat((targets["root_lin_vel"], targets["root_ang_vel"]), dim=1)
+        obs = torch.cat(
+            (
+                self.qpos[:, 2:3],
+                quat,
+                self.qvel[:, :6],
+                self.qpos[:, self.nonroot_qpos_adrs],
+                self.qvel[:, self.nonroot_qvel_adrs],
+                self.last_action,
+                torch.stack((up_z, torch.sin(phase), torch.cos(phase)), dim=1),
+                self.qpos[:, 2:3] - targets["root_height"][:, None],
+                targets["root_quat"],
+                root_vel_error,
+                joint_pos - targets["joint_pos"],
+                joint_vel - targets["joint_vel"],
+                ref_ctrl_action,
+                foot_pos - ref_foot_pos,
+                targets["foot_contact"],
+            ),
+            dim=1,
+        )
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0)
+        if self.domain_randomization and self.cfg.obs_noise_std > 0.0:
+            obs = obs + float(self.cfg.obs_noise_std) * torch.randn_like(obs)
+        return torch.clamp(obs, -20.0, 20.0)
+
+    def amp_observe(self) -> torch.Tensor:
+        foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
+        raw_features = torch.cat(
+            (
+                self.qpos[:, 2:3],
+                _canonical_quat(self.qpos[:, 3:7]),
+                self.qpos[:, self.robot_qpos_adrs],
+                self.qvel[:, self.robot_qvel_adrs],
+                foot_pos,
+            ),
+            dim=1,
+        )
+        features = (raw_features - self.feature_mean) / self.feature_std
+        features = torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
+        return torch.clamp(features, -10.0, 10.0)
+
+    def step(self, action: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if torch.is_tensor(action):
+            actions = action.to(device=self.device, dtype=torch.float32)
+        else:
+            actions = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+        if actions.shape != (self.num_envs, self.action_dim):
+            raise ValueError(f"Expected action shape {(self.num_envs, self.action_dim)}, got {tuple(actions.shape)}")
+
+        prev_action = self.last_action.clone()
+        commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
+        commanded_action = commanded_action * self._startup_action_ramp()
+        self.motion_phase = (self.motion_phase + self.motion.frequency * self.dt) % self.motion.frame_count
+        targets = self._targets_at_phase(self.motion_phase)
+        base_ctrl = self._reference_base_ctrl(targets["tendon_ctrl"])
+        applied_action = commanded_action
+        self._update_push_forces()
+
+        with wp.ScopedDevice(self.wp_device):
+            for _ in range(self.cfg.decimation):
+                applied_action = self._delayed_action(commanded_action)
+                self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
+                mjwarp.step(self.wp_model, self.wp_data)
+
+        self.episode_step += 1
+        foot_pos = self._foot_positions_local()
+        foot_vel = (foot_pos - self.last_foot_pos) / max(self.dt, 1.0e-6)
+        foot_contact = self._foot_contacts()
+        rewards, dones, time_outs, components = self._compute_reward_done(
+            commanded_action, prev_action, targets, foot_pos, foot_vel, foot_contact
+        )
+        episode_steps = self.episode_step.clone()
+        self.last_action[:] = commanded_action
+        self.last_foot_pos[:] = foot_pos
+
+        done_ids = torch.nonzero(dones, as_tuple=False).flatten()
+        if len(done_ids) > 0:
+            self.reset(done_ids)
+        else:
+            self.last_obs = self.observe()
+        info = {key: value for key, value in components.items()}
+        info["episode_step"] = episode_steps
+        info["time_outs"] = time_outs.to(torch.float32)
+        return self.last_obs, rewards, dones.to(torch.float32), info
+
+    def _compute_reward_done(
+        self,
+        action: torch.Tensor,
+        prev_action: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+        foot_pos: torch.Tensor,
+        foot_vel: torch.Tensor,
+        foot_contact: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        root_height = self.qpos[:, 2]
+        up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
+        root_quat = _canonical_quat(self.qpos[:, 3:7])
+        ref_root_quat = _canonical_quat(targets["root_quat"])
+
+        quat_dot = torch.abs(torch.sum(root_quat * ref_root_quat, dim=1)).clamp(0.0, 1.0)
+        orient_error = 2.0 * torch.acos(quat_dot)
+        root_orientation = torch.exp(-(orient_error.square()) / (0.35**2))
+
+        lin_vel_error = self.qvel[:, :3] - targets["root_lin_vel"]
+        ang_vel_error = self.qvel[:, 3:6] - targets["root_ang_vel"]
+        lin_vel_track = torch.exp(-torch.mean(lin_vel_error.square(), dim=1) / (0.75**2))
+        ang_vel_track = torch.exp(-torch.mean(ang_vel_error.square(), dim=1) / (1.50**2))
+        root_vel = 0.65 * lin_vel_track + 0.35 * ang_vel_track
+
+        height = torch.exp(-((root_height - targets["root_height"]).square()) / (0.09**2))
+        joint_pos = self.qpos[:, self.robot_qpos_adrs]
+        joint_vel = self.qvel[:, self.robot_qvel_adrs]
+        weight_sum = torch.sum(self.joint_reward_weights).clamp_min(1.0e-6)
+        pose_error = torch.sum((joint_pos - targets["joint_pos"]).square() * self.joint_reward_weights, dim=1) / weight_sum
+        vel_error = torch.sum((joint_vel - targets["joint_vel"]).square() * self.joint_reward_weights, dim=1) / weight_sum
+        pose_track = 0.70 * torch.exp(-pose_error / (0.28**2)) + 0.30 * torch.exp(-pose_error / (0.10**2))
+        vel_track = torch.exp(-vel_error / (4.0**2))
+
+        foot_pos_error = torch.mean((foot_pos - targets["foot_pos"]).square(), dim=(1, 2))
+        foot_pos_track = torch.exp(-foot_pos_error / (0.075**2))
+        side_metrics = self._side_foot_tracks(foot_pos, targets["foot_pos"], targets["foot_contact"])
+        foot_vel_error = torch.mean((foot_vel - targets["foot_vel"]).square(), dim=(1, 2))
+        foot_vel_track = torch.exp(-foot_vel_error / (max(self.cfg.foot_vel_tracking_sigma, 1.0e-6) ** 2))
+        stance_foot_track = self._stance_foot_track(foot_vel, foot_contact, targets["foot_contact"])
+        contact_track = torch.clamp(
+            1.0 - torch.mean(torch.abs(foot_contact - targets["foot_contact"]), dim=1),
+            0.0,
+            1.0,
+        )
+        ctrl_error = torch.mean(((self.ctrl - targets["tendon_ctrl"]) / self.ctrl_half_range).square(), dim=1)
+        ctrl_track = torch.exp(-ctrl_error / (0.45**2))
+        ctrl_penalty = torch.mean(action.square(), dim=1)
+        action_rate = torch.mean((action - prev_action).square(), dim=1)
+        if len(self.distal_joint_indices) > 0:
+            distal_vel_error = torch.mean(
+                (
+                    joint_vel[:, self.distal_joint_indices]
+                    - targets["joint_vel"][:, self.distal_joint_indices]
+                ).square(),
+                dim=1,
+            )
+        else:
+            distal_vel_error = vel_error
+        distal_vel_track = torch.exp(
+            -distal_vel_error / (max(self.cfg.distal_joint_vel_sigma, 1.0e-6) ** 2)
+        )
+        if self.has_distal_action:
+            distal_action = torch.mean(action[:, self.distal_action_mask].square(), dim=1)
+            distal_action_rate = torch.mean(
+                (action[:, self.distal_action_mask] - prev_action[:, self.distal_action_mask]).square(),
+                dim=1,
+            )
+        else:
+            distal_action = ctrl_penalty
+            distal_action_rate = action_rate
+        symmetry_track, foot_symmetry_track, contact_balance_track, action_balance_track = self._symmetry_track(
+            foot_pos,
+            foot_contact,
+            action,
+        )
+
+        reward = (
+            0.05
+            + 1.40 * pose_track
+            + 0.45 * vel_track
+            + 0.75 * height
+            + 0.90 * root_orientation
+            + 0.90 * root_vel
+            + 1.25 * foot_pos_track
+            + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
+            + self.cfg.step_gap_coef * side_metrics["step_gap"]
+            + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
+            + 0.55 * foot_vel_track
+            + 0.45 * stance_foot_track
+            + 0.55 * contact_track
+            + 0.45 * distal_vel_track
+            + self.cfg.symmetry_reward_coef * symmetry_track
+            + 0.35 * ctrl_track
+            - self.cfg.ctrl_penalty_coef * ctrl_penalty
+            - self.cfg.action_rate_penalty_coef * action_rate
+            - self.cfg.distal_action_penalty_coef * distal_action
+            - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+        )
+
+        bad_state = ~(
+            torch.isfinite(self.qpos).all(dim=1)
+            & torch.isfinite(self.qvel).all(dim=1)
+            & torch.isfinite(self.ctrl).all(dim=1)
+        )
+        fallen = (
+            (root_height < self.cfg.fall_height)
+            | (root_height > self.cfg.max_height)
+            | (up_z < self.cfg.min_upright_z)
+        )
+        timed_out = self.episode_step >= self.episode_timeout_step
+        dones = bad_state | fallen | timed_out
+        reward = reward - torch.where(bad_state | fallen, torch.full_like(reward, 2.0), torch.zeros_like(reward))
+
+        return reward, dones, timed_out, {
+            "root_vel": root_vel,
+            "root_orientation": root_orientation,
+            "height": height,
+            "pose_track": pose_track,
+            "vel_track": vel_track,
+            "foot_pos": foot_pos_track,
+            "side_foot_pos": side_metrics["side_foot_pos"],
+            "right_foot_pos": side_metrics["right_foot_pos"],
+            "left_foot_pos": side_metrics["left_foot_pos"],
+            "step_gap": side_metrics["step_gap"],
+            "step_gap_error": side_metrics["step_gap_error"],
+            "swing_advance": side_metrics["swing_advance"],
+            "right_swing_advance": side_metrics["right_swing_advance"],
+            "left_swing_advance": side_metrics["left_swing_advance"],
+            "foot_vel": foot_vel_track,
+            "stance_foot": stance_foot_track,
+            "contact": contact_track,
+            "distal_vel": distal_vel_track,
+            "symmetry": symmetry_track,
+            "foot_symmetry": foot_symmetry_track,
+            "contact_balance": contact_balance_track,
+            "action_balance": action_balance_track,
+            "ctrl_track": ctrl_track,
+            "ctrl_penalty": ctrl_penalty,
+            "action_rate": action_rate,
+            "distal_action": distal_action,
+            "distal_action_rate": distal_action_rate,
+        }
+
+    def _side_foot_tracks(
+        self,
+        foot_pos: torch.Tensor,
+        ref_foot_pos: torch.Tensor,
+        ref_foot_contact: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        right_center = torch.mean(foot_pos[:, 0:2], dim=1)
+        left_center = torch.mean(foot_pos[:, 2:4], dim=1)
+        side_center = torch.stack((right_center, left_center), dim=1)
+        ref_right_center = torch.mean(ref_foot_pos[:, 0:2], dim=1)
+        ref_left_center = torch.mean(ref_foot_pos[:, 2:4], dim=1)
+        ref_side_center = torch.stack((ref_right_center, ref_left_center), dim=1)
+
+        sigma = max(float(self.cfg.side_foot_pos_sigma), 1.0e-6)
+        side_error = torch.mean((side_center - ref_side_center).square(), dim=2)
+        right_foot_pos = torch.exp(-side_error[:, 0] / (sigma**2))
+        left_foot_pos = torch.exp(-side_error[:, 1] / (sigma**2))
+        side_foot_pos = torch.minimum(right_foot_pos, left_foot_pos)
+
+        actual_gap = side_center[:, 1, 0] - side_center[:, 0, 0]
+        ref_gap = ref_side_center[:, 1, 0] - ref_side_center[:, 0, 0]
+        step_gap_error = actual_gap - ref_gap
+        step_gap = torch.exp(
+            -step_gap_error.square() / (max(float(self.cfg.step_gap_sigma), 1.0e-6) ** 2)
+        )
+
+        swing_weight = 1.0 - ref_foot_contact
+        swing_sigma = max(float(self.cfg.swing_advance_sigma), 1.0e-6)
+        x_error = side_center[:, :, 0] - ref_side_center[:, :, 0]
+        side_swing = torch.exp(-x_error.square() / (swing_sigma**2))
+        swing_sum = torch.sum(swing_weight, dim=1)
+        swing_advance = torch.sum(side_swing * swing_weight, dim=1) / swing_sum.clamp_min(1.0e-6)
+        swing_advance = torch.where(swing_sum > 1.0e-6, swing_advance, torch.ones_like(swing_advance))
+
+        return {
+            "side_foot_pos": side_foot_pos,
+            "right_foot_pos": right_foot_pos,
+            "left_foot_pos": left_foot_pos,
+            "step_gap": step_gap,
+            "step_gap_error": step_gap_error,
+            "swing_advance": swing_advance,
+            "right_swing_advance": side_swing[:, 0],
+            "left_swing_advance": side_swing[:, 1],
+        }
+
+    def _stance_foot_track(
+        self,
+        foot_vel: torch.Tensor,
+        foot_contact: torch.Tensor,
+        ref_foot_contact: torch.Tensor,
+    ) -> torch.Tensor:
+        side_contact = torch.maximum(foot_contact, ref_foot_contact)
+        geom_weights = torch.stack(
+            (side_contact[:, 0], side_contact[:, 0], side_contact[:, 1], side_contact[:, 1]),
+            dim=1,
+        )
+        weight_sum = torch.sum(geom_weights, dim=1)
+        speed_sq = torch.sum(foot_vel.square(), dim=2)
+        stance_speed_sq = torch.sum(speed_sq * geom_weights, dim=1) / weight_sum.clamp_min(1.0e-6)
+        stance_track = torch.exp(-stance_speed_sq / (max(self.cfg.stance_foot_vel_sigma, 1.0e-6) ** 2))
+        return torch.where(weight_sum > 1.0e-6, stance_track, torch.ones_like(stance_track))
+
+    def _symmetry_track(
+        self,
+        foot_pos: torch.Tensor,
+        foot_contact: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        decay = float(np.clip(self.cfg.symmetry_ema_decay, 0.0, 0.9999))
+        right_x = torch.mean(foot_pos[:, 0:2, 0], dim=1)
+        left_x = torch.mean(foot_pos[:, 2:4, 0], dim=1)
+        side_x = torch.stack((right_x, left_x), dim=1)
+        self.foot_x_min[:] = torch.minimum(self.foot_x_min, side_x)
+        self.foot_x_max[:] = torch.maximum(self.foot_x_max, side_x)
+        right_stride = self.foot_x_max[:, 0] - self.foot_x_min[:, 0]
+        left_stride = self.foot_x_max[:, 1] - self.foot_x_min[:, 1]
+        side_stride = torch.stack((right_stride, left_stride), dim=1)
+        self.foot_stride_ema[:] = decay * self.foot_stride_ema + (1.0 - decay) * side_stride
+        stride_diff = self.foot_stride_ema[:, 0] - self.foot_stride_ema[:, 1]
+        sigma = max(self.cfg.symmetry_foot_pos_sigma, 1.0e-6)
+        stride_symmetry = torch.exp(-stride_diff.square() / (sigma**2))
+        # With foot positions expressed in the pelvis frame, a symmetric gait
+        # should keep the two side centers roughly mirrored front/back.
+        phase_diff = right_x + left_x
+        phase_symmetry = torch.exp(-phase_diff.square() / (sigma**2))
+        foot_symmetry = torch.minimum(stride_symmetry, phase_symmetry)
+
+        right_y = torch.mean(foot_pos[:, 0:2, 1], dim=1)
+        left_y = torch.mean(foot_pos[:, 2:4, 1], dim=1)
+        lateral_symmetry = torch.exp(
+            -(right_y + left_y).square() / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2)
+        )
+        foot_symmetry = 0.85 * foot_symmetry + 0.15 * lateral_symmetry
+
+        self.contact_balance_ema[:] = decay * self.contact_balance_ema + (1.0 - decay) * foot_contact
+        contact_diff = self.contact_balance_ema[:, 0] - self.contact_balance_ema[:, 1]
+        contact_balance = torch.exp(
+            -contact_diff.square() / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2)
+        )
+
+        if len(self.right_action_indices) > 0 and len(self.left_action_indices) > 0:
+            right_energy = torch.mean(action[:, self.right_action_indices].square(), dim=1)
+            left_energy = torch.mean(action[:, self.left_action_indices].square(), dim=1)
+            side_energy = torch.stack((right_energy, left_energy), dim=1)
+            self.action_energy_ema[:] = decay * self.action_energy_ema + (1.0 - decay) * side_energy
+            action_diff = self.action_energy_ema[:, 0] - self.action_energy_ema[:, 1]
+            action_balance = torch.exp(
+                -action_diff.square() / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2)
+            )
+        else:
+            action_balance = torch.ones_like(contact_balance)
+
+        symmetry = 0.60 * foot_symmetry + 0.25 * contact_balance + 0.15 * action_balance
+        return symmetry, foot_symmetry, contact_balance, action_balance
+
+    def close(self) -> None:
+        pass

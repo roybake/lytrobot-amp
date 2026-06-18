@@ -1,0 +1,22 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+
+# Training outputs
+logs/
+wandb/
+recording/
+runs/
+outputs/
+checkpoints/
+*.pt
+*.onnx
+*.mp4
+
+# Local editor state
+.vscode/*.log
