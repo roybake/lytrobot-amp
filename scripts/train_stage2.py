@@ -30,7 +30,7 @@ if __name__ == "__main__":
     if stage1_checkpoint is not None:
         if any(arg == "--resume-checkpoint" or arg.startswith("--resume-checkpoint=") for arg in sys.argv):
             raise SystemExit("Use only one of --stage1-checkpoint/--stage1-model or --resume-checkpoint.")
-        sys.argv.extend(["--resume-checkpoint", stage1_checkpoint])
+        sys.argv.extend(["--resume-checkpoint", stage1_checkpoint, "--resume-reset-progress"])
 
     if not any(arg == "--stage" or arg.startswith("--stage=") for arg in sys.argv):
         sys.argv.extend(["--stage", "stage2"])
@@ -54,4 +54,6 @@ if __name__ == "__main__":
         sys.argv.extend(["--device", "cuda"])
     if not any(arg == "--sim-backend" or arg.startswith("--sim-backend=") for arg in sys.argv):
         sys.argv.extend(["--sim-backend", "warp"])
+    if not any(arg == "--save-interval" or arg.startswith("--save-interval=") for arg in sys.argv):
+        sys.argv.extend(["--save-interval", "500"])
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")
