@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import fields
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 import mujoco
+import numpy as np
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.networks import ActorCritic
@@ -32,9 +34,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=1000, help="Number of policy steps to run. Use 0 for no limit.")
     parser.add_argument("--target-velocity", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Playback RNG seed. Omit it to randomize each run; set it to reproduce one play test.",
+    )
+    parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--stage", default="auto", choices=("auto", "stage1", "stage2"))
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--control-mode", default="auto", choices=("auto", "position", "hybrid"))
+    parser.add_argument("--hybrid-force-scale", type=float, default=None)
+    parser.add_argument("--stand-start-prob", type=float, default=None)
+    parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
+    parser.add_argument("--stand-start-transition-min-steps", type=int, default=None)
+    parser.add_argument("--stand-start-transition-max-steps", type=int, default=None)
+    parser.add_argument("--stand-start-push-delay-steps", type=int, default=None)
+    parser.add_argument(
+        "--camera-mode",
+        default="follow",
+        choices=("follow", "tracking", "free"),
+        help="Viewer/recording camera mode. follow manually locks lookat to the pelvis every frame.",
+    )
     parser.add_argument("--record-dir", default=str(REPO_ROOT / "recording"))
     parser.add_argument("--record-width", type=int, default=1920)
     parser.add_argument("--record-height", type=int, default=1080)
@@ -50,6 +72,7 @@ def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
         num_envs=1,
         target_velocity=args.target_velocity,
         reset_noise_scale=0.0,
+        stand_start_prob=0.0,
     )
     checkpoint_env_cfg = checkpoint.get("env_config", {})
     if isinstance(checkpoint_env_cfg, dict):
@@ -60,10 +83,29 @@ def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
     cfg.model_xml = args.model_xml
     cfg.motion_file = args.motion_file
     cfg.num_envs = 1
+    cfg.seed = int(args.seed)
     cfg.target_velocity = args.target_velocity
     cfg.reset_noise_scale = 0.0
+    if args.control_mode != "auto":
+        cfg.control_mode = args.control_mode
+    if args.hybrid_force_scale is not None:
+        cfg.hybrid_force_scale = float(args.hybrid_force_scale)
+    if args.stand_start_prob is not None:
+        cfg.stand_start_prob = float(args.stand_start_prob)
+    if args.stand_start_phase_delay_steps is not None:
+        cfg.stand_start_phase_delay_steps = int(args.stand_start_phase_delay_steps)
+    if args.stand_start_transition_min_steps is not None:
+        cfg.stand_start_transition_min_steps = int(args.stand_start_transition_min_steps)
+    if args.stand_start_transition_max_steps is not None:
+        cfg.stand_start_transition_max_steps = int(args.stand_start_transition_max_steps)
+    if args.stand_start_push_delay_steps is not None:
+        cfg.stand_start_push_delay_steps = int(args.stand_start_push_delay_steps)
     if args.domain_randomization is not None:
         cfg.domain_randomization = bool(args.domain_randomization)
+    if args.episode_random_seed is not None:
+        cfg.randomize_episode_seed = bool(args.episode_random_seed)
+    elif getattr(args, "seed_was_provided", False):
+        cfg.randomize_episode_seed = False
     return cfg
 
 
@@ -115,16 +157,47 @@ def configure_tracking_camera(
     model: mujoco.MjModel,
     camera: mujoco.MjvCamera,
     data: mujoco.MjData | None = None,
+    *,
+    mode: str = "follow",
 ) -> None:
     pelvis_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
-    if pelvis_body_id >= 0:
+    if mode == "tracking" and pelvis_body_id >= 0:
         camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         camera.trackbodyid = pelvis_body_id
+    else:
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
     camera.distance = 2.8
     camera.azimuth = 90.0
     camera.elevation = -12.0
-    if data is not None:
-        camera.lookat[:] = data.qpos[:3]
+    if data is not None and mode != "free":
+        update_follow_camera(model, camera, data, mode=mode)
+
+
+def pelvis_camera_target(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray | None:
+    pelvis_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    if pelvis_body_id >= 0:
+        target = data.xpos[pelvis_body_id].copy()
+        target[2] += 0.12
+        return target
+    if data.qpos.size >= 3:
+        return data.qpos[:3].copy()
+    return None
+
+
+def update_follow_camera(
+    model: mujoco.MjModel,
+    camera: mujoco.MjvCamera,
+    data: mujoco.MjData,
+    *,
+    mode: str,
+) -> None:
+    if mode == "free":
+        return
+    if mode == "tracking" and camera.type == mujoco.mjtCamera.mjCAMERA_TRACKING:
+        return
+    target = pelvis_camera_target(model, data)
+    if target is not None:
+        camera.lookat[:] = target
 
 
 class MujocoVideoRecorder:
@@ -138,6 +211,7 @@ class MujocoVideoRecorder:
         height: int,
         fps: float,
         crf: int,
+        camera_mode: str,
     ) -> None:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
@@ -146,12 +220,14 @@ class MujocoVideoRecorder:
         render_width = max(2, int(width) // 2 * 2)
         render_height = max(2, int(height) // 2 * 2)
         self.data = data
+        self.model = model
+        self.camera_mode = camera_mode
         self.output_path = output_path
         model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), render_width)
         model.vis.global_.offheight = max(int(model.vis.global_.offheight), render_height)
         self.renderer = mujoco.Renderer(model, height=render_height, width=render_width)
         self.camera = mujoco.MjvCamera()
-        configure_tracking_camera(model, self.camera, data)
+        configure_tracking_camera(model, self.camera, data, mode=camera_mode)
 
         fps_value = max(float(fps), 1.0)
         command = [
@@ -196,7 +272,7 @@ class MujocoVideoRecorder:
             return
         if camera is None:
             camera = self.camera
-            self.camera.lookat[:] = self.data.qpos[:3]
+        update_follow_camera(self.model, camera, self.data, mode=self.camera_mode)
         self.renderer.update_scene(self.data, camera=camera)
         frame = self.renderer.render()
         frame_bytes = frame.tobytes()
@@ -217,6 +293,12 @@ class MujocoVideoRecorder:
 
 def main() -> None:
     args = parse_args()
+    args.seed_was_provided = args.seed is not None
+    if args.seed is None:
+        args.seed = secrets.randbits(32)
+    torch.manual_seed(int(args.seed))
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     checkpoint = torch.load(args.checkpoint, map_location=args.device)
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
 
@@ -232,6 +314,10 @@ def main() -> None:
     ).to(args.device)
     policy.load_state_dict(checkpoint["actor_critic"])
     policy.eval()
+    print(
+        f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
+        f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode}"
+    )
 
     obs = env.reset()
     viewer = None
@@ -251,9 +337,10 @@ def main() -> None:
             height=args.record_height,
             fps=record_fps,
             crf=args.record_crf,
+            camera_mode=args.camera_mode,
         )
         print(f"[RECORD] saving {record_path}")
-        configure_tracking_camera(env.model, viewer.cam, env.datas[0])
+        configure_tracking_camera(env.model, viewer.cam, env.datas[0], mode=args.camera_mode)
         viewer.sync()
         recorder.write_frame(getattr(viewer, "cam", None))
 
@@ -269,7 +356,7 @@ def main() -> None:
             if viewer is not None:
                 if not viewer.is_running():
                     break
-                configure_tracking_camera(env.model, viewer.cam, env.datas[0])
+                update_follow_camera(env.model, viewer.cam, env.datas[0], mode=args.camera_mode)
                 viewer.sync()
                 if recorder is not None:
                     recorder.write_frame(getattr(viewer, "cam", None))

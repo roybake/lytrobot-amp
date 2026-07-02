@@ -9,6 +9,7 @@ import ctypes
 import gc
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -49,17 +50,30 @@ RESOURCE_METRIC_KEYS = (
     "system_mem_available_mb",
 )
 
+TRAIN_LOG_PROGRESS_RE = re.compile(r"\[TRAIN\]\s+iter=(\d+)\s+step=(\d+)")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train LYT biped locomotion with PPO-AMP.")
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
     parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
     parser.add_argument("--log-root", default=str(REPO_ROOT / "logs"))
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Existing run directory to append logs/checkpoints into when resuming.",
+    )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--stage", default="stage1", choices=("stage1", "stage2"))
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--resume-reset-optimizer", action="store_true")
+    parser.add_argument(
+        "--resume-reset-progress",
+        action="store_true",
+        help="Load checkpoint weights but restart iteration/global_step from zero.",
+    )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda", choices=("cuda",))
     parser.add_argument("--sim-backend", default="warp", choices=("warp",))
     parser.add_argument("--torch-threads", type=int, default=0)
@@ -73,11 +87,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-velocity", type=float, default=1.0)
     parser.add_argument("--reset-noise-scale", type=float, default=0.01)
     parser.add_argument("--motion-reset-prob", type=float, default=0.5)
+    parser.add_argument("--control-mode", default="position", choices=("position", "hybrid"))
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
     parser.add_argument("--distal-action-scale", type=float, default=1.0)
+    parser.add_argument("--hybrid-force-scale", type=float, default=0.15)
     parser.add_argument("--reference-ctrl-blend", type=float, default=1.0)
     parser.add_argument("--foot-vel-tracking-sigma", type=float, default=1.0)
-    parser.add_argument("--stance-foot-vel-sigma", type=float, default=0.30)
+    parser.add_argument("--stance-foot-vel-sigma", type=float, default=0.15)
+    parser.add_argument("--foot-vel-reward-coef", type=float, default=0.35)
+    parser.add_argument("--stance-foot-reward-coef", type=float, default=1.00)
+    parser.add_argument("--contact-reward-coef", type=float, default=0.70)
+    parser.add_argument("--missed-contact-penalty-coef", type=float, default=0.80)
     parser.add_argument("--side-foot-pos-sigma", type=float, default=0.08)
     parser.add_argument("--step-gap-sigma", type=float, default=0.12)
     parser.add_argument("--swing-advance-sigma", type=float, default=0.10)
@@ -90,10 +110,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symmetry-balance-sigma", type=float, default=0.25)
     parser.add_argument("--symmetry-ema-decay", type=float, default=0.99)
     parser.add_argument("--startup-action-ramp-steps", type=int, default=20)
+    parser.add_argument("--stand-start-prob", type=float, default=0.5)
+    parser.add_argument("--stand-start-phase-delay-steps", type=int, default=25)
+    parser.add_argument("--stand-start-transition-min-steps", type=int, default=80)
+    parser.add_argument("--stand-start-transition-max-steps", type=int, default=160)
+    parser.add_argument("--stand-start-push-delay-steps", type=int, default=100)
     parser.add_argument("--ctrl-penalty-coef", type=float, default=0.040)
     parser.add_argument("--action-rate-penalty-coef", type=float, default=0.100)
     parser.add_argument("--distal-action-penalty-coef", type=float, default=0.030)
     parser.add_argument("--distal-action-rate-penalty-coef", type=float, default=0.120)
+    parser.add_argument("--force-action-penalty-coef", type=float, default=0.020)
+    parser.add_argument("--force-action-rate-penalty-coef", type=float, default=0.040)
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--payload-mass-min", type=float, default=0.0)
     parser.add_argument("--payload-mass-max", type=float, default=3.0)
@@ -134,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-action-std", type=float, default=0.05)
     parser.add_argument("--max-action-std", type=float, default=0.60)
     parser.add_argument("--episode-metric-window", type=int, default=4096)
-    parser.add_argument("--save-interval", type=int, default=250)
+    parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--resource-log-interval", type=int, default=50)
     parser.add_argument(
@@ -159,8 +186,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-watch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--wandb-bootstrap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log an explicit zero bootstrap point at run start.",
+    )
     parser.add_argument("--wandb-project", default="lytrobot-amp")
     parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument(
+        "--wandb-run-id",
+        default=None,
+        help="Existing wandb run id to resume; inferred from --log-dir/wandb when omitted.",
+    )
+    parser.add_argument(
+        "--wandb-resume-from",
+        default=None,
+        help="W&B rewind target, e.g. '<run_id>?_step=<step>'; cannot be combined with normal resume.",
+    )
+    parser.add_argument(
+        "--resume-wandb-warmup-iterations",
+        type=int,
+        default=100,
+        help=(
+            "When appending to an existing run, skip reward/episode/task metrics in wandb "
+            "for this many resumed iterations so reset episode windows do not create spikes."
+        ),
+    )
+    parser.add_argument(
+        "--resume-wandb-min-episode-reward",
+        type=float,
+        default=None,
+        help="Keep reward/episode/task metrics out of wandb until mean_episode_reward reaches this value.",
+    )
+    parser.add_argument(
+        "--resume-wandb-min-episode-length",
+        type=float,
+        default=None,
+        help="Keep reward/episode/task metrics out of wandb until mean_episode_length reaches this value.",
+    )
     parser.add_argument("--wandb-tags", default="lytrobot,ppo,amp,walk")
     return parser.parse_args()
 
@@ -195,6 +259,55 @@ def make_log_dir(log_root: str, stage: str, run_name: str | None) -> Path:
     return log_dir
 
 
+def resolve_log_dir(args: argparse.Namespace) -> Path:
+    if args.log_dir is None:
+        return make_log_dir(args.log_root, args.stage, args.run_name)
+
+    log_dir = Path(args.log_dir).expanduser().resolve()
+    if not log_dir.exists():
+        raise FileNotFoundError(f"--log-dir does not exist: {log_dir}")
+    if not log_dir.is_dir():
+        raise NotADirectoryError(f"--log-dir is not a directory: {log_dir}")
+    return log_dir
+
+
+def infer_wandb_run_id(log_dir: Path) -> str | None:
+    wandb_dir = log_dir / "wandb"
+    if not wandb_dir.is_dir():
+        return None
+    run_dirs = sorted(
+        (path for path in wandb_dir.iterdir() if path.is_dir() and path.name.startswith("run-")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        for artifact in run_dir.glob("run-*.wandb"):
+            stem = artifact.stem
+            if stem.startswith("run-"):
+                return stem.removeprefix("run-")
+        parts = run_dir.name.split("-")
+        if parts:
+            return parts[-1]
+    return None
+
+
+def read_logged_training_progress(log_dir: Path) -> tuple[int, int] | None:
+    train_log = log_dir / "train.log"
+    if not train_log.exists():
+        return None
+    best: tuple[int, int] | None = None
+    with train_log.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = TRAIN_LOG_PROGRESS_RE.search(line)
+            if match is None:
+                continue
+            iteration = int(match.group(1))
+            global_step = int(match.group(2))
+            if best is None or iteration > best[0] or (iteration == best[0] and global_step > best[1]):
+                best = (iteration, global_step)
+    return best
+
+
 def maybe_init_wandb(args: argparse.Namespace, log_dir: Path):
     mode = os.environ.get("WANDB_MODE", "").lower()
     if not args.wandb or mode == "disabled":
@@ -207,9 +320,18 @@ def maybe_init_wandb(args: argparse.Namespace, log_dir: Path):
         return None
 
     tags = tuple(tag.strip() for tag in args.wandb_tags.split(",") if tag.strip())
+    run_id = args.wandb_run_id or infer_wandb_run_id(log_dir)
+    resume_from = args.wandb_resume_from
+    if resume_from is not None:
+        print(f"[INFO] rewinding/resuming wandb from {resume_from}")
+    if run_id is not None:
+        print(f"[INFO] resuming wandb run id={run_id}")
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
+        id=None if resume_from is not None else run_id,
+        resume=None if resume_from is not None else ("allow" if run_id is not None else None),
+        resume_from=resume_from,
         name=log_dir.name,
         tags=tags,
         dir=str(log_dir),
@@ -283,6 +405,38 @@ def _log_wandb_bootstrap(run, *, start_iteration: int, global_step: int) -> None
     run.log(bootstrap_metrics, step=int(global_step))
 
 
+def filter_resume_wandb_warmup_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    filtered: dict[str, float] = {}
+    for key, value in metrics.items():
+        if (
+            "reward" in key
+            or "length" in key
+            or key.startswith("task_")
+            or key in {"mean_episode_progress", "done_fraction"}
+        ):
+            continue
+        filtered[key] = value
+    filtered["resume_wandb_warmup"] = 1.0
+    return filtered
+
+
+def should_filter_resume_wandb_metrics(
+    metrics: dict[str, float],
+    *,
+    iteration: int,
+    warmup_until_iteration: int,
+    min_episode_reward: float | None,
+    min_episode_length: float | None,
+) -> bool:
+    if iteration < warmup_until_iteration:
+        return True
+    if min_episode_reward is not None and metrics.get("mean_episode_reward", 0.0) < min_episode_reward:
+        return True
+    if min_episode_length is not None and metrics.get("mean_episode_length", 0.0) < min_episode_length:
+        return True
+    return False
+
+
 def save_config(log_dir: Path, args: argparse.Namespace, env_cfg: LytRobotEnvCfg, ppo_cfg: PPOAMPConfig) -> None:
     payload = {
         "project_version": __version__,
@@ -292,7 +446,10 @@ def save_config(log_dir: Path, args: argparse.Namespace, env_cfg: LytRobotEnvCfg
         "ppo_amp": asdict(ppo_cfg),
     }
     (log_dir / "params").mkdir(parents=True, exist_ok=True)
-    with (log_dir / "params" / "config.json").open("w", encoding="utf-8") as f:
+    config_path = log_dir / "params" / "config.json"
+    if args.log_dir is not None and config_path.exists():
+        config_path = log_dir / "params" / f"resume_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with config_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
@@ -422,11 +579,13 @@ def main() -> None:
 
     device = select_device(args.device)
     sim_backend = select_sim_backend(args.sim_backend, device)
-    log_dir = make_log_dir(args.log_root, args.stage, args.run_name)
+    log_dir = resolve_log_dir(args)
     print(f"[INFO] log_dir={log_dir}")
     print(
         f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
-        f"seed={args.seed}, domain_randomization={args.domain_randomization}, wandb_default={args.wandb}"
+        f"seed={args.seed}, control_mode={args.control_mode}, "
+        f"domain_randomization={args.domain_randomization}, "
+        f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
     )
 
     env_cfg = LytRobotEnvCfg(
@@ -434,17 +593,24 @@ def main() -> None:
         motion_file=args.motion_file,
         num_envs=args.num_envs,
         seed=args.seed,
+        randomize_episode_seed=bool(args.episode_random_seed),
         decimation=args.decimation,
         episode_steps=args.episode_steps,
         episode_timeout_jitter_steps=args.episode_timeout_jitter_steps,
         target_velocity=args.target_velocity,
         reset_noise_scale=args.reset_noise_scale,
         motion_reset_prob=args.motion_reset_prob,
+        control_mode=args.control_mode,
         action_residual_scale=args.action_residual_scale,
         distal_action_scale=args.distal_action_scale,
+        hybrid_force_scale=args.hybrid_force_scale,
         reference_ctrl_blend=args.reference_ctrl_blend,
         foot_vel_tracking_sigma=args.foot_vel_tracking_sigma,
         stance_foot_vel_sigma=args.stance_foot_vel_sigma,
+        foot_vel_reward_coef=args.foot_vel_reward_coef,
+        stance_foot_reward_coef=args.stance_foot_reward_coef,
+        contact_reward_coef=args.contact_reward_coef,
+        missed_contact_penalty_coef=args.missed_contact_penalty_coef,
         side_foot_pos_sigma=args.side_foot_pos_sigma,
         step_gap_sigma=args.step_gap_sigma,
         swing_advance_sigma=args.swing_advance_sigma,
@@ -457,10 +623,17 @@ def main() -> None:
         symmetry_balance_sigma=args.symmetry_balance_sigma,
         symmetry_ema_decay=args.symmetry_ema_decay,
         startup_action_ramp_steps=args.startup_action_ramp_steps,
+        stand_start_prob=args.stand_start_prob,
+        stand_start_phase_delay_steps=args.stand_start_phase_delay_steps,
+        stand_start_transition_min_steps=args.stand_start_transition_min_steps,
+        stand_start_transition_max_steps=args.stand_start_transition_max_steps,
+        stand_start_push_delay_steps=args.stand_start_push_delay_steps,
         ctrl_penalty_coef=args.ctrl_penalty_coef,
         action_rate_penalty_coef=args.action_rate_penalty_coef,
         distal_action_penalty_coef=args.distal_action_penalty_coef,
         distal_action_rate_penalty_coef=args.distal_action_rate_penalty_coef,
+        force_action_penalty_coef=args.force_action_penalty_coef,
+        force_action_rate_penalty_coef=args.force_action_rate_penalty_coef,
         domain_randomization=bool(args.domain_randomization),
         payload_mass_min=args.payload_mass_min,
         payload_mass_max=args.payload_mass_max,
@@ -525,22 +698,55 @@ def main() -> None:
 
     start_iteration = 0
     if args.resume_checkpoint is not None:
-        start_iteration = trainer.load(
+        checkpoint_start_iteration = trainer.load(
             args.resume_checkpoint,
             load_optimizers=not args.resume_reset_optimizer,
         )
+        checkpoint_global_step = int(trainer.global_step)
+        if args.resume_reset_progress:
+            start_iteration = 0
+            trainer.global_step = 0
+        else:
+            start_iteration = checkpoint_start_iteration
+            logged_progress = read_logged_training_progress(log_dir) if args.log_dir is not None else None
+            if logged_progress is not None:
+                logged_iteration, logged_global_step = logged_progress
+                logged_start_iteration = logged_iteration + 1
+                if logged_start_iteration > start_iteration or logged_global_step > int(trainer.global_step):
+                    start_iteration = max(start_iteration, logged_start_iteration)
+                    trainer.global_step = max(int(trainer.global_step), logged_global_step)
+                    print(
+                        "[INFO] fast-forwarded resume progress from existing train.log "
+                        f"to iteration={start_iteration} global_step={trainer.global_step}"
+                    )
         optimizer_state = "reset" if args.resume_reset_optimizer else "loaded"
+        progress_state = (
+            f"reset from iteration={checkpoint_start_iteration} global_step={checkpoint_global_step}"
+            if args.resume_reset_progress
+            else f"iteration={start_iteration} global_step={trainer.global_step}"
+        )
         print(
             f"[INFO] resumed {args.resume_checkpoint} "
-            f"at iteration={start_iteration} global_step={trainer.global_step} optimizer={optimizer_state}"
+            f"at {progress_state} optimizer={optimizer_state}"
         )
     if start_iteration >= args.max_iterations:
         raise RuntimeError(
             f"Nothing to train: start_iteration={start_iteration} >= max_iterations={args.max_iterations}."
         )
 
-    if run is not None:
+    resuming_existing_log_dir = args.log_dir is not None and args.resume_checkpoint is not None
+    if run is not None and args.wandb_bootstrap:
         _log_wandb_bootstrap(run, start_iteration=start_iteration, global_step=int(trainer.global_step))
+
+    wandb_warmup_until_iteration = start_iteration
+    if run is not None and resuming_existing_log_dir and not args.resume_reset_progress:
+        warmup_iterations = max(int(args.resume_wandb_warmup_iterations), 0)
+        wandb_warmup_until_iteration = start_iteration + warmup_iterations
+        if warmup_iterations > 0:
+            print(
+                "[INFO] wandb resume warmup enabled: "
+                f"skipping reward/episode/task metrics until iteration {wandb_warmup_until_iteration}"
+            )
 
     last_iteration = start_iteration - 1
     last_global_step = trainer.global_step
@@ -614,7 +820,17 @@ def main() -> None:
                     metrics["mean_episode_reward"] = float(metrics["mean_reward"])
                 # Keep logging global_step explicitly because all charts use
                 # step_metric="global_step".
-                run.log(metrics, step=int(metrics["global_step"]))
+                if should_filter_resume_wandb_metrics(
+                    metrics,
+                    iteration=iteration,
+                    warmup_until_iteration=wandb_warmup_until_iteration,
+                    min_episode_reward=args.resume_wandb_min_episode_reward,
+                    min_episode_length=args.resume_wandb_min_episode_length,
+                ):
+                    run.log(filter_resume_wandb_warmup_metrics(metrics), step=int(metrics["global_step"]))
+                else:
+                    metrics["resume_wandb_warmup"] = 0.0
+                    run.log(metrics, step=int(metrics["global_step"]))
             if (iteration + 1) % max(args.save_interval, 1) == 0:
                 ckpt_step = iteration + 1
                 ckpt_path = log_dir / f"model_{ckpt_step}.pt"

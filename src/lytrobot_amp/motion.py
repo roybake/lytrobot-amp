@@ -9,6 +9,8 @@ from typing import Sequence
 import mujoco
 import numpy as np
 
+from .control import position_actuator_ids
+
 
 DEFAULT_COMMON_JOINTS: tuple[str, ...] = (
     "hip_flexion_r",
@@ -136,6 +138,7 @@ class MotionReference:
         motion_file: str | Path,
         model: mujoco.MjModel,
         common_joint_names: Sequence[str] = DEFAULT_COMMON_JOINTS,
+        actuator_ids: Sequence[int] | np.ndarray | None = None,
         zero_root_xy: bool = True,
     ) -> None:
         self.motion_file = Path(motion_file).expanduser().resolve()
@@ -187,9 +190,14 @@ class MotionReference:
         if self.root_body_id < 0:
             raise RuntimeError("Body 'pelvis' not found in robot model.")
         self.contact_geom_ids = resolve_contact_geom_ids(model)
-        self.actuator_tendon_ids = np.asarray(model.actuator_trnid[:, 0], dtype=np.int32)
-        self.ctrl_low = np.asarray(model.actuator_ctrlrange[:, 0], dtype=np.float32)
-        self.ctrl_high = np.asarray(model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.actuator_ids = (
+            np.asarray(actuator_ids, dtype=np.int32)
+            if actuator_ids is not None
+            else position_actuator_ids(model)
+        )
+        self.actuator_tendon_ids = np.asarray(model.actuator_trnid[self.actuator_ids, 0], dtype=np.int32)
+        self.ctrl_low = np.asarray(model.actuator_ctrlrange[self.actuator_ids, 0], dtype=np.float32)
+        self.ctrl_high = np.asarray(model.actuator_ctrlrange[self.actuator_ids, 1], dtype=np.float32)
 
         self.root_xy0 = self.source_qpos[0, :2].copy()
         self.foot_pos_dim = int(len(CONTACT_GEOM_NAMES) * 3)
@@ -235,7 +243,7 @@ class MotionReference:
         data = mujoco.MjData(self.model)
         qpos = np.zeros((self.frame_count, self.model.nq), dtype=np.float32)
         qvel = np.zeros((self.frame_count, self.model.nv), dtype=np.float32)
-        tendon_ctrl = np.zeros((self.frame_count, self.model.nu), dtype=np.float32)
+        tendon_ctrl = np.zeros((self.frame_count, len(self.actuator_ids)), dtype=np.float32)
         foot_pos = np.zeros((self.frame_count, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
         foot_world_z = np.zeros((self.frame_count, len(CONTACT_GEOM_NAMES)), dtype=np.float32)
 

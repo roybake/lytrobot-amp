@@ -493,6 +493,20 @@
     <position name="ankle_lb" tendon="ankle_lb_tendon" ctrlrange="0.36 0.505" kp="50000" forcerange="-300 0"/>
     <position name="ankle_rf" tendon="ankle_rf_tendon" ctrlrange="0.109 0.173" kp="50000" forcerange="-300 0"/>
     <position name="ankle_lf" tendon="ankle_lf_tendon" ctrlrange="0.109 0.173" kp="50000" forcerange="-300 0"/>
+    <motor name="hip_rm_force" tendon="hip_rm_tendon" gear="450" ctrlrange="-1 0" forcerange="-450 0"/>
+    <motor name="hip_lm_force" tendon="hip_lm_tendon" gear="450" ctrlrange="-1 0" forcerange="-450 0"/>
+    <motor name="hip_rb_force" tendon="hip_rb_tendon" gear="450" ctrlrange="-1 0" forcerange="-450 0"/>
+    <motor name="hip_lb_force" tendon="hip_lb_tendon" gear="450" ctrlrange="-1 0" forcerange="-450 0"/>
+    <motor name="hip_rf_force" tendon="hip_rf_tendon" gear="465" ctrlrange="-1 0" forcerange="-465 0"/>
+    <motor name="hip_lf_force" tendon="hip_lf_tendon" gear="465" ctrlrange="-1 0" forcerange="-465 0"/>
+    <motor name="knee_rb_force" tendon="knee_rb_tendon" gear="1000" ctrlrange="-1 0" forcerange="-1000 0"/>
+    <motor name="knee_lb_force" tendon="knee_lb_tendon" gear="1000" ctrlrange="-1 0" forcerange="-1000 0"/>
+    <motor name="knee_rf_force" tendon="knee_rf_tendon" gear="465" ctrlrange="-1 0" forcerange="-465 0"/>
+    <motor name="knee_lf_force" tendon="knee_lf_tendon" gear="465" ctrlrange="-1 0" forcerange="-465 0"/>
+    <motor name="ankle_rb_force" tendon="ankle_rb_tendon" gear="300" ctrlrange="-1 0" forcerange="-300 0"/>
+    <motor name="ankle_lb_force" tendon="ankle_lb_tendon" gear="300" ctrlrange="-1 0" forcerange="-300 0"/>
+    <motor name="ankle_rf_force" tendon="ankle_rf_tendon" gear="300" ctrlrange="-1 0" forcerange="-300 0"/>
+    <motor name="ankle_lf_force" tendon="ankle_lf_tendon" gear="300" ctrlrange="-1 0" forcerange="-300 0"/>
   </actuator> 
   <sensor>
     <accelerometer name="rootacc" site="rootIMU"/>

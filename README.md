@@ -6,7 +6,7 @@
 - 人体参考步态：`robot/reference_data/walk1.npz`或`robot/reference_data/walk1_mjcf.npz`
 - 目标任务：用 AMP 风格奖励和前向速度跟踪奖励训练机器人向前行走
 
-当前机器人是 14 个肌腱位置执行器，不是 Unitree G1 的关节位置电机。因此本项目没有硬套 `mjlab` 的 G1 环境注册，而是直接控制 MJCF 中的 tendon position actuators。
+默认控制是 14 个肌腱位置执行器。MJCF 里额外保留了 14 个 `_force` tendon motor actuator，仅在 `--control-mode hybrid` 时作为力补偿通道启用。
 
 ## 代码结构
 
@@ -47,15 +47,20 @@ uv sync
 
 ## 正常训练
 
-训练必须使用 GPU/Warp：`--device cuda --sim-backend warp`。stage1/stage2 入口都默认开启 wandb，并且每个 iteration 都会实时上报曲线；默认 1024 个并行环境、30000 iteration。第一阶段保持基础配置，不启用领域随机化，权重写入 `logs/stage1/<run>/`。
+训练必须使用 GPU/Warp：`--device cuda --sim-backend warp`。stage1/stage2 入口都默认开启 wandb，并且每个 iteration 都会实时上报曲线；默认 1024 个并行环境、30000 iteration。第一阶段保持基础配置，不启用领域随机化，权重写入 `logs/stage1/<run>/`。两个阶段训练默认开启 episode 级随机 seed：每个环境 episode reset 时都会从系统熵生成新的 seed，再采样起步相位、reset 噪声、随机化参数等；需要完全复现实验时可加 `--no-episode-random-seed`。
 
-本机训练与桌面共用 RTX 4060 Laptop GPU。为避免长时间 CUDA/Warp 负载导致桌面和 VSCode 无响应，默认每轮让出 10ms，并每 250 轮保存一次 checkpoint。独占计算 GPU 时可用 `--iteration-sleep-ms 0`；不建议在当前桌面 GPU 上把 `--num-envs` 提高到 2048。
+本机训练与桌面共用 RTX 4060 Laptop GPU。为避免长时间 CUDA/Warp 负载导致桌面和 VSCode 无响应，默认每轮让出 10ms，并每 500 轮保存一次 checkpoint。独占计算 GPU 时可用 `--iteration-sleep-ms 0`；不建议在当前桌面 GPU 上把 `--num-envs` 提高到 2048。
 
 旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期运行时主内存持续增长。当前版本升级后对照测试 RSS 已保持稳定；训练仍保留每 5 轮内存回收和 32GB RSS 安全停止保护。
 
 ```bash
+位控
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/train_stage1.py
+
+力位联控
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/train_stage1.py --control-mode hybrid
 ```
 
 第二阶段是独立训练入口，在第一阶段基础配置上启用领域随机化，默认同样开启 wandb，权重写入 `logs/stage2/<run>/`：
@@ -63,10 +68,11 @@ uv run python scripts/train_stage1.py
 ```bash
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/<stage1_run>/model_<iter>.pt
+  --stage1-checkpoint logs/stage1/06-26-08:03:21/model_final.pt \
+  --control-mode hybrid
 ```
 
-`--stage1-checkpoint` 用来指定接着哪个第一阶段权重模型训练，例如 `model_1000.pt` 或 `model_final.pt`。也可以使用等价别名 `--stage1-model`。如果不传这个参数，第二阶段会从头训练；如果需要恢复第二阶段自身的中断训练，也可以继续使用底层参数 `--resume-checkpoint logs/stage2/<run>/model_<iter>.pt`。
+`--stage1-checkpoint` 用来指定接着哪个第一阶段权重模型训练，例如 `model_1000.pt` 或 `model_final.pt`。它会加载模型和优化器状态，但把第二阶段的 iteration 与 `global_step` 从 0 重新计数，因此第一阶段已经达到 30000 iteration 时仍可直接开始第二阶段。也可以使用等价别名 `--stage1-model`。如果不传这个参数，第二阶段会从头训练；如果需要恢复第二阶段自身的中断训练，也可以继续使用底层参数 `--resume-checkpoint logs/stage2/<run>/model_<iter>.pt`，此时会保留第二阶段已有的训练进度。
 
 也可以显式调用统一入口：
 
@@ -101,13 +107,47 @@ uv run python scripts/train_stage2.py \
   --action-delay-max-ms 5.0
 ```
 
+为了让策略具备物理样机可用的“静止起步”能力，训练环境默认会把一部分 episode 设为双脚静止站立起步：先保持站立相位，再用 80~160 个 policy step 平滑接入周期步态，起步前 100 step 不施加随机推力。相关参数可以覆盖：
+
+```bash
+uv run python scripts/train_stage2.py \
+  --stage1-checkpoint logs/stage1/<stage1_run>/model_final.pt \
+  --stand-start-prob 0.5 \
+  --stand-start-phase-delay-steps 25 \
+  --stand-start-transition-min-steps 80 \
+  --stand-start-transition-max-steps 160 \
+  --stand-start-push-delay-steps 100
+```
+
+测试样机起步效果时建议强制从静止起步开始：
+
+```bash
+uv run python scripts/play.py \
+  --checkpoint logs/stage2/06-23-11:25:00/model_12500.pt \
+  --device cuda \
+  --viewer \
+  --steps 0 \
+  --stand-start-prob 1.0
+```
+
 
 指定模型可视化测试命令：
-
+stage1
 ```bash
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/play.py \
-  --checkpoint logs/stage1/06-18-10:01:10/model_7000.pt \
+  --checkpoint logs/stage1/06-26-08:03:21/model_final.pt \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+06-18-10:01:10/model_final.pt stage1最好
+
+stage2
+```bash
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/play.py \
+  --checkpoint logs/stage2/06-30-09:08:47/model_10250.pt \
   --device cuda \
   --viewer \
   --steps 0
@@ -155,8 +195,25 @@ uv run python scripts/train_stage1.py \
   --amp-reward-coef 1.2 \
   --task-reward-lerp 0.50 \
   --max-iterations 30000 \
-  --save-interval 250
+  --save-interval 500
 ```
+
+控制模式：
+
+- `--control-mode position`：默认模式，策略动作保持 14 维，只控制肌腱位置目标，兼容既有训练和 checkpoint。
+- `--control-mode hybrid`：力位联控模式，策略动作为 28 维，前 14 维沿用位置目标，后 14 维通过同名 `_force` actuator 输出单向额外拉力补偿；`--hybrid-force-scale` 默认 0.15，即最多使用各肌腱力限的约 15% 作为补偿。
+
+足端稳定奖励分为三个互不冲突的部分：参考局部足速只约束摆动脚；支撑脚按脚掌/脚趾的真实接触掩码约束世界坐标水平速度；参考要求支撑但实际离地时单独扣分。参考接触标签只用于判断当前是否应当落地，不再把参考局部足速错误地当成支撑脚世界零速。默认参数为：
+
+```bash
+--foot-vel-reward-coef 0.35 \
+--stance-foot-vel-sigma 0.15 \
+--stance-foot-reward-coef 1.0 \
+--contact-reward-coef 0.70 \
+--missed-contact-penalty-coef 0.80
+```
+
+其中 `task_stance_foot` 越接近 1 越好，`task_stance_foot_speed` 是接触足端的世界水平速度（m/s），`task_missed_contact` 是参考支撑却未接触的比例，后两项应持续下降。
 
 日志和权重写入 `logs/<stage>/<时间>/`，包括：
 
@@ -198,7 +255,33 @@ uv run python scripts/train_stage2.py \
   --save-interval 25
 ```
 
-`--max-iterations` 是最终 iteration 编号上限，不是额外训练轮数；从 `model_2049.pt` 恢复且设置 `2600` 时，会训练 `2050..2599`。重点观察 wandb 中的 `task_action_rate`、`task_distal_action_rate`、`task_stance_foot`、`task_distal_vel`、`mean_length` 和 `mean_amp_reward`。
+`--max-iterations` 是最终 iteration 编号上限，不是额外训练轮数；从 `model_2049.pt` 恢复且设置 `2600` 时，会训练 `2050..2599`。重点观察 wandb 中的 `task_action_rate`、`task_distal_action_rate`、`task_stance_foot`、`task_stance_foot_speed`、`task_missed_contact`、`task_distal_vel`、`mean_length` 和 `mean_amp_reward`。
+
+针对当前支撑脚前后蹭动，先从与第二阶段兼容的 14 维 position stage1 策略低学习率续训约 4000 iteration：
+
+```bash
+uv run python scripts/train_stage1.py \
+  --resume-checkpoint logs/stage1/06-18-10:01:10/model_final.pt \
+  --resume-reset-optimizer \
+  --run-name 06-30-no-slip-stage1 \
+  --learning-rate 5e-5 \
+  --disc-learning-rate 2e-5 \
+  --max-iterations 34000 \
+  --save-interval 100
+```
+
+选择 `task_stance_foot_speed`、`task_missed_contact` 已下降且步态未退化的 checkpoint，再进入第二阶段；不要直接用旧 stage2 权重消除已经形成的腾空蹭步：
+
+```bash
+uv run python scripts/train_stage2.py \
+  --stage1-checkpoint logs/stage1/06-30-no-slip-stage1/model_<best>.pt \
+  --resume-reset-optimizer \
+  --run-name 06-30-no-slip-stage2 \
+  --learning-rate 3e-5 \
+  --disc-learning-rate 1e-5 \
+  --max-iterations 10000 \
+  --save-interval 100
+```
 
 ## GPU 冒烟测试
 
@@ -290,10 +373,12 @@ python scripts/play.py \
 本机已完成以下检查：
 
 ```text
-python -m compileall -q src scripts
+python -m compileall -q src scripts tests
+python -m unittest discover -s tests -v
 python robot/Launch.py --headless --steps 20
 stage1 GPU/Warp 冒烟训练通过，保存 model_1.pt/model_final.pt
 stage2 GPU/Warp 领域随机化冒烟训练通过，保存 model_1.pt/model_final.pt
+旧 position stage1 checkpoint 使用新足端奖励续训加载通过
 stage1/stage2 model_final.pt 播放加载通过
 ```
 

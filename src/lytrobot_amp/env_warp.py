@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import secrets
 
 import mujoco
 import numpy as np
 import torch
 
+from .control import (
+    CONTROL_MODE_HYBRID,
+    force_actuator_ids_for_positions,
+    normalize_control_mode,
+    position_actuator_ids,
+)
 from .env import LytRobotEnvCfg
 from .motion import CONTACT_GEOM_NAMES, MotionReference, resolve_contact_geom_ids
 
@@ -64,19 +71,43 @@ class LytRobotWarpAmpEnv:
         self.base_geom_friction_np = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
         self.base_gravity_np = np.asarray(self.model.opt.gravity, dtype=np.float32).copy()
 
-        self.motion = MotionReference(cfg.motion_file, self.model)
+        self.control_mode = normalize_control_mode(cfg.control_mode)
+        self.position_actuator_ids_np = position_actuator_ids(self.model).astype(np.int64)
+        self.force_actuator_ids_np = (
+            force_actuator_ids_for_positions(self.model, self.position_actuator_ids_np).astype(np.int64)
+            if self.control_mode == CONTROL_MODE_HYBRID
+            else np.asarray([], dtype=np.int64)
+        )
+        self.position_action_dim = int(len(self.position_actuator_ids_np))
+        self.force_action_dim = int(len(self.force_actuator_ids_np))
+        self.action_dim = (
+            self.position_action_dim + self.force_action_dim
+            if self.control_mode == CONTROL_MODE_HYBRID
+            else self.position_action_dim
+        )
+        self.ctrl_dim = int(self.model.nu)
+        self.motion = MotionReference(cfg.motion_file, self.model, actuator_ids=self.position_actuator_ids_np)
         self.rng = np.random.default_rng(cfg.seed)
         self.num_envs = int(cfg.num_envs)
-        self.action_dim = int(self.model.nu)
 
-        self.ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
-        self.ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.full_ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
+        self.full_ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids_np, 0], dtype=np.float32)
+        self.ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids_np, 1], dtype=np.float32)
+        self.force_ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids_np, 0], dtype=np.float32)
+        self.force_ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids_np, 1], dtype=np.float32)
         self.ctrl_low = torch.as_tensor(self.ctrl_low_np, dtype=torch.float32, device=self.device)
         self.ctrl_high = torch.as_tensor(self.ctrl_high_np, dtype=torch.float32, device=self.device)
         self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
         self.ctrl_half_range = torch.clamp(0.5 * (self.ctrl_high - self.ctrl_low), min=1.0e-6)
+        self.force_ctrl_low = torch.as_tensor(self.force_ctrl_low_np, dtype=torch.float32, device=self.device)
+        self.force_ctrl_high = torch.as_tensor(self.force_ctrl_high_np, dtype=torch.float32, device=self.device)
+        self.position_actuator_ids = torch.as_tensor(
+            self.position_actuator_ids_np, dtype=torch.long, device=self.device
+        )
+        self.force_actuator_ids = torch.as_tensor(self.force_actuator_ids_np, dtype=torch.long, device=self.device)
         self.actuator_tendon_ids = torch.as_tensor(
-            np.asarray(self.model.actuator_trnid[:, 0], dtype=np.int64),
+            np.asarray(self.model.actuator_trnid[self.position_actuator_ids_np, 0], dtype=np.int64),
             dtype=torch.long,
             device=self.device,
         )
@@ -84,6 +115,9 @@ class LytRobotWarpAmpEnv:
         action_scale_np = self._build_action_scale(distal_action_mask_np)
         self.action_scale = torch.as_tensor(action_scale_np, dtype=torch.float32, device=self.device)
         self.distal_action_mask = torch.as_tensor(distal_action_mask_np, dtype=torch.bool, device=self.device)
+        self.distal_position_action_mask = torch.as_tensor(
+            self.distal_position_action_mask_np, dtype=torch.bool, device=self.device
+        )
         self.has_distal_action = bool(np.any(distal_action_mask_np))
         right_action_indices_np, left_action_indices_np = self._build_side_action_indices()
         self.right_action_indices = torch.as_tensor(right_action_indices_np, dtype=torch.long, device=self.device)
@@ -103,8 +137,10 @@ class LytRobotWarpAmpEnv:
         if self.floor_geom_id < 0:
             raise RuntimeError("Expected floor and foot contact geoms were not found in robot model.")
         self.contact_geom_ids = torch.as_tensor(contact_geom_ids_np, dtype=torch.long, device=self.device)
+        self.contact_geom_id_values = tuple(int(geom_id) for geom_id in contact_geom_ids_np)
         self.right_contact_geom_ids = self.contact_geom_ids[:2]
         self.left_contact_geom_ids = self.contact_geom_ids[2:]
+        self._build_stand_reference()
 
         self.joint_reward_weights = torch.as_tensor(
             self._build_joint_reward_weights(), dtype=torch.float32, device=self.device
@@ -126,6 +162,7 @@ class LytRobotWarpAmpEnv:
         self._init_warp_data()
 
         self.episode_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.episode_seed = np.full(self.num_envs, int(cfg.seed), dtype=np.uint64)
         self.episode_timeout_step = torch.full(
             (self.num_envs,),
             int(cfg.episode_steps),
@@ -137,12 +174,15 @@ class LytRobotWarpAmpEnv:
         self.last_foot_pos = torch.zeros(
             (self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device
         )
+        self.last_foot_world_pos = torch.zeros_like(self.last_foot_pos)
         self.foot_stride_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.foot_x_min = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.foot_x_max = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.contact_balance_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.action_energy_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.last_obs = torch.zeros((self.num_envs, self.obs_dim), dtype=torch.float32, device=self.device)
+        self.stand_start = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.stand_start_transition_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
         self._init_domain_randomization()
         self.reset()
 
@@ -194,33 +234,35 @@ class LytRobotWarpAmpEnv:
         return np.asarray(weights, dtype=np.float32)
 
     def _build_action_scale(self, distal_action_mask: np.ndarray) -> np.ndarray:
-        scale = np.ones(self.action_dim, dtype=np.float32)
+        scale = np.ones(self.position_action_dim, dtype=np.float32)
         distal_scale = float(np.clip(self.cfg.distal_action_scale, 0.05, 1.0))
-        scale[distal_action_mask] = distal_scale
+        scale[self.distal_position_action_mask_np] = distal_scale
         return scale
 
     def _build_distal_action_mask(self) -> np.ndarray:
         mask = np.zeros(self.action_dim, dtype=bool)
-        for actuator_id in range(self.action_dim):
+        self.distal_position_action_mask_np = np.zeros(self.position_action_dim, dtype=bool)
+        for action_id, actuator_id in enumerate(self.position_actuator_ids_np):
             actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
             tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
             tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
             if "ankle" in actuator_name or "ankle" in tendon_name:
-                mask[actuator_id] = True
+                mask[action_id] = True
+                self.distal_position_action_mask_np[action_id] = True
         return mask
 
     def _build_side_action_indices(self) -> tuple[np.ndarray, np.ndarray]:
         right: list[int] = []
         left: list[int] = []
-        for actuator_id in range(self.action_dim):
+        for action_id, actuator_id in enumerate(self.position_actuator_ids_np):
             actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
             tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
             tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
             name = f"{actuator_name} {tendon_name}"
             if "_r" in name:
-                right.append(actuator_id)
+                right.append(action_id)
             elif "_l" in name:
-                left.append(actuator_id)
+                left.append(action_id)
         return np.asarray(right, dtype=np.int64), np.asarray(left, dtype=np.int64)
 
     def _build_reference_tensors(self) -> None:
@@ -239,6 +281,36 @@ class LytRobotWarpAmpEnv:
         self.ref_foot_contact = tensor(self.motion.reference_foot_contact)
         self.feature_mean = tensor(self.motion.feature_mean)
         self.feature_std = tensor(self.motion.feature_std)
+
+    def _build_stand_reference(self) -> None:
+        data = mujoco.MjData(self.model)
+        data.qpos[:] = self.motion.model_qpos0
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, data)
+        tendon_lengths = np.asarray(data.ten_length, dtype=np.float32)
+        actuator_tendon_ids = np.asarray(self.model.actuator_trnid[self.position_actuator_ids_np, 0], dtype=np.int64)
+        tendon_ctrl = np.clip(tendon_lengths[actuator_tendon_ids], self.ctrl_low_np, self.ctrl_high_np)
+        root_mat = np.asarray(data.xmat[self.pelvis_body_id], dtype=np.float32).reshape(3, 3)
+        root_pos = np.asarray(data.xpos[self.pelvis_body_id], dtype=np.float32)
+        contact_geom_ids = self.contact_geom_ids.detach().cpu().numpy().astype(np.int64)
+        foot_world = np.asarray(data.geom_xpos[contact_geom_ids], dtype=np.float32)
+        foot_pos = (foot_world - root_pos) @ root_mat
+
+        def tensor(value: np.ndarray) -> torch.Tensor:
+            return torch.as_tensor(value, dtype=torch.float32, device=self.device)
+
+        quat = np.asarray(data.qpos[3:7], dtype=np.float32)
+        quat = quat / max(float(np.linalg.norm(quat)), 1.0e-6)
+        self.stand_root_height = tensor(np.asarray([float(data.qpos[2])], dtype=np.float32))
+        self.stand_root_quat = tensor(quat[None, :])
+        self.stand_root_lin_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        self.stand_root_ang_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        self.stand_joint_pos = tensor(np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)[None, :])
+        self.stand_joint_vel = torch.zeros((1, len(self.motion.robot_qvel_adrs)), dtype=torch.float32, device=self.device)
+        self.stand_tendon_ctrl = tensor(tendon_ctrl[None, :])
+        self.stand_foot_pos = tensor(foot_pos[None, :])
+        self.stand_foot_vel = torch.zeros((1, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device)
+        self.stand_foot_contact = torch.ones((1, 2), dtype=torch.float32, device=self.device)
 
     def _build_reset_helpers(self) -> None:
         limited_qpos_adrs: list[int] = []
@@ -304,7 +376,7 @@ class LytRobotWarpAmpEnv:
         self.action_delay_ticks = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.action_delay_cursor = 0
         self.env_tendon_length_scale = torch.ones(
-            (self.num_envs, self.action_dim), dtype=torch.float32, device=self.device
+            (self.num_envs, self.position_action_dim), dtype=torch.float32, device=self.device
         )
         self.push_force = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=self.device)
         self.push_time_left = np.zeros(self.num_envs, dtype=np.int32)
@@ -338,13 +410,31 @@ class LytRobotWarpAmpEnv:
         high = max(low + 1, int(self.cfg.push_duration_max_steps) + 1)
         return self.rng.integers(low, high, size=size, dtype=np.int32)
 
+    def _sample_stand_transition_steps(self, size: int) -> torch.Tensor:
+        low = max(1, int(self.cfg.stand_start_transition_min_steps))
+        high = max(low, int(self.cfg.stand_start_transition_max_steps))
+        if high <= low:
+            values = np.full(size, low, dtype=np.int64)
+        else:
+            values = self.rng.integers(low, high + 1, size=size, dtype=np.int64)
+        return torch.as_tensor(values, dtype=torch.long, device=self.device)
+
+    def _refresh_episode_rng(self, ids_np: np.ndarray) -> None:
+        if not self.cfg.randomize_episode_seed or ids_np.size == 0:
+            return
+        seeds = np.asarray([secrets.randbits(64) for _ in range(len(ids_np))], dtype=np.uint64)
+        self.episode_seed[ids_np] = seeds
+        seed_words = [int(seed & np.uint64(0xFFFFFFFF)) for seed in seeds]
+        seed_words += [int(seed >> np.uint64(32)) for seed in seeds]
+        self.rng = np.random.default_rng(np.random.SeedSequence(seed_words))
+
     def _sample_domain_randomization(self, ids_np: np.ndarray) -> None:
         if not self.domain_randomization or ids_np.size == 0:
             return
         tendon_scale = self._uniform_np(
             self.cfg.tendon_length_scale_min,
             self.cfg.tendon_length_scale_max,
-            (len(ids_np), self.action_dim),
+            (len(ids_np), self.position_action_dim),
         )
         ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
         self.env_tendon_length_scale[ids] = torch.as_tensor(tendon_scale, dtype=torch.float32, device=self.device)
@@ -467,6 +557,38 @@ class LytRobotWarpAmpEnv:
             "foot_contact": interp(self.ref_foot_contact),
         }
 
+    def _stand_start_progress(self) -> torch.Tensor:
+        delay = max(0, int(self.cfg.stand_start_phase_delay_steps))
+        raw = (self.episode_step.to(torch.float32) - float(delay)) / self.stand_start_transition_steps.to(torch.float32).clamp_min(1.0)
+        progress = torch.clamp(raw, 0.0, 1.0)
+        progress = progress * progress * (3.0 - 2.0 * progress)
+        return torch.where(self.stand_start, progress, torch.ones_like(progress))
+
+    def _blend_start_targets(self, targets: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        progress = self._stand_start_progress()
+
+        def blend(stand: torch.Tensor, walk: torch.Tensor) -> torch.Tensor:
+            shape = (self.num_envs,) + (1,) * (walk.ndim - 1)
+            weight = progress.reshape(shape)
+            return (1.0 - weight) * stand + weight * walk
+
+        root_quat = _canonical_quat(blend(self.stand_root_quat, targets["root_quat"]))
+        return {
+            "root_height": blend(self.stand_root_height, targets["root_height"]),
+            "root_quat": root_quat,
+            "root_lin_vel": blend(self.stand_root_lin_vel, targets["root_lin_vel"]),
+            "root_ang_vel": blend(self.stand_root_ang_vel, targets["root_ang_vel"]),
+            "joint_pos": blend(self.stand_joint_pos, targets["joint_pos"]),
+            "joint_vel": blend(self.stand_joint_vel, targets["joint_vel"]),
+            "tendon_ctrl": blend(self.stand_tendon_ctrl, targets["tendon_ctrl"]),
+            "foot_pos": blend(self.stand_foot_pos, targets["foot_pos"]),
+            "foot_vel": blend(self.stand_foot_vel, targets["foot_vel"]),
+            "foot_contact": blend(self.stand_foot_contact, targets["foot_contact"]),
+        }
+
+    def _targets_at_current_phase(self) -> dict[str, torch.Tensor]:
+        return self._blend_start_targets(self._targets_at_phase(self.motion_phase))
+
     def _clip_joint_ranges_batch(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
         if len(self._limited_qpos_adrs_np) == 0:
             return
@@ -481,17 +603,56 @@ class LytRobotWarpAmpEnv:
         crossed_high = (values > high) & (qvel[:, dadr] > 0.0)
         qvel[:, dadr] = np.where(crossed_low | crossed_high, 0.0, qvel[:, dadr])
 
-    def action_to_ctrl(self, action: torch.Tensor, base_ctrl: torch.Tensor | None = None) -> torch.Tensor:
+    def _split_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         clipped = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
+        position_action = clipped[:, : self.position_action_dim]
+        if self.control_mode == CONTROL_MODE_HYBRID:
+            force_action = clipped[:, self.position_action_dim :]
+        else:
+            force_action = torch.zeros((clipped.shape[0], 0), dtype=torch.float32, device=self.device)
+        return position_action, force_action
+
+    def _force_action_to_ctrl(self, force_action: torch.Tensor) -> torch.Tensor:
+        if self.control_mode != CONTROL_MODE_HYBRID:
+            return torch.zeros((force_action.shape[0], 0), dtype=torch.float32, device=self.device)
+        pull = torch.clamp(force_action.to(dtype=torch.float32, device=self.device), min=0.0)
+        ctrl = -float(np.clip(self.cfg.hybrid_force_scale, 0.0, 1.0)) * pull
+        return torch.clamp(ctrl, min=self.force_ctrl_low, max=self.force_ctrl_high)
+
+    def _position_ctrl_to_full_ctrl(
+        self,
+        position_ctrl: torch.Tensor,
+        force_action: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        full_ctrl = torch.zeros((position_ctrl.shape[0], self.ctrl_dim), dtype=torch.float32, device=self.device)
+        full_ctrl[:, self.position_actuator_ids] = position_ctrl
+        if self.control_mode == CONTROL_MODE_HYBRID:
+            force = (
+                torch.zeros((position_ctrl.shape[0], self.force_action_dim), dtype=torch.float32, device=self.device)
+                if force_action is None
+                else force_action
+            )
+            full_ctrl[:, self.force_actuator_ids] = self._force_action_to_ctrl(force)
+        return full_ctrl
+
+    def action_to_ctrl(self, action: torch.Tensor, base_ctrl: torch.Tensor | None = None) -> torch.Tensor:
+        position_action, force_action = self._split_action(action)
         base = self.ctrl_mid if base_ctrl is None else base_ctrl
-        ctrl = base + (
-            clipped * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
+        position_ctrl = base + (
+            position_action * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
         )
-        ctrl = torch.clamp(ctrl, min=self.ctrl_low, max=self.ctrl_high)
-        return self._apply_tendon_length_randomization(ctrl)
+        position_ctrl = torch.clamp(position_ctrl, min=self.ctrl_low, max=self.ctrl_high)
+        position_ctrl = self._apply_tendon_length_randomization(position_ctrl)
+        return self._position_ctrl_to_full_ctrl(position_ctrl, force_action)
 
     def ctrl_to_action(self, ctrl: torch.Tensor) -> torch.Tensor:
-        return torch.clamp((ctrl - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
+        ctrl_tensor = ctrl.to(dtype=torch.float32, device=self.device)
+        position_ctrl = ctrl_tensor[:, self.position_actuator_ids] if ctrl_tensor.shape[-1] == self.ctrl_dim else ctrl_tensor
+        position_action = torch.clamp((position_ctrl - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
+        if self.control_mode != CONTROL_MODE_HYBRID:
+            return position_action
+        force_zeros = torch.zeros((position_action.shape[0], self.force_action_dim), dtype=torch.float32, device=self.device)
+        return torch.cat((position_action, force_zeros), dim=1)
 
     def _current_tendon_ctrl(self) -> torch.Tensor:
         ctrl = self.ten_length[:, self.actuator_tendon_ids]
@@ -510,23 +671,38 @@ class LytRobotWarpAmpEnv:
         foot_world = self.geom_xpos[:, self.contact_geom_ids]
         return torch.matmul(foot_world - root_pos[:, None, :], root_mat)
 
-    def _foot_contacts(self) -> torch.Tensor:
-        contact = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+    def _foot_positions_world(self) -> torch.Tensor:
+        return self.geom_xpos[:, self.contact_geom_ids]
+
+    @staticmethod
+    def _side_contacts_from_geom(geom_contact: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (torch.amax(geom_contact[:, 0:2], dim=1), torch.amax(geom_contact[:, 2:4], dim=1)),
+            dim=1,
+        )
+
+    def _foot_geom_contacts(self) -> torch.Tensor:
+        contact = torch.zeros(
+            (self.num_envs, len(CONTACT_GEOM_NAMES)),
+            dtype=torch.float32,
+            device=self.device,
+        )
         g1 = self.contact_geom[:, 0]
         g2 = self.contact_geom[:, 1]
         world = self.contact_worldid
         valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
 
-        r0, r1 = self.right_contact_geom_ids
-        l0, l1 = self.left_contact_geom_ids
         floor = int(self.floor_geom_id)
-        right = valid & (((g1 == floor) & ((g2 == r0) | (g2 == r1))) | ((g2 == floor) & ((g1 == r0) | (g1 == r1))))
-        left = valid & (((g1 == floor) & ((g2 == l0) | (g2 == l1))) | ((g2 == floor) & ((g1 == l0) | (g1 == l1))))
-        if right.any():
-            contact[world[right], 0] = 1.0
-        if left.any():
-            contact[world[left], 1] = 1.0
+        for contact_index, geom in enumerate(self.contact_geom_id_values):
+            matched = valid & (
+                ((g1 == floor) & (g2 == geom))
+                | ((g2 == floor) & (g1 == geom))
+            )
+            contact[world[matched], contact_index] = 1.0
         return contact
+
+    def _foot_contacts(self) -> torch.Tensor:
+        return self._side_contacts_from_geom(self._foot_geom_contacts())
 
     def reset(self, env_ids: np.ndarray | list[int] | torch.Tensor | None = None) -> torch.Tensor:
         if env_ids is None:
@@ -537,10 +713,18 @@ class LytRobotWarpAmpEnv:
             ids_np = np.asarray(env_ids, dtype=np.int64)
         if ids_np.size == 0:
             return self.last_obs
+        self._refresh_episode_rng(ids_np)
 
         states = self.motion.sample_states(len(ids_np), self.rng)
-        use_motion_reset = self.rng.random(len(ids_np)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+        use_stand_start = self.rng.random(len(ids_np)) < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        use_motion_reset = (
+            ~use_stand_start
+            & (self.rng.random(len(ids_np)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)))
+        )
         self._sample_domain_randomization(ids_np)
+        ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
+        self.stand_start[ids] = torch.as_tensor(use_stand_start, dtype=torch.bool, device=self.device)
+        self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids_np))
         qpos = np.repeat(self.motion.model_qpos0[None, :], len(ids_np), axis=0).astype(np.float32)
         qvel = np.zeros((len(ids_np), self.model.nv), dtype=np.float32)
         phase = np.zeros(len(ids_np), dtype=np.float32)
@@ -557,7 +741,6 @@ class LytRobotWarpAmpEnv:
             ).astype(np.float32)
             self._clip_joint_ranges_batch(qpos, qvel)
 
-        ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
         self.qpos[ids] = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
         self.qvel[ids] = torch.as_tensor(qvel, dtype=torch.float32, device=self.device)
         self.motion_phase[ids] = torch.as_tensor(phase, dtype=torch.float32, device=self.device)
@@ -565,11 +748,13 @@ class LytRobotWarpAmpEnv:
         with wp.ScopedDevice(self.wp_device):
             mjwarp.forward(self.wp_model, self.wp_data)
 
-        targets = self._targets_at_phase(self.motion_phase)
-        self.ctrl[ids] = self._apply_tendon_length_randomization(self._reference_base_ctrl(targets["tendon_ctrl"]))[ids]
+        targets = self._targets_at_current_phase()
+        zero_action = torch.zeros((self.num_envs, self.action_dim), dtype=torch.float32, device=self.device)
+        self.ctrl[ids] = self.action_to_ctrl(zero_action, base_ctrl=self._reference_base_ctrl(targets["tendon_ctrl"]))[ids]
         self.last_action[ids] = 0.0
         foot_pos = self._foot_positions_local()[ids]
         self.last_foot_pos[ids] = foot_pos
+        self.last_foot_world_pos[ids] = self._foot_positions_world()[ids]
         side_x = torch.stack(
             (
                 torch.mean(foot_pos[:, 0:2, 0], dim=1),
@@ -599,7 +784,7 @@ class LytRobotWarpAmpEnv:
         return torch.as_tensor(values, dtype=torch.long, device=self.device)
 
     def observe(self) -> torch.Tensor:
-        targets = self._targets_at_phase(self.motion_phase)
+        targets = self._targets_at_current_phase()
         quat = _canonical_quat(self.qpos[:, 3:7])
         up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
         phase = 2.0 * torch.pi * self.motion_phase / float(self.motion.frame_count)
@@ -608,7 +793,12 @@ class LytRobotWarpAmpEnv:
         foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
         ref_foot_pos = targets["foot_pos"].reshape(self.num_envs, -1)
         ref_ctrl_action = self.ctrl_to_action(targets["tendon_ctrl"])
-        root_vel_error = self.qvel[:, :6] - torch.cat((targets["root_lin_vel"], targets["root_ang_vel"]), dim=1)
+        root_lin_vel_target = targets["root_lin_vel"].clone()
+        root_lin_vel_target[:, 0] = float(self.cfg.target_velocity) * self._stand_start_progress()
+        root_vel_error = self.qvel[:, :6] - torch.cat(
+            (root_lin_vel_target, targets["root_ang_vel"]),
+            dim=1,
+        )
         obs = torch.cat(
             (
                 self.qpos[:, 2:3],
@@ -661,11 +851,26 @@ class LytRobotWarpAmpEnv:
         prev_action = self.last_action.clone()
         commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
         commanded_action = commanded_action * self._startup_action_ramp()
-        self.motion_phase = (self.motion_phase + self.motion.frequency * self.dt) % self.motion.frame_count
-        targets = self._targets_at_phase(self.motion_phase)
+        phase_scale = self._stand_start_progress()
+        self.motion_phase = (
+            self.motion_phase + self.motion.frequency * self.dt * phase_scale
+        ) % self.motion.frame_count
+        targets = self._targets_at_current_phase()
         base_ctrl = self._reference_base_ctrl(targets["tendon_ctrl"])
         applied_action = commanded_action
         self._update_push_forces()
+        push_delay = int(self.cfg.stand_start_push_delay_steps)
+        if push_delay > 0:
+            starting = self.stand_start & (self.episode_step < push_delay)
+            if bool(torch.any(starting).item()):
+                self.push_force[starting] = 0.0
+                self.xfrc_applied[starting, self.pelvis_body_id] = 0.0
+                starting_np = starting.detach().cpu().numpy()
+                self.push_time_left[starting_np] = 0
+                self.push_time_to_next[starting_np] = np.maximum(
+                    self.push_time_to_next[starting_np],
+                    max(1, int(self.cfg.push_interval_min_steps)),
+                )
 
         with wp.ScopedDevice(self.wp_device):
             for _ in range(self.cfg.decimation):
@@ -676,13 +881,25 @@ class LytRobotWarpAmpEnv:
         self.episode_step += 1
         foot_pos = self._foot_positions_local()
         foot_vel = (foot_pos - self.last_foot_pos) / max(self.dt, 1.0e-6)
-        foot_contact = self._foot_contacts()
+        foot_world_pos = self._foot_positions_world()
+        foot_world_vel = (foot_world_pos - self.last_foot_world_pos) / max(self.dt, 1.0e-6)
+        foot_geom_contact = self._foot_geom_contacts()
+        foot_contact = self._side_contacts_from_geom(foot_geom_contact)
         rewards, dones, time_outs, components = self._compute_reward_done(
-            commanded_action, prev_action, targets, foot_pos, foot_vel, foot_contact
+            commanded_action,
+            prev_action,
+            float(self.cfg.target_velocity) * phase_scale,
+            targets,
+            foot_pos,
+            foot_vel,
+            foot_world_vel,
+            foot_geom_contact,
+            foot_contact,
         )
         episode_steps = self.episode_step.clone()
         self.last_action[:] = commanded_action
         self.last_foot_pos[:] = foot_pos
+        self.last_foot_world_pos[:] = foot_world_pos
 
         done_ids = torch.nonzero(dones, as_tuple=False).flatten()
         if len(done_ids) > 0:
@@ -698,9 +915,12 @@ class LytRobotWarpAmpEnv:
         self,
         action: torch.Tensor,
         prev_action: torch.Tensor,
+        target_forward_velocity: torch.Tensor,
         targets: dict[str, torch.Tensor],
         foot_pos: torch.Tensor,
         foot_vel: torch.Tensor,
+        foot_world_vel: torch.Tensor,
+        foot_geom_contact: torch.Tensor,
         foot_contact: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         root_height = self.qpos[:, 2]
@@ -712,7 +932,9 @@ class LytRobotWarpAmpEnv:
         orient_error = 2.0 * torch.acos(quat_dot)
         root_orientation = torch.exp(-(orient_error.square()) / (0.35**2))
 
-        lin_vel_error = self.qvel[:, :3] - targets["root_lin_vel"]
+        root_lin_vel_target = targets["root_lin_vel"].clone()
+        root_lin_vel_target[:, 0] = target_forward_velocity
+        lin_vel_error = self.qvel[:, :3] - root_lin_vel_target
         ang_vel_error = self.qvel[:, 3:6] - targets["root_ang_vel"]
         lin_vel_track = torch.exp(-torch.mean(lin_vel_error.square(), dim=1) / (0.75**2))
         ang_vel_track = torch.exp(-torch.mean(ang_vel_error.square(), dim=1) / (1.50**2))
@@ -730,18 +952,37 @@ class LytRobotWarpAmpEnv:
         foot_pos_error = torch.mean((foot_pos - targets["foot_pos"]).square(), dim=(1, 2))
         foot_pos_track = torch.exp(-foot_pos_error / (0.075**2))
         side_metrics = self._side_foot_tracks(foot_pos, targets["foot_pos"], targets["foot_contact"])
-        foot_vel_error = torch.mean((foot_vel - targets["foot_vel"]).square(), dim=(1, 2))
-        foot_vel_track = torch.exp(-foot_vel_error / (max(self.cfg.foot_vel_tracking_sigma, 1.0e-6) ** 2))
-        stance_foot_track = self._stance_foot_track(foot_vel, foot_contact, targets["foot_contact"])
+        foot_vel_track = self._swing_foot_vel_track(
+            foot_vel,
+            targets["foot_vel"],
+            targets["foot_contact"],
+        )
+        stance_foot_track, stance_foot_speed = self._stance_foot_track(
+            foot_world_vel,
+            foot_geom_contact,
+            targets["foot_contact"],
+        )
         contact_track = torch.clamp(
             1.0 - torch.mean(torch.abs(foot_contact - targets["foot_contact"]), dim=1),
             0.0,
             1.0,
         )
-        ctrl_error = torch.mean(((self.ctrl - targets["tendon_ctrl"]) / self.ctrl_half_range).square(), dim=1)
+        missed_contact = torch.mean(targets["foot_contact"] * (1.0 - foot_contact), dim=1)
+        position_action, force_action = self._split_action(action)
+        prev_position_action, prev_force_action = self._split_action(prev_action)
+        ctrl_error = torch.mean(
+            ((self.ctrl[:, self.position_actuator_ids] - targets["tendon_ctrl"]) / self.ctrl_half_range).square(),
+            dim=1,
+        )
         ctrl_track = torch.exp(-ctrl_error / (0.45**2))
-        ctrl_penalty = torch.mean(action.square(), dim=1)
-        action_rate = torch.mean((action - prev_action).square(), dim=1)
+        ctrl_penalty = torch.mean(position_action.square(), dim=1)
+        action_rate = torch.mean((position_action - prev_position_action).square(), dim=1)
+        if self.control_mode == CONTROL_MODE_HYBRID and self.force_action_dim > 0:
+            force_penalty = torch.mean(force_action.square(), dim=1)
+            force_action_rate = torch.mean((force_action - prev_force_action).square(), dim=1)
+        else:
+            force_penalty = torch.zeros_like(ctrl_penalty)
+            force_action_rate = torch.zeros_like(action_rate)
         if len(self.distal_joint_indices) > 0:
             distal_vel_error = torch.mean(
                 (
@@ -756,9 +997,12 @@ class LytRobotWarpAmpEnv:
             -distal_vel_error / (max(self.cfg.distal_joint_vel_sigma, 1.0e-6) ** 2)
         )
         if self.has_distal_action:
-            distal_action = torch.mean(action[:, self.distal_action_mask].square(), dim=1)
+            distal_action = torch.mean(position_action[:, self.distal_position_action_mask].square(), dim=1)
             distal_action_rate = torch.mean(
-                (action[:, self.distal_action_mask] - prev_action[:, self.distal_action_mask]).square(),
+                (
+                    position_action[:, self.distal_position_action_mask]
+                    - prev_position_action[:, self.distal_position_action_mask]
+                ).square(),
                 dim=1,
             )
         else:
@@ -767,7 +1011,7 @@ class LytRobotWarpAmpEnv:
         symmetry_track, foot_symmetry_track, contact_balance_track, action_balance_track = self._symmetry_track(
             foot_pos,
             foot_contact,
-            action,
+            position_action,
         )
 
         reward = (
@@ -781,9 +1025,9 @@ class LytRobotWarpAmpEnv:
             + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
             + self.cfg.step_gap_coef * side_metrics["step_gap"]
             + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
-            + 0.55 * foot_vel_track
-            + 0.45 * stance_foot_track
-            + 0.55 * contact_track
+            + self.cfg.foot_vel_reward_coef * foot_vel_track
+            + self.cfg.stance_foot_reward_coef * stance_foot_track
+            + self.cfg.contact_reward_coef * contact_track
             + 0.45 * distal_vel_track
             + self.cfg.symmetry_reward_coef * symmetry_track
             + 0.35 * ctrl_track
@@ -791,6 +1035,9 @@ class LytRobotWarpAmpEnv:
             - self.cfg.action_rate_penalty_coef * action_rate
             - self.cfg.distal_action_penalty_coef * distal_action
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+            - self.cfg.force_action_penalty_coef * force_penalty
+            - self.cfg.force_action_rate_penalty_coef * force_action_rate
+            - self.cfg.missed_contact_penalty_coef * missed_contact
         )
 
         bad_state = ~(
@@ -824,7 +1071,9 @@ class LytRobotWarpAmpEnv:
             "left_swing_advance": side_metrics["left_swing_advance"],
             "foot_vel": foot_vel_track,
             "stance_foot": stance_foot_track,
+            "stance_foot_speed": stance_foot_speed,
             "contact": contact_track,
+            "missed_contact": missed_contact,
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
             "foot_symmetry": foot_symmetry_track,
@@ -835,6 +1084,8 @@ class LytRobotWarpAmpEnv:
             "action_rate": action_rate,
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
+            "force_action": force_penalty,
+            "force_action_rate": force_action_rate,
         }
 
     def _side_foot_tracks(
@@ -882,22 +1133,70 @@ class LytRobotWarpAmpEnv:
             "left_swing_advance": side_swing[:, 1],
         }
 
-    def _stance_foot_track(
+    def _swing_foot_vel_track(
         self,
         foot_vel: torch.Tensor,
-        foot_contact: torch.Tensor,
+        ref_foot_vel: torch.Tensor,
         ref_foot_contact: torch.Tensor,
     ) -> torch.Tensor:
-        side_contact = torch.maximum(foot_contact, ref_foot_contact)
-        geom_weights = torch.stack(
-            (side_contact[:, 0], side_contact[:, 0], side_contact[:, 1], side_contact[:, 1]),
+        swing_weight = torch.repeat_interleave(
+            1.0 - torch.clamp(ref_foot_contact, 0.0, 1.0),
+            repeats=2,
             dim=1,
         )
-        weight_sum = torch.sum(geom_weights, dim=1)
-        speed_sq = torch.sum(foot_vel.square(), dim=2)
-        stance_speed_sq = torch.sum(speed_sq * geom_weights, dim=1) / weight_sum.clamp_min(1.0e-6)
-        stance_track = torch.exp(-stance_speed_sq / (max(self.cfg.stance_foot_vel_sigma, 1.0e-6) ** 2))
-        return torch.where(weight_sum > 1.0e-6, stance_track, torch.ones_like(stance_track))
+        weight_sum = torch.sum(swing_weight, dim=1)
+        error = torch.mean((foot_vel - ref_foot_vel).square(), dim=2)
+        score = torch.exp(
+            -error / (max(self.cfg.foot_vel_tracking_sigma, 1.0e-6) ** 2)
+        )
+        track = torch.sum(score * swing_weight, dim=1) / weight_sum.clamp_min(1.0e-6)
+        return torch.where(weight_sum > 1.0e-6, track, torch.ones_like(track))
+
+    def _stance_foot_track(
+        self,
+        foot_world_vel: torch.Tensor,
+        foot_geom_contact: torch.Tensor,
+        ref_foot_contact: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        side_contact = self._side_contacts_from_geom(foot_geom_contact)
+        side_weight = torch.maximum(side_contact, torch.clamp(ref_foot_contact, 0.0, 1.0))
+        horizontal_speed_sq = torch.sum(foot_world_vel[:, :, 0:2].square(), dim=2)
+        geom_score = torch.exp(
+            -horizontal_speed_sq / (max(self.cfg.stance_foot_vel_sigma, 1.0e-6) ** 2)
+        )
+
+        right_count = torch.sum(foot_geom_contact[:, 0:2], dim=1)
+        left_count = torch.sum(foot_geom_contact[:, 2:4], dim=1)
+        right_score = torch.sum(
+            geom_score[:, 0:2] * foot_geom_contact[:, 0:2], dim=1
+        ) / right_count.clamp_min(1.0e-6)
+        left_score = torch.sum(
+            geom_score[:, 2:4] * foot_geom_contact[:, 2:4], dim=1
+        ) / left_count.clamp_min(1.0e-6)
+        side_score = torch.stack(
+            (
+                torch.where(right_count > 1.0e-6, right_score, torch.zeros_like(right_score)),
+                torch.where(left_count > 1.0e-6, left_score, torch.zeros_like(left_score)),
+            ),
+            dim=1,
+        )
+        side_weight_sum = torch.sum(side_weight, dim=1)
+        stance_track = torch.sum(side_score * side_weight, dim=1) / side_weight_sum.clamp_min(1.0e-6)
+        stance_track = torch.where(
+            side_weight_sum > 1.0e-6,
+            stance_track,
+            torch.ones_like(stance_track),
+        )
+
+        horizontal_speed = torch.sqrt(horizontal_speed_sq)
+        contact_count = torch.sum(foot_geom_contact, dim=1)
+        stance_speed = torch.sum(horizontal_speed * foot_geom_contact, dim=1) / contact_count.clamp_min(1.0e-6)
+        stance_speed = torch.where(
+            contact_count > 1.0e-6,
+            stance_speed,
+            torch.zeros_like(stance_speed),
+        )
+        return stance_track, stance_speed
 
     def _symmetry_track(
         self,

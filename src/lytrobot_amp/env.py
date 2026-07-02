@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import secrets
 
 import mujoco
 import numpy as np
 
+from .control import (
+    CONTROL_MODE_HYBRID,
+    CONTROL_MODE_POSITION,
+    force_actuator_ids_for_positions,
+    normalize_control_mode,
+    position_actuator_ids,
+)
 from .motion import CONTACT_GEOM_NAMES, MotionReference, MotionTargets, resolve_contact_geom_ids
 
 
@@ -25,6 +33,7 @@ class LytRobotEnvCfg:
     motion_file: str = "robot/reference_data/walk1_mjcf.npz"
     num_envs: int = 4096
     seed: int = 42
+    randomize_episode_seed: bool = False
     decimation: int = 4
     timestep: float = 0.005
     episode_steps: int = 1000
@@ -32,14 +41,20 @@ class LytRobotEnvCfg:
     target_velocity: float = 1.0
     reset_noise_scale: float = 0.01
     motion_reset_prob: float = 0.5
+    control_mode: str = CONTROL_MODE_POSITION
     action_residual_scale: float = 0.5
     distal_action_scale: float = 1.0
+    hybrid_force_scale: float = 0.15
     reference_ctrl_blend: float = 1.0
     fall_height: float = 0.45
     max_height: float = 1.55
     min_upright_z: float = 0.45
     foot_vel_tracking_sigma: float = 1.0
-    stance_foot_vel_sigma: float = 0.30
+    stance_foot_vel_sigma: float = 0.15
+    foot_vel_reward_coef: float = 0.35
+    stance_foot_reward_coef: float = 1.00
+    contact_reward_coef: float = 0.70
+    missed_contact_penalty_coef: float = 0.80
     side_foot_pos_sigma: float = 0.08
     step_gap_sigma: float = 0.12
     swing_advance_sigma: float = 0.10
@@ -52,10 +67,17 @@ class LytRobotEnvCfg:
     symmetry_balance_sigma: float = 0.25
     symmetry_ema_decay: float = 0.99
     startup_action_ramp_steps: int = 20
+    stand_start_prob: float = 0.5
+    stand_start_phase_delay_steps: int = 25
+    stand_start_transition_min_steps: int = 80
+    stand_start_transition_max_steps: int = 160
+    stand_start_push_delay_steps: int = 100
     ctrl_penalty_coef: float = 0.040
     action_rate_penalty_coef: float = 0.100
     distal_action_penalty_coef: float = 0.030
     distal_action_rate_penalty_coef: float = 0.120
+    force_action_penalty_coef: float = 0.020
+    force_action_rate_penalty_coef: float = 0.040
     domain_randomization: bool = False
     payload_mass_min: float = 0.0
     payload_mass_max: float = 3.0
@@ -94,7 +116,22 @@ class LytRobotAmpEnv:
 
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
         self.model.opt.timestep = float(cfg.timestep)
-        self.motion = MotionReference(cfg.motion_file, self.model)
+        self.control_mode = normalize_control_mode(cfg.control_mode)
+        self.position_actuator_ids = position_actuator_ids(self.model)
+        self.force_actuator_ids = (
+            force_actuator_ids_for_positions(self.model, self.position_actuator_ids)
+            if self.control_mode == CONTROL_MODE_HYBRID
+            else np.asarray([], dtype=np.int32)
+        )
+        self.position_action_dim = int(len(self.position_actuator_ids))
+        self.force_action_dim = int(len(self.force_actuator_ids))
+        self.action_dim = (
+            self.position_action_dim + self.force_action_dim
+            if self.control_mode == CONTROL_MODE_HYBRID
+            else self.position_action_dim
+        )
+        self.ctrl_dim = int(self.model.nu)
+        self.motion = MotionReference(cfg.motion_file, self.model, actuator_ids=self.position_actuator_ids)
         self.rng = np.random.default_rng(cfg.seed)
         self.base_body_mass = np.asarray(self.model.body_mass, dtype=np.float32).copy()
         self.base_body_inertia = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
@@ -102,12 +139,16 @@ class LytRobotAmpEnv:
         self.base_gravity = np.asarray(self.model.opt.gravity, dtype=np.float32).copy()
 
         self.num_envs = int(cfg.num_envs)
-        self.action_dim = int(self.model.nu)
-        self.ctrl_low = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
-        self.ctrl_high = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.full_ctrl_low = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
+        self.full_ctrl_high = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        self.ctrl_low = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids, 0], dtype=np.float32)
+        self.ctrl_high = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids, 1], dtype=np.float32)
         self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
         self.ctrl_half_range = np.maximum(0.5 * (self.ctrl_high - self.ctrl_low), 1.0e-6)
-        self.actuator_tendon_ids = np.asarray(self.model.actuator_trnid[:, 0], dtype=np.int32)
+        self.force_ctrl_low = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids, 0], dtype=np.float32)
+        self.force_ctrl_high = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids, 1], dtype=np.float32)
+        self.actuator_tendon_ids = np.asarray(self.model.actuator_trnid[self.position_actuator_ids, 0], dtype=np.int32)
+        self._init_stand_reference()
         self.distal_action_mask = self._build_distal_action_mask()
         self.has_distal_action = bool(np.any(self.distal_action_mask))
         self.action_scale = self._build_action_scale()
@@ -122,6 +163,9 @@ class LytRobotAmpEnv:
             raise RuntimeError("Expected floor and foot contact geoms were not found in robot model.")
         self.right_contact_geom_ids = set(int(geom_id) for geom_id in self.contact_geom_ids[:2])
         self.left_contact_geom_ids = set(int(geom_id) for geom_id in self.contact_geom_ids[2:])
+        self.contact_geom_id_to_index = {
+            int(geom_id): contact_index for contact_index, geom_id in enumerate(self.contact_geom_ids)
+        }
 
         self.joint_reward_weights = self._build_joint_reward_weights()
         self.distal_joint_indices = np.asarray(
@@ -138,14 +182,18 @@ class LytRobotAmpEnv:
         self.episode_step = np.zeros(self.num_envs, dtype=np.int32)
         self.episode_timeout_step = np.full(self.num_envs, int(cfg.episode_steps), dtype=np.int32)
         self.motion_phase = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_seed = np.full(self.num_envs, int(cfg.seed), dtype=np.uint64)
         self.last_action = np.zeros((self.num_envs, self.action_dim), dtype=np.float32)
         self.last_foot_pos = np.zeros((self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
+        self.last_foot_world_pos = np.zeros_like(self.last_foot_pos)
         self.foot_stride_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_x_min = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_x_max = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.contact_balance_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.action_energy_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.last_obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
+        self.stand_start = np.zeros(self.num_envs, dtype=bool)
+        self.stand_start_transition_steps = np.ones(self.num_envs, dtype=np.int32)
         self._init_domain_randomization()
         self.reset()
 
@@ -197,34 +245,106 @@ class LytRobotAmpEnv:
         return np.asarray(weights, dtype=np.float32)
 
     def _build_action_scale(self) -> np.ndarray:
-        scale = np.ones(self.action_dim, dtype=np.float32)
+        scale = np.ones(self.position_action_dim, dtype=np.float32)
         distal_scale = float(np.clip(self.cfg.distal_action_scale, 0.05, 1.0))
-        scale[self.distal_action_mask] = distal_scale
+        scale[self.distal_position_action_mask] = distal_scale
         return scale
 
     def _build_distal_action_mask(self) -> np.ndarray:
         mask = np.zeros(self.action_dim, dtype=bool)
-        for actuator_id in range(self.action_dim):
+        self.distal_position_action_mask = np.zeros(self.position_action_dim, dtype=bool)
+        for action_id, actuator_id in enumerate(self.position_actuator_ids):
             actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
             tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
             tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
             if "ankle" in actuator_name or "ankle" in tendon_name:
-                mask[actuator_id] = True
+                mask[action_id] = True
+                self.distal_position_action_mask[action_id] = True
         return mask
 
     def _build_side_action_indices(self) -> tuple[np.ndarray, np.ndarray]:
         right: list[int] = []
         left: list[int] = []
-        for actuator_id in range(self.action_dim):
+        for action_id, actuator_id in enumerate(self.position_actuator_ids):
             actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
             tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
             tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
             name = f"{actuator_name} {tendon_name}"
             if "_r" in name:
-                right.append(actuator_id)
+                right.append(action_id)
             elif "_l" in name:
-                left.append(actuator_id)
+                left.append(action_id)
         return np.asarray(right, dtype=np.int32), np.asarray(left, dtype=np.int32)
+
+    def _init_stand_reference(self) -> None:
+        data = mujoco.MjData(self.model)
+        data.qpos[:] = self.motion.model_qpos0
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, data)
+        tendon_lengths = np.asarray(data.ten_length, dtype=np.float32)
+        tendon_ctrl = np.clip(tendon_lengths[self.actuator_tendon_ids], self.ctrl_low, self.ctrl_high)
+        self.stand_root_height = np.asarray([data.qpos[2]], dtype=np.float32)
+        self.stand_root_quat = _canonical_quat(data.qpos[3:7])[None, :]
+        self.stand_root_lin_vel = np.zeros((1, 3), dtype=np.float32)
+        self.stand_root_ang_vel = np.zeros((1, 3), dtype=np.float32)
+        self.stand_joint_pos = np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)[None, :]
+        self.stand_joint_vel = np.zeros((1, len(self.motion.robot_qvel_adrs)), dtype=np.float32)
+        self.stand_tendon_ctrl = tendon_ctrl[None, :]
+        self.stand_foot_pos = self.motion.foot_positions_local_from_data(data)[None, :]
+        self.stand_foot_vel = np.zeros((1, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
+        self.stand_foot_contact = np.ones((1, 2), dtype=np.float32)
+
+    def _sample_stand_transition_steps(self, size: int) -> np.ndarray:
+        low = max(1, int(self.cfg.stand_start_transition_min_steps))
+        high = max(low, int(self.cfg.stand_start_transition_max_steps))
+        if high <= low:
+            return np.full(size, low, dtype=np.int32)
+        return self.rng.integers(low, high + 1, size=size, dtype=np.int32)
+
+    def _refresh_episode_rng(self, ids: np.ndarray) -> None:
+        if not self.cfg.randomize_episode_seed or len(ids) == 0:
+            return
+        seeds = np.asarray([secrets.randbits(64) for _ in range(len(ids))], dtype=np.uint64)
+        self.episode_seed[ids] = seeds
+        seed_words = [int(seed & np.uint64(0xFFFFFFFF)) for seed in seeds]
+        seed_words += [int(seed >> np.uint64(32)) for seed in seeds]
+        self.rng = np.random.default_rng(np.random.SeedSequence(seed_words))
+
+    def _stand_start_progress(self) -> np.ndarray:
+        delay = max(0, int(self.cfg.stand_start_phase_delay_steps))
+        denom = np.maximum(self.stand_start_transition_steps.astype(np.float32), 1.0)
+        raw = (self.episode_step.astype(np.float32) - float(delay)) / denom
+        progress = np.clip(raw, 0.0, 1.0)
+        progress = progress * progress * (3.0 - 2.0 * progress)
+        return np.where(self.stand_start, progress, 1.0).astype(np.float32)
+
+    def _blend_start_targets(self, targets: MotionTargets) -> MotionTargets:
+        progress = self._stand_start_progress()
+        if not np.any(progress < 1.0):
+            return targets
+
+        def blend(stand: np.ndarray, walk: np.ndarray) -> np.ndarray:
+            weight_shape = (self.num_envs,) + (1,) * (walk.ndim - 1)
+            weight = progress.reshape(weight_shape)
+            return ((1.0 - weight) * stand + weight * walk).astype(np.float32)
+
+        root_quat = blend(self.stand_root_quat, targets.root_quat)
+        root_quat /= np.maximum(np.linalg.norm(root_quat, axis=1, keepdims=True), 1.0e-6)
+        return MotionTargets(
+            root_height=blend(self.stand_root_height, targets.root_height),
+            root_quat=root_quat.astype(np.float32),
+            root_lin_vel=blend(self.stand_root_lin_vel, targets.root_lin_vel),
+            root_ang_vel=blend(self.stand_root_ang_vel, targets.root_ang_vel),
+            joint_pos=blend(self.stand_joint_pos, targets.joint_pos),
+            joint_vel=blend(self.stand_joint_vel, targets.joint_vel),
+            tendon_ctrl=blend(self.stand_tendon_ctrl, targets.tendon_ctrl),
+            foot_pos=blend(self.stand_foot_pos, targets.foot_pos),
+            foot_vel=blend(self.stand_foot_vel, targets.foot_vel),
+            foot_contact=blend(self.stand_foot_contact, targets.foot_contact),
+        )
+
+    def _targets_at_current_phase(self) -> MotionTargets:
+        return self._blend_start_targets(self.motion.targets_at_phase(self.motion_phase))
 
     def _init_domain_randomization(self) -> None:
         self.domain_randomization = bool(self.cfg.domain_randomization)
@@ -234,7 +354,7 @@ class LytRobotAmpEnv:
         self.action_delay_history = np.zeros((self.num_envs, history_len, self.action_dim), dtype=np.float32)
         self.action_delay_cursor = np.zeros(self.num_envs, dtype=np.int32)
         self.action_delay_ticks = np.zeros(self.num_envs, dtype=np.int32)
-        self.env_tendon_length_scale = np.ones((self.num_envs, self.action_dim), dtype=np.float32)
+        self.env_tendon_length_scale = np.ones((self.num_envs, self.position_action_dim), dtype=np.float32)
         self.env_body_mass_scale = np.ones((self.num_envs, self.model.nbody), dtype=np.float32)
         self.env_payload_mass = np.zeros(self.num_envs, dtype=np.float32)
         self.env_ground_friction = np.full(self.num_envs, float(self.base_geom_friction[self.floor_geom_id, 0]) if hasattr(self, "floor_geom_id") else 1.0, dtype=np.float32)
@@ -266,7 +386,7 @@ class LytRobotAmpEnv:
         self.env_tendon_length_scale[ids] = self._uniform(
             self.cfg.tendon_length_scale_min,
             self.cfg.tendon_length_scale_max,
-            (len(ids), self.action_dim),
+            (len(ids), self.position_action_dim),
         )
         self.env_ground_friction[ids] = self._uniform(
             self.cfg.ground_friction_min,
@@ -360,27 +480,66 @@ class LytRobotAmpEnv:
         self.push_force[env_id, 3:] = 0.0
         self.push_time_left[env_id] = self._sample_push_duration()
 
+    def _split_action(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        clipped = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        position_action = clipped[: self.position_action_dim]
+        if self.control_mode == CONTROL_MODE_HYBRID:
+            force_action = clipped[self.position_action_dim :]
+        else:
+            force_action = np.zeros(0, dtype=np.float32)
+        return position_action, force_action
+
+    def _force_action_to_ctrl(self, force_action: np.ndarray) -> np.ndarray:
+        if self.control_mode != CONTROL_MODE_HYBRID:
+            return np.zeros(0, dtype=np.float32)
+        pull = np.maximum(np.asarray(force_action, dtype=np.float32), 0.0)
+        ctrl = -float(np.clip(self.cfg.hybrid_force_scale, 0.0, 1.0)) * pull
+        return np.clip(ctrl, self.force_ctrl_low, self.force_ctrl_high)
+
+    def _position_ctrl_to_full_ctrl(
+        self,
+        position_ctrl: np.ndarray,
+        force_action: np.ndarray | None = None,
+    ) -> np.ndarray:
+        full_ctrl = np.zeros(self.ctrl_dim, dtype=np.float32)
+        full_ctrl[self.position_actuator_ids] = np.asarray(position_ctrl, dtype=np.float32)
+        if self.control_mode == CONTROL_MODE_HYBRID:
+            force = np.zeros(self.force_action_dim, dtype=np.float32) if force_action is None else force_action
+            full_ctrl[self.force_actuator_ids] = self._force_action_to_ctrl(force)
+        return full_ctrl
+
     def action_to_ctrl(
         self,
         action: np.ndarray,
         base_ctrl: np.ndarray | None = None,
         env_id: int | None = None,
     ) -> np.ndarray:
-        clipped = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        position_action, force_action = self._split_action(action)
         if base_ctrl is None:
             base = self.ctrl_mid
         else:
             base = np.asarray(base_ctrl, dtype=np.float32)
-        ctrl = base + (
-            clipped * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
+        position_ctrl = base + (
+            position_action * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
         )
-        ctrl = np.clip(ctrl, self.ctrl_low, self.ctrl_high)
+        position_ctrl = np.clip(position_ctrl, self.ctrl_low, self.ctrl_high)
         if env_id is not None:
-            ctrl = self._apply_tendon_length_randomization(env_id, ctrl)
-        return ctrl
+            position_ctrl = self._apply_tendon_length_randomization(env_id, position_ctrl)
+        return self._position_ctrl_to_full_ctrl(position_ctrl, force_action)
 
     def ctrl_to_action(self, ctrl: np.ndarray) -> np.ndarray:
-        return np.clip((np.asarray(ctrl, dtype=np.float32) - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
+        ctrl_arr = np.asarray(ctrl, dtype=np.float32)
+        position_ctrl = (
+            np.take(ctrl_arr, self.position_actuator_ids, axis=-1)
+            if ctrl_arr.shape[-1] == self.ctrl_dim
+            else ctrl_arr
+        )
+        position_action = np.clip((position_ctrl - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
+        if self.control_mode != CONTROL_MODE_HYBRID:
+            return position_action
+        force_shape = position_action.shape[:-1] + (self.force_action_dim,)
+        force_zeros = np.zeros(force_shape, dtype=np.float32)
+        return np.concatenate((position_action, force_zeros), axis=-1).astype(np.float32)
 
     def _current_tendon_ctrl(self, data: mujoco.MjData) -> np.ndarray:
         tendon_lengths = np.asarray(data.ten_length, dtype=np.float32)
@@ -398,8 +557,19 @@ class LytRobotAmpEnv:
     def _foot_positions_local(self, data: mujoco.MjData) -> np.ndarray:
         return self.motion.foot_positions_local_from_data(data)
 
-    def _foot_contacts(self, data: mujoco.MjData) -> np.ndarray:
-        contact = np.zeros(2, dtype=np.float32)
+    def _foot_positions_world(self, data: mujoco.MjData) -> np.ndarray:
+        return np.asarray(data.geom_xpos[self.contact_geom_ids], dtype=np.float32).copy()
+
+    @staticmethod
+    def _side_contacts_from_geom(geom_contact: np.ndarray) -> np.ndarray:
+        geom_contact_arr = np.asarray(geom_contact, dtype=np.float32)
+        return np.asarray(
+            [np.max(geom_contact_arr[0:2]), np.max(geom_contact_arr[2:4])],
+            dtype=np.float32,
+        )
+
+    def _foot_geom_contacts(self, data: mujoco.MjData) -> np.ndarray:
+        contact = np.zeros(len(CONTACT_GEOM_NAMES), dtype=np.float32)
         for contact_id in range(data.ncon):
             geom1 = int(data.contact[contact_id].geom1)
             geom2 = int(data.contact[contact_id].geom2)
@@ -410,27 +580,40 @@ class LytRobotAmpEnv:
                 other = geom1
             if other is None:
                 continue
-            if other in self.right_contact_geom_ids:
-                contact[0] = 1.0
-            elif other in self.left_contact_geom_ids:
-                contact[1] = 1.0
+            contact_index = self.contact_geom_id_to_index.get(other)
+            if contact_index is not None:
+                contact[contact_index] = 1.0
         return contact
+
+    def _foot_contacts(self, data: mujoco.MjData) -> np.ndarray:
+        return self._side_contacts_from_geom(self._foot_geom_contacts(data))
 
     def reset(self, env_ids: np.ndarray | list[int] | None = None) -> np.ndarray:
         if env_ids is None:
             ids = np.arange(self.num_envs, dtype=np.int32)
         else:
             ids = np.asarray(env_ids, dtype=np.int32)
+        self._refresh_episode_rng(ids)
 
         states = self.motion.sample_states(len(ids), self.rng)
-        use_motion_reset = self.rng.random(len(ids)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+        use_stand_start = self.rng.random(len(ids)) < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        use_motion_reset = (
+            ~use_stand_start
+            & (self.rng.random(len(ids)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)))
+        )
         self._sample_domain_randomization(ids)
+        self.stand_start[ids] = use_stand_start
+        self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids))
         for row, env_id in enumerate(ids):
             self._apply_model_randomization(int(env_id))
             data = self.datas[int(env_id)]
             mujoco.mj_resetData(self.model, data)
 
-            if use_motion_reset[row]:
+            if use_stand_start[row]:
+                qpos = self.motion.model_qpos0.copy()
+                qvel = np.zeros(self.model.nv, dtype=np.float32)
+                phase = 0.0
+            elif use_motion_reset[row]:
                 qpos = states.qpos[row].copy()
                 qvel = states.qvel[row].copy()
                 phase = float(states.indices[row])
@@ -452,15 +635,19 @@ class LytRobotAmpEnv:
             data.qvel[:] = qvel
             mujoco.mj_forward(self.model, data)
             reference_ctrl = self.motion.targets_at_phase(np.asarray([phase], dtype=np.float32)).tendon_ctrl[0]
-            data.ctrl[:] = self._apply_tendon_length_randomization(
-                int(env_id),
-                self._reference_base_ctrl(reference_ctrl, data),
+            if use_stand_start[row]:
+                reference_ctrl = self.stand_tendon_ctrl[0]
+            data.ctrl[:] = self.action_to_ctrl(
+                np.zeros(self.action_dim, dtype=np.float32),
+                base_ctrl=self._reference_base_ctrl(reference_ctrl, data),
+                env_id=int(env_id),
             )
             self.last_action[int(env_id)] = 0.0
             self.action_delay_history[int(env_id)] = 0.0
             self.action_delay_cursor[int(env_id)] = 0
             foot_pos = self._foot_positions_local(data)
             self.last_foot_pos[int(env_id)] = foot_pos
+            self.last_foot_world_pos[int(env_id)] = self._foot_positions_world(data)
             side_x = np.asarray(
                 [
                     np.mean(foot_pos[0:2, 0]),
@@ -501,7 +688,8 @@ class LytRobotAmpEnv:
 
     def observe(self) -> np.ndarray:
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
-        reference_targets = self.motion.targets_at_phase(self.motion_phase)
+        reference_targets = self._targets_at_current_phase()
+        stand_start_progress = self._stand_start_progress()
         for env_id, data in enumerate(self.datas):
             quat = _canonical_quat(data.qpos[3:7])
             up_z = float(data.xmat[self.pelvis_body_id, 8])
@@ -511,6 +699,10 @@ class LytRobotAmpEnv:
             foot_pos = self._foot_positions_local(data).reshape(-1)
             ref_foot_pos = reference_targets.foot_pos[env_id].reshape(-1)
             ref_ctrl_action = self.ctrl_to_action(reference_targets.tendon_ctrl[env_id])
+            root_vel_target = np.concatenate(
+                (reference_targets.root_lin_vel[env_id], reference_targets.root_ang_vel[env_id])
+            ).astype(np.float32)
+            root_vel_target[0] = float(self.cfg.target_velocity) * float(stand_start_progress[env_id])
             obs[env_id] = np.concatenate(
                 (
                     np.asarray([data.qpos[2]], dtype=np.float32),
@@ -522,10 +714,7 @@ class LytRobotAmpEnv:
                     np.asarray([up_z, np.sin(phase), np.cos(phase)], dtype=np.float32),
                     np.asarray([data.qpos[2] - reference_targets.root_height[env_id]], dtype=np.float32),
                     reference_targets.root_quat[env_id],
-                    np.asarray(data.qvel[:6], dtype=np.float32)
-                    - np.concatenate(
-                        (reference_targets.root_lin_vel[env_id], reference_targets.root_ang_vel[env_id])
-                    ),
+                    np.asarray(data.qvel[:6], dtype=np.float32) - root_vel_target,
                     joint_pos - reference_targets.joint_pos[env_id],
                     joint_vel - reference_targets.joint_vel[env_id],
                     ref_ctrl_action,
@@ -570,7 +759,9 @@ class LytRobotAmpEnv:
             "left_swing_advance": [],
             "foot_vel": [],
             "stance_foot": [],
+            "stance_foot_speed": [],
             "contact": [],
+            "missed_contact": [],
             "distal_vel": [],
             "symmetry": [],
             "foot_symmetry": [],
@@ -581,13 +772,26 @@ class LytRobotAmpEnv:
             "action_rate": [],
             "distal_action": [],
             "distal_action_rate": [],
+            "force_action": [],
+            "force_action_rate": [],
         }
-        self.motion_phase = (self.motion_phase + self.motion.frequency * self.dt) % self.motion.frame_count
-        reference_targets = self.motion.targets_at_phase(self.motion_phase)
+        phase_scale = self._stand_start_progress()
+        self.motion_phase = (
+            self.motion_phase + self.motion.frequency * self.dt * phase_scale
+        ) % self.motion.frame_count
+        reference_targets = self._targets_at_current_phase()
 
         for env_id, data in enumerate(self.datas):
             self._apply_model_randomization(env_id)
-            self._update_push_force(env_id)
+            if (not self.stand_start[env_id]) or self.episode_step[env_id] >= int(self.cfg.stand_start_push_delay_steps):
+                self._update_push_force(env_id)
+            else:
+                self.push_force[env_id] = 0.0
+                self.push_time_left[env_id] = 0
+                self.push_time_to_next[env_id] = max(
+                    int(self.push_time_to_next[env_id]),
+                    max(1, int(self.cfg.push_interval_min_steps)),
+                )
             prev_action = self.last_action[env_id].copy()
             commanded_action = self._apply_action_noise(np.clip(actions[env_id], -1.0, 1.0))
             commanded_action = commanded_action * self._startup_action_ramp(env_id)
@@ -603,15 +807,21 @@ class LytRobotAmpEnv:
             self.episode_step[env_id] += 1
             foot_pos = self._foot_positions_local(data)
             foot_vel = (foot_pos - self.last_foot_pos[env_id]) / max(self.dt, 1.0e-6)
-            foot_contact = self._foot_contacts(data)
+            foot_world_pos = self._foot_positions_world(data)
+            foot_world_vel = (foot_world_pos - self.last_foot_world_pos[env_id]) / max(self.dt, 1.0e-6)
+            foot_geom_contact = self._foot_geom_contacts(data)
+            foot_contact = self._side_contacts_from_geom(foot_geom_contact)
             reward, done, timed_out, reward_parts = self._compute_reward_done(
                 data,
                 commanded_action,
                 prev_action,
                 env_id,
+                float(self.cfg.target_velocity) * float(phase_scale[env_id]),
                 reference_targets,
                 foot_pos,
                 foot_vel,
+                foot_world_vel,
+                foot_geom_contact,
                 foot_contact,
             )
             rewards[env_id] = reward
@@ -620,6 +830,7 @@ class LytRobotAmpEnv:
             episode_steps[env_id] = self.episode_step[env_id]
             self.last_action[env_id] = commanded_action
             self.last_foot_pos[env_id] = foot_pos
+            self.last_foot_world_pos[env_id] = foot_world_pos
             for key, value in reward_parts.items():
                 components[key].append(float(value))
 
@@ -640,9 +851,12 @@ class LytRobotAmpEnv:
         action: np.ndarray,
         prev_action: np.ndarray,
         env_id: int,
+        target_forward_velocity: float,
         reference_targets: MotionTargets,
         foot_pos: np.ndarray,
         foot_vel: np.ndarray,
+        foot_world_vel: np.ndarray,
+        foot_geom_contact: np.ndarray,
         foot_contact: np.ndarray,
     ) -> tuple[float, bool, bool, dict[str, float]]:
         root_height = float(data.qpos[2])
@@ -655,7 +869,9 @@ class LytRobotAmpEnv:
         orient_error = 2.0 * np.arccos(quat_dot)
         root_orientation = float(np.exp(-(orient_error**2) / (0.35**2)))
 
-        lin_vel_error = np.asarray(data.qvel[:3], dtype=np.float32) - reference_targets.root_lin_vel[env_id]
+        root_lin_vel_target = reference_targets.root_lin_vel[env_id].copy()
+        root_lin_vel_target[0] = target_forward_velocity
+        lin_vel_error = np.asarray(data.qvel[:3], dtype=np.float32) - root_lin_vel_target
         ang_vel_error = np.asarray(data.qvel[3:6], dtype=np.float32) - reference_targets.root_ang_vel[env_id]
         lin_vel_track = np.exp(-float(np.mean(np.square(lin_vel_error))) / (0.75**2))
         ang_vel_track = np.exp(-float(np.mean(np.square(ang_vel_error))) / (1.50**2))
@@ -680,23 +896,38 @@ class LytRobotAmpEnv:
             reference_targets.foot_pos[env_id],
             reference_targets.foot_contact[env_id],
         )
-        foot_vel_error = float(np.mean(np.square(foot_vel - reference_targets.foot_vel[env_id])))
-        foot_vel_track = float(np.exp(-foot_vel_error / (max(self.cfg.foot_vel_tracking_sigma, 1.0e-6) ** 2)))
-        stance_foot_track = self._stance_foot_track(
+        foot_vel_track = self._swing_foot_vel_track(
             foot_vel,
-            foot_contact,
+            reference_targets.foot_vel[env_id],
+            reference_targets.foot_contact[env_id],
+        )
+        stance_foot_track, stance_foot_speed = self._stance_foot_track(
+            foot_world_vel,
+            foot_geom_contact,
             reference_targets.foot_contact[env_id],
         )
         contact_track = float(
             np.clip(1.0 - np.mean(np.abs(foot_contact - reference_targets.foot_contact[env_id])), 0.0, 1.0)
         )
+        missed_contact = float(
+            np.mean(reference_targets.foot_contact[env_id] * (1.0 - foot_contact))
+        )
+        position_action, force_action = self._split_action(action)
+        prev_position_action, prev_force_action = self._split_action(prev_action)
         ctrl_delta = (
-            np.asarray(data.ctrl, dtype=np.float32) - reference_targets.tendon_ctrl[env_id]
+            np.asarray(data.ctrl[self.position_actuator_ids], dtype=np.float32)
+            - reference_targets.tendon_ctrl[env_id]
         ) / self.ctrl_half_range
         ctrl_error = float(np.mean(np.square(ctrl_delta)))
         ctrl_track = float(np.exp(-ctrl_error / (0.45**2)))
-        ctrl_penalty = float(np.mean(np.square(action)))
-        action_rate = float(np.mean(np.square(action - prev_action)))
+        ctrl_penalty = float(np.mean(np.square(position_action)))
+        action_rate = float(np.mean(np.square(position_action - prev_position_action)))
+        if self.control_mode == CONTROL_MODE_HYBRID and force_action.size > 0:
+            force_penalty = float(np.mean(np.square(force_action)))
+            force_action_rate = float(np.mean(np.square(force_action - prev_force_action)))
+        else:
+            force_penalty = 0.0
+            force_action_rate = 0.0
         if len(self.distal_joint_indices) > 0:
             distal_vel_error = float(
                 np.mean(
@@ -712,9 +943,14 @@ class LytRobotAmpEnv:
             np.exp(-distal_vel_error / (max(self.cfg.distal_joint_vel_sigma, 1.0e-6) ** 2))
         )
         if self.has_distal_action:
-            distal_action = float(np.mean(np.square(action[self.distal_action_mask])))
+            distal_action = float(np.mean(np.square(position_action[self.distal_position_action_mask])))
             distal_action_rate = float(
-                np.mean(np.square(action[self.distal_action_mask] - prev_action[self.distal_action_mask]))
+                np.mean(
+                    np.square(
+                        position_action[self.distal_position_action_mask]
+                        - prev_position_action[self.distal_position_action_mask]
+                    )
+                )
             )
         else:
             distal_action = ctrl_penalty
@@ -723,7 +959,7 @@ class LytRobotAmpEnv:
             env_id,
             foot_pos,
             foot_contact,
-            action,
+            position_action,
         )
 
         reward = (
@@ -737,9 +973,9 @@ class LytRobotAmpEnv:
             + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
             + self.cfg.step_gap_coef * side_metrics["step_gap"]
             + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
-            + 0.55 * foot_vel_track
-            + 0.45 * stance_foot_track
-            + 0.55 * contact_track
+            + self.cfg.foot_vel_reward_coef * foot_vel_track
+            + self.cfg.stance_foot_reward_coef * stance_foot_track
+            + self.cfg.contact_reward_coef * contact_track
             + 0.45 * distal_vel_track
             + self.cfg.symmetry_reward_coef * symmetry_track
             + 0.35 * ctrl_track
@@ -747,6 +983,9 @@ class LytRobotAmpEnv:
             - self.cfg.action_rate_penalty_coef * action_rate
             - self.cfg.distal_action_penalty_coef * distal_action
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+            - self.cfg.force_action_penalty_coef * force_penalty
+            - self.cfg.force_action_rate_penalty_coef * force_action_rate
+            - self.cfg.missed_contact_penalty_coef * missed_contact
         )
 
         bad_state = not (
@@ -781,7 +1020,9 @@ class LytRobotAmpEnv:
             "left_swing_advance": side_metrics["left_swing_advance"],
             "foot_vel": foot_vel_track,
             "stance_foot": stance_foot_track,
+            "stance_foot_speed": stance_foot_speed,
             "contact": contact_track,
+            "missed_contact": missed_contact,
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
             "foot_symmetry": foot_symmetry_track,
@@ -792,6 +1033,8 @@ class LytRobotAmpEnv:
             "action_rate": action_rate,
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
+            "force_action": force_penalty,
+            "force_action_rate": force_action_rate,
         }
 
     def _side_foot_tracks(
@@ -844,26 +1087,63 @@ class LytRobotAmpEnv:
             "left_swing_advance": float(side_swing[1]),
         }
 
-    def _stance_foot_track(
+    def _swing_foot_vel_track(
         self,
         foot_vel: np.ndarray,
-        foot_contact: np.ndarray,
+        ref_foot_vel: np.ndarray,
         ref_foot_contact: np.ndarray,
     ) -> float:
-        side_contact = np.maximum(
-            np.asarray(foot_contact, dtype=np.float32),
-            np.asarray(ref_foot_contact, dtype=np.float32),
+        swing_weight = np.repeat(
+            1.0 - np.clip(np.asarray(ref_foot_contact, dtype=np.float32), 0.0, 1.0),
+            2,
         )
-        geom_weights = np.asarray(
-            [side_contact[0], side_contact[0], side_contact[1], side_contact[1]],
-            dtype=np.float32,
-        )
-        weight_sum = float(np.sum(geom_weights))
+        weight_sum = float(np.sum(swing_weight))
         if weight_sum <= 1.0e-6:
             return 1.0
-        speed_sq = np.sum(np.square(foot_vel), axis=1)
-        stance_speed_sq = float(np.sum(speed_sq * geom_weights) / weight_sum)
-        return float(np.exp(-stance_speed_sq / (max(self.cfg.stance_foot_vel_sigma, 1.0e-6) ** 2)))
+        error = np.mean(np.square(foot_vel - ref_foot_vel), axis=1)
+        score = np.exp(
+            -error / (max(self.cfg.foot_vel_tracking_sigma, 1.0e-6) ** 2)
+        )
+        return float(np.sum(score * swing_weight) / weight_sum)
+
+    def _stance_foot_track(
+        self,
+        foot_world_vel: np.ndarray,
+        foot_geom_contact: np.ndarray,
+        ref_foot_contact: np.ndarray,
+    ) -> tuple[float, float]:
+        geom_contact = np.asarray(foot_geom_contact, dtype=np.float32)
+        side_contact = self._side_contacts_from_geom(geom_contact)
+        side_weight = np.maximum(
+            side_contact,
+            np.clip(np.asarray(ref_foot_contact, dtype=np.float32), 0.0, 1.0),
+        )
+        horizontal_speed_sq = np.sum(np.square(foot_world_vel[:, 0:2]), axis=1)
+        geom_score = np.exp(
+            -horizontal_speed_sq / (max(self.cfg.stance_foot_vel_sigma, 1.0e-6) ** 2)
+        )
+
+        side_score = np.zeros(2, dtype=np.float32)
+        for side_index, contact_slice in enumerate((slice(0, 2), slice(2, 4))):
+            contact_count = float(np.sum(geom_contact[contact_slice]))
+            if contact_count > 1.0e-6:
+                side_score[side_index] = float(
+                    np.sum(geom_score[contact_slice] * geom_contact[contact_slice]) / contact_count
+                )
+
+        side_weight_sum = float(np.sum(side_weight))
+        stance_track = (
+            float(np.sum(side_score * side_weight) / side_weight_sum)
+            if side_weight_sum > 1.0e-6
+            else 1.0
+        )
+        actual_contact_count = float(np.sum(geom_contact))
+        stance_speed = (
+            float(np.sum(np.sqrt(horizontal_speed_sq) * geom_contact) / actual_contact_count)
+            if actual_contact_count > 1.0e-6
+            else 0.0
+        )
+        return stance_track, stance_speed
 
     def _symmetry_track(
         self,
