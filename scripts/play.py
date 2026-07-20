@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import fields
+import json
 import re
 import secrets
 import shutil
@@ -26,11 +27,53 @@ from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.networks import ActorCritic
 
 
+class OnnxPolicy:
+    """Small NumPy adapter around an exported deterministic actor."""
+
+    def __init__(self, path: str | Path) -> None:
+        import onnxruntime as ort
+
+        self.session = ort.InferenceSession(
+            str(Path(path).expanduser()),
+            providers=("CPUExecutionProvider",),
+        )
+        self.input = self.session.get_inputs()[0]
+        self.output = self.session.get_outputs()[0]
+
+    def validate_dimensions(self, obs_dim: int, action_dim: int) -> None:
+        input_dim = self.input.shape[-1]
+        output_dim = self.output.shape[-1]
+        if isinstance(input_dim, int) and input_dim != obs_dim:
+            raise ValueError(f"ONNX obs_dim={input_dim} does not match environment obs_dim={obs_dim}.")
+        if isinstance(output_dim, int) and output_dim != action_dim:
+            raise ValueError(f"ONNX action_dim={output_dim} does not match environment action_dim={action_dim}.")
+
+    def act_inference(self, observation: np.ndarray) -> np.ndarray:
+        observation = np.asarray(observation, dtype=np.float32)
+        return self.session.run((self.output.name,), {self.input.name: observation})[0]
+
+
+def load_onnx_metadata(path: str | Path) -> dict:
+    import onnx
+
+    model = onnx.load(Path(path).expanduser(), load_external_data=False)
+    properties = {item.key: item.value for item in model.metadata_props}
+    serialized = properties.get("lytrobot_amp.metadata")
+    if serialized is None:
+        raise ValueError(
+            "ONNX model has no lytrobot_amp.metadata; use an ONNX model exported by this training code."
+        )
+    metadata = json.loads(serialized)
+    if not isinstance(metadata, dict):
+        raise ValueError("Invalid lytrobot_amp.metadata in ONNX model.")
+    return metadata
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Play/evaluate a LYT PPO-AMP checkpoint.")
+    parser = argparse.ArgumentParser(description="Play/evaluate a LYT BPO-AMP checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
-    parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1.npz"))
+    parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
     parser.add_argument("--steps", type=int, default=1000, help="Number of policy steps to run. Use 0 for no limit.")
     parser.add_argument("--target-velocity", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
@@ -44,8 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--stage", default="auto", choices=("auto", "stage1", "stage2"))
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--control-mode", default="auto", choices=("auto", "position", "hybrid"))
-    parser.add_argument("--hybrid-force-scale", type=float, default=None)
     parser.add_argument("--stand-start-prob", type=float, default=None)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=None)
@@ -86,10 +127,6 @@ def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
     cfg.seed = int(args.seed)
     cfg.target_velocity = args.target_velocity
     cfg.reset_noise_scale = 0.0
-    if args.control_mode != "auto":
-        cfg.control_mode = args.control_mode
-    if args.hybrid_force_scale is not None:
-        cfg.hybrid_force_scale = float(args.hybrid_force_scale)
     if args.stand_start_prob is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
     if args.stand_start_phase_delay_steps is not None:
@@ -130,7 +167,10 @@ def checkpoint_recording_path(
     stage: str,
 ) -> Path:
     checkpoint_path = Path(checkpoint_path).expanduser()
-    run_name = checkpoint_path.parent.name
+    # Keep recording names portable across Linux, Windows, FAT, and exFAT.
+    run_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", checkpoint_path.parent.name).rstrip(" .")
+    if not run_name:
+        run_name = "run"
     match = re.fullmatch(r"(?:model|modle)_(\d+)", checkpoint_path.stem)
     if match is not None:
         iteration = match.group(1)
@@ -299,21 +339,37 @@ def main() -> None:
     torch.manual_seed(int(args.seed))
     if str(args.device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    checkpoint_path = Path(args.checkpoint).expanduser()
+    is_onnx = checkpoint_path.suffix.lower() == ".onnx"
+    if is_onnx:
+        checkpoint = load_onnx_metadata(checkpoint_path)
+    elif checkpoint_path.suffix.lower() == ".pt":
+        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+    else:
+        raise ValueError("--checkpoint must be a .pt or .onnx model file.")
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
 
     env = LytRobotAmpEnv(make_env_cfg(args, checkpoint))
-    policy = ActorCritic(
-        obs_dim=env.obs_dim,
-        action_dim=env.action_dim,
-        actor_hidden_dims=tuple(ppo_cfg.get("actor_hidden_dims", (256, 128))),
-        critic_hidden_dims=tuple(ppo_cfg.get("critic_hidden_dims", (256, 128))),
-        init_std=float(ppo_cfg.get("init_std", 0.8)),
-        min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
-        max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
-    ).to(args.device)
-    policy.load_state_dict(checkpoint["actor_critic"])
-    policy.eval()
+    if is_onnx:
+        policy = OnnxPolicy(checkpoint_path)
+        policy.validate_dimensions(env.obs_dim, env.action_dim)
+    else:
+        policy = ActorCritic(
+            obs_dim=env.obs_dim,
+            action_dim=env.action_dim,
+            actor_hidden_dims=tuple(ppo_cfg.get("actor_hidden_dims", (256, 128))),
+            critic_hidden_dims=tuple(ppo_cfg.get("critic_hidden_dims", (256, 128))),
+            init_std=float(ppo_cfg.get("init_std", 0.8)),
+            min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
+            max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
+        ).to(args.device)
+        missing, unexpected = policy.load_state_dict(checkpoint["actor_critic"], strict=False)
+        if unexpected:
+            print(f"[WARN] ignored unexpected actor_critic checkpoint keys: {unexpected}")
+        non_median_missing = [key for key in missing if not key.startswith("median_critic.")]
+        if non_median_missing:
+            print(f"[WARN] actor_critic checkpoint missing keys: {non_median_missing}")
+        policy.eval()
     print(
         f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
         f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode}"
@@ -348,8 +404,11 @@ def main() -> None:
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
-            action = policy.act_inference(obs_tensor).cpu().numpy()
+            if is_onnx:
+                action = policy.act_inference(obs)
+            else:
+                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
+                action = policy.act_inference(obs_tensor).cpu().numpy()
             obs, reward, done, _info = env.step(action)
             rewards.append(float(reward[0]))
             step_count += 1

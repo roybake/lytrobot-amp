@@ -54,6 +54,13 @@ if __name__ == "__main__":
         sys.argv.extend(["--device", "cuda"])
     if not any(arg == "--sim-backend" or arg.startswith("--sim-backend=") for arg in sys.argv):
         sys.argv.extend(["--sim-backend", "warp"])
+    # 4096 envs generate four times as many samples per iteration as stage1.
+    # 7500 iterations therefore preserve the stage1 sample budget instead of
+    # accidentally running a 4x larger 2.95-billion-transition job.
+    if not any(arg == "--num-envs" or arg.startswith("--num-envs=") for arg in sys.argv):
+        sys.argv.extend(["--num-envs", "4096"])
+    if not any(arg == "--max-iterations" or arg.startswith("--max-iterations=") for arg in sys.argv):
+        sys.argv.extend(["--max-iterations", "7500"])
     if not any(arg == "--save-interval" or arg.startswith("--save-interval=") for arg in sys.argv):
         sys.argv.extend(["--save-interval", "500"])
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")

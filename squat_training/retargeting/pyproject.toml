@@ -1,0 +1,24 @@
+[project]
+name = "lytrobot-squat-omniretarget"
+version = "0.1.0"
+description = "Isolated OmniRetarget pipeline for the LYT lower-body squat reference."
+requires-python = ">=3.11"
+dependencies = [
+  "cvxpy==1.7.3",
+  "embreex==2.17.7.post6",
+  "jinja2>=3.1,<4",
+  "lxml==6.1.0",
+  "matplotlib==3.10.8",
+  "mujoco==3.9.0",
+  "numpy==2.4.6",
+  "pillow==12.3.0",
+  "scipy==1.16.2",
+  "smplx>=0.1.28,<0.2",
+  "torch==2.10.0",
+  "tqdm>=4.67,<5",
+  "transforms3d>=0.4.2,<0.5",
+  "trimesh>=4.7,<5",
+  "tyro>=0.9,<1",
+  "viser==1.0.27",
+  "yourdfpy>=0.0.58,<0.1",
+]

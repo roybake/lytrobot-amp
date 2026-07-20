@@ -1,10 +1,14 @@
-"""PPO with an AMP discriminator for the LYT robot environment."""
+"""Bounded Policy Optimization with an AMP discriminator for the LYT robot environment."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
+import json
+import os
 from pathlib import Path
+import time
+import uuid
 
 import numpy as np
 import torch
@@ -27,10 +31,19 @@ class PPOAMPConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
+    bpo_lambda: float = 0.001
+    bpo_tv_coef: float = 0.0
     value_clip_coef: float = 1.0
     entropy_coef: float = 0.002
     value_coef: float = 0.5
+    median_value_coef: float = 0.5
     max_grad_norm: float = 1.0
+    target_kl: float = 0.0
+    target_kl_stop_multiplier: float = 2.0
+    adaptive_lr: bool = True
+    min_learning_rate: float = 1.0e-5
+    max_learning_rate: float = 3.0e-4
+    kl_adapt_factor: float = 1.5
     amp_enabled: bool = True
     amp_reward_coef: float = 1.20
     task_reward_lerp: float = 0.50
@@ -84,11 +97,32 @@ class PPOAMPTrainer:
 
         self.obs = env.reset()
         self.global_step = 0
-        self.episode_reward_sums = np.zeros(env.num_envs, dtype=np.float32)
-        self.episode_lengths = np.zeros(env.num_envs, dtype=np.int32)
+        self.episode_reward_sums = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+        self.episode_lengths = torch.zeros(env.num_envs, dtype=torch.long, device=self.device)
         window = max(1, int(cfg.episode_metric_window))
         self.completed_episode_rewards: deque[float] = deque(maxlen=window)
         self.completed_episode_lengths: deque[int] = deque(maxlen=window)
+
+    def _policy_learning_rate(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def _set_policy_learning_rate(self, learning_rate: float) -> None:
+        learning_rate = float(learning_rate)
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
+
+    def _adapt_policy_learning_rate(self, approx_kl: float) -> None:
+        if not self.cfg.adaptive_lr or self.cfg.target_kl <= 0.0 or not np.isfinite(approx_kl):
+            return
+        factor = float(max(self.cfg.kl_adapt_factor, 1.01))
+        current_lr = self._policy_learning_rate()
+        min_lr = float(max(self.cfg.min_learning_rate, 0.0))
+        max_lr = float(max(self.cfg.max_learning_rate, min_lr))
+        target_kl = float(self.cfg.target_kl)
+        if approx_kl > target_kl:
+            self._set_policy_learning_rate(max(min_lr, current_lr / factor))
+        elif 0.0 < approx_kl < 0.25 * target_kl:
+            self._set_policy_learning_rate(min(max_lr, current_lr * factor))
 
     def _as_device_tensor(self, value: torch.Tensor | np.ndarray, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if torch.is_tensor(value):
@@ -101,6 +135,10 @@ class PPOAMPTrainer:
             return value.detach().cpu().numpy()
         return np.asarray(value)
 
+    @staticmethod
+    def _bpo_soft_abs(x: torch.Tensor) -> torch.Tensor:
+        return -0.5 * x + F.softplus(x)
+
     def collect_rollout(self) -> dict[str, torch.Tensor | np.ndarray]:
         num_steps = self.cfg.num_steps
         num_envs = self.env.num_envs
@@ -108,21 +146,21 @@ class PPOAMPTrainer:
         action_dim = self.env.action_dim
         amp_dim = self.env.amp_obs_dim
 
-        obs = torch.zeros((num_steps, num_envs, obs_dim), device=self.device)
-        actions = torch.zeros((num_steps, num_envs, action_dim), device=self.device)
-        log_probs = torch.zeros((num_steps, num_envs), device=self.device)
-        values = torch.zeros((num_steps, num_envs), device=self.device)
-        rewards = torch.zeros((num_steps, num_envs), device=self.device)
-        task_rewards = torch.zeros((num_steps, num_envs), device=self.device)
-        amp_rewards = torch.zeros((num_steps, num_envs), device=self.device)
-        dones = torch.zeros((num_steps, num_envs), device=self.device)
-        time_outs = torch.zeros((num_steps, num_envs), device=self.device)
-        amp_features = torch.zeros((num_steps, num_envs, amp_dim), device=self.device)
-        completed_episode_rewards: list[np.ndarray] = []
-        completed_episode_lengths: list[np.ndarray] = []
-        episode_progress_values: list[float] = []
-        reward_component_sums: dict[str, float] = {}
-        reward_component_counts: dict[str, int] = {}
+        obs = torch.empty((num_steps, num_envs, obs_dim), device=self.device)
+        actions = torch.empty((num_steps, num_envs, action_dim), device=self.device)
+        log_probs = torch.empty((num_steps, num_envs), device=self.device)
+        values = torch.empty((num_steps, num_envs), device=self.device)
+        rewards = torch.empty((num_steps, num_envs), device=self.device)
+        task_rewards = torch.empty((num_steps, num_envs), device=self.device)
+        amp_rewards = torch.empty((num_steps, num_envs), device=self.device)
+        dones = torch.empty((num_steps, num_envs), device=self.device)
+        time_outs = torch.empty((num_steps, num_envs), device=self.device)
+        amp_features = torch.empty((num_steps, num_envs, amp_dim), device=self.device)
+        completed_reward_values = torch.zeros((num_steps, num_envs), device=self.device)
+        completed_length_values = torch.zeros((num_steps, num_envs), device=self.device)
+        episode_progress_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        reward_component_keys: tuple[str, ...] = ()
+        reward_component_sums: torch.Tensor | None = None
 
         for step in range(num_steps):
             obs_tensor = self._as_device_tensor(self.obs)
@@ -136,21 +174,25 @@ class PPOAMPTrainer:
 
             env_action = action if getattr(self.env, "is_torch_env", False) else action.cpu().numpy()
             next_obs, task_reward_value, done_value, _info = self.env.step(env_action)
-            done_np = self._as_numpy(done_value)
-            episode_step_np = self._as_numpy(_info["episode_step"]).astype(np.int32)
-            episode_progress_values.append(float(episode_step_np.mean()))
-            for key, info_value in _info.items():
-                if key in ("episode_step", "time_outs"):
-                    continue
-                if torch.is_tensor(info_value):
-                    reward_component_sums[key] = reward_component_sums.get(key, 0.0) + float(
-                        info_value.detach().sum().cpu()
-                    )
-                    reward_component_counts[key] = reward_component_counts.get(key, 0) + int(info_value.numel())
-                else:
-                    values_np = np.asarray(info_value, dtype=np.float32)
-                    reward_component_sums[key] = reward_component_sums.get(key, 0.0) + float(values_np.sum())
-                    reward_component_counts[key] = reward_component_counts.get(key, 0) + int(values_np.size)
+            episode_step = self._as_device_tensor(_info["episode_step"])
+            episode_progress_sum = episode_progress_sum + episode_step.sum()
+            component_items = [
+                (key, info_value)
+                for key, info_value in _info.items()
+                if key not in ("episode_step", "time_outs")
+            ]
+            if not reward_component_keys:
+                reward_component_keys = tuple(key for key, _value in component_items)
+            component_matrix = torch.stack(
+                tuple(self._as_device_tensor(value).reshape(num_envs) for _key, value in component_items),
+                dim=0,
+            )
+            step_component_sums = component_matrix.sum(dim=1)
+            reward_component_sums = (
+                step_component_sums
+                if reward_component_sums is None
+                else reward_component_sums + step_component_sums
+            )
             task_reward = self._as_device_tensor(task_reward_value)
             done = self._as_device_tensor(done_value)
             time_out = self._as_device_tensor(_info.get("time_outs", np.zeros(num_envs, dtype=np.float32)))
@@ -158,9 +200,17 @@ class PPOAMPTrainer:
             if self.cfg.amp_enabled:
                 total_reward = total_reward + (1.0 - self.cfg.task_reward_lerp) * self.cfg.amp_reward_coef * amp_reward
             total_reward = float(max(self.cfg.reward_scale, 1.0e-6)) * total_reward
-            total_reward_np = self._as_numpy(total_reward).astype(np.float32, copy=False)
-            self.episode_reward_sums += total_reward_np
+            self.episode_reward_sums += total_reward
             self.episode_lengths += 1
+            done_mask = done > 0.0
+            completed_reward_values[step] = torch.where(
+                done_mask, self.episode_reward_sums, torch.zeros_like(self.episode_reward_sums)
+            )
+            completed_length_values[step] = torch.where(
+                done_mask, self.episode_lengths.to(torch.float32), torch.zeros_like(total_reward)
+            )
+            self.episode_reward_sums.masked_fill_(done_mask, 0.0)
+            self.episode_lengths.masked_fill_(done_mask, 0)
 
             obs[step] = obs_tensor
             actions[step] = action
@@ -172,17 +222,6 @@ class PPOAMPTrainer:
             dones[step] = done
             time_outs[step] = time_out
             amp_features[step] = amp_tensor
-            if np.any(done_np > 0.0):
-                done_mask = done_np.astype(bool)
-                done_rewards = self.episode_reward_sums[done_mask].copy()
-                done_lengths = self.episode_lengths[done_mask].copy()
-                completed_episode_rewards.append(done_rewards)
-                completed_episode_lengths.append(done_lengths)
-                self.completed_episode_rewards.extend(float(value) for value in done_rewards)
-                self.completed_episode_lengths.extend(int(value) for value in done_lengths)
-                self.episode_reward_sums[done_mask] = 0.0
-                self.episode_lengths[done_mask] = 0
-
             self.obs = next_obs
             self.global_step += num_envs
 
@@ -205,6 +244,33 @@ class PPOAMPTrainer:
             advantages[step] = last_gae
         returns = advantages + values
 
+        completed_payload = torch.stack((completed_reward_values, completed_length_values, dones)).detach().cpu().numpy()
+        completed_mask = completed_payload[2] > 0.0
+        completed_episode_rewards: list[np.ndarray] = []
+        completed_episode_lengths: list[np.ndarray] = []
+        if np.any(completed_mask):
+            done_rewards = completed_payload[0][completed_mask].astype(np.float32, copy=False)
+            done_lengths = completed_payload[1][completed_mask].astype(np.int32, copy=False)
+            completed_episode_rewards.append(done_rewards)
+            completed_episode_lengths.append(done_lengths)
+            self.completed_episode_rewards.extend(float(value) for value in done_rewards)
+            self.completed_episode_lengths.extend(int(value) for value in done_lengths)
+
+        if reward_component_sums is None:
+            reward_component_sums = torch.zeros(0, dtype=torch.float32, device=self.device)
+        component_means = reward_component_sums / max(num_steps * num_envs, 1)
+        summary_components = torch.cat(
+            (
+                component_means,
+                (episode_progress_sum / max(num_steps * num_envs, 1)).reshape(1),
+            )
+        )
+        component_values = summary_components.detach().cpu().tolist()
+        episode_progress = float(component_values[-1])
+        reward_components = {
+            key: float(component_values[index]) for index, key in enumerate(reward_component_keys)
+        }
+
         return {
             "obs": obs,
             "actions": actions,
@@ -220,11 +286,8 @@ class PPOAMPTrainer:
             "amp_features": amp_features,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
-            "episode_progress": float(np.mean(episode_progress_values)) if episode_progress_values else 0.0,
-            "reward_components": {
-                key: reward_component_sums[key] / max(reward_component_counts.get(key, 0), 1)
-                for key in reward_component_sums
-            },
+            "episode_progress": episode_progress,
+            "reward_components": reward_components,
         }
 
     def update_policy(self, rollout: dict[str, torch.Tensor | np.ndarray]) -> dict[str, float]:
@@ -233,35 +296,44 @@ class PPOAMPTrainer:
         old_log_probs = rollout["log_probs"].reshape(-1)
         returns = rollout["returns"].reshape(-1)
         old_values = rollout["values"].reshape(-1)
-        advantages = rollout["advantages"].reshape(-1)
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1.0e-8)
 
         batch_size = obs.shape[0]
-        indices = np.arange(batch_size)
         minibatches = max(1, min(self.cfg.num_minibatches, batch_size))
-
-        metrics = {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "entropy": 0.0,
-            "approx_kl": 0.0,
-            "clip_fraction": 0.0,
-        }
+        metric_names = (
+            "policy_loss",
+            "value_loss",
+            "median_value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_fraction",
+            "bpo_ratio_error",
+            "bpo_target_ratio",
+            "bpo_policy_weight",
+            "bpo_median_advantage_abs",
+        )
+        metric_sums = torch.zeros(len(metric_names), dtype=torch.float32, device=self.device)
         update_count = 0
+        bpo_lambda = float(max(self.cfg.bpo_lambda, 1.0e-6))
+        ratio_eps = float(max(self.cfg.clip_coef, 0.0))
 
+        stop_policy_update = False
+        kl_stop = float(max(self.cfg.target_kl, 0.0)) * float(max(self.cfg.target_kl_stop_multiplier, 1.0))
         for _epoch in range(self.cfg.update_epochs):
-            self.rng.shuffle(indices)
-            for minibatch_indices in np.array_split(indices, minibatches):
-                mb = torch.as_tensor(minibatch_indices, dtype=torch.long, device=self.device)
+            epoch_kl_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+            epoch_update_count = 0
+            indices = torch.randperm(batch_size, device=self.device)
+            for mb in torch.tensor_split(indices, minibatches):
                 _, new_log_prob, entropy, new_value = self.actor_critic.get_action_and_value(obs[mb], actions[mb])
+                median_value = self.actor_critic.median_value(obs[mb])
                 log_ratio = new_log_prob - old_log_probs[mb]
                 ratio = log_ratio.exp()
 
-                pg_loss1 = -advantages[mb] * ratio
-                pg_loss2 = -advantages[mb] * torch.clamp(
-                    ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef
-                )
-                policy_loss = torch.max(pg_loss1, pg_loss2).mean()
+                with torch.no_grad():
+                    median_advantage = returns[mb] - median_value
+                    target_ratio = 1.0 + ratio_eps * torch.tanh(median_advantage / (2.0 * bpo_lambda))
+                    policy_weight = (returns[mb] - new_value).abs() + float(max(self.cfg.bpo_tv_coef, 0.0))
+                ratio_error = (target_ratio - ratio).abs()
+                policy_loss = (ratio_error * policy_weight).mean()
 
                 value_clip = float(max(self.cfg.value_clip_coef, 0.0))
                 if value_clip > 0.0:
@@ -273,9 +345,18 @@ class PPOAMPTrainer:
                 value_losses = (new_value - returns[mb]).pow(2)
                 value_losses_clipped = (value_pred_clipped - returns[mb]).pow(2)
                 value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                median_value_loss = (
+                    bpo_lambda
+                    * self._bpo_soft_abs((returns[mb].detach() - median_value) / bpo_lambda)
+                ).mean()
                 entropy_loss = entropy.mean()
 
-                loss = policy_loss + self.cfg.value_coef * value_loss - self.cfg.entropy_coef * entropy_loss
+                loss = (
+                    policy_loss
+                    + self.cfg.value_coef * value_loss
+                    + self.cfg.median_value_coef * median_value_loss
+                    - self.cfg.entropy_coef * entropy_loss
+                )
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.cfg.max_grad_norm)
@@ -284,16 +365,46 @@ class PPOAMPTrainer:
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = ((ratio - 1.0).abs() > self.cfg.clip_coef).float().mean()
-                metrics["policy_loss"] += float(policy_loss.detach().cpu())
-                metrics["value_loss"] += float(value_loss.detach().cpu())
-                metrics["entropy"] += float(entropy_loss.detach().cpu())
-                metrics["approx_kl"] += float(approx_kl.detach().cpu())
-                metrics["clip_fraction"] += float(clip_fraction.detach().cpu())
+                    clip_fraction = ((ratio - 1.0).abs() > ratio_eps).float().mean()
+                    if kl_stop > 0.0 and torch.isfinite(approx_kl) and float(approx_kl.detach().cpu()) > kl_stop:
+                        stop_policy_update = True
+                metric_sums += torch.stack(
+                    (
+                        policy_loss,
+                        value_loss,
+                        median_value_loss,
+                        entropy_loss,
+                        approx_kl,
+                        clip_fraction,
+                        ratio_error.mean(),
+                        target_ratio.mean(),
+                        policy_weight.mean(),
+                        median_advantage.abs().mean(),
+                    )
+                ).detach()
                 update_count += 1
+                epoch_kl_sum += approx_kl.detach()
+                epoch_update_count += 1
+                if stop_policy_update:
+                    break
 
-        for key in metrics:
-            metrics[key] /= max(update_count, 1)
+            mean_epoch_kl = (
+                float((epoch_kl_sum / epoch_update_count).cpu()) if epoch_update_count > 0 else 0.0
+            )
+            self._adapt_policy_learning_rate(mean_epoch_kl)
+            if (
+                stop_policy_update
+                or (
+                    self.cfg.target_kl > 0.0
+                    and epoch_update_count > 0
+                    and mean_epoch_kl > self.cfg.target_kl
+                )
+            ):
+                break
+
+        metric_values = (metric_sums / max(update_count, 1)).cpu().tolist()
+        metrics = {key: float(metric_values[index]) for index, key in enumerate(metric_names)}
+        metrics["learning_rate"] = self._policy_learning_rate()
         return metrics
 
     def update_discriminator(self, rollout: dict[str, torch.Tensor | np.ndarray]) -> dict[str, float]:
@@ -303,7 +414,8 @@ class PPOAMPTrainer:
         agent_features = rollout["amp_features"].reshape((-1, self.env.amp_obs_dim)).detach()
         batch_size = agent_features.shape[0]
         amp_batch_size = max(1, min(self.cfg.amp_minibatch_size, batch_size))
-        metrics = {"amp_loss": 0.0, "amp_grad_penalty": 0.0, "amp_agent_prob": 0.0, "amp_ref_prob": 0.0}
+        metric_names = ("amp_loss", "amp_grad_penalty", "amp_agent_prob", "amp_ref_prob")
+        metric_sums = torch.zeros(len(metric_names), dtype=torch.float32, device=self.device)
         updates = max(1, self.cfg.amp_discriminator_updates)
 
         for _ in range(updates):
@@ -339,14 +451,17 @@ class PPOAMPTrainer:
             self.discriminator_optimizer.step()
 
             with torch.no_grad():
-                metrics["amp_loss"] += float(amp_loss.detach().cpu())
-                metrics["amp_grad_penalty"] += float(grad_penalty.detach().cpu())
-                metrics["amp_agent_prob"] += float(torch.sigmoid(logits_agent).mean().detach().cpu())
-                metrics["amp_ref_prob"] += float(torch.sigmoid(logits_ref).mean().detach().cpu())
+                metric_sums += torch.stack(
+                    (
+                        amp_loss,
+                        grad_penalty,
+                        torch.sigmoid(logits_agent).mean(),
+                        torch.sigmoid(logits_ref).mean(),
+                    )
+                ).detach()
 
-        for key in metrics:
-            metrics[key] /= updates
-        return metrics
+        metric_values = (metric_sums / updates).cpu().tolist()
+        return {key: float(metric_values[index]) for index, key in enumerate(metric_names)}
 
     def _amp_noisy_batch(self, batch: torch.Tensor) -> torch.Tensor:
         noise_std = float(max(self.cfg.amp_obs_noise_std, 0.0))
@@ -369,9 +484,13 @@ class PPOAMPTrainer:
         return gradients.pow(2).sum(dim=1).mean()
 
     def train_iteration(self) -> dict[str, float]:
+        iteration_start = time.perf_counter()
         rollout = self.collect_rollout()
+        rollout_end = time.perf_counter()
         policy_metrics = self.update_policy(rollout)
+        policy_end = time.perf_counter()
         amp_metrics = self.update_discriminator(rollout)
+        amp_end = time.perf_counter()
 
         reward = rollout["rewards"]
         task_reward = rollout["task_rewards"]
@@ -396,7 +515,17 @@ class PPOAMPTrainer:
         mean_episode_length = (
             float(np.mean(self.completed_episode_lengths)) if len(self.completed_episode_lengths) > 0 else 0.0
         )
-        rollout_reward = float(reward.mean().detach().cpu())
+        summary_values = torch.stack(
+            (
+                reward.mean(),
+                task_reward.mean(),
+                amp_reward.mean(),
+                dones.mean(),
+            )
+        ).detach().cpu().tolist()
+        rollout_reward, mean_task_reward, mean_amp_reward, done_fraction = map(float, summary_values)
+        rollout_seconds = max(rollout_end - iteration_start, 1.0e-9)
+        env_steps_per_second = float(self.cfg.num_steps * self.env.num_envs) / rollout_seconds
         metrics: dict[str, float] = {
             "global_step": float(self.global_step),
             "mean_reward": mean_episode_reward,
@@ -404,14 +533,20 @@ class PPOAMPTrainer:
             "mean_episode_reward": mean_episode_reward,
             "mean_episode_length": mean_episode_length,
             "rollout_mean_reward": rollout_reward,
-            "rollout_mean_task_reward": float(task_reward.mean().detach().cpu()),
-            "rollout_mean_amp_reward": float(amp_reward.mean().detach().cpu()),
+            "rollout_mean_task_reward": mean_task_reward,
+            "rollout_mean_amp_reward": mean_amp_reward,
             "rollout_episode_reward": rollout_episode_reward,
             "rollout_episode_length": rollout_episode_length,
-            "mean_task_reward": float(task_reward.mean().detach().cpu()),
-            "mean_amp_reward": float(amp_reward.mean().detach().cpu()),
+            "mean_task_reward": mean_task_reward,
+            "mean_amp_reward": mean_amp_reward,
             "mean_episode_progress": episode_progress,
-            "done_fraction": float(dones.mean().detach().cpu()),
+            "done_fraction": done_fraction,
+            "timing_rollout_s": rollout_end - iteration_start,
+            "timing_policy_update_s": policy_end - rollout_end,
+            "timing_amp_update_s": amp_end - policy_end,
+            "timing_iteration_s": amp_end - iteration_start,
+            "throughput_env_steps_s": env_steps_per_second,
+            "throughput_physics_steps_s": env_steps_per_second * int(self.env.cfg.decimation),
         }
         reward_components = rollout.get("reward_components", {})
         if isinstance(reward_components, dict):
@@ -432,14 +567,26 @@ class PPOAMPTrainer:
             if key in checkpoint and int(checkpoint[key]) != int(value):
                 raise ValueError(f"Checkpoint {key}={checkpoint[key]} does not match current environment {value}.")
 
-        self.actor_critic.load_state_dict(checkpoint["actor_critic"])
+        actor_state = checkpoint["actor_critic"]
+        missing, unexpected = self.actor_critic.load_state_dict(actor_state, strict=False)
+        if any(key.startswith("median_critic.") for key in missing):
+            self.actor_critic.median_critic.load_state_dict(self.actor_critic.critic.state_dict())
+            print("[WARN] checkpoint has no BPO median_critic; initialized it from critic weights.")
+        non_median_missing = [key for key in missing if not key.startswith("median_critic.")]
+        if non_median_missing:
+            print(f"[WARN] actor_critic checkpoint missing keys: {non_median_missing}")
+        if unexpected:
+            print(f"[WARN] ignored unexpected actor_critic checkpoint keys: {unexpected}")
         self.actor_critic.clamp_log_std_()
         if self.cfg.amp_enabled and "discriminator" in checkpoint:
             self.discriminator.load_state_dict(checkpoint["discriminator"])
 
         if load_optimizers:
             if "optimizer" in checkpoint:
-                self.optimizer.load_state_dict(checkpoint["optimizer"])
+                try:
+                    self.optimizer.load_state_dict(checkpoint["optimizer"])
+                except ValueError as exc:
+                    print(f"[WARN] skipped incompatible actor optimizer state: {exc}")
             if self.cfg.amp_enabled and "discriminator_optimizer" in checkpoint:
                 self.discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
         self._set_optimizer_lrs()
@@ -453,8 +600,8 @@ class PPOAMPTrainer:
         for group in self.discriminator_optimizer.param_groups:
             group["lr"] = float(self.cfg.discriminator_learning_rate)
 
-    def save(self, path: str | Path, iteration: int) -> None:
-        checkpoint = {
+    def _checkpoint_payload(self, iteration: int) -> dict:
+        return {
             "iteration": int(iteration),
             "global_step": int(self.global_step),
             "actor_critic": self.actor_critic.state_dict(),
@@ -468,6 +615,82 @@ class PPOAMPTrainer:
             "amp_obs_dim": self.env.amp_obs_dim,
             "common_joint_names": self.env.motion.common_joint_names,
         }
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, path)
+
+    def _export_onnx(self, path: Path, checkpoint: dict) -> None:
+        """Export the deterministic actor and embed everything needed by playback."""
+        import onnx
+
+        was_training = self.actor_critic.training
+        self.actor_critic.eval()
+        dummy_observation = torch.zeros(
+            (1, self.env.obs_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        try:
+            torch.onnx.export(
+                self.actor_critic.actor,
+                dummy_observation,
+                path,
+                input_names=("observation",),
+                output_names=("action",),
+                dynamic_axes={"observation": {0: "batch"}, "action": {0: "batch"}},
+                opset_version=17,
+                dynamo=False,
+            )
+        finally:
+            self.actor_critic.train(was_training)
+
+        model = onnx.load(path)
+        metadata = {
+            "format_version": 1,
+            "iteration": checkpoint["iteration"],
+            "global_step": checkpoint["global_step"],
+            "obs_dim": checkpoint["obs_dim"],
+            "action_dim": checkpoint["action_dim"],
+            "amp_obs_dim": checkpoint["amp_obs_dim"],
+            "ppo_amp_config": checkpoint["ppo_amp_config"],
+            "env_config": checkpoint["env_config"],
+            "common_joint_names": checkpoint["common_joint_names"],
+        }
+        if "sensor_observation" in checkpoint:
+            metadata["sensor_observation"] = checkpoint["sensor_observation"]
+        onnx.helper.set_model_props(
+            model,
+            {"lytrobot_amp.metadata": json.dumps(metadata, ensure_ascii=False)},
+        )
+        onnx.checker.check_model(model)
+        onnx.save(model, path)
+
+    @staticmethod
+    def _remove_stale_models(directory: Path, current_stem: str) -> None:
+        for suffix in (".pt", ".onnx"):
+            for candidate in directory.glob(f"model_*{suffix}"):
+                if candidate.stem != current_stem:
+                    candidate.unlink(missing_ok=True)
+
+    def _save_checkpoint_pair(self, path: str | Path, checkpoint: dict) -> tuple[Path, Path]:
+        pt_path = Path(path)
+        if pt_path.suffix != ".pt":
+            raise ValueError(f"Checkpoint path must end in .pt, got: {pt_path}")
+        onnx_path = pt_path.with_suffix(".onnx")
+        pt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        token = uuid.uuid4().hex
+        temporary_pt = pt_path.parent / f".{pt_path.name}.{token}.tmp"
+        temporary_onnx = onnx_path.parent / f".{onnx_path.name}.{token}.tmp"
+        try:
+            torch.save(checkpoint, temporary_pt)
+            self._export_onnx(temporary_onnx, checkpoint)
+            os.replace(temporary_pt, pt_path)
+            os.replace(temporary_onnx, onnx_path)
+        finally:
+            temporary_pt.unlink(missing_ok=True)
+            temporary_onnx.unlink(missing_ok=True)
+
+        self._remove_stale_models(pt_path.parent, pt_path.stem)
+        return pt_path, onnx_path
+
+    def save(self, path: str | Path, iteration: int) -> tuple[Path, Path]:
+        checkpoint = self._checkpoint_payload(iteration)
+        return self._save_checkpoint_pair(path, checkpoint)

@@ -9,17 +9,8 @@ import mujoco
 import numpy as np
 import torch
 
-from .control import (
-    CONTROL_MODE_HYBRID,
-    force_actuator_ids_for_positions,
-    normalize_control_mode,
-    position_actuator_ids,
-)
 from .env import LytRobotEnvCfg
 from .motion import CONTACT_GEOM_NAMES, MotionReference, resolve_contact_geom_ids
-
-WARP_NCONMAX = 256
-WARP_NJMAX = 128
 
 try:
     import mujoco_warp as mjwarp
@@ -62,6 +53,8 @@ class LytRobotWarpAmpEnv:
 
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
         self.model.opt.timestep = float(cfg.timestep)
+        self.model.opt.iterations = max(1, int(cfg.solver_iterations))
+        self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
         # MuJoCo Warp rejects non-zero contact margins with CCD enabled. The LYT
         # MJCF defaults geom margin to 0.001, so disable CCD for this backend.
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD.value
@@ -71,41 +64,25 @@ class LytRobotWarpAmpEnv:
         self.base_geom_friction_np = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
         self.base_gravity_np = np.asarray(self.model.opt.gravity, dtype=np.float32).copy()
 
-        self.control_mode = normalize_control_mode(cfg.control_mode)
-        self.position_actuator_ids_np = position_actuator_ids(self.model).astype(np.int64)
-        self.force_actuator_ids_np = (
-            force_actuator_ids_for_positions(self.model, self.position_actuator_ids_np).astype(np.int64)
-            if self.control_mode == CONTROL_MODE_HYBRID
-            else np.asarray([], dtype=np.int64)
-        )
+        self.position_actuator_ids_np = np.arange(self.model.nu, dtype=np.int64)
         self.position_action_dim = int(len(self.position_actuator_ids_np))
-        self.force_action_dim = int(len(self.force_actuator_ids_np))
-        self.action_dim = (
-            self.position_action_dim + self.force_action_dim
-            if self.control_mode == CONTROL_MODE_HYBRID
-            else self.position_action_dim
-        )
+        self.action_dim = self.position_action_dim
         self.ctrl_dim = int(self.model.nu)
         self.motion = MotionReference(cfg.motion_file, self.model, actuator_ids=self.position_actuator_ids_np)
-        self.rng = np.random.default_rng(cfg.seed)
+        rng_seed = secrets.randbits(128) if cfg.randomize_episode_seed else int(cfg.seed)
+        self.rng = np.random.default_rng(rng_seed)
         self.num_envs = int(cfg.num_envs)
+        self.actor_observation_enabled = True
 
-        self.full_ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
-        self.full_ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
         self.ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids_np, 0], dtype=np.float32)
         self.ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids_np, 1], dtype=np.float32)
-        self.force_ctrl_low_np = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids_np, 0], dtype=np.float32)
-        self.force_ctrl_high_np = np.asarray(self.model.actuator_ctrlrange[self.force_actuator_ids_np, 1], dtype=np.float32)
         self.ctrl_low = torch.as_tensor(self.ctrl_low_np, dtype=torch.float32, device=self.device)
         self.ctrl_high = torch.as_tensor(self.ctrl_high_np, dtype=torch.float32, device=self.device)
         self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
         self.ctrl_half_range = torch.clamp(0.5 * (self.ctrl_high - self.ctrl_low), min=1.0e-6)
-        self.force_ctrl_low = torch.as_tensor(self.force_ctrl_low_np, dtype=torch.float32, device=self.device)
-        self.force_ctrl_high = torch.as_tensor(self.force_ctrl_high_np, dtype=torch.float32, device=self.device)
         self.position_actuator_ids = torch.as_tensor(
             self.position_actuator_ids_np, dtype=torch.long, device=self.device
         )
-        self.force_actuator_ids = torch.as_tensor(self.force_actuator_ids_np, dtype=torch.long, device=self.device)
         self.actuator_tendon_ids = torch.as_tensor(
             np.asarray(self.model.actuator_trnid[self.position_actuator_ids_np, 0], dtype=np.int64),
             dtype=torch.long,
@@ -184,6 +161,7 @@ class LytRobotWarpAmpEnv:
         self.stand_start = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.stand_start_transition_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
         self._init_domain_randomization()
+        self._capture_warp_graphs()
         self.reset()
 
     @property
@@ -342,8 +320,8 @@ class LytRobotWarpAmpEnv:
                 self.model,
                 cpu_data,
                 nworld=self.num_envs,
-                nconmax=WARP_NCONMAX,
-                njmax=WARP_NJMAX,
+                nconmax=max(1, int(self.cfg.warp_nconmax)),
+                njmax=max(1, int(self.cfg.warp_njmax)),
             )
             mjwarp.forward(self.wp_model, self.wp_data)
 
@@ -364,6 +342,48 @@ class LytRobotWarpAmpEnv:
         self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid).long()
         self.contact_dim = wp.to_torch(self.wp_data.contact.dim).long()
 
+    def _capture_warp_graphs(self) -> None:
+        """Capture fixed-shape MuJoCo Warp launches to remove Python launch overhead."""
+        self._step_graph = None
+        self._forward_graph = None
+        if not bool(self.cfg.warp_cuda_graph):
+            return
+        assert wp is not None and mjwarp is not None
+        try:
+            with wp.ScopedDevice(self.wp_device):
+                with wp.ScopedCapture() as step_capture:
+                    mjwarp.step(self.wp_model, self.wp_data)
+            self._step_graph = step_capture.graph
+        except Exception as exc:
+            self._step_graph = None
+            print(f"[WARN] Warp step CUDA graph capture failed; using direct launches: {exc}")
+        try:
+            with wp.ScopedDevice(self.wp_device):
+                with wp.ScopedCapture() as forward_capture:
+                    mjwarp.forward(self.wp_model, self.wp_data)
+            self._forward_graph = forward_capture.graph
+        except Exception as exc:
+            self._forward_graph = None
+            print(f"[WARN] Warp forward CUDA graph capture failed; using direct launches: {exc}")
+
+    def _warp_step(self) -> None:
+        assert wp is not None and mjwarp is not None
+        if self._step_graph is None:
+            mjwarp.step(self.wp_model, self.wp_data)
+        else:
+            wp.capture_launch(self._step_graph)
+
+    def _warp_forward(self) -> None:
+        assert wp is not None and mjwarp is not None
+        if self._forward_graph is None:
+            mjwarp.forward(self.wp_model, self.wp_data)
+        else:
+            wp.capture_launch(self._forward_graph)
+
+    def _warp_decimated_step(self) -> None:
+        for _ in range(int(self.cfg.decimation)):
+            self._warp_step()
+
     def _init_domain_randomization(self) -> None:
         self.domain_randomization = bool(self.cfg.domain_randomization)
         max_delay_s = max(float(self.cfg.action_delay_min_ms), float(self.cfg.action_delay_max_ms), 0.0) / 1000.0
@@ -379,8 +399,10 @@ class LytRobotWarpAmpEnv:
             (self.num_envs, self.position_action_dim), dtype=torch.float32, device=self.device
         )
         self.push_force = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=self.device)
-        self.push_time_left = np.zeros(self.num_envs, dtype=np.int32)
-        self.push_time_to_next = self._sample_push_interval(self.num_envs)
+        self.push_time_left = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.push_time_to_next = torch.as_tensor(
+            self._sample_push_interval(self.num_envs), dtype=torch.long, device=self.device
+        )
         self.base_body_mass = torch.as_tensor(self.base_body_mass_np, dtype=torch.float32, device=self.device)
         self.base_body_inertia = torch.as_tensor(self.base_body_inertia_np, dtype=torch.float32, device=self.device)
         self.base_body_subtreemass = torch.as_tensor(
@@ -422,11 +444,8 @@ class LytRobotWarpAmpEnv:
     def _refresh_episode_rng(self, ids_np: np.ndarray) -> None:
         if not self.cfg.randomize_episode_seed or ids_np.size == 0:
             return
-        seeds = np.asarray([secrets.randbits(64) for _ in range(len(ids_np))], dtype=np.uint64)
+        seeds = self.rng.integers(0, np.iinfo(np.uint64).max, size=len(ids_np), dtype=np.uint64)
         self.episode_seed[ids_np] = seeds
-        seed_words = [int(seed & np.uint64(0xFFFFFFFF)) for seed in seeds]
-        seed_words += [int(seed >> np.uint64(32)) for seed in seeds]
-        self.rng = np.random.default_rng(np.random.SeedSequence(seed_words))
 
     def _sample_domain_randomization(self, ids_np: np.ndarray) -> None:
         if not self.domain_randomization or ids_np.size == 0:
@@ -449,8 +468,10 @@ class LytRobotWarpAmpEnv:
         )
         self.action_delay_history[ids] = 0.0
         self.push_force[ids] = 0.0
-        self.push_time_left[ids_np] = 0
-        self.push_time_to_next[ids_np] = self._sample_push_interval(len(ids_np))
+        self.push_time_left[ids] = 0
+        self.push_time_to_next[ids] = torch.as_tensor(
+            self._sample_push_interval(len(ids_np)), dtype=torch.long, device=self.device
+        )
         self._apply_global_domain_randomization()
 
     def _apply_global_domain_randomization(self) -> None:
@@ -477,10 +498,15 @@ class LytRobotWarpAmpEnv:
         self.wp_gravity[0] = self.base_gravity
         self.wp_gravity[0, 2] = -float(self._uniform_np(self.cfg.gravity_min, self.cfg.gravity_max))
 
-    def _apply_tendon_length_randomization(self, ctrl: torch.Tensor) -> torch.Tensor:
+    def _apply_tendon_length_randomization(
+        self,
+        ctrl: torch.Tensor,
+        env_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if not self.domain_randomization:
             return ctrl
-        scaled = self.ctrl_mid + (ctrl - self.ctrl_mid) * self.env_tendon_length_scale
+        scale = self.env_tendon_length_scale if env_ids is None else self.env_tendon_length_scale[env_ids]
+        scaled = self.ctrl_mid + (ctrl - self.ctrl_mid) * scale
         return torch.clamp(scaled, min=self.ctrl_low, max=self.ctrl_high)
 
     def _apply_action_noise(self, action: torch.Tensor) -> torch.Tensor:
@@ -510,25 +536,42 @@ class LytRobotWarpAmpEnv:
         if not self.domain_randomization:
             return
         active = self.push_time_left > 0
-        self.push_time_left[active] -= 1
+        self.push_time_left.sub_(active.to(self.push_time_left.dtype))
         ended = active & (self.push_time_left <= 0)
-        if np.any(ended):
-            self.push_time_to_next[ended] = self._sample_push_interval(int(np.count_nonzero(ended)))
-            ended_ids = torch.as_tensor(np.nonzero(ended)[0], dtype=torch.long, device=self.device)
-            self.push_force[ended_ids] = 0.0
+        interval_low = max(1, int(self.cfg.push_interval_min_steps))
+        interval_high = max(interval_low + 1, int(self.cfg.push_interval_max_steps) + 1)
+        sampled_intervals = torch.randint(
+            interval_low,
+            interval_high,
+            (self.num_envs,),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.push_time_to_next[:] = torch.where(ended, sampled_intervals, self.push_time_to_next)
+        self.push_force[:] = torch.where(ended[:, None], torch.zeros_like(self.push_force), self.push_force)
 
         idle = self.push_time_left <= 0
-        self.push_time_to_next[idle] -= 1
+        self.push_time_to_next.sub_(idle.to(self.push_time_to_next.dtype))
         start = idle & (self.push_time_to_next <= 0)
-        if np.any(start):
-            start_np = np.nonzero(start)[0]
-            directions = self.rng.normal(0.0, 1.0, size=(len(start_np), 3)).astype(np.float32)
-            directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1.0e-6)
-            magnitudes = self._uniform_np(self.cfg.push_force_min, self.cfg.push_force_max, (len(start_np), 1))
-            force = np.concatenate((directions * magnitudes, np.zeros((len(start_np), 3), dtype=np.float32)), axis=1)
-            ids = torch.as_tensor(start_np, dtype=torch.long, device=self.device)
-            self.push_force[ids] = torch.as_tensor(force, dtype=torch.float32, device=self.device)
-            self.push_time_left[start_np] = self._sample_push_duration(len(start_np))
+        directions = torch.randn((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        directions = directions / torch.linalg.norm(directions, dim=1, keepdim=True).clamp_min(1.0e-6)
+        low_force = min(float(self.cfg.push_force_min), float(self.cfg.push_force_max))
+        high_force = max(float(self.cfg.push_force_min), float(self.cfg.push_force_max))
+        magnitudes = low_force + (high_force - low_force) * torch.rand(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        sampled_force = torch.cat((directions * magnitudes, torch.zeros_like(directions)), dim=1)
+        self.push_force[:] = torch.where(start[:, None], sampled_force, self.push_force)
+        duration_low = max(1, int(self.cfg.push_duration_min_steps))
+        duration_high = max(duration_low + 1, int(self.cfg.push_duration_max_steps) + 1)
+        sampled_durations = torch.randint(
+            duration_low,
+            duration_high,
+            (self.num_envs,),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.push_time_left[:] = torch.where(start, sampled_durations, self.push_time_left)
 
         self.xfrc_applied[:, self.pelvis_body_id] = self.push_force
 
@@ -557,18 +600,29 @@ class LytRobotWarpAmpEnv:
             "foot_contact": interp(self.ref_foot_contact),
         }
 
-    def _stand_start_progress(self) -> torch.Tensor:
+    def _stand_start_progress(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        episode_step = self.episode_step if env_ids is None else self.episode_step[env_ids]
+        transition_steps = (
+            self.stand_start_transition_steps
+            if env_ids is None
+            else self.stand_start_transition_steps[env_ids]
+        )
+        stand_start = self.stand_start if env_ids is None else self.stand_start[env_ids]
         delay = max(0, int(self.cfg.stand_start_phase_delay_steps))
-        raw = (self.episode_step.to(torch.float32) - float(delay)) / self.stand_start_transition_steps.to(torch.float32).clamp_min(1.0)
+        raw = (episode_step.to(torch.float32) - float(delay)) / transition_steps.to(torch.float32).clamp_min(1.0)
         progress = torch.clamp(raw, 0.0, 1.0)
         progress = progress * progress * (3.0 - 2.0 * progress)
-        return torch.where(self.stand_start, progress, torch.ones_like(progress))
+        return torch.where(stand_start, progress, torch.ones_like(progress))
 
-    def _blend_start_targets(self, targets: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        progress = self._stand_start_progress()
+    def _blend_start_targets(
+        self,
+        targets: dict[str, torch.Tensor],
+        env_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        progress = self._stand_start_progress(env_ids)
 
         def blend(stand: torch.Tensor, walk: torch.Tensor) -> torch.Tensor:
-            shape = (self.num_envs,) + (1,) * (walk.ndim - 1)
+            shape = (walk.shape[0],) + (1,) * (walk.ndim - 1)
             weight = progress.reshape(shape)
             return (1.0 - weight) * stand + weight * walk
 
@@ -586,8 +640,9 @@ class LytRobotWarpAmpEnv:
             "foot_contact": blend(self.stand_foot_contact, targets["foot_contact"]),
         }
 
-    def _targets_at_current_phase(self) -> dict[str, torch.Tensor]:
-        return self._blend_start_targets(self._targets_at_phase(self.motion_phase))
+    def _targets_at_current_phase(self, env_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        phase = self.motion_phase if env_ids is None else self.motion_phase[env_ids]
+        return self._blend_start_targets(self._targets_at_phase(phase), env_ids=env_ids)
 
     def _clip_joint_ranges_batch(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
         if len(self._limited_qpos_adrs_np) == 0:
@@ -603,64 +658,38 @@ class LytRobotWarpAmpEnv:
         crossed_high = (values > high) & (qvel[:, dadr] > 0.0)
         qvel[:, dadr] = np.where(crossed_low | crossed_high, 0.0, qvel[:, dadr])
 
-    def _split_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        clipped = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
-        position_action = clipped[:, : self.position_action_dim]
-        if self.control_mode == CONTROL_MODE_HYBRID:
-            force_action = clipped[:, self.position_action_dim :]
-        else:
-            force_action = torch.zeros((clipped.shape[0], 0), dtype=torch.float32, device=self.device)
-        return position_action, force_action
-
-    def _force_action_to_ctrl(self, force_action: torch.Tensor) -> torch.Tensor:
-        if self.control_mode != CONTROL_MODE_HYBRID:
-            return torch.zeros((force_action.shape[0], 0), dtype=torch.float32, device=self.device)
-        pull = torch.clamp(force_action.to(dtype=torch.float32, device=self.device), min=0.0)
-        ctrl = -float(np.clip(self.cfg.hybrid_force_scale, 0.0, 1.0)) * pull
-        return torch.clamp(ctrl, min=self.force_ctrl_low, max=self.force_ctrl_high)
-
-    def _position_ctrl_to_full_ctrl(
+    def action_to_ctrl(
         self,
-        position_ctrl: torch.Tensor,
-        force_action: torch.Tensor | None = None,
+        action: torch.Tensor,
+        base_ctrl: torch.Tensor | None = None,
+        env_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        full_ctrl = torch.zeros((position_ctrl.shape[0], self.ctrl_dim), dtype=torch.float32, device=self.device)
-        full_ctrl[:, self.position_actuator_ids] = position_ctrl
-        if self.control_mode == CONTROL_MODE_HYBRID:
-            force = (
-                torch.zeros((position_ctrl.shape[0], self.force_action_dim), dtype=torch.float32, device=self.device)
-                if force_action is None
-                else force_action
-            )
-            full_ctrl[:, self.force_actuator_ids] = self._force_action_to_ctrl(force)
-        return full_ctrl
-
-    def action_to_ctrl(self, action: torch.Tensor, base_ctrl: torch.Tensor | None = None) -> torch.Tensor:
-        position_action, force_action = self._split_action(action)
+        position_action = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
         base = self.ctrl_mid if base_ctrl is None else base_ctrl
         position_ctrl = base + (
             position_action * self.ctrl_half_range * self.action_scale * float(self.cfg.action_residual_scale)
         )
         position_ctrl = torch.clamp(position_ctrl, min=self.ctrl_low, max=self.ctrl_high)
-        position_ctrl = self._apply_tendon_length_randomization(position_ctrl)
-        return self._position_ctrl_to_full_ctrl(position_ctrl, force_action)
+        position_ctrl = self._apply_tendon_length_randomization(position_ctrl, env_ids=env_ids)
+        return position_ctrl
 
     def ctrl_to_action(self, ctrl: torch.Tensor) -> torch.Tensor:
         ctrl_tensor = ctrl.to(dtype=torch.float32, device=self.device)
-        position_ctrl = ctrl_tensor[:, self.position_actuator_ids] if ctrl_tensor.shape[-1] == self.ctrl_dim else ctrl_tensor
-        position_action = torch.clamp((position_ctrl - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
-        if self.control_mode != CONTROL_MODE_HYBRID:
-            return position_action
-        force_zeros = torch.zeros((position_action.shape[0], self.force_action_dim), dtype=torch.float32, device=self.device)
-        return torch.cat((position_action, force_zeros), dim=1)
+        return torch.clamp((ctrl_tensor - self.ctrl_mid) / self.ctrl_half_range, -1.0, 1.0)
 
     def _current_tendon_ctrl(self) -> torch.Tensor:
         ctrl = self.ten_length[:, self.actuator_tendon_ids]
         return torch.clamp(ctrl, min=self.ctrl_low, max=self.ctrl_high)
 
-    def _reference_base_ctrl(self, reference_ctrl: torch.Tensor) -> torch.Tensor:
+    def _reference_base_ctrl(
+        self,
+        reference_ctrl: torch.Tensor,
+        env_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         blend = float(np.clip(self.cfg.reference_ctrl_blend, 0.0, 1.0))
         current = self._current_tendon_ctrl()
+        if env_ids is not None:
+            current = current[env_ids]
         if blend <= 0.0:
             return current
         return torch.clamp((1.0 - blend) * current + blend * reference_ctrl, min=self.ctrl_low, max=self.ctrl_high)
@@ -691,6 +720,7 @@ class LytRobotWarpAmpEnv:
         g2 = self.contact_geom[:, 1]
         world = self.contact_worldid
         valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
+        safe_world = torch.clamp(world, 0, self.num_envs - 1)
 
         floor = int(self.floor_geom_id)
         for contact_index, geom in enumerate(self.contact_geom_id_values):
@@ -698,7 +728,13 @@ class LytRobotWarpAmpEnv:
                 ((g1 == floor) & (g2 == geom))
                 | ((g2 == floor) & (g1 == geom))
             )
-            contact[world[matched], contact_index] = 1.0
+            contact[:, contact_index].scatter_reduce_(
+                0,
+                safe_world,
+                matched.to(torch.float32),
+                reduce="amax",
+                include_self=True,
+            )
         return contact
 
     def _foot_contacts(self) -> torch.Tensor:
@@ -746,11 +782,19 @@ class LytRobotWarpAmpEnv:
         self.motion_phase[ids] = torch.as_tensor(phase, dtype=torch.float32, device=self.device)
         self.ctrl[ids] = 0.0
         with wp.ScopedDevice(self.wp_device):
-            mjwarp.forward(self.wp_model, self.wp_data)
+            self._warp_forward()
 
-        targets = self._targets_at_current_phase()
-        zero_action = torch.zeros((self.num_envs, self.action_dim), dtype=torch.float32, device=self.device)
-        self.ctrl[ids] = self.action_to_ctrl(zero_action, base_ctrl=self._reference_base_ctrl(targets["tendon_ctrl"]))[ids]
+        self.episode_step[ids] = 0
+        self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
+        targets = self._targets_at_current_phase() if self.actor_observation_enabled else None
+        reset_targets = (
+            {key: value[ids] for key, value in targets.items()}
+            if targets is not None
+            else self._targets_at_current_phase(ids)
+        )
+        zero_action = torch.zeros((len(ids_np), self.action_dim), dtype=torch.float32, device=self.device)
+        reset_base_ctrl = self._reference_base_ctrl(reset_targets["tendon_ctrl"], env_ids=ids)
+        self.ctrl[ids] = self.action_to_ctrl(zero_action, base_ctrl=reset_base_ctrl, env_ids=ids)
         self.last_action[ids] = 0.0
         foot_pos = self._foot_positions_local()[ids]
         self.last_foot_pos[ids] = foot_pos
@@ -767,9 +811,9 @@ class LytRobotWarpAmpEnv:
         self.foot_stride_ema[ids] = 0.0
         self.contact_balance_ema[ids] = 0.0
         self.action_energy_ema[ids] = 0.0
-        self.episode_step[ids] = 0
-        self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
-        self.last_obs = self.observe()
+        if self.actor_observation_enabled:
+            assert targets is not None
+            self.last_obs = self.observe(targets=targets)
         return self.last_obs
 
     def _sample_timeout_steps(self, batch_size: int) -> torch.Tensor:
@@ -783,8 +827,8 @@ class LytRobotWarpAmpEnv:
             values = self.rng.integers(low, high, size=batch_size, dtype=np.int64)
         return torch.as_tensor(values, dtype=torch.long, device=self.device)
 
-    def observe(self) -> torch.Tensor:
-        targets = self._targets_at_current_phase()
+    def observe(self, targets: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+        targets = self._targets_at_current_phase() if targets is None else targets
         quat = _canonical_quat(self.qpos[:, 3:7])
         up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
         phase = 2.0 * torch.pi * self.motion_phase / float(self.motion.frame_count)
@@ -862,21 +906,29 @@ class LytRobotWarpAmpEnv:
         push_delay = int(self.cfg.stand_start_push_delay_steps)
         if push_delay > 0:
             starting = self.stand_start & (self.episode_step < push_delay)
-            if bool(torch.any(starting).item()):
-                self.push_force[starting] = 0.0
-                self.xfrc_applied[starting, self.pelvis_body_id] = 0.0
-                starting_np = starting.detach().cpu().numpy()
-                self.push_time_left[starting_np] = 0
-                self.push_time_to_next[starting_np] = np.maximum(
-                    self.push_time_to_next[starting_np],
-                    max(1, int(self.cfg.push_interval_min_steps)),
-                )
+            self.push_force[:] = torch.where(starting[:, None], torch.zeros_like(self.push_force), self.push_force)
+            self.xfrc_applied[:, self.pelvis_body_id] = torch.where(
+                starting[:, None],
+                torch.zeros_like(self.push_force),
+                self.xfrc_applied[:, self.pelvis_body_id],
+            )
+            self.push_time_left[:] = torch.where(starting, torch.zeros_like(self.push_time_left), self.push_time_left)
+            self.push_time_to_next[:] = torch.where(
+                starting,
+                torch.clamp_min(self.push_time_to_next, max(1, int(self.cfg.push_interval_min_steps))),
+                self.push_time_to_next,
+            )
 
         with wp.ScopedDevice(self.wp_device):
-            for _ in range(self.cfg.decimation):
-                applied_action = self._delayed_action(commanded_action)
+            if not self.domain_randomization or self.max_action_delay_ticks <= 0:
+                applied_action = commanded_action
                 self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
-                mjwarp.step(self.wp_model, self.wp_data)
+                self._warp_decimated_step()
+            else:
+                for _ in range(self.cfg.decimation):
+                    applied_action = self._delayed_action(commanded_action)
+                    self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
+                    self._warp_step()
 
         self.episode_step += 1
         foot_pos = self._foot_positions_local()
@@ -901,11 +953,12 @@ class LytRobotWarpAmpEnv:
         self.last_foot_pos[:] = foot_pos
         self.last_foot_world_pos[:] = foot_world_pos
 
-        done_ids = torch.nonzero(dones, as_tuple=False).flatten()
-        if len(done_ids) > 0:
-            self.reset(done_ids)
+        done_ids_np = np.flatnonzero(dones.detach().cpu().numpy())
+        if done_ids_np.size > 0:
+            self.reset(done_ids_np)
         else:
-            self.last_obs = self.observe()
+            if self.actor_observation_enabled:
+                self.last_obs = self.observe()
         info = {key: value for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.to(torch.float32)
@@ -939,6 +992,24 @@ class LytRobotWarpAmpEnv:
         lin_vel_track = torch.exp(-torch.mean(lin_vel_error.square(), dim=1) / (0.75**2))
         ang_vel_track = torch.exp(-torch.mean(ang_vel_error.square(), dim=1) / (1.50**2))
         root_vel = 0.65 * lin_vel_track + 0.35 * ang_vel_track
+        forward_velocity = self.qvel[:, 0]
+        forward_velocity_error = forward_velocity - target_forward_velocity
+        forward_velocity_track = torch.exp(
+            -forward_velocity_error.square()
+            / (max(float(self.cfg.forward_velocity_tracking_sigma), 1.0e-6) ** 2)
+        )
+        target_velocity_scale = max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+        forward_progress = torch.clamp(forward_velocity / target_velocity_scale, -1.0, 1.0)
+        forward_velocity_deficit = torch.clamp(
+            (target_forward_velocity - forward_velocity) / target_velocity_scale,
+            0.0,
+            2.0,
+        )
+        forward_velocity_excess = torch.clamp(
+            (forward_velocity - target_forward_velocity) / target_velocity_scale,
+            0.0,
+            2.0,
+        )
 
         height = torch.exp(-((root_height - targets["root_height"]).square()) / (0.09**2))
         joint_pos = self.qpos[:, self.robot_qpos_adrs]
@@ -968,8 +1039,8 @@ class LytRobotWarpAmpEnv:
             1.0,
         )
         missed_contact = torch.mean(targets["foot_contact"] * (1.0 - foot_contact), dim=1)
-        position_action, force_action = self._split_action(action)
-        prev_position_action, prev_force_action = self._split_action(prev_action)
+        position_action = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
+        prev_position_action = torch.clamp(prev_action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
         ctrl_error = torch.mean(
             ((self.ctrl[:, self.position_actuator_ids] - targets["tendon_ctrl"]) / self.ctrl_half_range).square(),
             dim=1,
@@ -977,12 +1048,6 @@ class LytRobotWarpAmpEnv:
         ctrl_track = torch.exp(-ctrl_error / (0.45**2))
         ctrl_penalty = torch.mean(position_action.square(), dim=1)
         action_rate = torch.mean((position_action - prev_position_action).square(), dim=1)
-        if self.control_mode == CONTROL_MODE_HYBRID and self.force_action_dim > 0:
-            force_penalty = torch.mean(force_action.square(), dim=1)
-            force_action_rate = torch.mean((force_action - prev_force_action).square(), dim=1)
-        else:
-            force_penalty = torch.zeros_like(ctrl_penalty)
-            force_action_rate = torch.zeros_like(action_rate)
         if len(self.distal_joint_indices) > 0:
             distal_vel_error = torch.mean(
                 (
@@ -1008,7 +1073,15 @@ class LytRobotWarpAmpEnv:
         else:
             distal_action = ctrl_penalty
             distal_action_rate = action_rate
-        symmetry_track, foot_symmetry_track, contact_balance_track, action_balance_track = self._symmetry_track(
+        (
+            symmetry_track,
+            foot_symmetry_track,
+            stride_symmetry_track,
+            phase_symmetry_track,
+            lateral_symmetry_track,
+            contact_balance_track,
+            action_balance_track,
+        ) = self._symmetry_track(
             foot_pos,
             foot_contact,
             position_action,
@@ -1021,6 +1094,10 @@ class LytRobotWarpAmpEnv:
             + 0.75 * height
             + 0.90 * root_orientation
             + 0.90 * root_vel
+            + self.cfg.forward_velocity_reward_coef * forward_velocity_track
+            + self.cfg.forward_progress_reward_coef * forward_progress
+            - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+            - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
             + 1.25 * foot_pos_track
             + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
             + self.cfg.step_gap_coef * side_metrics["step_gap"]
@@ -1035,8 +1112,6 @@ class LytRobotWarpAmpEnv:
             - self.cfg.action_rate_penalty_coef * action_rate
             - self.cfg.distal_action_penalty_coef * distal_action
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
-            - self.cfg.force_action_penalty_coef * force_penalty
-            - self.cfg.force_action_rate_penalty_coef * force_action_rate
             - self.cfg.missed_contact_penalty_coef * missed_contact
         )
 
@@ -1052,10 +1127,20 @@ class LytRobotWarpAmpEnv:
         )
         timed_out = self.episode_step >= self.episode_timeout_step
         dones = bad_state | fallen | timed_out
+        termination = bad_state | fallen
         reward = reward - torch.where(bad_state | fallen, torch.full_like(reward, 2.0), torch.zeros_like(reward))
 
         return reward, dones, timed_out, {
+            "root_height_value": root_height,
+            "reference_root_height_value": targets["root_height"],
             "root_vel": root_vel,
+            "forward_velocity": forward_velocity,
+            "forward_velocity_error": forward_velocity_error,
+            "forward_velocity_track": forward_velocity_track,
+            "forward_progress": forward_progress,
+            "forward_velocity_deficit": forward_velocity_deficit,
+            "forward_velocity_excess": forward_velocity_excess,
+            "termination": termination.to(torch.float32),
             "root_orientation": root_orientation,
             "height": height,
             "pose_track": pose_track,
@@ -1077,6 +1162,9 @@ class LytRobotWarpAmpEnv:
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
             "foot_symmetry": foot_symmetry_track,
+            "stride_symmetry": stride_symmetry_track,
+            "phase_symmetry": phase_symmetry_track,
+            "lateral_symmetry": lateral_symmetry_track,
             "contact_balance": contact_balance_track,
             "action_balance": action_balance_track,
             "ctrl_track": ctrl_track,
@@ -1084,8 +1172,6 @@ class LytRobotWarpAmpEnv:
             "action_rate": action_rate,
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
-            "force_action": force_penalty,
-            "force_action_rate": force_action_rate,
         }
 
     def _side_foot_tracks(
@@ -1203,7 +1289,15 @@ class LytRobotWarpAmpEnv:
         foot_pos: torch.Tensor,
         foot_contact: torch.Tensor,
         action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         decay = float(np.clip(self.cfg.symmetry_ema_decay, 0.0, 0.9999))
         right_x = torch.mean(foot_pos[:, 0:2, 0], dim=1)
         left_x = torch.mean(foot_pos[:, 2:4, 0], dim=1)
@@ -1248,8 +1342,24 @@ class LytRobotWarpAmpEnv:
         else:
             action_balance = torch.ones_like(contact_balance)
 
-        symmetry = 0.60 * foot_symmetry + 0.25 * contact_balance + 0.15 * action_balance
-        return symmetry, foot_symmetry, contact_balance, action_balance
+        foot_weight = max(float(self.cfg.symmetry_foot_weight), 0.0)
+        contact_weight = max(float(self.cfg.symmetry_contact_weight), 0.0)
+        action_weight = max(float(self.cfg.symmetry_action_weight), 0.0)
+        weight_sum = max(foot_weight + contact_weight + action_weight, 1.0e-6)
+        symmetry = (
+            foot_weight * foot_symmetry
+            + contact_weight * contact_balance
+            + action_weight * action_balance
+        ) / weight_sum
+        return (
+            symmetry,
+            foot_symmetry,
+            stride_symmetry,
+            phase_symmetry,
+            lateral_symmetry,
+            contact_balance,
+            action_balance,
+        )
 
     def close(self) -> None:
         pass

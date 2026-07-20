@@ -9,9 +9,6 @@ from typing import Sequence
 import mujoco
 import numpy as np
 
-from .control import position_actuator_ids
-
-
 DEFAULT_COMMON_JOINTS: tuple[str, ...] = (
     "hip_flexion_r",
     "hip_adduction_r",
@@ -30,10 +27,10 @@ DEFAULT_COMMON_JOINTS: tuple[str, ...] = (
 )
 
 CONTACT_GEOM_NAMES: tuple[str, ...] = (
-    "foot_r_contact",
-    "toe_r_contact",
-    "foot_l_contact",
-    "toe_l_contact",
+    "foot_r",
+    "toe_r",
+    "foot_l",
+    "toe_l",
 )
 CONTACT_BODY_FALLBACKS: tuple[str, ...] = (
     "foot_r",
@@ -66,7 +63,7 @@ def _filter_short_contact_runs(contact: np.ndarray, min_run_frames: int = CONTAC
 
 
 def resolve_contact_geom_ids(model: mujoco.MjModel) -> np.ndarray:
-    """Resolve foot/toe contact geoms, allowing unnamed mesh geoms on foot bodies."""
+    """Resolve the foot/toe mesh geoms used for ground contact."""
     geom_ids: list[int] = []
     missing: list[str] = []
     for geom_name, body_name in zip(CONTACT_GEOM_NAMES, CONTACT_BODY_FALLBACKS, strict=True):
@@ -151,6 +148,15 @@ class MotionReference:
         self.frequency = float(np.asarray(archive["frequency"]).item())
         self.frame_count = int(self.source_qpos.shape[0])
         self.zero_root_xy = zero_root_xy
+        self.source_foot_contact: np.ndarray | None = None
+        if "foot_contact" in archive.files:
+            source_foot_contact = np.asarray(archive["foot_contact"], dtype=np.float32)
+            expected_shape = (self.frame_count, 2)
+            if source_foot_contact.shape != expected_shape:
+                raise ValueError(
+                    f"foot_contact must have shape {expected_shape}, got {source_foot_contact.shape}."
+                )
+            self.source_foot_contact = np.clip(source_foot_contact, 0.0, 1.0)
 
         source_joint_names = [str(name) for name in archive["joint_names"]]
         self.source_joint_to_index = {name: i for i, name in enumerate(source_joint_names)}
@@ -193,7 +199,7 @@ class MotionReference:
         self.actuator_ids = (
             np.asarray(actuator_ids, dtype=np.int32)
             if actuator_ids is not None
-            else position_actuator_ids(model)
+            else np.arange(model.nu, dtype=np.int32)
         )
         self.actuator_tendon_ids = np.asarray(model.actuator_trnid[self.actuator_ids, 0], dtype=np.int32)
         self.ctrl_low = np.asarray(model.actuator_ctrlrange[self.actuator_ids, 0], dtype=np.float32)
@@ -268,6 +274,11 @@ class MotionReference:
         right_contact = _filter_short_contact_runs(right_side_z <= right_threshold)
         left_contact = _filter_short_contact_runs(left_side_z <= left_threshold)
         foot_contact = np.stack((right_contact, left_contact), axis=1).astype(np.float32)
+        if self.source_foot_contact is not None:
+            # Locomotion references can keep the legacy height inference, while
+            # stationary tasks such as squats explicitly declare both planted
+            # feet throughout the cycle.
+            foot_contact = self.source_foot_contact.copy()
 
         self.reference_qpos = qpos
         self.reference_qvel = qvel

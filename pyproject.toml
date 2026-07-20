@@ -12,6 +12,8 @@ dependencies = [
   "mujoco==3.9.0",
   "mujoco-warp==3.9.0.1",
   "numpy==2.4.6",
+  "onnx==1.22.0",
+  "onnxruntime==1.27.0",
   "torch==2.10.0",
   "warp-lang==1.14.0",
   "wandb==0.27.2",
