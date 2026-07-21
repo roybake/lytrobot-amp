@@ -1,0 +1,89 @@
+<mujoco model="lyt_14dof_retarget">
+  <compiler angle="radian"/>
+  <option gravity="0 0 -9.81"/>
+  <default>
+    <joint type="hinge" limited="true" damping="0.1"/>
+    <geom contype="1" conaffinity="1" condim="3" friction="1 0.1 0.1" rgba="0.65 0.75 0.85 1"/>
+  </default>
+  <worldbody>
+    <geom name="ground" type="plane" size="3 3 0.1" rgba="0.8 0.8 0.8 1"/>
+    <body name="pelvis" pos="0 0 0.875">
+      <freejoint/>
+      <geom name="pelvis_collision" type="box" size="0.09 0.13 0.07" contype="0" conaffinity="0"/>
+      <body name="right_hip_flexion" pos="0.012032 -0.082674 -0.074584">
+        <joint name="hip_flexion_r" axis="0 -1 0" range="-0.787 0.787"/>
+        <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+        <body name="right_hip_adduction">
+          <joint name="hip_adduction_r" axis="1 0 0" range="-0.524 0.2"/>
+          <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+          <body name="right_hip">
+            <joint name="hip_rotation_r" axis="0 0 1" range="-2.0944 2.0944"/>
+            <geom name="right_thigh_collision" type="capsule" size="0.045" fromto="0 0 0 0.021988 0.0085393 -0.3638" contype="0" conaffinity="0"/>
+            <body name="right_knee" pos="0.021988 0.0085393 -0.3638">
+              <joint name="knee_angle_r" axis="-0.0270811 -0.997283 0.0685032" range="-2 0"/>
+              <geom name="right_shank_collision" type="capsule" size="0.04" fromto="0 0 0 0.022557 -0.0061213 -0.38882" contype="0" conaffinity="0"/>
+              <body name="right_ankle" pos="0.022557 -0.0061213 -0.38882">
+                <joint name="ankle_angle_r" axis="-0.051785 -0.99459 0.090048" range="-0.5 0.7"/>
+                <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+                <body name="right_foot" pos="-0.0086471 0.00034291 -0.015818">
+                  <joint name="subtalar_angle_r" axis="0.762058 0.313439 0.566589" range="-1 1"/>
+                  <geom name="right_foot_collision" type="box" pos="0.04 0 -0.014" size="0.075 0.045 0.014"/>
+                  <body name="right_heel_sole" pos="-0.025 0 -0.031978">
+                    <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                  </body>
+                  <body name="right_sole" pos="0.04 0 -0.031978">
+                    <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                  </body>
+                  <body name="right_toe" pos="0.11963 -0.012783 -0.01619">
+                    <joint name="mtp_angle_r" axis="-0.375959 -0.926408 -0.02056" range="-1 1"/>
+                    <geom name="right_toe_collision" type="box" pos="0.035 0 -0.004" size="0.035 0.04 0.01"/>
+                    <body name="right_toe_sole" pos="0.035 0 -0.015788">
+                      <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="left_hip_flexion" pos="0.012032 0.082674 -0.074584">
+        <joint name="hip_flexion_l" axis="0 -1 0" range="-0.787 0.787"/>
+        <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+        <body name="left_hip_adduction">
+          <joint name="hip_adduction_l" axis="-1 0 0" range="-0.524 0.2"/>
+          <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+          <body name="left_hip">
+            <joint name="hip_rotation_l" axis="0 0 -1" range="-2.0944 2.0944"/>
+            <geom name="left_thigh_collision" type="capsule" size="0.045" fromto="0 0 0 0.021988 -0.0085393 -0.3638" contype="0" conaffinity="0"/>
+            <body name="left_knee" pos="0.021988 -0.0085393 -0.3638">
+              <joint name="knee_angle_l" axis="0.0270811 -0.997283 -0.0685032" range="-2 0"/>
+              <geom name="left_shank_collision" type="capsule" size="0.04" fromto="0 0 0 0.022557 0.0061213 -0.38882" contype="0" conaffinity="0"/>
+              <body name="left_ankle" pos="0.022557 0.0061213 -0.38882">
+                <joint name="ankle_angle_l" axis="0.051785 -0.99459 -0.090048" range="-0.5 0.7"/>
+                <geom type="sphere" size="0.005" density="1000" contype="0" conaffinity="0" rgba="0 0 0 0"/>
+                <body name="left_foot" pos="-0.0086471 -0.00034291 -0.015818">
+                  <joint name="subtalar_angle_l" axis="-0.762058 0.313439 -0.566589" range="-1 1"/>
+                  <geom name="left_foot_collision" type="box" pos="0.04 0 -0.014" size="0.075 0.045 0.014"/>
+                  <body name="left_heel_sole" pos="-0.025 0 -0.031978">
+                    <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                  </body>
+                  <body name="left_sole" pos="0.04 0 -0.031978">
+                    <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                  </body>
+                  <body name="left_toe" pos="0.11963 0.012783 -0.01619">
+                    <joint name="mtp_angle_l" axis="0.375959 -0.926408 0.02056" range="-1 1"/>
+                    <geom name="left_toe_collision" type="box" pos="0.035 0 -0.004" size="0.035 0.04 0.01"/>
+                    <body name="left_toe_sole" pos="0.035 0 -0.015788">
+                      <site type="sphere" size="0.002" rgba="0 0 0 0"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

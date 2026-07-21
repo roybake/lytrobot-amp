@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the LYT robot with PPO-AMP."""
+"""Train the LYT robot with BPO-AMP."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -54,7 +56,7 @@ TRAIN_LOG_PROGRESS_RE = re.compile(r"\[TRAIN\]\s+iter=(\d+)\s+step=(\d+)")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train LYT biped locomotion with PPO-AMP.")
+    parser = argparse.ArgumentParser(description="Train LYT biped locomotion with BPO-AMP.")
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
     parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
     parser.add_argument("--log-root", default=str(REPO_ROOT / "logs"))
@@ -79,18 +81,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=0)
 
     parser.add_argument("--num-envs", type=int, default=4096)
-    parser.add_argument("--max-iterations", type=int, default=30000)
+    parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=24)
     parser.add_argument("--episode-steps", type=int, default=1000)
     parser.add_argument("--episode-timeout-jitter-steps", type=int, default=240)
     parser.add_argument("--decimation", type=int, default=4)
+    parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument("--solver-ls-iterations", type=int, default=20)
+    parser.add_argument("--warp-nconmax", type=int, default=32)
+    parser.add_argument("--warp-njmax", type=int, default=128)
+    parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-velocity", type=float, default=1.0)
+    parser.add_argument("--forward-velocity-tracking-sigma", type=float, default=0.25)
+    parser.add_argument("--forward-velocity-reward-coef", type=float, default=0.0)
+    parser.add_argument("--forward-progress-reward-coef", type=float, default=0.0)
+    parser.add_argument("--forward-velocity-deficit-penalty-coef", type=float, default=0.0)
+    parser.add_argument("--forward-velocity-excess-penalty-coef", type=float, default=0.0)
     parser.add_argument("--reset-noise-scale", type=float, default=0.01)
     parser.add_argument("--motion-reset-prob", type=float, default=0.5)
-    parser.add_argument("--control-mode", default="position", choices=("position", "hybrid"))
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
     parser.add_argument("--distal-action-scale", type=float, default=1.0)
-    parser.add_argument("--hybrid-force-scale", type=float, default=0.15)
     parser.add_argument("--reference-ctrl-blend", type=float, default=1.0)
     parser.add_argument("--foot-vel-tracking-sigma", type=float, default=1.0)
     parser.add_argument("--stance-foot-vel-sigma", type=float, default=0.15)
@@ -109,6 +119,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symmetry-foot-pos-sigma", type=float, default=0.08)
     parser.add_argument("--symmetry-balance-sigma", type=float, default=0.25)
     parser.add_argument("--symmetry-ema-decay", type=float, default=0.99)
+    parser.add_argument("--symmetry-foot-weight", type=float, default=0.60)
+    parser.add_argument("--symmetry-contact-weight", type=float, default=0.25)
+    parser.add_argument("--symmetry-action-weight", type=float, default=0.15)
     parser.add_argument("--startup-action-ramp-steps", type=int, default=20)
     parser.add_argument("--stand-start-prob", type=float, default=0.5)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=25)
@@ -119,8 +132,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-rate-penalty-coef", type=float, default=0.100)
     parser.add_argument("--distal-action-penalty-coef", type=float, default=0.030)
     parser.add_argument("--distal-action-rate-penalty-coef", type=float, default=0.120)
-    parser.add_argument("--force-action-penalty-coef", type=float, default=0.020)
-    parser.add_argument("--force-action-rate-penalty-coef", type=float, default=0.040)
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--payload-mass-min", type=float, default=0.0)
     parser.add_argument("--payload-mass-max", type=float, default=3.0)
@@ -145,8 +156,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--reward-scale", type=float, default=0.25)
+    parser.add_argument("--clip-coef", type=float, default=None)
+    parser.add_argument("--bpo-lambda", type=float, default=None)
+    parser.add_argument("--bpo-tv-coef", type=float, default=None)
     parser.add_argument("--value-clip-coef", type=float, default=1.0)
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--median-value-coef", type=float, default=None)
+    parser.add_argument("--target-kl", type=float, default=None)
+    parser.add_argument("--target-kl-stop-multiplier", type=float, default=None)
+    parser.add_argument("--adaptive-lr", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--min-learning-rate", type=float, default=None)
+    parser.add_argument("--max-learning-rate", type=float, default=None)
+    parser.add_argument("--kl-adapt-factor", type=float, default=None)
     parser.add_argument("--disc-learning-rate", type=float, default=3.0e-5)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--minibatches", type=int, default=4)
@@ -164,6 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--resource-log-interval", type=int, default=50)
+    parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument(
         "--max-process-rss-mb",
         type=float,
@@ -173,13 +195,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-cleanup-interval",
         type=int,
-        default=5,
+        default=0,
         help="Run Python GC and return free glibc heap pages to the OS every N iterations; set 0 to disable.",
     )
     parser.add_argument(
         "--iteration-sleep-ms",
         type=float,
-        default=10.0,
+        default=0.0,
         help="Yield the shared display GPU/desktop briefly after each training iteration; set 0 to disable.",
     )
 
@@ -225,7 +247,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Keep reward/episode/task metrics out of wandb until mean_episode_length reaches this value.",
     )
-    parser.add_argument("--wandb-tags", default="lytrobot,ppo,amp,walk")
+    parser.add_argument("--wandb-tags", default="lytrobot,bpo,amp,walk")
     return parser.parse_args()
 
 
@@ -269,6 +291,24 @@ def resolve_log_dir(args: argparse.Namespace) -> Path:
     if not log_dir.is_dir():
         raise NotADirectoryError(f"--log-dir is not a directory: {log_dir}")
     return log_dir
+
+
+def resolve_resume_checkpoint(path: str | None) -> str | None:
+    """Validate a resume checkpoint before allocating logs, W&B, or CUDA state."""
+
+    if path is None:
+        return None
+    checkpoint = Path(path).expanduser().resolve()
+    if checkpoint.is_file():
+        return str(checkpoint)
+
+    fallback = checkpoint.parent / "model_final.pt"
+    fallback_hint = (
+        f" The completed run has {fallback}; use that file instead."
+        if fallback.is_file()
+        else ""
+    )
+    raise FileNotFoundError(f"--resume-checkpoint does not exist: {checkpoint}.{fallback_hint}")
 
 
 def infer_wandb_run_id(log_dir: Path) -> str | None:
@@ -378,8 +418,20 @@ def _setup_wandb_metrics() -> None:
     ):
         wandb.define_metric(m, summary="last")
 
-    # -- PPO training losses ------------------------------------------------
-    for m in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
+    # -- BPO training losses ------------------------------------------------
+    for m in (
+        "policy_loss",
+        "value_loss",
+        "median_value_loss",
+        "entropy",
+        "approx_kl",
+        "clip_fraction",
+        "bpo_ratio_error",
+        "bpo_target_ratio",
+        "bpo_policy_weight",
+        "bpo_median_advantage_abs",
+        "learning_rate",
+    ):
         wandb.define_metric(m, summary="last")
 
     # -- AMP discriminator --------------------------------------------------
@@ -477,9 +529,9 @@ class TrainingRunLogger:
         self.metrics_csv_path = metrics_csv_path
         self.train_log_path = train_log_path
         self.console_log_interval = _effective_console_log_interval(log_interval)
-        self._csv_file = metrics_csv_path.open("a", newline="", encoding="utf-8", buffering=1)
+        self._csv_file = None
         self._csv_writer: csv.DictWriter | None = None
-        self._log_file = train_log_path.open("a", encoding="utf-8", buffering=1)
+        self._log_file = train_log_path.open("a", encoding="utf-8", buffering=64 * 1024)
         if self.console_log_interval > max(int(log_interval), 1):
             print(
                 "[INFO] VSCode terminal detected; "
@@ -487,22 +539,49 @@ class TrainingRunLogger:
                 f"full logs at {self.train_log_path}"
             )
 
+    def _open_csv_writer(self, metrics: dict[str, float]) -> None:
+        requested_fieldnames = list(metrics.keys())
+        self.metrics_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not self.metrics_csv_path.exists() or self.metrics_csv_path.stat().st_size == 0
+        fieldnames = requested_fieldnames
+        if not write_header:
+            with self.metrics_csv_path.open(newline="", encoding="utf-8") as existing_file:
+                reader = csv.DictReader(existing_file)
+                existing_fieldnames = list(reader.fieldnames or [])
+                fieldnames = existing_fieldnames + [
+                    field for field in requested_fieldnames if field not in existing_fieldnames
+                ]
+                if fieldnames != existing_fieldnames:
+                    rows = list(reader)
+                    temp_path = self.metrics_csv_path.with_suffix(self.metrics_csv_path.suffix + ".tmp")
+                    with temp_path.open("w", newline="", encoding="utf-8") as temp_file:
+                        writer = csv.DictWriter(temp_file, fieldnames=fieldnames, extrasaction="ignore")
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    temp_path.replace(self.metrics_csv_path)
+        self._csv_file = self.metrics_csv_path.open("a", newline="", encoding="utf-8", buffering=1024 * 1024)
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            self._csv_writer.writeheader()
+
     def write_metrics(self, metrics: dict[str, float]) -> None:
         if self._csv_writer is None:
-            write_header = self.metrics_csv_path.stat().st_size == 0
-            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=list(metrics.keys()))
-            if write_header:
-                self._csv_writer.writeheader()
+            self._open_csv_writer(metrics)
         self._csv_writer.writerow(metrics)
 
     def emit(self, message: str, *, iteration: int | None = None, force: bool = False) -> None:
         self._log_file.write(message + "\n")
+        if force or iteration is None or iteration % 10 == 0:
+            self._log_file.flush()
+            if self._csv_file is not None:
+                self._csv_file.flush()
         should_print = force or iteration is None or iteration % self.console_log_interval == 0
         if should_print:
             print(message)
 
     def close(self) -> None:
-        self._csv_file.close()
+        if self._csv_file is not None:
+            self._csv_file.close()
         self._log_file.close()
 
 
@@ -572,10 +651,20 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
+    # Fail before creating a log directory, starting W&B, or initializing the
+    # simulator. Long runs commonly replace numbered snapshots with
+    # model_final.pt during graceful shutdown.
+    args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint)
     if args.domain_randomization is None:
         args.domain_randomization = args.stage == "stage2"
+    if args.max_iterations is None:
+        args.max_iterations = 7500 if args.stage == "stage2" else 30000
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.set_float32_matmul_precision("high")
 
     device = select_device(args.device)
     sim_backend = select_sim_backend(args.sim_backend, device)
@@ -583,7 +672,7 @@ def main() -> None:
     print(f"[INFO] log_dir={log_dir}")
     print(
         f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
-        f"seed={args.seed}, control_mode={args.control_mode}, "
+        f"seed={args.seed}, control=position, "
         f"domain_randomization={args.domain_randomization}, "
         f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
     )
@@ -597,13 +686,21 @@ def main() -> None:
         decimation=args.decimation,
         episode_steps=args.episode_steps,
         episode_timeout_jitter_steps=args.episode_timeout_jitter_steps,
+        solver_iterations=args.solver_iterations,
+        solver_ls_iterations=args.solver_ls_iterations,
+        warp_nconmax=args.warp_nconmax,
+        warp_njmax=args.warp_njmax,
+        warp_cuda_graph=args.warp_cuda_graph,
         target_velocity=args.target_velocity,
+        forward_velocity_tracking_sigma=args.forward_velocity_tracking_sigma,
+        forward_velocity_reward_coef=args.forward_velocity_reward_coef,
+        forward_progress_reward_coef=args.forward_progress_reward_coef,
+        forward_velocity_deficit_penalty_coef=args.forward_velocity_deficit_penalty_coef,
+        forward_velocity_excess_penalty_coef=args.forward_velocity_excess_penalty_coef,
         reset_noise_scale=args.reset_noise_scale,
         motion_reset_prob=args.motion_reset_prob,
-        control_mode=args.control_mode,
         action_residual_scale=args.action_residual_scale,
         distal_action_scale=args.distal_action_scale,
-        hybrid_force_scale=args.hybrid_force_scale,
         reference_ctrl_blend=args.reference_ctrl_blend,
         foot_vel_tracking_sigma=args.foot_vel_tracking_sigma,
         stance_foot_vel_sigma=args.stance_foot_vel_sigma,
@@ -622,6 +719,9 @@ def main() -> None:
         symmetry_foot_pos_sigma=args.symmetry_foot_pos_sigma,
         symmetry_balance_sigma=args.symmetry_balance_sigma,
         symmetry_ema_decay=args.symmetry_ema_decay,
+        symmetry_foot_weight=args.symmetry_foot_weight,
+        symmetry_contact_weight=args.symmetry_contact_weight,
+        symmetry_action_weight=args.symmetry_action_weight,
         startup_action_ramp_steps=args.startup_action_ramp_steps,
         stand_start_prob=args.stand_start_prob,
         stand_start_phase_delay_steps=args.stand_start_phase_delay_steps,
@@ -632,8 +732,6 @@ def main() -> None:
         action_rate_penalty_coef=args.action_rate_penalty_coef,
         distal_action_penalty_coef=args.distal_action_penalty_coef,
         distal_action_rate_penalty_coef=args.distal_action_rate_penalty_coef,
-        force_action_penalty_coef=args.force_action_penalty_coef,
-        force_action_rate_penalty_coef=args.force_action_rate_penalty_coef,
         domain_randomization=bool(args.domain_randomization),
         payload_mass_min=args.payload_mass_min,
         payload_mass_max=args.payload_mass_max,
@@ -656,12 +754,33 @@ def main() -> None:
         action_delay_min_ms=args.action_delay_min_ms,
         action_delay_max_ms=args.action_delay_max_ms,
     )
+    ppo_defaults = PPOAMPConfig()
     ppo_cfg = PPOAMPConfig(
         seed=args.seed,
         learning_rate=args.learning_rate,
         reward_scale=args.reward_scale,
+        clip_coef=args.clip_coef if args.clip_coef is not None else ppo_defaults.clip_coef,
+        bpo_lambda=args.bpo_lambda if args.bpo_lambda is not None else ppo_defaults.bpo_lambda,
+        bpo_tv_coef=args.bpo_tv_coef if args.bpo_tv_coef is not None else ppo_defaults.bpo_tv_coef,
         value_clip_coef=args.value_clip_coef,
         value_coef=args.value_coef,
+        median_value_coef=(
+            args.median_value_coef if args.median_value_coef is not None else ppo_defaults.median_value_coef
+        ),
+        target_kl=args.target_kl if args.target_kl is not None else ppo_defaults.target_kl,
+        target_kl_stop_multiplier=(
+            args.target_kl_stop_multiplier
+            if args.target_kl_stop_multiplier is not None
+            else ppo_defaults.target_kl_stop_multiplier
+        ),
+        adaptive_lr=args.adaptive_lr if args.adaptive_lr is not None else ppo_defaults.adaptive_lr,
+        min_learning_rate=(
+            args.min_learning_rate if args.min_learning_rate is not None else ppo_defaults.min_learning_rate
+        ),
+        max_learning_rate=(
+            args.max_learning_rate if args.max_learning_rate is not None else ppo_defaults.max_learning_rate
+        ),
+        kl_adapt_factor=args.kl_adapt_factor if args.kl_adapt_factor is not None else ppo_defaults.kl_adapt_factor,
         discriminator_learning_rate=args.disc_learning_rate,
         num_steps=args.num_steps,
         update_epochs=args.epochs,
@@ -781,9 +900,15 @@ def main() -> None:
                     f"done={metrics['done_fraction']:.3f} "
                     f"pi={metrics['policy_loss']:.4f} "
                     f"v={metrics['value_loss']:.4f} "
+                    f"mv={metrics['median_value_loss']:.4f} "
+                    f"br={metrics['bpo_ratio_error']:.4f} "
+                    f"kl={metrics['approx_kl']:.4f} "
+                    f"lr={metrics['learning_rate']:.2e} "
                     f"d={metrics['amp_loss']:.4f} "
                     f"da={metrics['amp_agent_prob']:.3f} "
-                    f"dr={metrics['amp_ref_prob']:.3f}",
+                    f"dr={metrics['amp_ref_prob']:.3f} "
+                    f"fps={metrics['throughput_env_steps_s']:.0f} "
+                    f"time={metrics['timing_iteration_s']:.2f}s",
                     iteration=iteration,
                 )
             if resource_metrics:
@@ -805,15 +930,15 @@ def main() -> None:
                 process_rss_mb = resource_metrics.get("process_rss_mb", 0.0)
                 if args.max_process_rss_mb > 0.0 and process_rss_mb >= args.max_process_rss_mb:
                     emergency_path = log_dir / f"model_memory_guard_{iteration + 1}.pt"
-                    trainer.save(emergency_path, iteration=iteration)
+                    emergency_pt, emergency_onnx = trainer.save(emergency_path, iteration=iteration)
                     run_logger.emit(
                         "[MEMORY_GUARD] "
                         f"rss={process_rss_mb:.0f}MB reached limit={args.max_process_rss_mb:.0f}MB; "
-                        f"saved {emergency_path} and stopping before system OOM.",
+                        f"saved {emergency_pt} and {emergency_onnx}; stopping before system OOM.",
                         force=True,
                     )
                     break
-            if run is not None:
+            if run is not None and iteration % max(args.wandb_log_interval, 1) == 0:
                 # 兼容旧口径：若历史使用 `mean_reward`，把它同步为
                 # `mean_episode_reward`，以便旧 run 与新面板都能显示。
                 if "mean_episode_reward" not in metrics and "mean_reward" in metrics:
@@ -834,16 +959,16 @@ def main() -> None:
             if (iteration + 1) % max(args.save_interval, 1) == 0:
                 ckpt_step = iteration + 1
                 ckpt_path = log_dir / f"model_{ckpt_step}.pt"
-                trainer.save(ckpt_path, iteration=iteration)
-                run_logger.emit(f"[INFO] saved {ckpt_path}", force=True)
+                saved_pt, saved_onnx = trainer.save(ckpt_path, iteration=iteration)
+                run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
             if args.iteration_sleep_ms > 0.0:
                 torch.cuda.synchronize()
                 time.sleep(args.iteration_sleep_ms / 1000.0)
     finally:
         trainer.global_step = last_global_step
         final_path = log_dir / "model_final.pt"
-        trainer.save(final_path, iteration=last_iteration)
-        run_logger.emit(f"[INFO] saved {final_path}", force=True)
+        saved_pt, saved_onnx = trainer.save(final_path, iteration=last_iteration)
+        run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
         run_logger.close()
         env.close()
         if run is not None:

@@ -17,6 +17,7 @@ checkpoints/
 *.pt
 *.onnx
 *.mp4
+MUJOCO_LOG.TXT
 
 # Local editor state
 .vscode/*.log

@@ -1,4 +1,4 @@
-"""Neural networks used by the PPO-AMP trainer."""
+"""Neural networks used by the BPO-AMP trainer."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ def build_mlp(
 
 
 class ActorCritic(nn.Module):
+    """Actor-critic with likelihoods computed from raw Gaussian samples."""
+
     def __init__(
         self,
         obs_dim: int,
@@ -43,6 +45,7 @@ class ActorCritic(nn.Module):
         super().__init__()
         self.actor = build_mlp(obs_dim, actor_hidden_dims, action_dim, output_activation=nn.Tanh())
         self.critic = build_mlp(obs_dim, critic_hidden_dims, 1)
+        self.median_critic = build_mlp(obs_dim, critic_hidden_dims, 1)
         self.min_action_std = float(max(min_action_std, 1.0e-4))
         self.max_action_std = float(max(max_action_std, self.min_action_std))
         self.log_std = nn.Parameter(torch.full((action_dim,), float(init_std)).log())
@@ -70,11 +73,17 @@ class ActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dist = self._distribution(obs)
         if action is None:
-            action = torch.clamp(dist.sample(), -1.0, 1.0)
+            # The environments clip the executed command to actuator limits.
+            # Keep the sampled action itself here so PPO/BPO likelihood ratios
+            # are computed under the distribution that actually produced it.
+            action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         value = self.critic(obs).squeeze(-1)
         return action, log_prob, entropy, value
+
+    def median_value(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.median_critic(obs).squeeze(-1)
 
     @torch.no_grad()
     def act_inference(self, obs: torch.Tensor) -> torch.Tensor:
