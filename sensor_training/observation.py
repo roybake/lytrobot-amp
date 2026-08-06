@@ -92,6 +92,13 @@ class HistoryMotionReference:
         rng: np.random.Generator,
         mirror_prob: float = 0.5,
     ) -> np.ndarray:
+        if isinstance(self.source.reference_features, tuple):
+            return self._sample_library_features(
+                batch_size,
+                rng,
+                mirror_prob=mirror_prob,
+            )
+
         current_phase = rng.uniform(0.0, float(self.source.frame_count), size=(batch_size, 1))
         frame_offsets = np.arange(
             1 - self.history_frame_count,
@@ -108,3 +115,56 @@ class HistoryMotionReference:
             mirror_mask = rng.random(batch_size) < probability
             regular[mirror_mask] = mirrored[mirror_mask]
         return regular.reshape(batch_size, self.feature_dim).astype(np.float32)
+
+    def _sample_library_features(
+        self,
+        batch_size: int,
+        rng: np.random.Generator,
+        *,
+        mirror_prob: float,
+    ) -> np.ndarray:
+        """Sample coherent histories from every clip in a MotionLibrary."""
+
+        motion_ids = self.source.sample_motion_ids(batch_size, rng)
+        output = np.empty(
+            (batch_size, self.history_frame_count, self.source.feature_dim),
+            dtype=np.float32,
+        )
+        frame_offsets = np.arange(
+            1 - self.history_frame_count,
+            1,
+            dtype=np.float64,
+        )[None, :]
+        probability = float(np.clip(mirror_prob, 0.0, 1.0))
+        mirror_mask = (
+            rng.random(batch_size) < probability
+            if probability > 0.0
+            else np.zeros(batch_size, dtype=bool)
+        )
+
+        for motion_id in np.unique(motion_ids):
+            rows = np.flatnonzero(motion_ids == motion_id)
+            frame_count = int(self.source.frame_counts[motion_id])
+            current_phase = rng.uniform(
+                0.0,
+                float(frame_count),
+                size=(len(rows), 1),
+            )
+            reference_stride = (
+                float(self.source.frequencies[motion_id]) * self.policy_dt
+            )
+            phases = current_phase + frame_offsets * reference_stride
+            regular = self._interpolate_table(
+                self.source.reference_features[motion_id],
+                phases,
+            )
+            if np.any(mirror_mask[rows]):
+                mirrored = self._interpolate_table(
+                    self.source.mirrored_reference_features[motion_id],
+                    phases,
+                )
+                local_mirror = mirror_mask[rows]
+                regular[local_mirror] = mirrored[local_mirror]
+            output[rows] = regular
+
+        return output.reshape(batch_size, self.feature_dim).astype(np.float32)

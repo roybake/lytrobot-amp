@@ -39,7 +39,7 @@
   <worldbody>
     <body name="pelvis" pos="       0 0      0.875" >
       <geom type="mesh" rgba="1 1 1 1" mesh="pelvis" density="3325.68"/>
-      <light name="spotlight" mode="trackcom" pos="0 50 2" dir="0 -1 0"/>
+      <light name="spotlight" mode="trackcom" pos="0 50 2" dir="0 -1 0" diffuse="0 0 0" specular="0 0 0"/>
       <camera name="track" mode="trackcom" pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
       <site name="root" pos="0 0 0" size="0.003" rgba="1 0 0 1"/>
       <site name="rootIMU" pos="0 0 -0.081"/>

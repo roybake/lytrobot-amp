@@ -9,7 +9,29 @@ import secrets
 import mujoco
 import numpy as np
 
-from .motion import CONTACT_GEOM_NAMES, MotionReference, MotionTargets, resolve_contact_geom_ids
+from .motion import (
+    CONTACT_GEOM_NAMES,
+    MotionLibrary,
+    MotionReference,
+    MotionTargets,
+    load_motion_library,
+    resolve_contact_geom_ids,
+)
+from .terrain import (
+    MoreTerrainCfg,
+    StairTerrainCfg,
+    course_end_x,
+    course_motion_sequence,
+    course_stage_end_positions,
+    course_stage_scenarios,
+    load_model,
+    randomized_course_orders,
+    sample_course_start_stages,
+    terrain_geom_ids,
+    terrain_kind_from_motion,
+    terrain_spawn_offset,
+    validate_terrain_types,
+)
 
 
 def _canonical_quat(quat: np.ndarray) -> np.ndarray:
@@ -20,10 +42,198 @@ def _canonical_quat(quat: np.ndarray) -> np.ndarray:
     return quat / max(float(norm), 1.0e-6)
 
 
+def _stair_root_height_transform(
+    motion: MotionReference,
+    *,
+    step_height: float,
+    step_count: int,
+    descending: bool,
+) -> tuple[float, float]:
+    """Return anchor/scale mapping a stair clip to the compiled stair rise."""
+
+    start = float(motion.reference_root_height[0])
+    end = float(motion.reference_root_height[-1])
+    reference_rise = abs(end - start)
+    desired_rise = max(float(step_height), 0.0) * max(int(step_count), 0)
+    if desired_rise > 0.0 and reference_rise < 1.0e-4:
+        raise ValueError(
+            "Stair reference has no measurable root-height change; it cannot be "
+            "matched to non-zero stair geometry."
+        )
+    scale = desired_rise / reference_rise if desired_rise > 0.0 else 1.0
+    # Scaling about the low end preserves the robot's pelvis clearance at the
+    # course datum while moving the high end onto the actual stair top.
+    anchor = end if descending else start
+    return anchor, scale
+
+
+def _sanitize_reward_outputs(
+    reward: float,
+    bad_state: bool,
+    fallen: bool,
+    components: dict[str, float],
+    *,
+    fall_penalty: float = 2.0,
+) -> tuple[float, bool, dict[str, float]]:
+    """Return finite reward diagnostics and mark derived numerical failures."""
+
+    invalid = bool(bad_state or not np.isfinite(reward))
+    invalid = invalid or any(not np.isfinite(value) for value in components.values())
+    if invalid:
+        safe_reward = -2.0
+    else:
+        safe_reward = float(reward) - (
+            max(float(fall_penalty), 0.0) if fallen else 0.0
+        )
+
+    safe_components = {
+        key: 0.0 if invalid else float(np.clip(np.nan_to_num(value), -1.0e6, 1.0e6))
+        for key, value in components.items()
+    }
+    safe_components["invalid_state"] = float(invalid)
+    return safe_reward, invalid, safe_components
+
+
+def _stability_gated_locomotion_terms(
+    forward_velocity_track: float,
+    forward_progress: float,
+    root_orientation: float,
+    height: float,
+) -> tuple[float, float, float]:
+    """Grant positive locomotion reward only while the torso remains stable."""
+
+    stability = float(
+        np.sqrt(
+            np.clip(float(root_orientation), 0.0, 1.0)
+            * np.clip(float(height), 0.0, 1.0)
+        )
+    )
+    gated_track = float(forward_velocity_track) * stability
+    progress = float(forward_progress)
+    gated_progress = min(progress, 0.0) + max(progress, 0.0) * stability
+    return stability, gated_track, gated_progress
+
+
+def _bounded_specific_cot_excess(
+    specific_cot: float | np.ndarray,
+    limit: float,
+) -> float | np.ndarray:
+    """Return a bounded relative CoT violation in ``[0, 1]``.
+
+    Normalizing the raw excess by the tiny acceptance limit makes nearly every
+    early-training transition hit the same large penalty.  A negative per-step
+    reward then teaches the policy to end the episode as quickly as possible.
+    Normalizing by the measured CoT preserves zero penalty at or below the
+    limit and caps the configured penalty coefficient's actual contribution.
+    """
+
+    values = np.asarray(specific_cot, dtype=np.float32)
+    safe_limit = max(float(limit), 1.0e-6)
+    finite = np.nan_to_num(values, nan=1.0e6, posinf=1.0e6, neginf=0.0)
+    excess = np.maximum(finite - safe_limit, 0.0)
+    bounded = np.clip(excess / np.maximum(finite, safe_limit), 0.0, 1.0)
+    if np.ndim(specific_cot) == 0:
+        return float(bounded)
+    return bounded
+
+
+def _forward_progress_guard(
+    position_x: np.ndarray,
+    episode_step: np.ndarray,
+    anchor_x: np.ndarray,
+    anchor_step: np.ndarray,
+    *,
+    dt: float,
+    min_speed: float,
+    grace_steps: int,
+    window_steps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Check net world-X progress over fixed windows and advance the anchors."""
+
+    position_x = np.asarray(position_x, dtype=np.float32)
+    episode_step = np.asarray(episode_step, dtype=np.int32)
+    next_anchor_x = np.asarray(anchor_x, dtype=np.float32).copy()
+    next_anchor_step = np.asarray(anchor_step, dtype=np.int32).copy()
+    speed = np.zeros_like(position_x, dtype=np.float32)
+    stalled = np.zeros_like(position_x, dtype=bool)
+    if min_speed <= 0.0 or window_steps <= 0:
+        return speed, stalled, next_anchor_x, next_anchor_step
+
+    grace_steps = max(int(grace_steps), 0)
+    start_tracking = episode_step == grace_steps
+    next_anchor_x[start_tracking] = position_x[start_tracking]
+    next_anchor_step[start_tracking] = episode_step[start_tracking]
+
+    elapsed = episode_step - next_anchor_step
+    active = episode_step > grace_steps
+    finite = np.isfinite(position_x) & np.isfinite(next_anchor_x)
+    valid_elapsed = np.maximum(elapsed, 1)
+    measured = active & finite
+    speed[measured] = (
+        (position_x[measured] - next_anchor_x[measured])
+        / (valid_elapsed[measured] * max(float(dt), 1.0e-6))
+    )
+    check = active & (elapsed >= int(window_steps))
+    stalled = check & (~finite | (speed < float(min_speed)))
+    next_anchor_x[check] = position_x[check]
+    next_anchor_step[check] = episode_step[check]
+    return speed, stalled, next_anchor_x, next_anchor_step
+
+
+def scaled_randomization_range(
+    nominal: float,
+    low: float,
+    high: float,
+    scale: float,
+) -> tuple[float, float]:
+    """Interpolate a domain-randomization range out from its nominal value."""
+
+    scale = float(np.clip(scale, 0.0, 1.0))
+    return (
+        float(nominal + scale * (low - nominal)),
+        float(nominal + scale * (high - nominal)),
+    )
+
+
 @dataclass
 class LytRobotEnvCfg:
     model_xml: str = "robot/MJCFmodelposition.xml"
     motion_file: str = "robot/reference_data/walk1_mjcf.npz"
+    motion_files: tuple[str, ...] = ()
+    motion_names: tuple[str, ...] = ()
+    motion_weights: tuple[float, ...] = ()
+    motion_loop: tuple[bool, ...] = ()
+    skill_conditioning: bool = True
+    use_reference_velocity: bool = False
+    terrain_types: tuple[str, ...] = ()
+    terrain_asset_dir: str = ""
+    stair_terrain: bool = False
+    stair_step_height: float = 0.08
+    stair_step_depth: float = 0.30
+    stair_step_count: int = 5
+    stair_width: float = 2.0
+    stair_run_in: float = 1.5
+    stair_top_length: float = 1.2
+    stair_run_out: float = 1.5
+    stair_start_x: float = -1.5
+    stair_down_offset: float = 0.0
+    flat_lane_y: float = 3.0
+    rough_lane_y: float = 6.0
+    pit_lane_y: float = 9.0
+    gap_lane_y: float = 12.0
+    terrain_lane_width: float = 2.0
+    rough_terrain_height: float = 0.05
+    slope_angle_deg: float = 6.0
+    gap_terrain_width: float = 0.20
+    serial_terrain_course: bool = False
+    terrain_course_variants: int = 8
+    terrain_course_lane_spacing: float = 3.0
+    terrain_course_base_height: float = 0.30
+    terrain_course_random_assignment: bool = True
+    terrain_course_completion_reward: float = 25.0
+    terrain_course_stage_reward: float = 0.0
+    terrain_course_stage_tolerance: float = 0.35
+    terrain_course_random_start_prob: float = 0.0
     num_envs: int = 4096
     seed: int = 42
     randomize_episode_seed: bool = False
@@ -42,11 +252,21 @@ class LytRobotEnvCfg:
     forward_progress_reward_coef: float = 0.0
     forward_velocity_deficit_penalty_coef: float = 0.0
     forward_velocity_excess_penalty_coef: float = 0.0
+    min_forward_progress_speed: float = 0.0
+    forward_progress_grace_steps: int = 50
+    forward_progress_window_steps: int = 50
+    forward_progress_termination_penalty: float = 2.0
+    fall_penalty: float = 2.0
+    terminate_incomplete_motion_end: bool = False
+    specific_cot_limit: float = 0.8
+    specific_cot_penalty_coef: float = 0.0
+    cot_min_forward_speed: float = 0.10
     reset_noise_scale: float = 0.01
     motion_reset_prob: float = 0.5
     action_residual_scale: float = 0.5
     distal_action_scale: float = 1.0
     reference_ctrl_blend: float = 1.0
+    motion_transition_blend_steps: int = 0
     fall_height: float = 0.45
     max_height: float = 1.55
     min_upright_z: float = 0.45
@@ -81,6 +301,8 @@ class LytRobotEnvCfg:
     distal_action_penalty_coef: float = 0.030
     distal_action_rate_penalty_coef: float = 0.120
     domain_randomization: bool = False
+    domain_randomization_scale: float = 1.0
+    warp_global_domain_randomization: bool = False
     payload_mass_min: float = 0.0
     payload_mass_max: float = 3.0
     body_mass_scale_min: float = 0.85
@@ -116,7 +338,54 @@ class LytRobotAmpEnv:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model XML not found: {self.model_path}")
 
-        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        terrain_types = validate_terrain_types(cfg.terrain_types)
+        if cfg.serial_terrain_course and not terrain_types:
+            raise ValueError("serial terrain course requires at least one terrain type.")
+        self.stair_cfg = StairTerrainCfg(
+            enabled=bool(cfg.stair_terrain or "stairs" in terrain_types),
+            step_height=cfg.stair_step_height,
+            step_depth=cfg.stair_step_depth,
+            step_count=cfg.stair_step_count,
+            width=cfg.stair_width,
+            run_in=cfg.stair_run_in,
+            top_length=cfg.stair_top_length,
+            run_out=cfg.stair_run_out,
+            start_x=cfg.stair_start_x,
+        )
+        course_orders = (
+            randomized_course_orders(
+                terrain_types,
+                cfg.terrain_course_variants,
+                cfg.seed,
+            )
+            if cfg.serial_terrain_course
+            else ()
+        )
+        self.more_terrain_cfg = MoreTerrainCfg(
+            enabled=bool(terrain_types),
+            terrain_types=terrain_types,
+            asset_dir=cfg.terrain_asset_dir,
+            serial_course=bool(cfg.serial_terrain_course),
+            course_orders=course_orders,
+            course_lane_spacing=cfg.terrain_course_lane_spacing,
+            course_base_height=cfg.terrain_course_base_height,
+            flat_lane_y=cfg.flat_lane_y,
+            rough_lane_y=cfg.rough_lane_y,
+            pit_lane_y=cfg.pit_lane_y,
+            gap_lane_y=cfg.gap_lane_y,
+            lane_width=cfg.terrain_lane_width,
+            rough_height=cfg.rough_terrain_height,
+            slope_angle_deg=cfg.slope_angle_deg,
+            gap_width=cfg.gap_terrain_width,
+        )
+        self.complex_terrain_enabled = bool(
+            self.stair_cfg.enabled or self.more_terrain_cfg.enabled
+        )
+        self.model = load_model(
+            self.model_path,
+            self.stair_cfg,
+            self.more_terrain_cfg,
+        )
         self.model.opt.timestep = float(cfg.timestep)
         self.model.opt.iterations = max(1, int(cfg.solver_iterations))
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
@@ -124,7 +393,74 @@ class LytRobotAmpEnv:
         self.position_action_dim = int(len(self.position_actuator_ids))
         self.action_dim = self.position_action_dim
         self.ctrl_dim = int(self.model.nu)
-        self.motion = MotionReference(cfg.motion_file, self.model, actuator_ids=self.position_actuator_ids)
+        motion_files = cfg.motion_files or (cfg.motion_file,)
+        self.motion = load_motion_library(
+            motion_files,
+            self.model,
+            actuator_ids=self.position_actuator_ids,
+            motion_weights=cfg.motion_weights or None,
+            motion_names=cfg.motion_names or None,
+            motion_loop=cfg.motion_loop or None,
+        )
+        self.motion_count = (
+            self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
+        )
+        motion_names = (
+            self.motion.motion_names
+            if isinstance(self.motion, MotionLibrary)
+            else (Path(cfg.motion_file).stem,)
+        )
+        self.stair_motion_mask = np.asarray(
+            ["stair" in name.lower() for name in motion_names], dtype=bool
+        )
+        self.stair_down_motion_mask = np.asarray(
+            ["stair_down" in name.lower() for name in motion_names], dtype=bool
+        )
+        motion_references = (
+            self.motion.motions
+            if isinstance(self.motion, MotionLibrary)
+            else (self.motion,)
+        )
+        self.motion_stair_height_anchor = np.zeros(self.motion_count, dtype=np.float32)
+        self.motion_stair_height_scale = np.ones(self.motion_count, dtype=np.float32)
+        for motion_id, motion_reference in enumerate(motion_references):
+            if not self.stair_motion_mask[motion_id]:
+                continue
+            anchor, scale = _stair_root_height_transform(
+                motion_reference,
+                step_height=self.stair_cfg.step_height,
+                step_count=self.stair_cfg.step_count,
+                descending=bool(self.stair_down_motion_mask[motion_id]),
+            )
+            self.motion_stair_height_anchor[motion_id] = anchor
+            self.motion_stair_height_scale[motion_id] = scale
+        self.nominal_root_height = float(self.motion.model_qpos0[2])
+        self.motion_terrain_kinds = tuple(
+            terrain_kind_from_motion(name) for name in motion_names
+        )
+        missing_terrains = sorted(
+            {
+                kind
+                for kind in self.motion_terrain_kinds
+                if kind not in {"flat", "stairs"} and kind not in terrain_types
+            }
+        )
+        if missing_terrains:
+            raise ValueError(
+                "Motion library contains terrain-conditioned clips without matching "
+                f"terrain geometry: {missing_terrains}. Enable them with terrain_types."
+            )
+        self.course_motion_sequences = self._build_course_motion_sequences(motion_names)
+        self.course_stage_scenario_names = tuple(
+            course_stage_scenarios(order)
+            for order in self.more_terrain_cfg.normalized_course_orders
+        )
+        self.course_stage_end_x = self._build_course_stage_end_x()
+        self.course_finish_x = (
+            course_end_x(self.more_terrain_cfg, 0)
+            if self.more_terrain_cfg.serial_course
+            else float("inf")
+        )
         self.rng = np.random.default_rng(cfg.seed)
         self.base_body_mass = np.asarray(self.model.body_mass, dtype=np.float32).copy()
         self.base_body_inertia = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
@@ -136,6 +472,7 @@ class LytRobotAmpEnv:
         self.ctrl_high = np.asarray(self.model.actuator_ctrlrange[self.position_actuator_ids, 1], dtype=np.float32)
         self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
         self.ctrl_half_range = np.maximum(0.5 * (self.ctrl_high - self.ctrl_low), 1.0e-6)
+        self.robot_mass = float(np.sum(self.model.body_mass))
         self.actuator_tendon_ids = np.asarray(self.model.actuator_trnid[self.position_actuator_ids, 0], dtype=np.int32)
         self._init_stand_reference()
         self.distal_action_mask = self._build_distal_action_mask()
@@ -147,6 +484,7 @@ class LytRobotAmpEnv:
         if self.pelvis_body_id < 0:
             raise RuntimeError("Body 'pelvis' not found in robot model.")
         self.floor_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self.terrain_geom_ids = set(int(value) for value in terrain_geom_ids(self.model))
         self.contact_geom_ids = resolve_contact_geom_ids(self.model)
         if self.floor_geom_id < 0:
             raise RuntimeError("Expected floor and foot contact geoms were not found in robot model.")
@@ -170,9 +508,20 @@ class LytRobotAmpEnv:
         self.datas = [mujoco.MjData(self.model) for _ in range(self.num_envs)]
         self.episode_step = np.zeros(self.num_envs, dtype=np.int32)
         self.episode_timeout_step = np.full(self.num_envs, int(cfg.episode_steps), dtype=np.int32)
+        self.forward_progress_anchor_x = np.zeros(self.num_envs, dtype=np.float32)
+        self.forward_progress_anchor_step = np.zeros(self.num_envs, dtype=np.int32)
         self.motion_phase = np.zeros(self.num_envs, dtype=np.float32)
+        self.motion_ids = np.zeros(self.num_envs, dtype=np.int32)
+        self.course_variant_ids = np.zeros(self.num_envs, dtype=np.int32)
+        self.course_stage_ids = np.zeros(self.num_envs, dtype=np.int32)
+        self.course_start_stage_ids = np.zeros(self.num_envs, dtype=np.int32)
         self.episode_seed = np.full(self.num_envs, int(cfg.seed), dtype=np.uint64)
         self.last_action = np.zeros((self.num_envs, self.action_dim), dtype=np.float32)
+        self.last_reference_ctrl = np.zeros(
+            (self.num_envs, self.action_dim), dtype=np.float32
+        )
+        self.motion_transition_from_ctrl = np.zeros_like(self.last_reference_ctrl)
+        self.motion_transition_steps_left = np.zeros(self.num_envs, dtype=np.int32)
         self.last_foot_pos = np.zeros((self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
         self.last_foot_world_pos = np.zeros_like(self.last_foot_pos)
         self.foot_stride_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
@@ -202,11 +551,65 @@ class LytRobotAmpEnv:
             + self.motion.foot_pos_dim
             + self.motion.contact_dim
         )
-        return int(current_state_dim + tracking_dim)
+        skill_dim = self.motion_count if self.cfg.skill_conditioning and self.motion_count > 1 else 0
+        return int(current_state_dim + tracking_dim + skill_dim)
 
     @property
     def amp_obs_dim(self) -> int:
         return self.motion.feature_dim
+
+    def _build_course_motion_sequences(
+        self,
+        motion_names: tuple[str, ...],
+    ) -> np.ndarray:
+        if not self.more_terrain_cfg.serial_course:
+            return np.empty((0, 0), dtype=np.int32)
+        if not isinstance(self.motion, MotionLibrary):
+            raise ValueError("serial terrain course requires a multi-motion library.")
+        name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
+        rows: list[list[int]] = []
+        for order in self.more_terrain_cfg.normalized_course_orders:
+            names = course_motion_sequence(order)
+            missing = [name for name in names if name not in name_to_id]
+            if missing:
+                raise ValueError(
+                    "Serial terrain course is missing required motion clips: "
+                    f"{sorted(set(missing))}."
+                )
+            rows.append([name_to_id[name] for name in names])
+        return np.asarray(rows, dtype=np.int32)
+
+    def _build_course_stage_end_x(self) -> np.ndarray:
+        """Physical root-X boundary for each action in every serial course."""
+
+        if not self.more_terrain_cfg.serial_course:
+            return np.empty((0, 0), dtype=np.float32)
+        rows = [
+            course_stage_end_positions(self.more_terrain_cfg, variant)
+            for variant in range(len(self.more_terrain_cfg.normalized_course_orders))
+        ]
+        result = np.asarray(rows, dtype=np.float32)
+        if result.shape != self.course_motion_sequences.shape:
+            raise ValueError(
+                "Serial course motion stages and physical boundaries do not align: "
+                f"motions={self.course_motion_sequences.shape}, boundaries={result.shape}."
+            )
+        return result
+
+    def _course_height_offsets(self) -> np.ndarray:
+        if not self.more_terrain_cfg.serial_course:
+            return np.zeros(self.num_envs, dtype=np.float32)
+        # Gap/pit clips were retargeted on the original 0.30 m platforms;
+        # the other references use zero as their terrain datum.
+        return np.asarray(
+            [
+                0.0
+                if self.motion_terrain_kinds[int(motion_id)] in {"gap", "pit"}
+                else self.more_terrain_cfg.course_base_height
+                for motion_id in self.motion_ids
+            ],
+            dtype=np.float32,
+        )
 
     def _get_nonroot_joint_adrs(self) -> tuple[np.ndarray, np.ndarray]:
         qpos_adrs: list[int] = []
@@ -333,10 +736,47 @@ class LytRobotAmpEnv:
         )
 
     def _targets_at_current_phase(self) -> MotionTargets:
-        return self._blend_start_targets(self.motion.targets_at_phase(self.motion_phase))
+        if isinstance(self.motion, MotionLibrary):
+            targets = self.motion.targets_at_phase(self.motion_phase, self.motion_ids)
+        else:
+            targets = self.motion.targets_at_phase(self.motion_phase)
+        stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
+        stair_scale = self.motion_stair_height_scale[self.motion_ids]
+        scaled_root_lin_vel = targets.root_lin_vel.copy()
+        scaled_root_lin_vel[:, 2] *= stair_scale
+        targets = MotionTargets(
+            root_height=(
+                stair_anchor + (targets.root_height - stair_anchor) * stair_scale
+            ).astype(np.float32),
+            root_quat=targets.root_quat,
+            root_lin_vel=scaled_root_lin_vel.astype(np.float32),
+            root_ang_vel=targets.root_ang_vel,
+            joint_pos=targets.joint_pos,
+            joint_vel=targets.joint_vel,
+            tendon_ctrl=targets.tendon_ctrl,
+            foot_pos=targets.foot_pos,
+            foot_vel=targets.foot_vel,
+            foot_contact=targets.foot_contact,
+        )
+        targets = self._blend_start_targets(targets)
+        if not self.more_terrain_cfg.serial_course:
+            return targets
+        return MotionTargets(
+            root_height=(targets.root_height + self._course_height_offsets()).astype(np.float32),
+            root_quat=targets.root_quat,
+            root_lin_vel=targets.root_lin_vel,
+            root_ang_vel=targets.root_ang_vel,
+            joint_pos=targets.joint_pos,
+            joint_vel=targets.joint_vel,
+            tendon_ctrl=targets.tendon_ctrl,
+            foot_pos=targets.foot_pos,
+            foot_vel=targets.foot_vel,
+            foot_contact=targets.foot_contact,
+        )
 
     def _init_domain_randomization(self) -> None:
         self.domain_randomization = bool(self.cfg.domain_randomization)
+        self.domain_randomization_scale = float(np.clip(self.cfg.domain_randomization_scale, 0.0, 1.0))
         max_delay_s = max(float(self.cfg.action_delay_min_ms), float(self.cfg.action_delay_max_ms), 0.0) / 1000.0
         self.max_action_delay_ticks = int(np.ceil(max_delay_s / max(float(self.cfg.timestep), 1.0e-9)))
         history_len = max(1, self.max_action_delay_ticks + 1)
@@ -352,6 +792,20 @@ class LytRobotAmpEnv:
         self.push_time_left = np.zeros(self.num_envs, dtype=np.int32)
         self.push_time_to_next = np.zeros(self.num_envs, dtype=np.int32)
 
+    def set_domain_randomization_scale(self, scale: float) -> None:
+        """Set curriculum strength for subsequently sampled and step-wise noise."""
+
+        self.domain_randomization_scale = float(np.clip(scale, 0.0, 1.0))
+        self.cfg.domain_randomization_scale = self.domain_randomization_scale
+
+    def set_terrain_course_random_start_prob(self, probability: float) -> None:
+        """Set the random-stage curriculum probability used by future resets."""
+
+        probability = float(probability)
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("terrain course random-start probability must be in [0, 1].")
+        self.cfg.terrain_course_random_start_prob = probability
+
     def _uniform(self, low: float, high: float, size: int | tuple[int, ...] | None = None) -> np.ndarray:
         low_f = float(low)
         high_f = float(high)
@@ -365,27 +819,46 @@ class LytRobotAmpEnv:
         if not self.domain_randomization or len(ids) == 0:
             return
         ids = np.asarray(ids, dtype=np.int32)
-        self.env_payload_mass[ids] = self._uniform(self.cfg.payload_mass_min, self.cfg.payload_mass_max, len(ids))
+        scale = self.domain_randomization_scale
+        payload_low, payload_high = scaled_randomization_range(
+            0.0, self.cfg.payload_mass_min, self.cfg.payload_mass_max, scale
+        )
+        body_low, body_high = scaled_randomization_range(
+            1.0, self.cfg.body_mass_scale_min, self.cfg.body_mass_scale_max, scale
+        )
+        tendon_low, tendon_high = scaled_randomization_range(
+            1.0, self.cfg.tendon_length_scale_min, self.cfg.tendon_length_scale_max, scale
+        )
+        nominal_friction = float(self.base_geom_friction[self.floor_geom_id, 0])
+        friction_low, friction_high = scaled_randomization_range(
+            nominal_friction, self.cfg.ground_friction_min, self.cfg.ground_friction_max, scale
+        )
+        nominal_gravity = abs(float(self.base_gravity[2]))
+        gravity_low, gravity_high = scaled_randomization_range(
+            nominal_gravity, self.cfg.gravity_min, self.cfg.gravity_max, scale
+        )
+        self.env_payload_mass[ids] = self._uniform(payload_low, payload_high, len(ids))
         self.env_body_mass_scale[ids] = self._uniform(
-            self.cfg.body_mass_scale_min,
-            self.cfg.body_mass_scale_max,
+            body_low,
+            body_high,
             (len(ids), self.model.nbody),
         )
         self.env_body_mass_scale[ids, 0] = 1.0
         self.env_tendon_length_scale[ids] = self._uniform(
-            self.cfg.tendon_length_scale_min,
-            self.cfg.tendon_length_scale_max,
+            tendon_low,
+            tendon_high,
             (len(ids), self.position_action_dim),
         )
         self.env_ground_friction[ids] = self._uniform(
-            self.cfg.ground_friction_min,
-            self.cfg.ground_friction_max,
+            friction_low,
+            friction_high,
             len(ids),
         )
-        self.env_gravity[ids] = self._uniform(self.cfg.gravity_min, self.cfg.gravity_max, len(ids))
+        self.env_gravity[ids] = self._uniform(gravity_low, gravity_high, len(ids))
 
-        min_delay = max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
-        max_delay = max(min_delay, float(self.cfg.action_delay_max_ms) / 1000.0)
+        min_delay = scale * max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
+        max_delay = scale * max(0.0, float(self.cfg.action_delay_max_ms)) / 1000.0
+        max_delay = max(min_delay, max_delay)
         delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids))
         delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int32)
         self.action_delay_ticks[ids] = np.clip(delay_ticks, 0, self.max_action_delay_ticks)
@@ -415,7 +888,8 @@ class LytRobotAmpEnv:
         self.model.body_inertia[:] = self.base_body_inertia * self.env_body_mass_scale[env_id, :, None]
         self.model.body_inertia[0] = self.base_body_inertia[0]
         self.model.geom_friction[:] = self.base_geom_friction
-        self.model.geom_friction[self.floor_geom_id, 0] = self.env_ground_friction[env_id]
+        terrain_ids = np.fromiter(self.terrain_geom_ids, dtype=np.int32)
+        self.model.geom_friction[terrain_ids, 0] = self.env_ground_friction[env_id]
         self.model.opt.gravity[:] = self.base_gravity
         self.model.opt.gravity[2] = -float(self.env_gravity[env_id])
 
@@ -429,7 +903,12 @@ class LytRobotAmpEnv:
         if not self.domain_randomization or self.cfg.action_noise_std <= 0.0:
             return action
         return np.clip(
-            action + self.rng.normal(0.0, float(self.cfg.action_noise_std), size=action.shape).astype(np.float32),
+            action
+            + self.rng.normal(
+                0.0,
+                self.domain_randomization_scale * float(self.cfg.action_noise_std),
+                size=action.shape,
+            ).astype(np.float32),
             -1.0,
             1.0,
         )
@@ -464,7 +943,12 @@ class LytRobotAmpEnv:
             return
         direction = self.rng.normal(0.0, 1.0, size=3).astype(np.float32)
         direction /= max(float(np.linalg.norm(direction)), 1.0e-6)
-        magnitude = float(self._uniform(self.cfg.push_force_min, self.cfg.push_force_max))
+        magnitude = float(
+            self._uniform(
+                self.domain_randomization_scale * float(self.cfg.push_force_min),
+                self.domain_randomization_scale * float(self.cfg.push_force_max),
+            )
+        )
         self.push_force[env_id, :3] = direction * magnitude
         self.push_force[env_id, 3:] = 0.0
         self.push_time_left[env_id] = self._sample_push_duration()
@@ -505,6 +989,26 @@ class LytRobotAmpEnv:
         ref = np.asarray(reference_ctrl, dtype=np.float32)
         return np.clip((1.0 - blend) * current + blend * ref, self.ctrl_low, self.ctrl_high)
 
+    def _transition_reference_ctrl(
+        self, reference_ctrl: np.ndarray, env_id: int
+    ) -> np.ndarray:
+        """Blend only a newly selected motion onto the previous reference."""
+        target = np.asarray(reference_ctrl, dtype=np.float32)
+        total_steps = max(0, int(self.cfg.motion_transition_blend_steps))
+        steps_left = int(self.motion_transition_steps_left[env_id])
+        if total_steps > 0 and steps_left > 0:
+            alpha = float(total_steps - steps_left + 1) / float(total_steps)
+            transitioned = (
+                (1.0 - alpha) * self.motion_transition_from_ctrl[env_id]
+                + alpha * target
+            ).astype(np.float32)
+            self.motion_transition_steps_left[env_id] = steps_left - 1
+        else:
+            transitioned = target.copy()
+            self.motion_transition_steps_left[env_id] = 0
+        self.last_reference_ctrl[env_id] = transitioned
+        return transitioned
+
     def _foot_positions_local(self, data: mujoco.MjData) -> np.ndarray:
         return self.motion.foot_positions_local_from_data(data)
 
@@ -525,9 +1029,9 @@ class LytRobotAmpEnv:
             geom1 = int(data.contact[contact_id].geom1)
             geom2 = int(data.contact[contact_id].geom2)
             other = None
-            if geom1 == self.floor_geom_id:
+            if geom1 in self.terrain_geom_ids:
                 other = geom2
-            elif geom2 == self.floor_geom_id:
+            elif geom2 in self.terrain_geom_ids:
                 other = geom1
             if other is None:
                 continue
@@ -546,11 +1050,58 @@ class LytRobotAmpEnv:
             ids = np.asarray(env_ids, dtype=np.int32)
         self._refresh_episode_rng(ids)
 
-        states = self.motion.sample_states(len(ids), self.rng)
-        use_stand_start = self.rng.random(len(ids)) < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        serial_course = self.more_terrain_cfg.serial_course
+        if serial_course:
+            variant_count = len(self.more_terrain_cfg.normalized_course_orders)
+            variants = (
+                self.rng.integers(0, variant_count, size=len(ids), dtype=np.int32)
+                if self.cfg.terrain_course_random_assignment
+                else np.mod(ids, variant_count).astype(np.int32)
+            )
+            start_stages = sample_course_start_stages(
+                self.rng,
+                len(ids),
+                self.course_motion_sequences.shape[1],
+                self.cfg.terrain_course_random_start_prob,
+            )
+            self.course_variant_ids[ids] = variants
+            self.course_stage_ids[ids] = start_stages
+            self.course_start_stage_ids[ids] = start_stages
+            sampled_motion_ids = self.course_motion_sequences[
+                variants, start_stages
+            ]
+            assert isinstance(self.motion, MotionLibrary)
+            states = self.motion.sample_states(
+                len(ids), self.rng, motion_ids=sampled_motion_ids
+            )
+            for row, motion_id in enumerate(sampled_motion_ids):
+                states.qpos[row] = self.motion.motions[int(motion_id)].reference_qpos[0]
+                # A serial course always starts at its entrance.  Starting at
+                # rest avoids turning a corrupt reference seam into an impulse
+                # and lets the policy learn the acceleration into its route.
+                states.qvel[row] = 0.0
+                states.indices[row] = 0
+        elif isinstance(self.motion, MotionLibrary):
+            sampled_motion_ids = self.motion.sample_motion_ids(len(ids), self.rng)
+            states = self.motion.sample_states(len(ids), self.rng, motion_ids=sampled_motion_ids)
+        else:
+            sampled_motion_ids = np.zeros(len(ids), dtype=np.int32)
+            states = self.motion.sample_states(len(ids), self.rng)
+        self.motion_ids[ids] = sampled_motion_ids
+        use_stand_start = (
+            np.zeros(len(ids), dtype=bool)
+            if serial_course
+            else self.rng.random(len(ids))
+            < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        )
         use_motion_reset = (
-            ~use_stand_start
-            & (self.rng.random(len(ids)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)))
+            np.ones(len(ids), dtype=bool)
+            if serial_course
+            else ~use_stand_start
+            & (
+                self.rng.random(len(ids))
+                < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+            )
         )
         self._sample_domain_randomization(ids)
         self.stand_start[ids] = use_stand_start
@@ -573,6 +1124,37 @@ class LytRobotAmpEnv:
                 qvel = np.zeros(self.model.nv, dtype=np.float32)
                 phase = 0.0
 
+            if use_motion_reset[row]:
+                motion_id = int(sampled_motion_ids[row])
+                height_anchor = self.motion_stair_height_anchor[motion_id]
+                height_scale = self.motion_stair_height_scale[motion_id]
+                qpos[2] = height_anchor + (qpos[2] - height_anchor) * height_scale
+                qvel[2] *= height_scale
+
+            if self.complex_terrain_enabled:
+                if serial_course:
+                    scenario = self.course_stage_scenario_names[
+                        int(variants[row])
+                    ][int(start_stages[row])]
+                    terrain_kind = (
+                        "stairs" if scenario in {"stair_up", "stair_down"} else scenario
+                    )
+                    stair_down = scenario == "stair_down"
+                else:
+                    terrain_kind = self.motion_terrain_kinds[sampled_motion_ids[row]]
+                    stair_down = bool(
+                        self.stair_down_motion_mask[sampled_motion_ids[row]]
+                    )
+                offset = terrain_spawn_offset(
+                    terrain_kind,
+                    self.more_terrain_cfg,
+                    self.stair_cfg,
+                    stair_down=stair_down,
+                    stair_down_offset=self.cfg.stair_down_offset,
+                    course_variant=int(self.course_variant_ids[int(env_id)]),
+                )
+                qpos[:3] += offset
+
             if self.cfg.reset_noise_scale > 0.0:
                 qpos[self.motion.robot_qpos_adrs] += self.rng.normal(
                     0.0, self.cfg.reset_noise_scale, size=len(self.motion.robot_qpos_adrs)
@@ -585,9 +1167,20 @@ class LytRobotAmpEnv:
             data.qpos[:] = qpos
             data.qvel[:] = qvel
             mujoco.mj_forward(self.model, data)
-            reference_ctrl = self.motion.targets_at_phase(np.asarray([phase], dtype=np.float32)).tendon_ctrl[0]
+            if isinstance(self.motion, MotionLibrary):
+                reference_ctrl = self.motion.targets_at_phase(
+                    np.asarray([phase], dtype=np.float32),
+                    np.asarray([sampled_motion_ids[row]], dtype=np.int32),
+                ).tendon_ctrl[0]
+            else:
+                reference_ctrl = self.motion.targets_at_phase(
+                    np.asarray([phase], dtype=np.float32)
+                ).tendon_ctrl[0]
             if use_stand_start[row]:
                 reference_ctrl = self.stand_tendon_ctrl[0]
+            self.last_reference_ctrl[int(env_id)] = reference_ctrl
+            self.motion_transition_from_ctrl[int(env_id)] = reference_ctrl
+            self.motion_transition_steps_left[int(env_id)] = 0
             data.ctrl[:] = self.action_to_ctrl(
                 np.zeros(self.action_dim, dtype=np.float32),
                 base_ctrl=self._reference_base_ctrl(reference_ctrl, data),
@@ -613,6 +1206,8 @@ class LytRobotAmpEnv:
             self.action_energy_ema[int(env_id)] = 0.0
             self.episode_step[int(env_id)] = 0
             self.episode_timeout_step[int(env_id)] = self._sample_timeout_step()
+            self.forward_progress_anchor_x[int(env_id)] = float(data.qpos[0])
+            self.forward_progress_anchor_step[int(env_id)] = 0
             self.motion_phase[int(env_id)] = phase
 
         self.last_obs = self.observe()
@@ -644,7 +1239,12 @@ class LytRobotAmpEnv:
         for env_id, data in enumerate(self.datas):
             quat = _canonical_quat(data.qpos[3:7])
             up_z = float(data.xmat[self.pelvis_body_id, 8])
-            phase = 2.0 * np.pi * float(self.motion_phase[env_id]) / float(self.motion.frame_count)
+            frame_count = (
+                int(self.motion.frame_counts[self.motion_ids[env_id]])
+                if isinstance(self.motion, MotionLibrary)
+                else self.motion.frame_count
+            )
+            phase = 2.0 * np.pi * float(self.motion_phase[env_id]) / float(frame_count)
             joint_pos = np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)
             joint_vel = np.asarray(data.qvel[self.motion.robot_qvel_adrs], dtype=np.float32)
             foot_pos = self._foot_positions_local(data).reshape(-1)
@@ -653,9 +1253,11 @@ class LytRobotAmpEnv:
             root_vel_target = np.concatenate(
                 (reference_targets.root_lin_vel[env_id], reference_targets.root_ang_vel[env_id])
             ).astype(np.float32)
-            root_vel_target[0] = float(self.cfg.target_velocity) * float(stand_start_progress[env_id])
-            obs[env_id] = np.concatenate(
-                (
+            if not self.cfg.use_reference_velocity:
+                root_vel_target[0] = float(self.cfg.target_velocity) * float(
+                    stand_start_progress[env_id]
+                )
+            parts = [
                     np.asarray([data.qpos[2]], dtype=np.float32),
                     quat,
                     np.asarray(data.qvel[:6], dtype=np.float32),
@@ -671,17 +1273,31 @@ class LytRobotAmpEnv:
                     ref_ctrl_action,
                     foot_pos - ref_foot_pos,
                     reference_targets.foot_contact[env_id],
-                )
-            )
+            ]
+            if self.cfg.skill_conditioning and self.motion_count > 1:
+                skill = np.zeros(self.motion_count, dtype=np.float32)
+                skill[self.motion_ids[env_id]] = 1.0
+                parts.append(skill)
+            obs[env_id] = np.concatenate(parts)
         obs = np.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0)
         if self.domain_randomization and self.cfg.obs_noise_std > 0.0:
-            obs += self.rng.normal(0.0, float(self.cfg.obs_noise_std), size=obs.shape).astype(np.float32)
+            obs += self.rng.normal(
+                0.0,
+                self.domain_randomization_scale * float(self.cfg.obs_noise_std),
+                size=obs.shape,
+            ).astype(np.float32)
         return np.clip(obs, -20.0, 20.0).astype(np.float32)
 
     def amp_observe(self) -> np.ndarray:
         qpos = np.stack([np.asarray(data.qpos, dtype=np.float32) for data in self.datas], axis=0)
         qvel = np.stack([np.asarray(data.qvel, dtype=np.float32) for data in self.datas], axis=0)
         foot_pos = np.stack([self._foot_positions_local(data) for data in self.datas], axis=0)
+        qpos = qpos.copy()
+        if self.more_terrain_cfg.serial_course:
+            qpos[:, 2] -= self._course_height_offsets()
+        stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
+        stair_scale = self.motion_stair_height_scale[self.motion_ids]
+        qpos[:, 2] = stair_anchor + (qpos[:, 2] - stair_anchor) / stair_scale
         return self.motion.features_from_state(qpos, qvel, foot_pos=foot_pos)
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
@@ -701,6 +1317,10 @@ class LytRobotAmpEnv:
             "forward_progress": [],
             "forward_velocity_deficit": [],
             "forward_velocity_excess": [],
+            "actuator_power": [],
+            "mechanical_energy": [],
+            "specific_cot": [],
+            "specific_cot_excess": [],
             "termination": [],
             "root_orientation": [],
             "height": [],
@@ -735,9 +1355,95 @@ class LytRobotAmpEnv:
             "distal_action_rate": [],
         }
         phase_scale = self._stand_start_progress()
-        self.motion_phase = (
-            self.motion_phase + self.motion.frequency * self.dt * phase_scale
-        ) % self.motion.frame_count
+        course_complete = np.zeros(self.num_envs, dtype=bool)
+        course_suffix_complete = np.zeros(self.num_envs, dtype=bool)
+        course_stage_advance = np.zeros(self.num_envs, dtype=bool)
+        incomplete_motion_end_candidate = np.zeros(self.num_envs, dtype=bool)
+        incomplete_motion_required_x = np.full(self.num_envs, np.inf, dtype=np.float32)
+        incomplete_motion_end_flags = np.zeros(self.num_envs, dtype=bool)
+        if isinstance(self.motion, MotionLibrary):
+            frequencies = self.motion.frequencies[self.motion_ids]
+            frame_counts = self.motion.frame_counts[self.motion_ids].astype(np.float32)
+            next_phase = self.motion_phase + frequencies * self.dt * phase_scale
+            if self.more_terrain_cfg.serial_course:
+                motion_complete = next_phase >= frame_counts - 1.0
+                active_looping = self.motion.motion_loop[self.motion_ids].copy()
+                last_stage = self.course_motion_sequences.shape[1] - 1
+                at_last_stage = self.course_stage_ids >= last_stage
+                reached_finish = np.asarray(
+                    [data.qpos[0] for data in self.datas], dtype=np.float32
+                ) >= (
+                    self.course_finish_x
+                    - self.more_terrain_cfg.course_completion_tolerance
+                )
+                course_suffix_complete = (
+                    motion_complete
+                    & at_last_stage
+                    & reached_finish
+                )
+                course_complete = course_suffix_complete & (
+                    self.course_start_stage_ids == 0
+                )
+                stage_end_x = self.course_stage_end_x[
+                    self.course_variant_ids, self.course_stage_ids
+                ]
+                reached_stage_end = np.asarray(
+                    [data.qpos[0] for data in self.datas], dtype=np.float32
+                ) >= (
+                    stage_end_x - float(self.cfg.terrain_course_stage_tolerance)
+                )
+                # Do not let the reference sequence run through every terrain
+                # while a high-reward policy remains near the starting line.
+                advance = motion_complete & reached_stage_end & ~at_last_stage
+                course_stage_advance = advance.copy()
+                transition_steps = max(0, int(self.cfg.motion_transition_blend_steps))
+                if transition_steps > 0 and np.any(advance):
+                    self.motion_transition_from_ctrl[advance] = self.last_reference_ctrl[
+                        advance
+                    ]
+                    self.motion_transition_steps_left[advance] = transition_steps
+                incomplete_motion_required_x = np.where(
+                    at_last_stage,
+                    self.course_finish_x
+                    - self.more_terrain_cfg.course_completion_tolerance,
+                    stage_end_x - float(self.cfg.terrain_course_stage_tolerance),
+                ).astype(np.float32)
+                incomplete_motion_end_candidate = (
+                    bool(self.cfg.terminate_incomplete_motion_end)
+                    & motion_complete
+                    & ~active_looping
+                    & ~advance
+                    & ~course_suffix_complete
+                )
+                self.course_stage_ids[advance] += 1
+                if np.any(advance):
+                    self.motion_ids[advance] = self.course_motion_sequences[
+                        self.course_variant_ids[advance], self.course_stage_ids[advance]
+                    ]
+                looping = self.motion.motion_loop[self.motion_ids]
+                retry_loop = motion_complete & looping & ~reached_stage_end & ~at_last_stage
+                self.motion_phase = np.where(
+                    advance,
+                    0.0,
+                    np.where(
+                        retry_loop,
+                        np.mod(next_phase, frame_counts),
+                        np.minimum(next_phase, frame_counts - 1.0),
+                    ),
+                ).astype(np.float32)
+            else:
+                looping = self.motion.motion_loop[self.motion_ids]
+                self.motion_phase = np.where(
+                    looping,
+                    np.mod(next_phase, frame_counts),
+                    np.minimum(next_phase, frame_counts - 1.0),
+                ).astype(np.float32)
+                motion_complete = (~looping) & (next_phase >= frame_counts - 1.0)
+        else:
+            self.motion_phase = (
+                self.motion_phase + self.motion.frequency * self.dt * phase_scale
+            ) % self.motion.frame_count
+            motion_complete = np.zeros(self.num_envs, dtype=bool)
         reference_targets = self._targets_at_current_phase()
 
         for env_id, data in enumerate(self.datas):
@@ -754,7 +1460,13 @@ class LytRobotAmpEnv:
             prev_action = self.last_action[env_id].copy()
             commanded_action = self._apply_action_noise(np.clip(actions[env_id], -1.0, 1.0))
             commanded_action = commanded_action * self._startup_action_ramp(env_id)
-            base_ctrl = self._reference_base_ctrl(reference_targets.tendon_ctrl[env_id], data)
+            transitioned_reference_ctrl = self._transition_reference_ctrl(
+                reference_targets.tendon_ctrl[env_id], env_id
+            )
+            base_ctrl = self._reference_base_ctrl(transitioned_reference_ctrl, data)
+            start_x = float(data.qpos[0])
+            mechanical_energy = 0.0
+            mechanical_energy_invalid = False
             data.xfrc_applied[:] = 0.0
             data.xfrc_applied[self.pelvis_body_id] = self.push_force[env_id]
             applied_action = commanded_action
@@ -762,6 +1474,14 @@ class LytRobotAmpEnv:
                 applied_action = self._delayed_action(env_id, commanded_action)
                 data.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl, env_id=env_id)
                 mujoco.mj_step(self.model, data)
+                substep_energy = float(
+                    np.sum(np.abs(data.actuator_force * data.actuator_velocity))
+                    * float(self.cfg.timestep)
+                )
+                if np.isfinite(substep_energy):
+                    mechanical_energy += substep_energy
+                else:
+                    mechanical_energy_invalid = True
 
             self.episode_step[env_id] += 1
             foot_pos = self._foot_positions_local(data)
@@ -775,7 +1495,11 @@ class LytRobotAmpEnv:
                 commanded_action,
                 prev_action,
                 env_id,
-                float(self.cfg.target_velocity) * float(phase_scale[env_id]),
+                (
+                    float(reference_targets.root_lin_vel[env_id, 0])
+                    if self.cfg.use_reference_velocity
+                    else float(self.cfg.target_velocity) * float(phase_scale[env_id])
+                ),
                 reference_targets,
                 foot_pos,
                 foot_vel,
@@ -783,16 +1507,112 @@ class LytRobotAmpEnv:
                 foot_geom_contact,
                 foot_contact,
             )
+            invalid_step = bool(
+                mechanical_energy_invalid
+                or reward_parts.get("invalid_state", 0.0) > 0.5
+            )
+            if invalid_step:
+                reward = -2.0
+                done = True
+                timed_out = False
+                mechanical_energy = 0.0
+                reward_parts = {key: 0.0 for key in reward_parts}
+                reward_parts["invalid_state"] = 1.0
+                reward_parts["termination"] = 1.0
             rewards[env_id] = reward
-            dones[env_id] = done
-            time_outs[env_id] = timed_out
+            forward_distance = max(
+                float(np.nan_to_num(float(data.qpos[0]) - start_x, nan=0.0)),
+                0.0,
+            )
+            cot_distance = max(
+                forward_distance,
+                float(self.cfg.cot_min_forward_speed) * self.dt,
+                1.0e-6,
+            )
+            specific_cot = float(
+                np.nan_to_num(
+                    mechanical_energy
+                    / max(self.robot_mass * cot_distance, 1.0e-6),
+                    nan=1.0e6,
+                    posinf=1.0e6,
+                    neginf=1.0e6,
+                )
+            )
+            cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
+            specific_cot_excess = float(
+                _bounded_specific_cot_excess(specific_cot, cot_limit)
+            )
+            if self.cfg.specific_cot_penalty_coef != 0.0:
+                rewards[env_id] -= (
+                    float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
+                )
+            reward_parts.update(
+                {
+                    "actuator_power": mechanical_energy / max(self.dt, 1.0e-6),
+                    "mechanical_energy": mechanical_energy,
+                    "specific_cot": specific_cot,
+                    "specific_cot_excess": specific_cot_excess,
+                }
+            )
+            if self.more_terrain_cfg.serial_course:
+                rewards[env_id] += (
+                    float(self.cfg.terrain_course_completion_reward)
+                    * float(course_suffix_complete[env_id])
+                    + float(self.cfg.terrain_course_stage_reward)
+                    * float(course_stage_advance[env_id])
+                )
+            successful_motion_end = (
+                bool(course_suffix_complete[env_id])
+                if self.more_terrain_cfg.serial_course
+                else bool(motion_complete[env_id])
+            )
+            incomplete_motion_end = bool(
+                incomplete_motion_end_candidate[env_id]
+                and float(data.qpos[0]) < float(incomplete_motion_required_x[env_id])
+            )
+            incomplete_motion_end_flags[env_id] = incomplete_motion_end
+            reward_parts["incomplete_motion_end"] = float(incomplete_motion_end)
+            dones[env_id] = done or successful_motion_end or incomplete_motion_end
+            time_outs[env_id] = timed_out or successful_motion_end
             episode_steps[env_id] = self.episode_step[env_id]
             self.last_action[env_id] = commanded_action
             self.last_foot_pos[env_id] = foot_pos
             self.last_foot_world_pos[env_id] = foot_world_pos
             for key, value in reward_parts.items():
                 components.setdefault(key, []).append(float(value))
+            if self.more_terrain_cfg.serial_course:
+                components.setdefault("course_completion", []).append(
+                    float(course_suffix_complete[env_id])
+                )
+                components.setdefault("course_stage_completion", []).append(
+                    float(course_stage_advance[env_id])
+                )
 
+        progress_speed, insufficient_progress, next_anchor_x, next_anchor_step = (
+            _forward_progress_guard(
+                np.asarray([data.qpos[0] for data in self.datas], dtype=np.float32),
+                self.episode_step,
+                self.forward_progress_anchor_x,
+                self.forward_progress_anchor_step,
+                dt=self.dt,
+                min_speed=float(self.cfg.min_forward_progress_speed),
+                grace_steps=int(self.cfg.forward_progress_grace_steps),
+                window_steps=int(self.cfg.forward_progress_window_steps),
+            )
+        )
+        self.forward_progress_anchor_x[:] = next_anchor_x
+        self.forward_progress_anchor_step[:] = next_anchor_step
+        forward_progress_failure = insufficient_progress | incomplete_motion_end_flags
+        rewards -= (
+            float(self.cfg.forward_progress_termination_penalty)
+            * forward_progress_failure.astype(np.float32)
+        )
+        dones |= insufficient_progress
+        components["forward_progress_window_speed"] = progress_speed.tolist()
+        components["insufficient_progress"] = insufficient_progress.astype(np.float32).tolist()
+
+        reported_course_stage = self.course_stage_ids.copy()
+        reported_course_start_stage = self.course_start_stage_ids.copy()
         done_ids = np.nonzero(dones)[0].astype(np.int32)
         if len(done_ids) > 0:
             self.reset(done_ids)
@@ -802,6 +1622,12 @@ class LytRobotAmpEnv:
         info = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.astype(np.float32)
+        if self.more_terrain_cfg.serial_course:
+            info["course_complete"] = course_complete.astype(np.float32)
+            info["course_suffix_complete"] = course_suffix_complete.astype(np.float32)
+            info["course_stage"] = reported_course_stage.astype(np.float32)
+            info["course_start_stage"] = reported_course_start_stage.astype(np.float32)
+            info["successes"] = course_complete.astype(np.float32)
         return self.last_obs.copy(), rewards, dones.astype(np.float32), info
 
     def _compute_reward_done(
@@ -853,6 +1679,16 @@ class LytRobotAmpEnv:
         )
 
         height = float(np.exp(-((root_height - ref_root_height) ** 2) / (0.09**2)))
+        (
+            locomotion_stability,
+            stable_forward_velocity_track,
+            stable_forward_progress,
+        ) = _stability_gated_locomotion_terms(
+            forward_velocity_track,
+            forward_progress,
+            root_orientation,
+            height,
+        )
         joint_pos = np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)
         joint_vel = np.asarray(data.qvel[self.motion.robot_qvel_adrs], dtype=np.float32)
         pose_error = float(
@@ -946,8 +1782,8 @@ class LytRobotAmpEnv:
             + 0.75 * height
             + 0.90 * root_orientation
             + 0.90 * root_vel
-            + self.cfg.forward_velocity_reward_coef * forward_velocity_track
-            + self.cfg.forward_progress_reward_coef * forward_progress
+            + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+            + self.cfg.forward_progress_reward_coef * stable_forward_progress
             - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
             - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
             + 1.25 * foot_pos_track
@@ -972,18 +1808,18 @@ class LytRobotAmpEnv:
             and np.isfinite(data.qvel).all()
             and np.isfinite(data.ctrl).all()
         )
+        min_root_height = ref_root_height + (
+            float(self.cfg.fall_height) - self.nominal_root_height
+        )
+        max_root_height = ref_root_height + (
+            float(self.cfg.max_height) - self.nominal_root_height
+        )
         fallen = (
-            root_height < self.cfg.fall_height
-            or root_height > self.cfg.max_height
+            root_height < min_root_height
+            or root_height > max_root_height
             or up_z < self.cfg.min_upright_z
         )
-        timed_out = self.episode_step[env_id] >= self.episode_timeout_step[env_id]
-        done = bool(bad_state or fallen or timed_out)
-        termination = bool(bad_state or fallen)
-        if bad_state or fallen:
-            reward -= 2.0
-
-        return float(reward), done, bool(timed_out), {
+        components = {
             "root_height_value": root_height,
             "reference_root_height_value": ref_root_height,
             "root_vel": root_vel,
@@ -991,9 +1827,11 @@ class LytRobotAmpEnv:
             "forward_velocity_error": forward_velocity_error,
             "forward_velocity_track": forward_velocity_track,
             "forward_progress": forward_progress,
+            "locomotion_stability": locomotion_stability,
+            "stable_forward_velocity_track": stable_forward_velocity_track,
+            "stable_forward_progress": stable_forward_progress,
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
-            "termination": float(termination),
             "root_orientation": root_orientation,
             "height": height,
             "pose_track": pose_track,
@@ -1026,6 +1864,18 @@ class LytRobotAmpEnv:
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
         }
+        reward, bad_state, components = _sanitize_reward_outputs(
+            reward,
+            bad_state,
+            fallen,
+            components,
+            fall_penalty=self.cfg.fall_penalty,
+        )
+        timed_out = self.episode_step[env_id] >= self.episode_timeout_step[env_id]
+        done = bool(bad_state or fallen or timed_out)
+        termination = bool(bad_state or fallen)
+        components["termination"] = float(termination)
+        return float(reward), done, bool(timed_out), components
 
     def _side_foot_tracks(
         self,

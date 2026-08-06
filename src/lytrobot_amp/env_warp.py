@@ -9,8 +9,32 @@ import mujoco
 import numpy as np
 import torch
 
-from .env import LytRobotEnvCfg
-from .motion import CONTACT_GEOM_NAMES, MotionReference, resolve_contact_geom_ids
+from .env import (
+    LytRobotEnvCfg,
+    _stair_root_height_transform,
+    scaled_randomization_range,
+)
+from .motion import (
+    CONTACT_GEOM_NAMES,
+    MotionLibrary,
+    load_motion_library,
+    resolve_contact_geom_ids,
+)
+from .terrain import (
+    MoreTerrainCfg,
+    StairTerrainCfg,
+    course_end_x,
+    course_motion_sequence,
+    course_stage_end_positions,
+    course_stage_scenarios,
+    load_model,
+    randomized_course_orders,
+    sample_course_start_stages,
+    terrain_geom_ids,
+    terrain_kind_from_motion,
+    terrain_spawn_offset,
+    validate_terrain_types,
+)
 
 try:
     import mujoco_warp as mjwarp
@@ -26,6 +50,115 @@ else:
 def _canonical_quat(quat: torch.Tensor) -> torch.Tensor:
     quat = torch.where(quat[..., :1] < 0.0, -quat, quat)
     return quat / torch.linalg.norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+
+def _sanitize_reward_outputs(
+    reward: torch.Tensor,
+    bad_state: torch.Tensor,
+    fallen: torch.Tensor,
+    components: dict[str, torch.Tensor],
+    *,
+    fall_penalty: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Quarantine one invalid simulation without contaminating the whole batch."""
+
+    invalid = bad_state | ~torch.isfinite(reward)
+    for value in components.values():
+        invalid = invalid | ~torch.isfinite(value)
+
+    finite_reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+    finite_reward = finite_reward - torch.where(
+        fallen,
+        torch.full_like(finite_reward, max(float(fall_penalty), 0.0)),
+        torch.zeros_like(finite_reward),
+    )
+    finite_reward = torch.where(
+        invalid,
+        torch.full_like(finite_reward, -2.0),
+        finite_reward,
+    )
+
+    safe_components: dict[str, torch.Tensor] = {}
+    for key, value in components.items():
+        safe_value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_value = torch.clamp(safe_value, -1.0e6, 1.0e6)
+        safe_components[key] = torch.where(invalid, torch.zeros_like(safe_value), safe_value)
+    safe_components["invalid_state"] = invalid.to(torch.float32)
+    return finite_reward, invalid, safe_components
+
+
+def _stability_gated_locomotion_terms(
+    forward_velocity_track: torch.Tensor,
+    forward_progress: torch.Tensor,
+    root_orientation: torch.Tensor,
+    height: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Grant positive locomotion reward only while the torso remains stable."""
+
+    stability = torch.sqrt(
+        torch.clamp(root_orientation, 0.0, 1.0)
+        * torch.clamp(height, 0.0, 1.0)
+    )
+    gated_track = forward_velocity_track * stability
+    gated_progress = torch.clamp_max(forward_progress, 0.0) + (
+        torch.clamp_min(forward_progress, 0.0) * stability
+    )
+    return stability, gated_track, gated_progress
+
+
+def _bounded_specific_cot_excess(
+    specific_cot: torch.Tensor,
+    limit: float,
+) -> torch.Tensor:
+    """Return a bounded relative CoT violation in ``[0, 1]``."""
+
+    safe_limit = max(float(limit), 1.0e-6)
+    finite = torch.nan_to_num(specific_cot, nan=1.0e6, posinf=1.0e6, neginf=0.0)
+    excess = torch.clamp_min(finite - safe_limit, 0.0)
+    return torch.clamp(
+        excess / torch.clamp_min(finite, safe_limit),
+        0.0,
+        1.0,
+    )
+
+
+def _forward_progress_guard(
+    position_x: torch.Tensor,
+    episode_step: torch.Tensor,
+    anchor_x: torch.Tensor,
+    anchor_step: torch.Tensor,
+    *,
+    dt: float,
+    min_speed: float,
+    grace_steps: int,
+    window_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Check net world-X progress over fixed windows and advance the anchors."""
+
+    next_anchor_x = anchor_x.clone()
+    next_anchor_step = anchor_step.clone()
+    speed = torch.zeros_like(position_x)
+    stalled = torch.zeros_like(position_x, dtype=torch.bool)
+    if min_speed <= 0.0 or window_steps <= 0:
+        return speed, stalled, next_anchor_x, next_anchor_step
+
+    grace_steps = max(int(grace_steps), 0)
+    start_tracking = episode_step == grace_steps
+    next_anchor_x = torch.where(start_tracking, position_x, next_anchor_x)
+    next_anchor_step = torch.where(start_tracking, episode_step, next_anchor_step)
+
+    elapsed = episode_step - next_anchor_step
+    active = episode_step > grace_steps
+    finite = torch.isfinite(position_x) & torch.isfinite(next_anchor_x)
+    raw_speed = (position_x - next_anchor_x) / (
+        elapsed.clamp_min(1).to(position_x.dtype) * max(float(dt), 1.0e-6)
+    )
+    speed = torch.where(active & finite, raw_speed, speed)
+    check = active & (elapsed >= int(window_steps))
+    stalled = check & (~finite | (speed < float(min_speed)))
+    next_anchor_x = torch.where(check, position_x, next_anchor_x)
+    next_anchor_step = torch.where(check, episode_step, next_anchor_step)
+    return speed, stalled, next_anchor_x, next_anchor_step
 
 
 class LytRobotWarpAmpEnv:
@@ -51,7 +184,54 @@ class LytRobotWarpAmpEnv:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model XML not found: {self.model_path}")
 
-        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        terrain_types = validate_terrain_types(cfg.terrain_types)
+        if cfg.serial_terrain_course and not terrain_types:
+            raise ValueError("serial terrain course requires at least one terrain type.")
+        self.stair_cfg = StairTerrainCfg(
+            enabled=bool(cfg.stair_terrain or "stairs" in terrain_types),
+            step_height=cfg.stair_step_height,
+            step_depth=cfg.stair_step_depth,
+            step_count=cfg.stair_step_count,
+            width=cfg.stair_width,
+            run_in=cfg.stair_run_in,
+            top_length=cfg.stair_top_length,
+            run_out=cfg.stair_run_out,
+            start_x=cfg.stair_start_x,
+        )
+        course_orders = (
+            randomized_course_orders(
+                terrain_types,
+                cfg.terrain_course_variants,
+                cfg.seed,
+            )
+            if cfg.serial_terrain_course
+            else ()
+        )
+        self.more_terrain_cfg = MoreTerrainCfg(
+            enabled=bool(terrain_types),
+            terrain_types=terrain_types,
+            asset_dir=cfg.terrain_asset_dir,
+            serial_course=bool(cfg.serial_terrain_course),
+            course_orders=course_orders,
+            course_lane_spacing=cfg.terrain_course_lane_spacing,
+            course_base_height=cfg.terrain_course_base_height,
+            flat_lane_y=cfg.flat_lane_y,
+            rough_lane_y=cfg.rough_lane_y,
+            pit_lane_y=cfg.pit_lane_y,
+            gap_lane_y=cfg.gap_lane_y,
+            lane_width=cfg.terrain_lane_width,
+            rough_height=cfg.rough_terrain_height,
+            slope_angle_deg=cfg.slope_angle_deg,
+            gap_width=cfg.gap_terrain_width,
+        )
+        self.complex_terrain_enabled = bool(
+            self.stair_cfg.enabled or self.more_terrain_cfg.enabled
+        )
+        self.model = load_model(
+            self.model_path,
+            self.stair_cfg,
+            self.more_terrain_cfg,
+        )
         self.model.opt.timestep = float(cfg.timestep)
         self.model.opt.iterations = max(1, int(cfg.solver_iterations))
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
@@ -68,7 +248,77 @@ class LytRobotWarpAmpEnv:
         self.position_action_dim = int(len(self.position_actuator_ids_np))
         self.action_dim = self.position_action_dim
         self.ctrl_dim = int(self.model.nu)
-        self.motion = MotionReference(cfg.motion_file, self.model, actuator_ids=self.position_actuator_ids_np)
+        self.motion = load_motion_library(
+            cfg.motion_files or (cfg.motion_file,),
+            self.model,
+            actuator_ids=self.position_actuator_ids_np,
+            motion_weights=cfg.motion_weights or None,
+            motion_names=cfg.motion_names or None,
+            motion_loop=cfg.motion_loop or None,
+        )
+        self.motion_count = (
+            self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
+        )
+        motion_names = (
+            self.motion.motion_names
+            if isinstance(self.motion, MotionLibrary)
+            else (Path(cfg.motion_file).stem,)
+        )
+        self.stair_motion_mask_np = np.asarray(
+            ["stair" in name.lower() for name in motion_names], dtype=bool
+        )
+        self.stair_down_motion_mask_np = np.asarray(
+            ["stair_down" in name.lower() for name in motion_names], dtype=bool
+        )
+        motion_references = (
+            self.motion.motions
+            if isinstance(self.motion, MotionLibrary)
+            else (self.motion,)
+        )
+        self.motion_stair_height_anchor_np = np.zeros(
+            self.motion_count, dtype=np.float32
+        )
+        self.motion_stair_height_scale_np = np.ones(
+            self.motion_count, dtype=np.float32
+        )
+        for motion_id, motion_reference in enumerate(motion_references):
+            if not self.stair_motion_mask_np[motion_id]:
+                continue
+            anchor, scale = _stair_root_height_transform(
+                motion_reference,
+                step_height=self.stair_cfg.step_height,
+                step_count=self.stair_cfg.step_count,
+                descending=bool(self.stair_down_motion_mask_np[motion_id]),
+            )
+            self.motion_stair_height_anchor_np[motion_id] = anchor
+            self.motion_stair_height_scale_np[motion_id] = scale
+        self.nominal_root_height = float(self.motion.model_qpos0[2])
+        self.motion_terrain_kinds = tuple(
+            terrain_kind_from_motion(name) for name in motion_names
+        )
+        missing_terrains = sorted(
+            {
+                kind
+                for kind in self.motion_terrain_kinds
+                if kind not in {"flat", "stairs"} and kind not in terrain_types
+            }
+        )
+        if missing_terrains:
+            raise ValueError(
+                "Motion library contains terrain-conditioned clips without matching "
+                f"terrain geometry: {missing_terrains}. Enable them with terrain_types."
+            )
+        self.course_motion_sequences_np = self._build_course_motion_sequences(motion_names)
+        self.course_stage_scenario_names = tuple(
+            course_stage_scenarios(order)
+            for order in self.more_terrain_cfg.normalized_course_orders
+        )
+        self.course_stage_end_x_np = self._build_course_stage_end_x()
+        self.course_finish_x = (
+            course_end_x(self.more_terrain_cfg, 0)
+            if self.more_terrain_cfg.serial_course
+            else float("inf")
+        )
         rng_seed = secrets.randbits(128) if cfg.randomize_episode_seed else int(cfg.seed)
         self.rng = np.random.default_rng(rng_seed)
         self.num_envs = int(cfg.num_envs)
@@ -80,6 +330,7 @@ class LytRobotWarpAmpEnv:
         self.ctrl_high = torch.as_tensor(self.ctrl_high_np, dtype=torch.float32, device=self.device)
         self.ctrl_mid = 0.5 * (self.ctrl_low + self.ctrl_high)
         self.ctrl_half_range = torch.clamp(0.5 * (self.ctrl_high - self.ctrl_low), min=1.0e-6)
+        self.robot_mass = float(np.sum(self.model.body_mass))
         self.position_actuator_ids = torch.as_tensor(
             self.position_actuator_ids_np, dtype=torch.long, device=self.device
         )
@@ -110,10 +361,14 @@ class LytRobotWarpAmpEnv:
         if self.pelvis_body_id < 0:
             raise RuntimeError("Body 'pelvis' not found in robot model.")
         self.floor_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        terrain_ids_np = terrain_geom_ids(self.model).astype(np.int64)
         contact_geom_ids_np = resolve_contact_geom_ids(self.model).astype(np.int64)
         if self.floor_geom_id < 0:
             raise RuntimeError("Expected floor and foot contact geoms were not found in robot model.")
         self.contact_geom_ids = torch.as_tensor(contact_geom_ids_np, dtype=torch.long, device=self.device)
+        self.terrain_geom_ids = torch.as_tensor(
+            terrain_ids_np, dtype=torch.long, device=self.device
+        )
         self.contact_geom_id_values = tuple(int(geom_id) for geom_id in contact_geom_ids_np)
         self.right_contact_geom_ids = self.contact_geom_ids[:2]
         self.left_contact_geom_ids = self.contact_geom_ids[2:]
@@ -146,8 +401,35 @@ class LytRobotWarpAmpEnv:
             dtype=torch.long,
             device=self.device,
         )
+        self.forward_progress_anchor_x = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.forward_progress_anchor_step = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self.motion_phase = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.course_variant_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.course_stage_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.course_start_stage_ids = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.course_motion_sequences = torch.as_tensor(
+            self.course_motion_sequences_np,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.course_stage_end_x = torch.as_tensor(
+            self.course_stage_end_x_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.last_action = torch.zeros((self.num_envs, self.action_dim), dtype=torch.float32, device=self.device)
+        self.last_reference_ctrl = torch.zeros_like(self.last_action)
+        self.motion_transition_from_ctrl = torch.zeros_like(self.last_action)
+        self.motion_transition_steps_left = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self.last_foot_pos = torch.zeros(
             (self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device
         )
@@ -180,11 +462,50 @@ class LytRobotWarpAmpEnv:
             + self.motion.foot_pos_dim
             + self.motion.contact_dim
         )
-        return int(current_state_dim + tracking_dim)
+        skill_dim = self.motion_count if self.cfg.skill_conditioning and self.motion_count > 1 else 0
+        return int(current_state_dim + tracking_dim + skill_dim)
 
     @property
     def amp_obs_dim(self) -> int:
         return self.motion.feature_dim
+
+    def _build_course_motion_sequences(
+        self,
+        motion_names: tuple[str, ...],
+    ) -> np.ndarray:
+        if not self.more_terrain_cfg.serial_course:
+            return np.empty((0, 0), dtype=np.int64)
+        if not isinstance(self.motion, MotionLibrary):
+            raise ValueError("serial terrain course requires a multi-motion library.")
+        name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
+        rows: list[list[int]] = []
+        for order in self.more_terrain_cfg.normalized_course_orders:
+            names = course_motion_sequence(order)
+            missing = [name for name in names if name not in name_to_id]
+            if missing:
+                raise ValueError(
+                    "Serial terrain course is missing required motion clips: "
+                    f"{sorted(set(missing))}."
+                )
+            rows.append([name_to_id[name] for name in names])
+        return np.asarray(rows, dtype=np.int64)
+
+    def _build_course_stage_end_x(self) -> np.ndarray:
+        """Physical root-X boundary for each action in every serial course."""
+
+        if not self.more_terrain_cfg.serial_course:
+            return np.empty((0, 0), dtype=np.float32)
+        rows = [
+            course_stage_end_positions(self.more_terrain_cfg, variant)
+            for variant in range(len(self.more_terrain_cfg.normalized_course_orders))
+        ]
+        result = np.asarray(rows, dtype=np.float32)
+        if result.shape != self.course_motion_sequences_np.shape:
+            raise ValueError(
+                "Serial course motion stages and physical boundaries do not align: "
+                f"motions={self.course_motion_sequences_np.shape}, boundaries={result.shape}."
+            )
+        return result
 
     def _get_nonroot_joint_adrs(self) -> tuple[np.ndarray, np.ndarray]:
         qpos_adrs: list[int] = []
@@ -247,18 +568,56 @@ class LytRobotWarpAmpEnv:
         def tensor(value: np.ndarray) -> torch.Tensor:
             return torch.as_tensor(value, dtype=torch.float32, device=self.device)
 
-        self.ref_root_height = tensor(self.motion.reference_root_height)
-        self.ref_root_quat = tensor(self.motion.reference_root_quat)
-        self.ref_root_lin_vel = tensor(self.motion.reference_root_lin_vel)
-        self.ref_root_ang_vel = tensor(self.motion.reference_root_ang_vel)
-        self.ref_joint_pos = tensor(self.motion.reference_joint_pos)
-        self.ref_joint_vel = tensor(self.motion.reference_joint_vel)
-        self.ref_tendon_ctrl = tensor(self.motion.reference_tendon_ctrl)
-        self.ref_foot_pos = tensor(self.motion.reference_foot_pos)
-        self.ref_foot_vel = tensor(self.motion.reference_foot_vel)
-        self.ref_foot_contact = tensor(self.motion.reference_foot_contact)
+        def packed(attribute: str) -> np.ndarray:
+            if isinstance(self.motion, MotionLibrary):
+                return self.motion.packed(attribute)
+            return np.asarray(getattr(self.motion, attribute))[None, ...]
+
+        self.ref_root_height = tensor(packed("reference_root_height"))
+        self.ref_root_quat = tensor(packed("reference_root_quat"))
+        self.ref_root_lin_vel = tensor(packed("reference_root_lin_vel"))
+        self.ref_root_ang_vel = tensor(packed("reference_root_ang_vel"))
+        self.ref_joint_pos = tensor(packed("reference_joint_pos"))
+        self.ref_joint_vel = tensor(packed("reference_joint_vel"))
+        self.ref_tendon_ctrl = tensor(packed("reference_tendon_ctrl"))
+        self.ref_foot_pos = tensor(packed("reference_foot_pos"))
+        self.ref_foot_vel = tensor(packed("reference_foot_vel"))
+        self.ref_foot_contact = tensor(packed("reference_foot_contact"))
+        self.motion_frame_counts = torch.as_tensor(
+            (
+                self.motion.frame_counts
+                if isinstance(self.motion, MotionLibrary)
+                else np.asarray([self.motion.frame_count], dtype=np.int32)
+            ),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.motion_frequencies = torch.as_tensor(
+            (
+                self.motion.frequencies
+                if isinstance(self.motion, MotionLibrary)
+                else np.asarray([self.motion.frequency], dtype=np.float32)
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.motion_loop = torch.as_tensor(
+            (
+                self.motion.motion_loop
+                if isinstance(self.motion, MotionLibrary)
+                else np.asarray([True])
+            ),
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.feature_mean = tensor(self.motion.feature_mean)
         self.feature_std = tensor(self.motion.feature_std)
+        self.motion_stair_height_anchor = tensor(
+            self.motion_stair_height_anchor_np
+        )
+        self.motion_stair_height_scale = tensor(
+            self.motion_stair_height_scale_np
+        )
 
     def _build_stand_reference(self) -> None:
         data = mujoco.MjData(self.model)
@@ -332,6 +691,8 @@ class LytRobotWarpAmpEnv:
         self.xmat = wp.to_torch(self.wp_data.xmat)
         self.geom_xpos = wp.to_torch(self.wp_data.geom_xpos)
         self.ten_length = wp.to_torch(self.wp_data.ten_length)
+        self.actuator_force = wp.to_torch(self.wp_data.actuator_force)
+        self.actuator_velocity = wp.to_torch(self.wp_data.actuator_velocity)
         self.xfrc_applied = wp.to_torch(self.wp_data.xfrc_applied)
         self.wp_body_mass = wp.to_torch(self.wp_model.body_mass)
         self.wp_body_inertia = wp.to_torch(self.wp_model.body_inertia)
@@ -341,6 +702,11 @@ class LytRobotWarpAmpEnv:
         self.contact_geom = wp.to_torch(self.wp_data.contact.geom).long()
         self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid).long()
         self.contact_dim = wp.to_torch(self.wp_data.contact.dim).long()
+        self._warp_reset_mask = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
     def _capture_warp_graphs(self) -> None:
         """Capture fixed-shape MuJoCo Warp launches to remove Python launch overhead."""
@@ -380,12 +746,35 @@ class LytRobotWarpAmpEnv:
         else:
             wp.capture_launch(self._forward_graph)
 
-    def _warp_decimated_step(self) -> None:
+    def _warp_decimated_step(self) -> tuple[torch.Tensor, torch.Tensor]:
+        mechanical_energy = torch.zeros(
+            self.num_envs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        invalid_energy = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
         for _ in range(int(self.cfg.decimation)):
             self._warp_step()
+            actuator_power = torch.sum(
+                torch.abs(self.actuator_force * self.actuator_velocity),
+                dim=1,
+            )
+            invalid_energy |= ~torch.isfinite(actuator_power)
+            mechanical_energy += torch.nan_to_num(
+                actuator_power,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ) * float(self.cfg.timestep)
+        return mechanical_energy, invalid_energy
 
     def _init_domain_randomization(self) -> None:
         self.domain_randomization = bool(self.cfg.domain_randomization)
+        self.domain_randomization_scale = float(np.clip(self.cfg.domain_randomization_scale, 0.0, 1.0))
         max_delay_s = max(float(self.cfg.action_delay_min_ms), float(self.cfg.action_delay_max_ms), 0.0) / 1000.0
         self.max_action_delay_ticks = int(np.ceil(max_delay_s / max(float(self.cfg.timestep), 1.0e-9)))
         history_len = max(1, self.max_action_delay_ticks + 1)
@@ -412,6 +801,39 @@ class LytRobotWarpAmpEnv:
         )
         self.base_geom_friction = torch.as_tensor(self.base_geom_friction_np, dtype=torch.float32, device=self.device)
         self.base_gravity = torch.as_tensor(self.base_gravity_np, dtype=torch.float32, device=self.device)
+
+    def set_domain_randomization_scale(self, scale: float) -> None:
+        """Set curriculum strength without changing ongoing global dynamics."""
+
+        self.domain_randomization_scale = float(np.clip(scale, 0.0, 1.0))
+        self.cfg.domain_randomization_scale = self.domain_randomization_scale
+
+    def set_terrain_course_random_start_prob(self, probability: float) -> None:
+        """Set the random-stage curriculum probability used by future resets."""
+
+        probability = float(probability)
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("terrain course random-start probability must be in [0, 1].")
+        self.cfg.terrain_course_random_start_prob = probability
+
+    def _reset_warp_worlds(self, ids: torch.Tensor) -> None:
+        """Fully clear MuJoCo-Warp state for selected worlds before respawning.
+
+        Assigning only qpos/qvel leaves solver warm-start, acceleration and
+        contact buffers untouched.  Once one of those buffers becomes
+        non-finite, that world remains poisoned across every later episode.
+        MuJoCo-Warp's per-world reset is the authoritative equivalent of
+        ``mj_resetData`` and preserves all worlds not selected by ``ids``.
+        """
+
+        self._warp_reset_mask.zero_()
+        self._warp_reset_mask[ids] = True
+        with wp.ScopedDevice(self.wp_device):
+            mjwarp.reset_data(
+                self.wp_model,
+                self.wp_data,
+                reset=wp.from_torch(self._warp_reset_mask),
+            )
 
     def _uniform_np(self, low: float, high: float, size: int | tuple[int, ...] | None = None) -> np.ndarray:
         low_f = float(low)
@@ -447,18 +869,28 @@ class LytRobotWarpAmpEnv:
         seeds = self.rng.integers(0, np.iinfo(np.uint64).max, size=len(ids_np), dtype=np.uint64)
         self.episode_seed[ids_np] = seeds
 
-    def _sample_domain_randomization(self, ids_np: np.ndarray) -> None:
+    def _sample_domain_randomization(
+        self,
+        ids_np: np.ndarray,
+        *,
+        resample_global: bool = False,
+    ) -> None:
         if not self.domain_randomization or ids_np.size == 0:
             return
+        scale = self.domain_randomization_scale
+        tendon_low, tendon_high = scaled_randomization_range(
+            1.0, self.cfg.tendon_length_scale_min, self.cfg.tendon_length_scale_max, scale
+        )
         tendon_scale = self._uniform_np(
-            self.cfg.tendon_length_scale_min,
-            self.cfg.tendon_length_scale_max,
+            tendon_low,
+            tendon_high,
             (len(ids_np), self.position_action_dim),
         )
         ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
         self.env_tendon_length_scale[ids] = torch.as_tensor(tendon_scale, dtype=torch.float32, device=self.device)
-        min_delay = max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
-        max_delay = max(min_delay, float(self.cfg.action_delay_max_ms) / 1000.0)
+        min_delay = scale * max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
+        max_delay = scale * max(0.0, float(self.cfg.action_delay_max_ms)) / 1000.0
+        max_delay = max(min_delay, max_delay)
         delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids_np))
         delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int64)
         self.action_delay_ticks[ids] = torch.as_tensor(
@@ -472,31 +904,47 @@ class LytRobotWarpAmpEnv:
         self.push_time_to_next[ids] = torch.as_tensor(
             self._sample_push_interval(len(ids_np)), dtype=torch.long, device=self.device
         )
-        self._apply_global_domain_randomization()
+        if resample_global and bool(self.cfg.warp_global_domain_randomization):
+            self._apply_global_domain_randomization()
 
     def _apply_global_domain_randomization(self) -> None:
         if not self.domain_randomization:
             return
+        scale = self.domain_randomization_scale
+        body_low, body_high = scaled_randomization_range(
+            1.0, self.cfg.body_mass_scale_min, self.cfg.body_mass_scale_max, scale
+        )
+        payload_low, payload_high = scaled_randomization_range(
+            0.0, self.cfg.payload_mass_min, self.cfg.payload_mass_max, scale
+        )
+        nominal_friction = float(self.base_geom_friction_np[self.floor_geom_id, 0])
+        friction_low, friction_high = scaled_randomization_range(
+            nominal_friction, self.cfg.ground_friction_min, self.cfg.ground_friction_max, scale
+        )
+        nominal_gravity = abs(float(self.base_gravity_np[2]))
+        gravity_low, gravity_high = scaled_randomization_range(
+            nominal_gravity, self.cfg.gravity_min, self.cfg.gravity_max, scale
+        )
         body_scale = torch.as_tensor(
-            self._uniform_np(self.cfg.body_mass_scale_min, self.cfg.body_mass_scale_max, self.model.nbody),
+            self._uniform_np(body_low, body_high, self.model.nbody),
             dtype=torch.float32,
             device=self.device,
         )
         body_scale[0] = 1.0
         body_mass = self.base_body_mass * body_scale
         if self.pelvis_body_id >= 0:
-            payload_mass = float(self._uniform_np(self.cfg.payload_mass_min, self.cfg.payload_mass_max))
+            payload_mass = float(self._uniform_np(payload_low, payload_high))
             body_mass[self.pelvis_body_id] += payload_mass
         self.wp_body_mass[0] = body_mass
         self.wp_body_inertia[0] = self.base_body_inertia * body_scale[:, None]
         self.wp_body_inertia[0, 0] = self.base_body_inertia[0]
         self.wp_body_subtreemass[0] = self.base_body_subtreemass
         self.wp_geom_friction[0] = self.base_geom_friction
-        self.wp_geom_friction[0, self.floor_geom_id, 0] = float(
-            self._uniform_np(self.cfg.ground_friction_min, self.cfg.ground_friction_max)
+        self.wp_geom_friction[0, self.terrain_geom_ids, 0] = float(
+            self._uniform_np(friction_low, friction_high)
         )
         self.wp_gravity[0] = self.base_gravity
-        self.wp_gravity[0, 2] = -float(self._uniform_np(self.cfg.gravity_min, self.cfg.gravity_max))
+        self.wp_gravity[0, 2] = -float(self._uniform_np(gravity_low, gravity_high))
 
     def _apply_tendon_length_randomization(
         self,
@@ -512,7 +960,8 @@ class LytRobotWarpAmpEnv:
     def _apply_action_noise(self, action: torch.Tensor) -> torch.Tensor:
         if not self.domain_randomization or self.cfg.action_noise_std <= 0.0:
             return action
-        return torch.clamp(action + float(self.cfg.action_noise_std) * torch.randn_like(action), -1.0, 1.0)
+        noise_std = self.domain_randomization_scale * float(self.cfg.action_noise_std)
+        return torch.clamp(action + noise_std * torch.randn_like(action), -1.0, 1.0)
 
     def _startup_action_ramp(self) -> torch.Tensor:
         ramp_steps = max(0, int(self.cfg.startup_action_ramp_steps))
@@ -555,8 +1004,12 @@ class LytRobotWarpAmpEnv:
         start = idle & (self.push_time_to_next <= 0)
         directions = torch.randn((self.num_envs, 3), dtype=torch.float32, device=self.device)
         directions = directions / torch.linalg.norm(directions, dim=1, keepdim=True).clamp_min(1.0e-6)
-        low_force = min(float(self.cfg.push_force_min), float(self.cfg.push_force_max))
-        high_force = max(float(self.cfg.push_force_min), float(self.cfg.push_force_max))
+        low_force = self.domain_randomization_scale * min(
+            float(self.cfg.push_force_min), float(self.cfg.push_force_max)
+        )
+        high_force = self.domain_randomization_scale * max(
+            float(self.cfg.push_force_min), float(self.cfg.push_force_max)
+        )
         magnitudes = low_force + (high_force - low_force) * torch.rand(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
@@ -575,14 +1028,30 @@ class LytRobotWarpAmpEnv:
 
         self.xfrc_applied[:, self.pelvis_body_id] = self.push_force
 
-    def _targets_at_phase(self, phase: torch.Tensor) -> dict[str, torch.Tensor]:
-        low = torch.floor(phase).long() % self.motion.frame_count
-        high = (low + 1) % self.motion.frame_count
+    def _targets_at_phase(
+        self,
+        phase: torch.Tensor,
+        motion_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        ids = (
+            torch.zeros_like(phase, dtype=torch.long)
+            if motion_ids is None
+            else motion_ids
+        )
+        frame_counts = self.motion_frame_counts[ids]
+        looping = self.motion_loop[ids]
+        floor_phase = torch.floor(phase).long()
+        low = torch.where(
+            looping,
+            torch.remainder(floor_phase, frame_counts),
+            torch.minimum(torch.clamp_min(floor_phase, 0), frame_counts - 1),
+        )
+        high = torch.where(looping, torch.remainder(low + 1, frame_counts), torch.minimum(low + 1, frame_counts - 1))
         blend = (phase - torch.floor(phase)).to(torch.float32)
 
         def interp(values: torch.Tensor) -> torch.Tensor:
-            low_values = values[low]
-            high_values = values[high]
+            low_values = values[ids, low]
+            high_values = values[ids, high]
             shape = (blend.shape[0],) + (1,) * (low_values.ndim - 1)
             b = blend.reshape(shape)
             return (1.0 - b) * low_values + b * high_values
@@ -642,7 +1111,30 @@ class LytRobotWarpAmpEnv:
 
     def _targets_at_current_phase(self, env_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         phase = self.motion_phase if env_ids is None else self.motion_phase[env_ids]
-        return self._blend_start_targets(self._targets_at_phase(phase), env_ids=env_ids)
+        motion_ids = self.motion_ids if env_ids is None else self.motion_ids[env_ids]
+        targets = self._targets_at_phase(phase, motion_ids)
+        stair_anchor = self.motion_stair_height_anchor[motion_ids]
+        stair_scale = self.motion_stair_height_scale[motion_ids]
+        targets["root_height"] = stair_anchor + (
+            targets["root_height"] - stair_anchor
+        ) * stair_scale
+        targets["root_lin_vel"] = targets["root_lin_vel"].clone()
+        targets["root_lin_vel"][:, 2] *= stair_scale
+        targets = self._blend_start_targets(targets, env_ids=env_ids)
+        if self.more_terrain_cfg.serial_course:
+            terrain_offset = torch.full_like(
+                targets["root_height"],
+                float(self.more_terrain_cfg.course_base_height),
+            )
+            no_offset = torch.zeros_like(terrain_offset)
+            pit_gap = torch.zeros_like(motion_ids, dtype=torch.bool)
+            for motion_id, kind in enumerate(self.motion_terrain_kinds):
+                if kind in {"gap", "pit"}:
+                    pit_gap = pit_gap | (motion_ids == motion_id)
+            targets["root_height"] = targets["root_height"] + torch.where(
+                pit_gap, no_offset, terrain_offset
+            )
+        return targets
 
     def _clip_joint_ranges_batch(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
         if len(self._limited_qpos_adrs_np) == 0:
@@ -694,6 +1186,37 @@ class LytRobotWarpAmpEnv:
             return current
         return torch.clamp((1.0 - blend) * current + blend * reference_ctrl, min=self.ctrl_low, max=self.ctrl_high)
 
+    def _transition_reference_ctrl(
+        self, reference_ctrl: torch.Tensor
+    ) -> torch.Tensor:
+        """Blend only a newly selected motion onto the previous reference."""
+        target = reference_ctrl.to(dtype=torch.float32, device=self.device)
+        total_steps = max(0, int(self.cfg.motion_transition_blend_steps))
+        if total_steps <= 0:
+            self.motion_transition_steps_left.zero_()
+            self.last_reference_ctrl.copy_(target)
+            return target
+
+        active = self.motion_transition_steps_left > 0
+        alpha = (
+            total_steps - self.motion_transition_steps_left + 1
+        ).to(torch.float32) / float(total_steps)
+        alpha = torch.clamp(alpha, 0.0, 1.0)[:, None]
+        transitioned = torch.where(
+            active[:, None],
+            (1.0 - alpha) * self.motion_transition_from_ctrl + alpha * target,
+            target,
+        )
+        self.motion_transition_steps_left.copy_(
+            torch.where(
+                active,
+                self.motion_transition_steps_left - 1,
+                torch.zeros_like(self.motion_transition_steps_left),
+            )
+        )
+        self.last_reference_ctrl.copy_(transitioned)
+        return transitioned
+
     def _foot_positions_local(self) -> torch.Tensor:
         root_pos = self.xpos[:, self.pelvis_body_id]
         root_mat = self.xmat[:, self.pelvis_body_id]
@@ -722,11 +1245,12 @@ class LytRobotWarpAmpEnv:
         valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
         safe_world = torch.clamp(world, 0, self.num_envs - 1)
 
-        floor = int(self.floor_geom_id)
+        g1_terrain = torch.isin(g1, self.terrain_geom_ids)
+        g2_terrain = torch.isin(g2, self.terrain_geom_ids)
         for contact_index, geom in enumerate(self.contact_geom_id_values):
             matched = valid & (
-                ((g1 == floor) & (g2 == geom))
-                | ((g2 == floor) & (g1 == geom))
+                (g1_terrain & (g2 == geom))
+                | (g2_terrain & (g1 == geom))
             )
             contact[:, contact_index].scatter_reduce_(
                 0,
@@ -751,14 +1275,73 @@ class LytRobotWarpAmpEnv:
             return self.last_obs
         self._refresh_episode_rng(ids_np)
 
-        states = self.motion.sample_states(len(ids_np), self.rng)
-        use_stand_start = self.rng.random(len(ids_np)) < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
-        use_motion_reset = (
-            ~use_stand_start
-            & (self.rng.random(len(ids_np)) < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)))
+        serial_course = self.more_terrain_cfg.serial_course
+        if serial_course:
+            variant_count = len(self.more_terrain_cfg.normalized_course_orders)
+            variants = (
+                self.rng.integers(0, variant_count, size=len(ids_np), dtype=np.int64)
+                if self.cfg.terrain_course_random_assignment
+                else np.mod(ids_np, variant_count).astype(np.int64)
+            )
+            start_stages = sample_course_start_stages(
+                self.rng,
+                len(ids_np),
+                self.course_motion_sequences_np.shape[1],
+                self.cfg.terrain_course_random_start_prob,
+            ).astype(np.int64)
+            sampled_motion_ids = self.course_motion_sequences_np[
+                variants, start_stages
+            ].astype(np.int32)
+            assert isinstance(self.motion, MotionLibrary)
+            states = self.motion.sample_states(
+                len(ids_np), self.rng, motion_ids=sampled_motion_ids
+            )
+            for row, motion_id in enumerate(sampled_motion_ids):
+                states.qpos[row] = self.motion.motions[int(motion_id)].reference_qpos[0]
+                # Match the CPU serial-course reset: enter every route at rest
+                # instead of applying a reference seam velocity as an impulse.
+                states.qvel[row] = 0.0
+                states.indices[row] = 0
+        elif isinstance(self.motion, MotionLibrary):
+            sampled_motion_ids = self.motion.sample_motion_ids(len(ids_np), self.rng)
+            states = self.motion.sample_states(len(ids_np), self.rng, motion_ids=sampled_motion_ids)
+        else:
+            sampled_motion_ids = np.zeros(len(ids_np), dtype=np.int32)
+            states = self.motion.sample_states(len(ids_np), self.rng)
+        use_stand_start = (
+            np.zeros(len(ids_np), dtype=bool)
+            if serial_course
+            else self.rng.random(len(ids_np))
+            < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
         )
-        self._sample_domain_randomization(ids_np)
+        use_motion_reset = (
+            np.ones(len(ids_np), dtype=bool)
+            if serial_course
+            else ~use_stand_start
+            & (
+                self.rng.random(len(ids_np))
+                < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+            )
+        )
+        # Mass, inertia, friction, and gravity live on the single shared Warp
+        # model.  They are opt-in because one draw would otherwise change all
+        # worlds at once and destroy the within-batch dynamics distribution.
+        full_reset = ids_np.size == self.num_envs
+        self._sample_domain_randomization(ids_np, resample_global=full_reset)
         ids = torch.as_tensor(ids_np, dtype=torch.long, device=self.device)
+        self._reset_warp_worlds(ids)
+        if serial_course:
+            self.course_variant_ids[ids] = torch.as_tensor(
+                variants, dtype=torch.long, device=self.device
+            )
+            start_stage_tensor = torch.as_tensor(
+                start_stages, dtype=torch.long, device=self.device
+            )
+            self.course_stage_ids[ids] = start_stage_tensor
+            self.course_start_stage_ids[ids] = start_stage_tensor
+        self.motion_ids[ids] = torch.as_tensor(
+            sampled_motion_ids, dtype=torch.long, device=self.device
+        )
         self.stand_start[ids] = torch.as_tensor(use_stand_start, dtype=torch.bool, device=self.device)
         self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids_np))
         qpos = np.repeat(self.motion.model_qpos0[None, :], len(ids_np), axis=0).astype(np.float32)
@@ -767,6 +1350,37 @@ class LytRobotWarpAmpEnv:
         qpos[use_motion_reset] = states.qpos[use_motion_reset]
         qvel[use_motion_reset] = states.qvel[use_motion_reset]
         phase[use_motion_reset] = states.indices[use_motion_reset].astype(np.float32)
+        reset_motion_ids = sampled_motion_ids[use_motion_reset]
+        reset_height_anchor = self.motion_stair_height_anchor_np[reset_motion_ids]
+        reset_height_scale = self.motion_stair_height_scale_np[reset_motion_ids]
+        qpos[use_motion_reset, 2] = reset_height_anchor + (
+            qpos[use_motion_reset, 2] - reset_height_anchor
+        ) * reset_height_scale
+        qvel[use_motion_reset, 2] *= reset_height_scale
+        if self.complex_terrain_enabled:
+            for row, motion_id in enumerate(sampled_motion_ids):
+                if serial_course:
+                    scenario = self.course_stage_scenario_names[
+                        int(variants[row])
+                    ][int(start_stages[row])]
+                    terrain_kind = (
+                        "stairs" if scenario in {"stair_up", "stair_down"} else scenario
+                    )
+                    stair_down = scenario == "stair_down"
+                else:
+                    terrain_kind = self.motion_terrain_kinds[int(motion_id)]
+                    stair_down = bool(
+                        self.stair_down_motion_mask_np[int(motion_id)]
+                    )
+                offset = terrain_spawn_offset(
+                    terrain_kind,
+                    self.more_terrain_cfg,
+                    self.stair_cfg,
+                    stair_down=stair_down,
+                    stair_down_offset=self.cfg.stair_down_offset,
+                    course_variant=(int(variants[row]) if serial_course else 0),
+                )
+                qpos[row, :3] += offset
 
         if self.cfg.reset_noise_scale > 0.0:
             qpos[:, self.motion.robot_qpos_adrs] += self.rng.normal(
@@ -786,12 +1400,17 @@ class LytRobotWarpAmpEnv:
 
         self.episode_step[ids] = 0
         self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
+        self.forward_progress_anchor_x[ids] = self.qpos[ids, 0]
+        self.forward_progress_anchor_step[ids] = 0
         targets = self._targets_at_current_phase() if self.actor_observation_enabled else None
         reset_targets = (
             {key: value[ids] for key, value in targets.items()}
             if targets is not None
             else self._targets_at_current_phase(ids)
         )
+        self.last_reference_ctrl[ids] = reset_targets["tendon_ctrl"]
+        self.motion_transition_from_ctrl[ids] = reset_targets["tendon_ctrl"]
+        self.motion_transition_steps_left[ids] = 0
         zero_action = torch.zeros((len(ids_np), self.action_dim), dtype=torch.float32, device=self.device)
         reset_base_ctrl = self._reference_base_ctrl(reset_targets["tendon_ctrl"], env_ids=ids)
         self.ctrl[ids] = self.action_to_ctrl(zero_action, base_ctrl=reset_base_ctrl, env_ids=ids)
@@ -831,20 +1450,23 @@ class LytRobotWarpAmpEnv:
         targets = self._targets_at_current_phase() if targets is None else targets
         quat = _canonical_quat(self.qpos[:, 3:7])
         up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
-        phase = 2.0 * torch.pi * self.motion_phase / float(self.motion.frame_count)
+        frame_counts = self.motion_frame_counts[self.motion_ids].to(torch.float32)
+        phase = 2.0 * torch.pi * self.motion_phase / frame_counts
         joint_pos = self.qpos[:, self.robot_qpos_adrs]
         joint_vel = self.qvel[:, self.robot_qvel_adrs]
         foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
         ref_foot_pos = targets["foot_pos"].reshape(self.num_envs, -1)
         ref_ctrl_action = self.ctrl_to_action(targets["tendon_ctrl"])
         root_lin_vel_target = targets["root_lin_vel"].clone()
-        root_lin_vel_target[:, 0] = float(self.cfg.target_velocity) * self._stand_start_progress()
+        if not self.cfg.use_reference_velocity:
+            root_lin_vel_target[:, 0] = (
+                float(self.cfg.target_velocity) * self._stand_start_progress()
+            )
         root_vel_error = self.qvel[:, :6] - torch.cat(
             (root_lin_vel_target, targets["root_ang_vel"]),
             dim=1,
         )
-        obs = torch.cat(
-            (
+        parts = [
                 self.qpos[:, 2:3],
                 quat,
                 self.qvel[:, :6],
@@ -860,19 +1482,41 @@ class LytRobotWarpAmpEnv:
                 ref_ctrl_action,
                 foot_pos - ref_foot_pos,
                 targets["foot_contact"],
-            ),
-            dim=1,
-        )
+        ]
+        if self.cfg.skill_conditioning and self.motion_count > 1:
+            parts.append(
+                torch.nn.functional.one_hot(
+                    self.motion_ids, num_classes=self.motion_count
+                ).to(torch.float32)
+            )
+        obs = torch.cat(parts, dim=1)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0)
         if self.domain_randomization and self.cfg.obs_noise_std > 0.0:
-            obs = obs + float(self.cfg.obs_noise_std) * torch.randn_like(obs)
+            noise_std = self.domain_randomization_scale * float(self.cfg.obs_noise_std)
+            obs = obs + noise_std * torch.randn_like(obs)
         return torch.clamp(obs, -20.0, 20.0)
 
     def amp_observe(self) -> torch.Tensor:
         foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
+        root_height = self.qpos[:, 2]
+        if self.more_terrain_cfg.serial_course:
+            terrain_offset = torch.full_like(
+                root_height, float(self.more_terrain_cfg.course_base_height)
+            )
+            no_offset = torch.zeros_like(terrain_offset)
+            pit_gap = torch.zeros_like(self.motion_ids, dtype=torch.bool)
+            for motion_id, kind in enumerate(self.motion_terrain_kinds):
+                if kind in {"gap", "pit"}:
+                    pit_gap = pit_gap | (self.motion_ids == motion_id)
+            root_height = root_height - torch.where(
+                pit_gap, no_offset, terrain_offset
+            )
+        stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
+        stair_scale = self.motion_stair_height_scale[self.motion_ids]
+        root_height = stair_anchor + (root_height - stair_anchor) / stair_scale
         raw_features = torch.cat(
             (
-                self.qpos[:, 2:3],
+                root_height[:, None],
                 _canonical_quat(self.qpos[:, 3:7]),
                 self.qpos[:, self.robot_qpos_adrs],
                 self.qvel[:, self.robot_qvel_adrs],
@@ -893,14 +1537,114 @@ class LytRobotWarpAmpEnv:
             raise ValueError(f"Expected action shape {(self.num_envs, self.action_dim)}, got {tuple(actions.shape)}")
 
         prev_action = self.last_action.clone()
+        start_x = self.qpos[:, 0].clone()
         commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
         commanded_action = commanded_action * self._startup_action_ramp()
         phase_scale = self._stand_start_progress()
-        self.motion_phase = (
-            self.motion_phase + self.motion.frequency * self.dt * phase_scale
-        ) % self.motion.frame_count
+        frame_counts = self.motion_frame_counts[self.motion_ids].to(torch.float32)
+        next_phase = (
+            self.motion_phase
+            + self.motion_frequencies[self.motion_ids] * self.dt * phase_scale
+        )
+        course_complete = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        course_suffix_complete = torch.zeros_like(course_complete)
+        course_stage_advance = torch.zeros_like(course_complete)
+        incomplete_motion_end_candidate = torch.zeros_like(course_complete)
+        incomplete_motion_required_x = torch.full_like(
+            self.qpos[:, 0], float("inf")
+        )
+        if self.more_terrain_cfg.serial_course:
+            motion_complete = next_phase >= frame_counts - 1.0
+            active_looping = self.motion_loop[self.motion_ids].clone()
+            last_stage = self.course_motion_sequences.shape[1] - 1
+            at_last_stage = self.course_stage_ids >= last_stage
+            reached_finish = self.qpos[:, 0] >= (
+                self.course_finish_x
+                - self.more_terrain_cfg.course_completion_tolerance
+            )
+            course_suffix_complete = (
+                motion_complete
+                & at_last_stage
+                & reached_finish
+            )
+            course_complete = course_suffix_complete & (
+                self.course_start_stage_ids == 0
+            )
+            stage_end_x = self.course_stage_end_x[
+                self.course_variant_ids, self.course_stage_ids
+            ]
+            reached_stage_end = self.qpos[:, 0] >= (
+                stage_end_x - float(self.cfg.terrain_course_stage_tolerance)
+            )
+            # Keep the current action active until the robot has physically
+            # reached its expected course boundary.
+            advance = motion_complete & reached_stage_end & ~at_last_stage
+            course_stage_advance = advance
+            transition_steps = max(0, int(self.cfg.motion_transition_blend_steps))
+            if transition_steps > 0:
+                self.motion_transition_from_ctrl.copy_(
+                    torch.where(
+                        advance[:, None],
+                        self.last_reference_ctrl,
+                        self.motion_transition_from_ctrl,
+                    )
+                )
+                self.motion_transition_steps_left.copy_(
+                    torch.where(
+                        advance,
+                        torch.full_like(
+                            self.motion_transition_steps_left, transition_steps
+                        ),
+                        self.motion_transition_steps_left,
+                    )
+                )
+            incomplete_motion_required_x = torch.where(
+                at_last_stage,
+                torch.full_like(
+                    stage_end_x,
+                    self.course_finish_x
+                    - self.more_terrain_cfg.course_completion_tolerance,
+                ),
+                stage_end_x - float(self.cfg.terrain_course_stage_tolerance),
+            )
+            incomplete_motion_end_candidate = (
+                bool(self.cfg.terminate_incomplete_motion_end)
+                & motion_complete
+                & ~active_looping
+                & ~advance
+                & ~course_suffix_complete
+            )
+            self.course_stage_ids[:] = self.course_stage_ids + advance.to(torch.long)
+            next_motion_ids = self.course_motion_sequences[
+                self.course_variant_ids, self.course_stage_ids
+            ]
+            self.motion_ids[:] = torch.where(advance, next_motion_ids, self.motion_ids)
+            looping = self.motion_loop[self.motion_ids]
+            retry_loop = motion_complete & looping & ~reached_stage_end & ~at_last_stage
+            self.motion_phase[:] = torch.where(
+                advance,
+                torch.zeros_like(next_phase),
+                torch.where(
+                    retry_loop,
+                    torch.remainder(next_phase, frame_counts),
+                    torch.minimum(next_phase, frame_counts - 1.0),
+                ),
+            )
+        else:
+            looping = self.motion_loop[self.motion_ids]
+            self.motion_phase = torch.where(
+                looping,
+                torch.remainder(next_phase, frame_counts),
+                torch.minimum(next_phase, frame_counts - 1.0),
+            )
+            motion_complete = (~looping) & (next_phase >= frame_counts - 1.0)
         targets = self._targets_at_current_phase()
-        base_ctrl = self._reference_base_ctrl(targets["tendon_ctrl"])
+        transitioned_reference_ctrl = self._transition_reference_ctrl(
+            targets["tendon_ctrl"]
+        )
+        base_ctrl = self._reference_base_ctrl(transitioned_reference_ctrl)
         applied_action = commanded_action
         self._update_push_forces()
         push_delay = int(self.cfg.stand_start_push_delay_steps)
@@ -923,12 +1667,35 @@ class LytRobotWarpAmpEnv:
             if not self.domain_randomization or self.max_action_delay_ticks <= 0:
                 applied_action = commanded_action
                 self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
-                self._warp_decimated_step()
+                mechanical_energy, mechanical_energy_invalid = (
+                    self._warp_decimated_step()
+                )
             else:
+                mechanical_energy = torch.zeros(
+                    self.num_envs,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                mechanical_energy_invalid = torch.zeros(
+                    self.num_envs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
                 for _ in range(self.cfg.decimation):
                     applied_action = self._delayed_action(commanded_action)
                     self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
                     self._warp_step()
+                    actuator_power = torch.sum(
+                        torch.abs(self.actuator_force * self.actuator_velocity),
+                        dim=1,
+                    )
+                    mechanical_energy_invalid |= ~torch.isfinite(actuator_power)
+                    mechanical_energy += torch.nan_to_num(
+                        actuator_power,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ) * float(self.cfg.timestep)
 
         self.episode_step += 1
         foot_pos = self._foot_positions_local()
@@ -940,7 +1707,11 @@ class LytRobotWarpAmpEnv:
         rewards, dones, time_outs, components = self._compute_reward_done(
             commanded_action,
             prev_action,
-            float(self.cfg.target_velocity) * phase_scale,
+            (
+                targets["root_lin_vel"][:, 0]
+                if self.cfg.use_reference_velocity
+                else float(self.cfg.target_velocity) * phase_scale
+            ),
             targets,
             foot_pos,
             foot_vel,
@@ -948,11 +1719,117 @@ class LytRobotWarpAmpEnv:
             foot_geom_contact,
             foot_contact,
         )
+        invalid_step = mechanical_energy_invalid | (
+            components["invalid_state"] > 0.5
+        )
+        rewards = torch.where(
+            mechanical_energy_invalid,
+            torch.full_like(rewards, -2.0),
+            rewards,
+        )
+        dones = dones | mechanical_energy_invalid
+        time_outs = time_outs & ~mechanical_energy_invalid
+        for key, value in components.items():
+            components[key] = torch.where(
+                mechanical_energy_invalid,
+                torch.zeros_like(value),
+                value,
+            )
+        components["invalid_state"] = invalid_step.to(torch.float32)
+        components["termination"] = torch.maximum(
+            components["termination"],
+            mechanical_energy_invalid.to(torch.float32),
+        )
+        mechanical_energy = torch.where(
+            invalid_step,
+            torch.zeros_like(mechanical_energy),
+            mechanical_energy,
+        )
+        actuator_power = mechanical_energy / max(self.dt, 1.0e-6)
+        forward_distance = torch.nan_to_num(
+            torch.clamp(self.qpos[:, 0] - start_x, min=0.0),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        cot_distance = torch.clamp(
+            forward_distance,
+            min=max(float(self.cfg.cot_min_forward_speed) * self.dt, 1.0e-6),
+        )
+        specific_cot = torch.nan_to_num(
+            mechanical_energy / (max(self.robot_mass, 1.0e-6) * cot_distance),
+            nan=1.0e6,
+            posinf=1.0e6,
+            neginf=1.0e6,
+        )
+        cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
+        specific_cot_excess = _bounded_specific_cot_excess(
+            specific_cot,
+            cot_limit,
+        )
+        if self.cfg.specific_cot_penalty_coef != 0.0:
+            rewards = rewards - (
+                float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
+            )
+        components.update(
+            {
+                "actuator_power": actuator_power,
+                "mechanical_energy": mechanical_energy,
+                "specific_cot": specific_cot,
+                "specific_cot_excess": specific_cot_excess,
+            }
+        )
+        if self.more_terrain_cfg.serial_course:
+            rewards = rewards + (
+                float(self.cfg.terrain_course_completion_reward)
+                * course_suffix_complete.to(torch.float32)
+                + float(self.cfg.terrain_course_stage_reward)
+                * course_stage_advance.to(torch.float32)
+            )
+            components["course_completion"] = course_suffix_complete.to(torch.float32)
+            components["course_stage_completion"] = course_stage_advance.to(torch.float32)
+        incomplete_motion_end = incomplete_motion_end_candidate & (
+            self.qpos[:, 0] < incomplete_motion_required_x
+        )
+        (
+            progress_speed,
+            insufficient_progress,
+            next_anchor_x,
+            next_anchor_step,
+        ) = _forward_progress_guard(
+            self.qpos[:, 0],
+            self.episode_step,
+            self.forward_progress_anchor_x,
+            self.forward_progress_anchor_step,
+            dt=self.dt,
+            min_speed=float(self.cfg.min_forward_progress_speed),
+            grace_steps=int(self.cfg.forward_progress_grace_steps),
+            window_steps=int(self.cfg.forward_progress_window_steps),
+        )
+        self.forward_progress_anchor_x[:] = next_anchor_x
+        self.forward_progress_anchor_step[:] = next_anchor_step
+        forward_progress_failure = incomplete_motion_end | insufficient_progress
+        rewards = rewards - (
+            float(self.cfg.forward_progress_termination_penalty)
+            * forward_progress_failure.to(torch.float32)
+        )
+        components["forward_progress_window_speed"] = progress_speed
+        components["insufficient_progress"] = insufficient_progress.to(torch.float32)
+        components["incomplete_motion_end"] = incomplete_motion_end.to(torch.float32)
+        successful_motion_end = (
+            course_suffix_complete
+            if self.more_terrain_cfg.serial_course
+            else motion_complete
+        )
+        dones = dones | successful_motion_end | forward_progress_failure
+        time_outs = time_outs | successful_motion_end
         episode_steps = self.episode_step.clone()
         self.last_action[:] = commanded_action
         self.last_foot_pos[:] = foot_pos
         self.last_foot_world_pos[:] = foot_world_pos
 
+        reported_course_stage = self.course_stage_ids.clone()
+        reported_course_start_stage = self.course_start_stage_ids.clone()
         done_ids_np = np.flatnonzero(dones.detach().cpu().numpy())
         if done_ids_np.size > 0:
             self.reset(done_ids_np)
@@ -962,6 +1839,12 @@ class LytRobotWarpAmpEnv:
         info = {key: value for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.to(torch.float32)
+        if self.more_terrain_cfg.serial_course:
+            info["course_complete"] = course_complete.to(torch.float32)
+            info["course_suffix_complete"] = course_suffix_complete.to(torch.float32)
+            info["course_stage"] = reported_course_stage.to(torch.float32)
+            info["course_start_stage"] = reported_course_start_stage.to(torch.float32)
+            info["successes"] = course_complete.to(torch.float32)
         return self.last_obs, rewards, dones.to(torch.float32), info
 
     def _compute_reward_done(
@@ -1012,6 +1895,16 @@ class LytRobotWarpAmpEnv:
         )
 
         height = torch.exp(-((root_height - targets["root_height"]).square()) / (0.09**2))
+        (
+            locomotion_stability,
+            stable_forward_velocity_track,
+            stable_forward_progress,
+        ) = _stability_gated_locomotion_terms(
+            forward_velocity_track,
+            forward_progress,
+            root_orientation,
+            height,
+        )
         joint_pos = self.qpos[:, self.robot_qpos_adrs]
         joint_vel = self.qvel[:, self.robot_qvel_adrs]
         weight_sum = torch.sum(self.joint_reward_weights).clamp_min(1.0e-6)
@@ -1094,8 +1987,8 @@ class LytRobotWarpAmpEnv:
             + 0.75 * height
             + 0.90 * root_orientation
             + 0.90 * root_vel
-            + self.cfg.forward_velocity_reward_coef * forward_velocity_track
-            + self.cfg.forward_progress_reward_coef * forward_progress
+            + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+            + self.cfg.forward_progress_reward_coef * stable_forward_progress
             - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
             - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
             + 1.25 * foot_pos_track
@@ -1120,17 +2013,18 @@ class LytRobotWarpAmpEnv:
             & torch.isfinite(self.qvel).all(dim=1)
             & torch.isfinite(self.ctrl).all(dim=1)
         )
+        min_root_height = targets["root_height"] + (
+            float(self.cfg.fall_height) - self.nominal_root_height
+        )
+        max_root_height = targets["root_height"] + (
+            float(self.cfg.max_height) - self.nominal_root_height
+        )
         fallen = (
-            (root_height < self.cfg.fall_height)
-            | (root_height > self.cfg.max_height)
+            (root_height < min_root_height)
+            | (root_height > max_root_height)
             | (up_z < self.cfg.min_upright_z)
         )
-        timed_out = self.episode_step >= self.episode_timeout_step
-        dones = bad_state | fallen | timed_out
-        termination = bad_state | fallen
-        reward = reward - torch.where(bad_state | fallen, torch.full_like(reward, 2.0), torch.zeros_like(reward))
-
-        return reward, dones, timed_out, {
+        components = {
             "root_height_value": root_height,
             "reference_root_height_value": targets["root_height"],
             "root_vel": root_vel,
@@ -1138,9 +2032,11 @@ class LytRobotWarpAmpEnv:
             "forward_velocity_error": forward_velocity_error,
             "forward_velocity_track": forward_velocity_track,
             "forward_progress": forward_progress,
+            "locomotion_stability": locomotion_stability,
+            "stable_forward_velocity_track": stable_forward_velocity_track,
+            "stable_forward_progress": stable_forward_progress,
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
-            "termination": termination.to(torch.float32),
             "root_orientation": root_orientation,
             "height": height,
             "pose_track": pose_track,
@@ -1173,6 +2069,18 @@ class LytRobotWarpAmpEnv:
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
         }
+        reward, bad_state, components = _sanitize_reward_outputs(
+            reward,
+            bad_state,
+            fallen,
+            components,
+            fall_penalty=self.cfg.fall_penalty,
+        )
+        timed_out = self.episode_step >= self.episode_timeout_step
+        dones = bad_state | fallen | timed_out
+        termination = bad_state | fallen
+        components["termination"] = termination.to(torch.float32)
+        return reward, dones, timed_out, components
 
     def _side_foot_tracks(
         self,

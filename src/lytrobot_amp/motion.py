@@ -88,6 +88,7 @@ class MotionState:
     qpos: np.ndarray
     qvel: np.ndarray
     indices: np.ndarray
+    motion_ids: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,38 @@ def _normalize_quat(quat: np.ndarray) -> np.ndarray:
     return quat / np.maximum(norm, 1.0e-6)
 
 
+def _repair_loop_root_translation_velocity(
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    frequency: float,
+) -> np.ndarray:
+    """Repair the horizontal root velocity at a translating loop seam.
+
+    Older generated walking references differentiated the last and first root
+    positions as if they occupied the same cycle.  Because walking advances in
+    X, that produced roughly -20 m/s at both seam frames.  Recomputing the two
+    boundary samples with the cycle displacement keeps old archives usable.
+    """
+
+    repaired = np.asarray(qvel, dtype=np.float32).copy()
+    positions = np.asarray(qpos, dtype=np.float64)
+    if positions.ndim != 2 or len(positions) < 3 or repaired.shape[1] < 2:
+        return repaired
+
+    root_steps = np.diff(positions[:, :2], axis=0)
+    cycle_translation = (
+        positions[-1, :2] - positions[0, :2] + np.median(root_steps, axis=0)
+    )
+    scale = 0.5 * float(frequency)
+    repaired[0, :2] = (
+        positions[1, :2] - (positions[-1, :2] - cycle_translation)
+    ) * scale
+    repaired[-1, :2] = (
+        positions[0, :2] + cycle_translation - positions[-2, :2]
+    ) * scale
+    return repaired
+
+
 class MotionReference:
     """Maps the walking npz onto the tendon-driven MuJoCo robot.
 
@@ -146,6 +179,17 @@ class MotionReference:
         self.source_qpos = np.asarray(archive["qpos"], dtype=np.float32)
         self.source_qvel = np.asarray(archive["qvel"], dtype=np.float32)
         self.frequency = float(np.asarray(archive["frequency"]).item())
+        self.source_loop = (
+            bool(np.asarray(archive["loop"]).item())
+            if "loop" in archive.files
+            else False
+        )
+        if self.source_loop:
+            self.source_qvel = _repair_loop_root_translation_velocity(
+                self.source_qpos,
+                self.source_qvel,
+                self.frequency,
+            )
         self.frame_count = int(self.source_qpos.shape[0])
         self.zero_root_xy = zero_root_xy
         self.source_foot_contact: np.ndarray | None = None
@@ -466,3 +510,279 @@ class MotionReference:
             if np.any(mirror):
                 features[mirror] = self.mirrored_reference_features[indices[mirror]]
         return features
+
+
+class MotionLibrary:
+    """Balanced retargeted clips for a single skill-conditioned AMP policy."""
+
+    def __init__(
+        self,
+        motion_files: Sequence[str | Path],
+        model: mujoco.MjModel,
+        *,
+        actuator_ids: Sequence[int] | np.ndarray | None = None,
+        motion_weights: Sequence[float] | None = None,
+        motion_names: Sequence[str] | None = None,
+        motion_loop: Sequence[bool] | None = None,
+    ) -> None:
+        paths = tuple(Path(path).expanduser().resolve() for path in motion_files)
+        if not paths:
+            raise ValueError("MotionLibrary requires at least one clip.")
+        self.motions = tuple(
+            MotionReference(path, model, actuator_ids=actuator_ids) for path in paths
+        )
+        first = self.motions[0]
+        for motion in self.motions[1:]:
+            if motion.common_joint_names != first.common_joint_names:
+                raise ValueError("All motion clips must map the same robot joints.")
+            if motion.feature_dim != first.feature_dim:
+                raise ValueError("All motion clips must have the same AMP feature dimension.")
+
+        self.motion_files = paths
+        self.motion_count = len(paths)
+        self.motion_names = tuple(
+            motion_names if motion_names is not None else [path.stem for path in paths]
+        )
+        if len(self.motion_names) != self.motion_count:
+            raise ValueError("motion_names length must match motion_files.")
+        self.motion_loop = np.asarray(
+            motion_loop if motion_loop is not None else [True] * self.motion_count,
+            dtype=bool,
+        )
+        if self.motion_loop.shape != (self.motion_count,):
+            raise ValueError("motion_loop length must match motion_files.")
+        weights = np.asarray(
+            motion_weights if motion_weights is not None else np.ones(self.motion_count),
+            dtype=np.float64,
+        )
+        if (
+            weights.shape != (self.motion_count,)
+            or np.any(weights < 0.0)
+            or not np.any(weights > 0.0)
+        ):
+            raise ValueError("motion_weights must be non-negative and contain a positive value.")
+        self.motion_weights = weights / weights.sum()
+
+        self.model = model
+        self.model_qpos0 = first.model_qpos0
+        self.common_joint_names = first.common_joint_names
+        self.robot_qpos_adrs = first.robot_qpos_adrs
+        self.robot_qvel_adrs = first.robot_qvel_adrs
+        self.root_body_id = first.root_body_id
+        self.contact_geom_ids = first.contact_geom_ids
+        self.actuator_ids = first.actuator_ids
+        self.actuator_tendon_ids = first.actuator_tendon_ids
+        self.foot_pos_dim = first.foot_pos_dim
+        self.contact_dim = first.contact_dim
+        self.feature_dim = first.feature_dim
+        self.frame_counts = np.asarray(
+            [motion.frame_count for motion in self.motions], dtype=np.int32
+        )
+        self.frequencies = np.asarray(
+            [motion.frequency for motion in self.motions], dtype=np.float32
+        )
+        self.max_frame_count = int(self.frame_counts.max())
+
+        raw_features = [
+            motion._features_from_parts(
+                motion.reference_root_height[:, None],
+                motion.reference_root_quat,
+                motion.reference_joint_pos,
+                motion.reference_joint_vel,
+                motion.reference_foot_pos.reshape(motion.frame_count, -1),
+            )
+            for motion in self.motions
+        ]
+        all_raw = np.concatenate(raw_features, axis=0)
+        self.feature_mean = all_raw.mean(axis=0).astype(np.float32)
+        self.feature_std = np.maximum(
+            all_raw.std(axis=0), first._feature_scale_floor()
+        ).astype(np.float32)
+        self.reference_features = tuple(
+            self._normalize_features(raw) for raw in raw_features
+        )
+        self.mirrored_reference_features = tuple(
+            self._normalize_features(motion._mirror_raw_features(raw))
+            for motion, raw in zip(self.motions, raw_features, strict=True)
+        )
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.frame_counts[0])
+
+    @property
+    def frequency(self) -> float:
+        return float(self.frequencies[0])
+
+    @property
+    def motion_file(self) -> Path:
+        return self.motion_files[0]
+
+    def _normalize_features(self, features: np.ndarray) -> np.ndarray:
+        normalized = (features - self.feature_mean) / self.feature_std
+        normalized = np.nan_to_num(normalized, nan=0.0, posinf=10.0, neginf=-10.0)
+        return np.clip(normalized, -10.0, 10.0).astype(np.float32)
+
+    def foot_positions_local_from_data(self, data: mujoco.MjData) -> np.ndarray:
+        return self.motions[0].foot_positions_local_from_data(data)
+
+    def sample_motion_ids(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> np.ndarray:
+        return rng.choice(
+            self.motion_count, size=batch_size, p=self.motion_weights
+        ).astype(np.int32)
+
+    def sample_states(
+        self,
+        batch_size: int,
+        rng: np.random.Generator,
+        motion_ids: np.ndarray | None = None,
+    ) -> MotionState:
+        ids = (
+            self.sample_motion_ids(batch_size, rng)
+            if motion_ids is None
+            else np.asarray(motion_ids, dtype=np.int32)
+        )
+        if ids.shape != (batch_size,):
+            raise ValueError(f"Expected motion_ids shape {(batch_size,)}, got {ids.shape}.")
+        indices = np.asarray(
+            [rng.integers(0, self.frame_counts[motion_id]) for motion_id in ids],
+            dtype=np.int32,
+        )
+        qpos = np.stack(
+            [
+                self.motions[motion_id].reference_qpos[index]
+                for motion_id, index in zip(ids, indices, strict=True)
+            ]
+        )
+        qvel = np.stack(
+            [
+                self.motions[motion_id].reference_qvel[index]
+                for motion_id, index in zip(ids, indices, strict=True)
+            ]
+        )
+        return MotionState(qpos=qpos, qvel=qvel, indices=indices, motion_ids=ids)
+
+    def targets_at_phase(
+        self,
+        phase: np.ndarray,
+        motion_ids: np.ndarray | None = None,
+    ) -> MotionTargets:
+        phase_arr = np.asarray(phase, dtype=np.float32)
+        ids = (
+            np.zeros(len(phase_arr), dtype=np.int32)
+            if motion_ids is None
+            else np.asarray(motion_ids, dtype=np.int32)
+        )
+        if ids.shape != phase_arr.shape:
+            raise ValueError("motion_ids must have the same shape as phase.")
+        targets = []
+        for motion_id, value in zip(ids, phase_arr, strict=True):
+            frame_count = self.frame_counts[motion_id]
+            bounded = (
+                np.mod(value, frame_count)
+                if self.motion_loop[motion_id]
+                else np.clip(value, 0.0, frame_count - 1.0)
+            )
+            targets.append(
+                self.motions[motion_id].targets_at_phase(
+                    np.asarray([bounded], dtype=np.float32)
+                )
+            )
+
+        def join(name: str) -> np.ndarray:
+            return np.concatenate([getattr(target, name) for target in targets], axis=0)
+
+        return MotionTargets(
+            root_height=join("root_height"),
+            root_quat=join("root_quat"),
+            root_lin_vel=join("root_lin_vel"),
+            root_ang_vel=join("root_ang_vel"),
+            joint_pos=join("joint_pos"),
+            joint_vel=join("joint_vel"),
+            tendon_ctrl=join("tendon_ctrl"),
+            foot_pos=join("foot_pos"),
+            foot_vel=join("foot_vel"),
+            foot_contact=join("foot_contact"),
+        )
+
+    def features_from_state(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        foot_pos: np.ndarray | None = None,
+    ) -> np.ndarray:
+        qpos_arr = np.asarray(qpos, dtype=np.float32)
+        qvel_arr = np.asarray(qvel, dtype=np.float32)
+        single = qpos_arr.ndim == 1
+        if single:
+            qpos_arr = qpos_arr[None, :]
+            qvel_arr = qvel_arr[None, :]
+        batch_size = len(qpos_arr)
+        foot = (
+            np.zeros((batch_size, self.foot_pos_dim), dtype=np.float32)
+            if foot_pos is None
+            else np.asarray(foot_pos, dtype=np.float32).reshape(batch_size, -1)
+        )
+        raw = self.motions[0]._features_from_parts(
+            qpos_arr[:, 2:3],
+            qpos_arr[:, 3:7],
+            qpos_arr[:, self.robot_qpos_adrs],
+            qvel_arr[:, self.robot_qvel_adrs],
+            foot,
+        )
+        features = self._normalize_features(raw)
+        return features[0] if single else features
+
+    def sample_features(
+        self,
+        batch_size: int,
+        rng: np.random.Generator,
+        mirror_prob: float = 0.5,
+    ) -> np.ndarray:
+        motion_ids = self.sample_motion_ids(batch_size, rng)
+        output = np.empty((batch_size, self.feature_dim), dtype=np.float32)
+        prob = float(np.clip(mirror_prob, 0.0, 1.0))
+        for row, motion_id in enumerate(motion_ids):
+            frame = int(rng.integers(0, self.frame_counts[motion_id]))
+            source = (
+                self.mirrored_reference_features[motion_id]
+                if rng.random() < prob
+                else self.reference_features[motion_id]
+            )
+            output[row] = source[frame]
+        return output
+
+    def packed(self, attribute: str) -> np.ndarray:
+        """Pad a per-frame MotionReference attribute for GPU indexed lookup."""
+
+        values = [np.asarray(getattr(motion, attribute)) for motion in self.motions]
+        shape = (self.motion_count, self.max_frame_count) + values[0].shape[1:]
+        result = np.empty(shape, dtype=values[0].dtype)
+        for motion_id, value in enumerate(values):
+            result[motion_id, : len(value)] = value
+            result[motion_id, len(value) :] = value[-1]
+        return result
+
+
+def load_motion_library(
+    motion_files: Sequence[str | Path],
+    model: mujoco.MjModel,
+    *,
+    actuator_ids: Sequence[int] | np.ndarray | None = None,
+    motion_weights: Sequence[float] | None = None,
+    motion_names: Sequence[str] | None = None,
+    motion_loop: Sequence[bool] | None = None,
+) -> MotionReference | MotionLibrary:
+    files = tuple(motion_files)
+    if len(files) == 1:
+        return MotionReference(files[0], model, actuator_ids=actuator_ids)
+    return MotionLibrary(
+        files,
+        model,
+        actuator_ids=actuator_ids,
+        motion_weights=motion_weights,
+        motion_names=motion_names,
+        motion_loop=motion_loop,
+    )

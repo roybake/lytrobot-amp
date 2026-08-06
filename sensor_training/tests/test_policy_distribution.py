@@ -64,6 +64,13 @@ class SensorPolicyDistributionTests(unittest.TestCase):
         self.assertEqual(cfg.target_kl_stop_multiplier, 2.0)
         self.assertTrue(cfg.adaptive_lr)
         self.assertEqual(cfg.max_learning_rate, 3.0e-4)
+        self.assertEqual(cfg.recurrent_hidden_dim, 128)
+        self.assertEqual(cfg.num_experts, 4)
+        self.assertEqual(cfg.residual_scale, 0.35)
+        self.assertGreater(cfg.gate_change_coef, 0.0)
+        self.assertGreater(cfg.expert_load_balance_coef, 0.0)
+        self.assertGreater(cfg.residual_l2_coef, 0.0)
+        self.assertGreater(cfg.privileged_context_loss_coef, 0.0)
 
 
 if __name__ == "__main__":
