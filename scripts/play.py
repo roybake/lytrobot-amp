@@ -16,8 +16,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+for path in (REPO_ROOT, SRC_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import torch
 import mujoco
@@ -25,6 +26,7 @@ import numpy as np
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.networks import ActorCritic
+from lytrobot_amp.terrain import load_multi_robot_model
 
 
 class OnnxPolicy:
@@ -37,8 +39,12 @@ class OnnxPolicy:
             str(Path(path).expanduser()),
             providers=("CPUExecutionProvider",),
         )
-        self.input = self.session.get_inputs()[0]
-        self.output = self.session.get_outputs()[0]
+        self.inputs = {value.name: value for value in self.session.get_inputs()}
+        self.outputs = {value.name: value for value in self.session.get_outputs()}
+        self.input = self.inputs["observation"]
+        self.output = self.outputs["action"]
+        self.recurrent = "recurrent_state" in self.inputs
+        self.recurrent_state: np.ndarray | None = None
 
     def validate_dimensions(self, obs_dim: int, action_dim: int) -> None:
         input_dim = self.input.shape[-1]
@@ -48,9 +54,33 @@ class OnnxPolicy:
         if isinstance(output_dim, int) and output_dim != action_dim:
             raise ValueError(f"ONNX action_dim={output_dim} does not match environment action_dim={action_dim}.")
 
-    def act_inference(self, observation: np.ndarray) -> np.ndarray:
+    def act_inference(
+        self,
+        observation: np.ndarray,
+        episode_start: np.ndarray | None = None,
+    ) -> np.ndarray:
         observation = np.asarray(observation, dtype=np.float32)
-        return self.session.run((self.output.name,), {self.input.name: observation})[0]
+        feeds = {self.input.name: observation}
+        output_names = (self.output.name,)
+        if self.recurrent:
+            hidden_dim = self.inputs["recurrent_state"].shape[-1]
+            if not isinstance(hidden_dim, int):
+                raise ValueError("ONNX recurrent_state has no fixed hidden dimension.")
+            if self.recurrent_state is None or self.recurrent_state.shape[0] != observation.shape[0]:
+                self.recurrent_state = np.zeros(
+                    (observation.shape[0], hidden_dim),
+                    dtype=np.float32,
+                )
+                episode_start = np.ones(observation.shape[0], dtype=np.float32)
+            if episode_start is None:
+                episode_start = np.zeros(observation.shape[0], dtype=np.float32)
+            feeds["recurrent_state"] = self.recurrent_state
+            feeds["episode_start"] = np.asarray(episode_start, dtype=np.float32)
+            output_names = (self.output.name, "next_recurrent_state")
+        outputs = self.session.run(output_names, feeds)
+        if self.recurrent:
+            self.recurrent_state = outputs[1]
+        return outputs[0]
 
 
 def load_onnx_metadata(path: str | Path) -> dict:
@@ -85,7 +115,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--viewer", action="store_true")
-    parser.add_argument("--stage", default="auto", choices=("auto", "stage1", "stage2"))
+    parser.add_argument(
+        "--num-robots",
+        type=int,
+        default=None,
+        help="Robots shown simultaneously; multimotion playback defaults to 3.",
+    )
+    parser.add_argument(
+        "--serial-terrain-course",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use randomized all-terrain serial courses (enabled by default for multimotion).",
+    )
+    parser.add_argument(
+        "--stage",
+        default="auto",
+        choices=("auto", "stage1", "stage2", "multimotion"),
+        help="Checkpoint group used for recording output; auto infers it from the path and metadata.",
+    )
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--stand-start-prob", type=float, default=None)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
@@ -106,7 +153,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
+def make_env_cfg(
+    args: argparse.Namespace,
+    checkpoint: dict,
+    stage: str | None = None,
+) -> LytRobotEnvCfg:
     cfg = LytRobotEnvCfg(
         model_xml=args.model_xml,
         motion_file=args.motion_file,
@@ -123,10 +174,31 @@ def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
                 setattr(cfg, key, value)
     cfg.model_xml = args.model_xml
     cfg.motion_file = args.motion_file
-    cfg.num_envs = 1
+    resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
+    robot_count = args.num_robots
+    if robot_count is None:
+        robot_count = 3 if resolved_stage == "multimotion" else 1
+    if robot_count < 1:
+        raise ValueError("--num-robots must be positive.")
+    cfg.num_envs = int(robot_count)
     cfg.seed = int(args.seed)
     cfg.target_velocity = args.target_velocity
     cfg.reset_noise_scale = 0.0
+    use_serial_course = (
+        resolved_stage == "multimotion"
+        if args.serial_terrain_course is None
+        else bool(args.serial_terrain_course)
+    )
+    # Honor an explicit --no-serial-terrain-course even when the checkpoint
+    # was trained with a serial course.  Previously the copied checkpoint
+    # value stayed True because only the enabling branch assigned this field.
+    cfg.serial_terrain_course = use_serial_course
+    if use_serial_course:
+        cfg.terrain_course_variants = max(int(robot_count), 1)
+        cfg.terrain_course_random_assignment = False
+        # Playback is a strict full-route evaluation, never a curriculum reset.
+        cfg.terrain_course_random_start_prob = 0.0
+        cfg.stand_start_prob = 0.0
     if args.stand_start_prob is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
     if args.stand_start_phase_delay_steps is not None:
@@ -147,16 +219,22 @@ def make_env_cfg(args: argparse.Namespace, checkpoint: dict) -> LytRobotEnvCfg:
 
 
 def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -> str:
-    if stage_arg in {"stage1", "stage2"}:
+    if stage_arg in {"stage1", "stage2", "multimotion"}:
         return stage_arg
     parts = set(Path(checkpoint_path).expanduser().parts)
+    if "multimotion" in parts:
+        return "multimotion"
     if "stage2" in parts:
         return "stage2"
     if "stage1" in parts:
         return "stage1"
     env_cfg = checkpoint.get("env_config", {})
-    if isinstance(env_cfg, dict) and bool(env_cfg.get("domain_randomization", False)):
-        return "stage2"
+    if isinstance(env_cfg, dict):
+        motion_files = env_cfg.get("motion_files", ())
+        if isinstance(motion_files, (list, tuple)) and len(motion_files) > 1:
+            return "multimotion"
+        if bool(env_cfg.get("domain_randomization", False)):
+            return "stage2"
     return "stage1"
 
 
@@ -200,23 +278,41 @@ def configure_tracking_camera(
     *,
     mode: str = "follow",
 ) -> None:
-    pelvis_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    pelvis_ids = playback_pelvis_body_ids(model)
+    pelvis_body_id = pelvis_ids[0] if len(pelvis_ids) == 1 else -1
     if mode == "tracking" and pelvis_body_id >= 0:
         camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         camera.trackbodyid = pelvis_body_id
     else:
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    camera.distance = 2.8
-    camera.azimuth = 90.0
-    camera.elevation = -12.0
+    if len(pelvis_ids) > 1:
+        camera.distance = max(8.0, 4.0 * len(pelvis_ids))
+        camera.azimuth = 125.0
+        camera.elevation = -24.0
+    else:
+        camera.distance = 2.8
+        camera.azimuth = 90.0
+        camera.elevation = -12.0
     if data is not None and mode != "free":
         update_follow_camera(model, camera, data, mode=mode)
 
 
+def playback_pelvis_body_ids(model: mujoco.MjModel) -> list[int]:
+    direct = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    if direct >= 0:
+        return [int(direct)]
+    result: list[int] = []
+    for body_id in range(model.nbody):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if re.fullmatch(r"robot_\d+_pelvis", name):
+            result.append(body_id)
+    return result
+
+
 def pelvis_camera_target(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray | None:
-    pelvis_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
-    if pelvis_body_id >= 0:
-        target = data.xpos[pelvis_body_id].copy()
+    pelvis_ids = playback_pelvis_body_ids(model)
+    if pelvis_ids:
+        target = np.mean(np.asarray(data.xpos[pelvis_ids]), axis=0)
         target[2] += 0.12
         return target
     if data.qpos.size >= 3:
@@ -238,6 +334,25 @@ def update_follow_camera(
     target = pelvis_camera_target(model, data)
     if target is not None:
         camera.lookat[:] = target
+
+
+def sync_multi_robot_state(
+    display_model: mujoco.MjModel,
+    display_data: mujoco.MjData,
+    env: LytRobotAmpEnv,
+) -> None:
+    """Mirror independent environment states into the display-only scene."""
+
+    block = int(env.model.nq)
+    expected = block * env.num_envs
+    if display_model.nq != expected:
+        raise ValueError(
+            f"Display model nq={display_model.nq} does not match {env.num_envs}x{block}."
+        )
+    for env_id, source in enumerate(env.datas):
+        start = env_id * block
+        display_data.qpos[start : start + block] = source.qpos
+    mujoco.mj_forward(display_model, display_data)
 
 
 class MujocoVideoRecorder:
@@ -348,21 +463,58 @@ def main() -> None:
     else:
         raise ValueError("--checkpoint must be a .pt or .onnx model file.")
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
+    stage = infer_stage(args.checkpoint, checkpoint, args.stage)
 
-    env = LytRobotAmpEnv(make_env_cfg(args, checkpoint))
+    env_cfg = make_env_cfg(args, checkpoint, stage)
+    if env_cfg.serial_terrain_course and not (
+        env_cfg.forward_velocity_reward_coef > 0.0
+        or env_cfg.forward_progress_reward_coef > 0.0
+        or env_cfg.forward_velocity_deficit_penalty_coef > 0.0
+    ):
+        print(
+            "[WARN] This checkpoint was trained without an explicit forward-course "
+            "objective and may stand in place. It must be fine-tuned or retrained "
+            "with the corrected multimotion defaults."
+        )
+    env = LytRobotAmpEnv(env_cfg)
+    sensor_architecture = checkpoint.get("sensor_policy_architecture", {})
+    recurrent_sensor_policy = bool(sensor_architecture.get("recurrent", False))
     if is_onnx:
         policy = OnnxPolicy(checkpoint_path)
         policy.validate_dimensions(env.obs_dim, env.action_dim)
+        recurrent_sensor_policy = policy.recurrent
+        recurrent_state = None
     else:
-        policy = ActorCritic(
-            obs_dim=env.obs_dim,
-            action_dim=env.action_dim,
-            actor_hidden_dims=tuple(ppo_cfg.get("actor_hidden_dims", (256, 128))),
-            critic_hidden_dims=tuple(ppo_cfg.get("critic_hidden_dims", (256, 128))),
-            init_std=float(ppo_cfg.get("init_std", 0.8)),
-            min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
-            max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
-        ).to(args.device)
+        if recurrent_sensor_policy:
+            from sensor_training.networks import SensorActorCritic
+
+            policy = SensorActorCritic(
+                obs_dim=env.obs_dim,
+                action_dim=env.action_dim,
+                actor_hidden_dims=tuple(ppo_cfg.get("actor_hidden_dims", (256, 128))),
+                critic_hidden_dims=tuple(ppo_cfg.get("critic_hidden_dims", (256, 128))),
+                init_std=float(ppo_cfg.get("init_std", 0.8)),
+                min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
+                max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
+                sensor_frame_dim=int(sensor_architecture["sensor_frame_dim"]),
+                recurrent_hidden_dim=int(sensor_architecture["recurrent_hidden_dim"]),
+                num_experts=int(sensor_architecture["num_experts"]),
+                gate_hidden_dims=tuple(sensor_architecture["gate_hidden_dims"]),
+                expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),
+                residual_scale=float(sensor_architecture["residual_scale"]),
+            ).to(args.device)
+            recurrent_state = policy.initial_state(env.num_envs)
+        else:
+            policy = ActorCritic(
+                obs_dim=env.obs_dim,
+                action_dim=env.action_dim,
+                actor_hidden_dims=tuple(ppo_cfg.get("actor_hidden_dims", (256, 128))),
+                critic_hidden_dims=tuple(ppo_cfg.get("critic_hidden_dims", (256, 128))),
+                init_std=float(ppo_cfg.get("init_std", 0.8)),
+                min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
+                max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
+            ).to(args.device)
+            recurrent_state = None
         missing, unexpected = policy.load_state_dict(checkpoint["actor_critic"], strict=False)
         if unexpected:
             print(f"[WARN] ignored unexpected actor_critic checkpoint keys: {unexpected}")
@@ -372,22 +524,37 @@ def main() -> None:
         policy.eval()
     print(
         f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
-        f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode}"
+        f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode} "
+        f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course}"
     )
+    if env.cfg.serial_terrain_course:
+        for index, order in enumerate(env.more_terrain_cfg.normalized_course_orders):
+            print(f"[COURSE {index + 1}] {' -> '.join(order)}")
 
     obs = env.reset()
+    episode_start = np.ones(env.num_envs, dtype=np.float32)
     viewer = None
     recorder = None
+    display_model = env.model
+    display_data = env.datas[0]
+    if env.num_envs > 1 and args.viewer:
+        display_model = load_multi_robot_model(
+            env_cfg.model_xml,
+            env.num_envs,
+            env.stair_cfg,
+            env.more_terrain_cfg,
+        )
+        display_data = mujoco.MjData(display_model)
+        sync_multi_robot_state(display_model, display_data, env)
     if args.viewer:
-        import mujoco.viewer
+        from mujoco import viewer as mujoco_viewer
 
-        viewer = mujoco.viewer.launch_passive(env.model, env.datas[0])
-        stage = infer_stage(args.checkpoint, checkpoint, args.stage)
+        viewer = mujoco_viewer.launch_passive(display_model, display_data)
         record_path = checkpoint_recording_path(args.checkpoint, checkpoint, args.record_dir, stage)
         record_fps = args.record_fps if args.record_fps > 0.0 else 1.0 / max(env.dt, 1.0e-6)
         recorder = MujocoVideoRecorder(
-            env.model,
-            env.datas[0],
+            display_model,
+            display_data,
             record_path,
             width=args.record_width,
             height=args.record_height,
@@ -396,32 +563,51 @@ def main() -> None:
             camera_mode=args.camera_mode,
         )
         print(f"[RECORD] saving {record_path}")
-        configure_tracking_camera(env.model, viewer.cam, env.datas[0], mode=args.camera_mode)
+        configure_tracking_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
         viewer.sync()
         recorder.write_frame(getattr(viewer, "cam", None))
 
     rewards: list[float] = []
+    forward_velocities: list[float] = []
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
             if is_onnx:
-                action = policy.act_inference(obs)
+                action = policy.act_inference(obs, episode_start=episode_start)
             else:
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
-                action = policy.act_inference(obs_tensor).cpu().numpy()
+                if recurrent_sensor_policy:
+                    start_tensor = torch.as_tensor(
+                        episode_start,
+                        dtype=torch.float32,
+                        device=args.device,
+                    )
+                    action_tensor, recurrent_state = policy.act_inference_recurrent(
+                        obs_tensor,
+                        recurrent_state,
+                        start_tensor,
+                    )
+                    action = action_tensor.cpu().numpy()
+                else:
+                    action = policy.act_inference(obs_tensor).cpu().numpy()
             obs, reward, done, _info = env.step(action)
-            rewards.append(float(reward[0]))
+            episode_start = np.asarray(done, dtype=np.float32)
+            rewards.extend(float(value) for value in reward)
+            if "forward_velocity" in _info:
+                forward_velocities.extend(
+                    float(value) for value in _info["forward_velocity"]
+                )
             step_count += 1
             if viewer is not None:
                 if not viewer.is_running():
                     break
-                update_follow_camera(env.model, viewer.cam, env.datas[0], mode=args.camera_mode)
+                if env.num_envs > 1:
+                    sync_multi_robot_state(display_model, display_data, env)
+                update_follow_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
                 viewer.sync()
                 if recorder is not None:
                     recorder.write_frame(getattr(viewer, "cam", None))
                 time.sleep(env.dt)
-            if bool(done[0]):
-                obs = env.reset()
     finally:
         if recorder is not None:
             recorder.close()
@@ -431,7 +617,14 @@ def main() -> None:
         env.close()
 
     mean_reward = sum(rewards) / max(len(rewards), 1)
-    print(f"[PLAY] steps={len(rewards)} mean_reward={mean_reward:.4f}")
+    mean_forward_velocity = sum(forward_velocities) / max(
+        len(forward_velocities), 1
+    )
+    print(
+        f"[PLAY] policy_steps={step_count} robot_samples={len(rewards)} "
+        f"mean_reward={mean_reward:.4f} "
+        f"mean_forward_velocity={mean_forward_velocity:.4f}m/s"
+    )
 
 
 if __name__ == "__main__":

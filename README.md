@@ -8,6 +8,61 @@
 
 所有训练统一使用 14 个肌腱位置执行器，策略动作固定为 14 维位置目标修正量。
 
+## 直线全地形多动作训练
+
+当前训练策略按要求暂不训练转身，只使用 walk、rough、pit、gap、stair_up、
+stair_down 六种参考动作，连续通过 MoRE 风格不平路、沟坑、间隙、坡道和楼梯。
+左/右转参考文件仍保留给后续独立转身课程使用，不再拼入直线地形路线：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/train_multimotion.py \
+  --num-envs 4096 \
+  --max-iterations 30000
+```
+
+该入口已内置 4096 环境配置：每轮 24 步、98,304 条 transition，PPO 使用 8 个
+minibatch（每个 12,288 条），AMP 每轮执行 2 次 4096 样本更新。
+
+若从头训练，先用 `scripts/train_multimotion_walk.py` 完成兼容多动作网络布局的平地
+稳定预训练，再把该 checkpoint 传给上面的完整课程入口；具体命令和晋级指标见
+[`multimotion/README.md`](multimotion/README.md)。
+旧的八动作（含 turn_left/turn_right）checkpoint 使用 8 维技能条件，不能直接加载到
+当前六动作策略；需要从六动作平地 warmup 新开训练。
+
+多动作训练的 checkpoint、ONNX、指标和 W&B 文件统一保存在
+`logs/multimotion/<月-日-时:分:秒>/`，每次启动自动创建新的时间目录。
+每个训练机器人面前都是包含 rough、pit、gap、6°上/下坡和 stairs 的完整直线串联路线；启动时预生成
+多种随机地形顺序，episode 会随机分配路线并连续执行全部动作/地形段，走完整条路线
+后才成功重置。默认前 5000 轮全部从路线入口训练，随后用 10000 轮把随机后续阶段
+reset 的概率线性提高到 80%，避免尚未学会平地稳定行走时就被直接投放到困难地形；
+成功率始终只统计从路线入口开始并完整走到终点的 episode。
+每次新 checkpoint 的 `.pt` 和 `.onnx` 都成功写入后，会自动删除该时间目录中
+旧的 `model_*` 权重；正常训练结束后只保留 `model_final.pt` 和
+`model_final.onnx`。
+
+可视化测试 `model_26000.pt`（打开 viewer 后会同步录屏）：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/play.py \
+  --checkpoint logs/multimotion/07-30-11:52:12/model_26000.pt \
+  --stage multimotion \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+录像默认保存为
+`recording/multimotion/07-30-11-52-12-26000.mp4`；重复测试会追加编号，
+不会覆盖已有录像。多动作测试默认同屏显示 3 个机器人，每个机器人使用一条独立的
+随机顺序完整路线；可用 `--num-robots` 调整数量，用 `--seed` 复现路线顺序。
+
+动作数据来源、重定向复现、阶梯尺寸、Stage2 命令和实现说明见
+[`multimotion/README.md`](multimotion/README.md)。
+仅依赖 IMU 与肌腱长度实现跨地形过渡的论文选型、训练期特权监督和部署边界见
+[`docs/proprioceptive_terrain_transition.md`](docs/proprioceptive_terrain_transition.md)。
+
 ## 代码结构
 
 ```text
@@ -63,6 +118,17 @@ uv run python sensor_training/train_stage1.py
 
 蹲起
 uv run python squat_training/train_stage1.py
+
+多动作
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/train_multimotion.py --max-iterations 30000
+
+uv run python scripts/train_multimotion.py \
+  --resume-checkpoint logs/multimotion_walk_warmup/<运行目录>/model_final.pt \
+  --resume-reset-progress \
+  --resume-reset-optimizer \
+  --num-envs 4096 \
+  --max-iterations 30000
 ```
 
 第二阶段是独立训练入口，在第一阶段基础配置上启用领域随机化，默认同样开启 wandb，权重写入 `logs/stage2/<run>/`：
@@ -82,7 +148,7 @@ uv run python sensor_training/train_stage2.py \
   --stage1-checkpoint logs/squat_sensor_policy/stage1/07-17-08:46:52/model_final.pt
 ```
 
-`--stage1-checkpoint` 用来指定接着哪个第一阶段权重模型训练，例如 `model_1000.pt` 或 `model_final.pt`。它会加载模型和优化器状态，但把第二阶段的 iteration 与 `global_step` 从 0 重新计数，因此第一阶段已经达到 30000 iteration 时仍可直接开始第二阶段。也可以使用等价别名 `--stage1-model`。如果不传这个参数，第二阶段会从头训练；如果需要恢复第二阶段自身的中断训练，也可以继续使用底层参数 `--resume-checkpoint logs/stage2/<run>/model_<iter>.pt`，此时会保留第二阶段已有的训练进度。
+`--stage1-checkpoint` 用来指定第一阶段权重，例如 `model_1000.pt` 或 `model_final.pt`，并把第二阶段的 iteration 与 `global_step` 从 0 重新计数。蹲起 Stage2 还会重置优化器，并根据成功率、下蹲深度和异常终止率自适应调整域随机化强度；不要把旧 Stage2 checkpoint 传给这个参数。也可以使用等价别名 `--stage1-model`。如果需要恢复第二阶段自身的中断训练，使用底层参数 `--resume-checkpoint logs/stage2/<run>/model_<iter>.pt`，此时会保留第二阶段已有的训练进度、域随机化强度和优化器状态。
 
 也可以显式调用统一入口：
 
@@ -158,7 +224,19 @@ uv run python scripts/play.py \
 
 蹲起
 uv run python squat_training/play.py \
-  --checkpoint logs/squat_sensor_policy/stage2/07-18-09:36:29/model_final.pt\
+  --checkpoint logs/squat_sensor_policy/stage2/07-23-15:09:10/model_final.pt \
+  --no-domain-randomization \
+  --seed 42 \
+  --no-episode-random-seed \
+  --viewer \
+  --steps 0
+
+多动作
+cd /home/yeah/code/LYTrobot_amp
+uv run python scripts/play.py \
+  --checkpoint logs/multimotion/08-01-10:12:33/model_final.pt \
+  --stage multimotion \
+  --device cuda \
   --viewer \
   --steps 0
 ```
@@ -174,14 +252,16 @@ uv run python scripts/play.py \
   --steps 0
 
 uv run python scripts/play.py \
-  --checkpoint logs/squat_sensor_policy/stage1/07-17-08:46:52/model_final.pt \
+  --checkpoint logs/squat_sensor_policy/stage2/07-23-15:09:10/model_final.pt \
   --viewer \
   --steps 0
 
 
 ```
 
-使用 `--viewer` 打开 MuJoCo 测试时会自动录制 MP4，按阶段保存到 `recording/stage1/` 或 `recording/stage2/`。命名来自权重所在 run 和 iteration，例如：
+使用 `--viewer` 打开 MuJoCo 测试时会自动录制 MP4，按任务保存到
+`recording/stage1/`、`recording/stage2/` 或 `recording/multimotion/`。
+命名来自权重所在 run 和 iteration，例如：
 
 ```text
 recording/stage1/06-06-21-19-41-2049.mp4
@@ -405,7 +485,9 @@ python scripts/play.py \
   --viewer
 ```
 
-这条命令也会自动生成 `recording/stage2/<run>-<iteration>.mp4`。测试第一阶段 checkpoint 时会保存到 `recording/stage1/`。
+这条命令也会自动生成 `recording/stage2/<run>-<iteration>.mp4`。测试第一阶段
+checkpoint 时会保存到 `recording/stage1/`；多动作 checkpoint 会自动识别并保存到
+`recording/multimotion/`，也可以通过 `--stage multimotion` 显式指定。
 
 ## 已验证
 

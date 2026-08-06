@@ -27,7 +27,12 @@ def main() -> None:
     if not _has_arg("--log-root"):
         sys.argv.extend(["--log-root", str(REPO_ROOT / "logs" / "sensor_policy")])
     if not _has_arg("--wandb-tags"):
-        sys.argv.extend(["--wandb-tags", "lytrobot,bpo,amp,imu,tendon,history6"])
+        sys.argv.extend(
+            [
+                "--wandb-tags",
+                "lytrobot,bpo,amp,imu,tendon,recurrent,gru,residual-moe",
+            ]
+        )
 
     base_train.LytRobotWarpAmpEnv = SensorHistoryWarpAmpEnv
     base_train.PPOAMPConfig = SensorPPOAMPConfig
