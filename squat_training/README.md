@@ -61,12 +61,20 @@ uv run python squat_training/train_stage2.py \
   --stage1-checkpoint logs/squat_sensor_policy/stage1/<run-name>/model_final.pt
 ```
 
+Stage2 默认重置优化器并使用 `1e-4` 学习率。域随机化每 250 轮评估一次：成功率和下蹲深度达标且异常终止率足够低时强度增加 `0.025`，性能明显下降时回退，不再按训练轮数强行增加。外力最终范围仍为 0–80 N，但间隔放宽为 75–200 个控制步；20% 回合从站立状态开始。
+
+Warp 的质量、惯量、地面摩擦和重力属于整个批次共享参数，默认保持标称值，避免单次随机抽样同时改变全部 4096 个环境。逐环境的肌腱长度、动作延迟，以及逐步的观测/动作噪声和外力仍参与随机化。只有明确传入 `--warp-global-domain-randomization` 才启用共享参数抽样。
+
+训练时重点观察 `bottom_depth_success_rate`、`episode_success_rate`、`rollout_episode_success_rate`、`termination_fraction` 和 `domain_randomization_scale`。`episode_success_rate` 是最近已完成回合的滑动成功率，`rollout_episode_success_rate` 是当前 rollout 的即时值；前者不会再因一次 24 步 rollout 没有自然结束的回合而突然归零。
+
 短程验证和回放：
 
 ```bash
 uv run python squat_training/train_stage1.py \
   --num-envs 32 --num-steps 4 --max-iterations 1 --no-wandb --run-name smoke
-uv run python squat_training/play.py --checkpoint <checkpoint.pt>
+uv run python squat_training/play.py \
+  --checkpoint <checkpoint.pt> \
+  --no-domain-randomization --seed 42 --no-episode-random-seed
 ```
 
 不经过策略网络，将 14 自由度 OmniRetarget 结果映射到完整机器人 MJCF 后直接可视化：
@@ -76,3 +84,5 @@ uv run python squat_training/play_reference.py
 ```
 
 所有训练日志写入 `logs/squat_sensor_policy/`，录像写入 `recording/squat_sensor_policy/`。
+W&B 的 `episode` 分组中会记录 `episode/total_reward`（已完成回合的平均累计总回报）
+和 `episode/length`（已完成回合的平均长度），两条曲线统一使用 `global_step` 作为横轴。

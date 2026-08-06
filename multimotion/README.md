@@ -95,18 +95,20 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
   --output recording/reference/multimotion_foot_contact_slow.mp4
 ```
 
-## MoRE-discoRL 四类地形
+## 当前多动作训练地形
 
 源文件与许可证已复制到 `robot/terrains/more_discolrl/`，来源为本机
 `/home/yeah/code/unitreeG1/MORE/MoRE-discoRL`。`src/lytrobot_amp/terrain.py`
-把 gap、pit、rough、6°上/下坡和 stairs 适配为 LYT 可连续通过的串联路线。
+地形实现支持 gap、pit、rough、6°上/下坡和 stairs；当前训练入口只把 rough、
+6°上/下坡和 stairs 拼入 LYT 连续串联路线。gap、pit 数据与实现仍保留用于离线参考
+验证，不参与当前多动作训练。
 正式训练把 rough 最大高度差限制为 0.05 m，并使用 3 级、台阶高 0.20 m、
 踏面 0.22 m 的最难考核楼梯；原始 CMU 楼梯参考数据仍来自 0.13 m 高、
 0.58 m 深的重定向标定。环境会把参考骨盆升降幅度缩放到实际台阶总高度，并使用
 相对参考高度的摔倒边界；踏面长度差异仍由策略通过观测和残差动作适应。
 
-每条完整状态路线包含 rough、pit、gap、6°上/下坡和 stairs，地形沿前进方向首尾拼接。由于所有
-Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8 条不同随机排列
+每条完整状态路线只包含 rough、6°上/下坡和 stairs，地形沿前进方向首尾拼接。由于所有
+Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8 条随机排列
 （可用 `--terrain-course-variants` 修改），每个 episode 随机选择其中一条。机器人
 按走路及所选路线的地形动作连续推进；楼梯段自动展开为上楼和下楼，
 只有完成整条路线才记作成功结束。每种排列都包含全部地形，不会退化成单地形通道。
@@ -168,10 +170,10 @@ transition；PPO 划分为 8 个 12,288 样本 minibatch，AMP 使用 4096 样�
 使用平地 walk；同时暂不施加 CoT 惩罚，先学习立即纠偏和持续不摔倒。选择
 `mean_episode_length` 持续接近 `1000`、`termination_fraction` 接近 0 且速度没有明显
 超过参考值的 checkpoint，再执行第二条命令进入完整串联路线。不要从旧的
-`1.4 m/s` checkpoint 继续训练。旧八动作 checkpoint 的技能 one-hot 和当前六动作
-观测维度不同，也不能用于续训；先运行六动作 walk warmup。
+`1.4 m/s` checkpoint 继续训练。旧八动作或六动作 checkpoint 的技能 one-hot 和当前
+四动作观测维度不同，也不能用于续训；先运行四动作 walk warmup。
 
-如果兼容当前六动作布局的旧 checkpoint 中 `forward_velocity_reward_coef`、
+如果兼容当前四动作布局的旧 checkpoint 中 `forward_velocity_reward_coef`、
 `forward_progress_reward_coef` 和 `forward_velocity_deficit_penalty_coef` 都是
 0，策略通常会学成原地站立。需要加载权重并用当前的向前奖励重新计数续训；仅修改
 `play.py` 的目标速度不会改变已经训练好的策略：
@@ -230,13 +232,13 @@ uv run python scripts/play.py \
 
 训练机制包括：
 
-- 一个策略共享六种直线动作，actor 观测追加 6 维动作 one-hot；左右转身暂不参与训练；
+- 一个策略共享四种直线动作，actor 观测追加 4 维动作 one-hot；左右转身暂不参与训练；
 - reset 后立即启用策略的肌腱残差纠偏，不再用前20步渐增限制压制动态平衡动作；
 - 前进速度与进度奖励乘以根部姿态/高度稳定度，倾倒前冲不再获得完整正奖励；
 - 速度跟踪带宽收紧到 `0.20 m/s`，超速惩罚系数提高到 `3.0`，抑制超过参考速度后继续前冲；
 - 摔倒终止额外扣 `10`，确保高速前冲后立即倒地的回报低于持续稳定行走；
-- 完整评测 episode 从走路开始，依次通过随机排列的 rough、pit、gap、6°上/下坡和 stairs 全部地形；
-- AMP 判别器从六个直线地形重定向片段的共享归一化混合分布采样；
+- 完整评测 episode 从走路开始，依次通过随机排列的 rough、6°上/下坡和 stairs 全部地形；
+- AMP 判别器从四个直线地形重定向片段的共享归一化混合分布采样；
 - PPO/BPO 强化学习奖励继续跟踪根姿态、线/角速度、关节、足端与接触；
 - 动作片段结束后自动切换下一路段，完成整条串联路线后才成功重置；
 - 台阶和地面均参与足端接触奖励与摩擦领域随机化。

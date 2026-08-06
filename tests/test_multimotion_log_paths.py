@@ -83,7 +83,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         ]
         self.assertEqual(
             names,
-            ["walk", "rough_walk", "pit_walk", "gap_cross", "stair_up", "stair_down"],
+            ["walk", "rough_walk", "stair_up", "stair_down"],
         )
 
     def test_random_stage_curriculum_preserves_full_route_warmup(self) -> None:
@@ -148,9 +148,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         start = args.index("--terrain-types") + 1
         end = next(index for index in range(start, len(args)) if args[index].startswith("--"))
         terrains = set(args[start:end])
-        self.assertTrue(
-            {"rough", "slope_up", "slope_down", "stairs"}.issubset(terrains)
-        )
+        self.assertEqual(terrains, {"rough", "slope_up", "slope_down", "stairs"})
         self.assertEqual(value("--rough-terrain-height"), MAX_ROUGH_HEIGHT_DIFFERENCE_M)
         self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
         self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[1])

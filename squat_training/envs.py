@@ -123,6 +123,43 @@ class SquatRewardMixin:
         root_height = parts["root_height_value"]
         reference_root_height = parts["reference_root_height_value"]
         stand_height = float(np.max(self.motion.reference_root_height))
+        bottom_height = float(np.min(self.motion.reference_root_height))
+        squat_depth_range = max(stand_height - bottom_height, 1.0e-6)
+        if torch.is_tensor(root_height):
+            squat_depth_progress = torch.clamp(
+                (stand_height - root_height) / squat_depth_range, 0.0, 1.0
+            )
+            reference_depth_progress = torch.clamp(
+                (stand_height - reference_root_height) / squat_depth_range, 0.0, 1.0
+            )
+            bottom_gate = torch.clamp(
+                1.0 - torch.abs(phase_fraction - 0.50) / 0.30, 0.0, 1.0
+            )
+            bottom_depth_track = bottom_gate * torch.clamp(
+                1.0 - torch.abs(squat_depth_progress - reference_depth_progress), 0.0, 1.0
+            )
+            bottom_depth_deficit = bottom_gate * torch.clamp(
+                reference_depth_progress - squat_depth_progress, 0.0, 1.0
+            )
+            bottom_depth_success = bottom_gate * (squat_depth_progress >= 0.85).to(torch.float32)
+        else:
+            squat_depth_progress = float(np.clip(
+                (stand_height - root_height) / squat_depth_range, 0.0, 1.0
+            ))
+            reference_depth_progress = float(np.clip(
+                (stand_height - reference_root_height) / squat_depth_range, 0.0, 1.0
+            ))
+            bottom_gate = float(np.clip(
+                1.0 - abs(phase_fraction - 0.50) / 0.30, 0.0, 1.0
+            ))
+            bottom_depth_track = bottom_gate * float(np.clip(
+                1.0 - abs(squat_depth_progress - reference_depth_progress), 0.0, 1.0
+            ))
+            bottom_depth_deficit = bottom_gate * float(np.clip(
+                reference_depth_progress - squat_depth_progress, 0.0, 1.0
+            ))
+            bottom_depth_success = bottom_gate * float(squat_depth_progress >= 0.85)
+
         progress_floor = float(self.cfg.fall_height)
         progress_range = max(stand_height - progress_floor, 1.0e-6)
         if torch.is_tensor(root_height):
@@ -162,6 +199,8 @@ class SquatRewardMixin:
             - 2.50 * missed_stand
             + 4.00 * ascent_progress_track
             - 6.00 * ascent_height_lag
+            + 3.00 * bottom_depth_track
+            - 5.00 * bottom_depth_deficit
             - self.cfg.ctrl_penalty_coef * parts["ctrl_penalty"]
             - self.cfg.action_rate_penalty_coef * parts["action_rate"]
             - self.cfg.distal_action_penalty_coef * parts["distal_action"]
@@ -179,6 +218,12 @@ class SquatRewardMixin:
         parts["reference_height_progress"] = reference_height_progress
         parts["ascent_progress_track"] = ascent_progress_track
         parts["ascent_height_lag"] = ascent_height_lag
+        parts["squat_depth_progress"] = squat_depth_progress
+        parts["reference_depth_progress"] = reference_depth_progress
+        parts["bottom_gate"] = bottom_gate
+        parts["bottom_depth_track"] = bottom_depth_track
+        parts["bottom_depth_deficit"] = bottom_depth_deficit
+        parts["bottom_depth_success"] = bottom_depth_success
         return reward, done, timed_out, parts
 
 

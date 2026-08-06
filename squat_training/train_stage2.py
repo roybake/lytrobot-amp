@@ -33,7 +33,14 @@ if __name__ == "__main__":
     if stage1_checkpoint is not None:
         if _has_arg("--resume-checkpoint"):
             raise SystemExit("Use only one of --stage1-checkpoint/--stage1-model or --resume-checkpoint.")
-        sys.argv.extend(["--resume-checkpoint", stage1_checkpoint, "--resume-reset-progress"])
+        sys.argv.extend(
+            [
+                "--resume-checkpoint",
+                stage1_checkpoint,
+                "--resume-reset-progress",
+                "--resume-reset-optimizer",
+            ]
+        )
 
     defaults = {
         "--stage": "stage2",
@@ -42,6 +49,16 @@ if __name__ == "__main__":
         "--num-envs": "4096",
         "--max-iterations": "30000",
         "--save-interval": "500",
+        "--learning-rate": "1e-4",
+        "--min-learning-rate": "1e-5",
+        "--max-learning-rate": "1e-4",
+        "--dr-curriculum-mode": "adaptive",
+        "--dr-curriculum-initial-scale": "0.0",
+        "--dr-curriculum-update-interval": "250",
+        "--dr-curriculum-step": "0.025",
+        "--push-interval-min-steps": "75",
+        "--push-interval-max-steps": "200",
+        "--stand-start-prob": "0.20",
     }
     for name, value in defaults.items():
         if not _has_arg(name):

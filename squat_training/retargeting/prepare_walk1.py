@@ -60,25 +60,46 @@ def contact_windows(contact: np.ndarray) -> list[tuple[int, int]]:
     return windows
 
 
-def foot_roll_schedule(contacts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Assign a circular heel-to-flat-to-toe phase to each stance interval."""
+def foot_roll_schedule(
+    contacts: np.ndarray,
+    *,
+    cyclic: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assign a heel-to-flat-to-toe phase to each stance interval.
+
+    ``cyclic=False`` is required for finite clips.  Treating a finite stair or
+    turn clip as circular can join the final stance to the initial stance and
+    incorrectly label its first frames as toe-off instead of heel strike.
+    """
     contacts = np.asarray(contacts, dtype=bool)
     if contacts.ndim != 2 or contacts.shape[1] != 2:
         raise ValueError(f"Expected contact shape (T, 2), got {contacts.shape}.")
-    duplicate_endpoint = len(contacts) > 1 and np.array_equal(contacts[0], contacts[-1])
+    duplicate_endpoint = (
+        cyclic
+        and len(contacts) > 1
+        and np.array_equal(contacts[0], contacts[-1])
+    )
     unique = contacts[:-1] if duplicate_endpoint else contacts
     phases = np.full(unique.shape, -1.0, dtype=np.float32)
     modes = np.full(unique.shape, ROLL_SWING, dtype=np.int8)
 
     for side in range(2):
         active = unique[:, side]
-        starts = np.flatnonzero(active & ~np.roll(active, 1))
+        if cyclic:
+            starts = np.flatnonzero(active & ~np.roll(active, 1))
+        else:
+            previous = np.r_[False, active[:-1]]
+            starts = np.flatnonzero(active & ~previous)
         for start in starts:
             indices: list[int] = []
             frame = int(start)
-            while active[frame] and len(indices) < len(active):
+            while (
+                frame < len(active)
+                and active[frame]
+                and len(indices) < len(active)
+            ):
                 indices.append(frame)
-                frame = (frame + 1) % len(active)
+                frame = (frame + 1) % len(active) if cyclic else frame + 1
             run_phase = np.linspace(0.0, 1.0, len(indices), dtype=np.float32)
             phases[indices, side] = run_phase
             modes[np.asarray(indices)[run_phase < HEEL_PHASE_END], side] = ROLL_HEEL

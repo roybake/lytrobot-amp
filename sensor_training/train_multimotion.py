@@ -92,7 +92,7 @@ def default_train_args() -> list[str]:
     args[tag_index] = (
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
         "asymmetric-critic,residual-moe,sensor-only,"
-        "more,serial-course,random-order,flat,rough,pit,gap,slope-up,slope-down,stairs,"
+        "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
         "acceptance,sim2real,adaptive-dr"
     )
     # SensorHistoryEnv never exposes the skill one-hot, and persisting this as

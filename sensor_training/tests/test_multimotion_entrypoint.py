@@ -28,8 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MOTION_NAMES = (
     "walk",
     "rough_walk",
-    "pit_walk",
-    "gap_cross",
     "stair_up",
     "stair_down",
 )
@@ -88,7 +86,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             args[terrain_start:terrain_end],
-            ["gap", "pit", "rough", "slope_up", "slope_down", "stairs"],
+            ["rough", "slope_up", "slope_down", "stairs"],
         )
 
     def test_real_multimotion_env_exposes_only_336_sensor_values(self) -> None:
@@ -101,12 +99,10 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                     for name in MOTION_NAMES
                 ),
                 motion_names=MOTION_NAMES,
-                motion_loop=(True, False, False, False, False, False),
+                motion_loop=(True, False, False, False),
                 skill_conditioning=False,
                 use_reference_velocity=True,
                 terrain_types=(
-                    "gap",
-                    "pit",
                     "rough",
                     "slope_up",
                     "slope_down",

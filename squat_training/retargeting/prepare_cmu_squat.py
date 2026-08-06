@@ -175,8 +175,13 @@ def convert(asf_path: Path, amc_path: Path, start: int, end: int, stride: int) -
             positions[frame_index, joint_index] = joints[ASF_TO_OUTPUT[output_name]].coordinate
 
     positions *= CMU_LENGTH_TO_METERS
-    # CMU is Y-up with X forward and Z lateral. OmniRetarget and MuJoCo use Z-up.
+    # CMU is right-handed Y-up with X forward and Z pointing to the subject's
+    # right.  OmniRetarget and MuJoCo are right-handed Z-up with +Y to the
+    # subject's left, hence [x, y, z] -> [x, -z, y].  Omitting the minus sign
+    # mirrors the skeleton and makes a semantic right leg target the robot's
+    # left side, which in turn produces severe leg crossing after retargeting.
     positions = positions[..., [0, 2, 1]]
+    positions[..., 1] *= -1.0
     root_xy0 = positions[0, JOINT_NAMES.index("Hips"), :2].copy()
     positions[..., :2] -= root_xy0
     toe_indices = [JOINT_NAMES.index("RightToeBase"), JOINT_NAMES.index("LeftToeBase")]

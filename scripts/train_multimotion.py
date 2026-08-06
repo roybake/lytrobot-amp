@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train one AMP+RL policy across six straight MoRE terrain actions."""
+"""Train one AMP+RL policy across flat, rough, slope, and stair terrains."""
 
 from __future__ import annotations
 
@@ -32,28 +32,20 @@ def default_train_args() -> list[str]:
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
-        str(REFERENCE_DIR / "pit_walk_omniretarget.npz"),
-        str(REFERENCE_DIR / "gap_cross_omniretarget.npz"),
         str(REFERENCE_DIR / "stair_up_omniretarget.npz"),
         str(REFERENCE_DIR / "stair_down_omniretarget.npz"),
         "--motion-names",
         "walk",
         "rough_walk",
-        "pit_walk",
-        "gap_cross",
         "stair_up",
         "stair_down",
         "--motion-weights",
-        "0.20",
-        "0.16",
-        "0.16",
-        "0.16",
-        "0.16",
-        "0.16",
+        "0.25",
+        "0.25",
+        "0.25",
+        "0.25",
         "--motion-loop",
         "true",
-        "false",
-        "false",
         "false",
         "false",
         "false",
@@ -69,7 +61,7 @@ def default_train_args() -> list[str]:
         "4",
         "--minibatches",
         str(PPO_MINIBATCHES),
-        # Draw enough AMP examples to cover all six skills on every update.
+        # Draw enough AMP examples to cover all four skills on every update.
         "--amp-minibatch-size",
         str(AMP_MINIBATCH_SIZE),
         "--amp-disc-updates",
@@ -115,8 +107,6 @@ def default_train_args() -> list[str]:
         "--symmetry-reward-coef",
         "0.50",
         "--terrain-types",
-        "gap",
-        "pit",
         "rough",
         "slope_up",
         "slope_down",
@@ -132,8 +122,6 @@ def default_train_args() -> list[str]:
         str(COURSE_RANDOM_START_RAMP_ITERATIONS),
         "--terrain-course-stage-reward",
         "5.0",
-        "--gap-terrain-width",
-        "0.20",
         "--rough-terrain-height",
         f"{MAX_ROUGH_HEIGHT_DIFFERENCE_M:g}",
         "--slope-angle-deg",
@@ -167,7 +155,7 @@ def default_train_args() -> list[str]:
         "--wandb-tags",
         (
             "lytrobot,bpo,amp,multimotion,more,serial-course,random-order,"
-            "flat,gap,pit,rough,slope-up,slope-down,stairs,acceptance"
+            "flat,rough,slope-up,slope-down,stairs,acceptance"
         ),
     ]
 

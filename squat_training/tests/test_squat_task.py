@@ -245,6 +245,59 @@ class SquatTaskTests(unittest.TestCase):
         self.assertGreater(float(ascent_parts["missed_stand"]), 0.9)
         self.assertLess(float(ascent_reward), float(bottom_reward) - 2.0)
 
+    def test_bottom_depth_signal_rejects_a_shallow_squat(self) -> None:
+        cfg = LytRobotEnvCfg(symmetry_reward_coef=0.75)
+        parts = {
+            "root_height_value": SHALLOW_ROOT_MAX,
+            "reference_root_height_value": SHALLOW_ROOT_MIN,
+            "pose_track": 0.0,
+            "height": 0.0,
+            "root_orientation": 1.0,
+            "root_vel": 0.0,
+            "vel_track": 0.0,
+            "distal_vel": 0.0,
+            "foot_pos": 1.0,
+            "stance_foot": 1.0,
+            "contact": 1.0,
+            "symmetry": 1.0,
+            "ctrl_track": 0.0,
+            "ctrl_penalty": 0.0,
+            "action_rate": 0.0,
+            "distal_action": 0.0,
+            "distal_action_rate": 0.0,
+            "missed_contact": 0.0,
+            "termination": 0.0,
+        }
+
+        class RewardSource:
+            def _compute_reward_done(self):
+                return 0.0, False, False, dict(self.parts)
+
+        class RewardHarness(SquatRewardMixin, RewardSource):
+            pass
+
+        harness = RewardHarness()
+        harness.cfg = cfg
+        harness.motion = type(
+            "Motion",
+            (),
+            {
+                "frame_count": 240,
+                "reference_root_height": np.asarray([SHALLOW_ROOT_MIN, SHALLOW_ROOT_MAX]),
+            },
+        )()
+        harness.motion_phase = np.asarray([120.0], dtype=np.float32)
+        harness.parts = parts
+        shallow_reward, _, _, shallow_parts = harness._compute_reward_done()
+
+        harness.parts = {**parts, "root_height_value": SHALLOW_ROOT_MIN, "height": 1.0}
+        full_reward, _, _, full_parts = harness._compute_reward_done()
+
+        self.assertGreater(float(shallow_parts["bottom_depth_deficit"]), 0.95)
+        self.assertEqual(float(shallow_parts["bottom_depth_success"]), 0.0)
+        self.assertLess(float(shallow_reward), float(full_reward) - 5.0)
+        self.assertGreater(float(full_parts["bottom_depth_success"]), 0.95)
+
     def test_ascent_height_signal_rewards_partial_recovery_outside_gaussian_band(self) -> None:
         cfg = LytRobotEnvCfg(symmetry_reward_coef=0.75)
         parts = {
