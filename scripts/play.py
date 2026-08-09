@@ -134,6 +134,8 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint group used for recording output; auto infers it from the path and metadata.",
     )
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--push-force-min", type=float, default=None)
+    parser.add_argument("--push-force-max", type=float, default=None)
     parser.add_argument("--stand-start-prob", type=float, default=None)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=None)
@@ -211,6 +213,10 @@ def make_env_cfg(
         cfg.stand_start_push_delay_steps = int(args.stand_start_push_delay_steps)
     if args.domain_randomization is not None:
         cfg.domain_randomization = bool(args.domain_randomization)
+    if args.push_force_min is not None:
+        cfg.push_force_min = float(args.push_force_min)
+    if args.push_force_max is not None:
+        cfg.push_force_max = float(args.push_force_max)
     if args.episode_random_seed is not None:
         cfg.randomize_episode_seed = bool(args.episode_random_seed)
     elif getattr(args, "seed_was_provided", False):

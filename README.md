@@ -10,8 +10,8 @@
 
 ## 直线全地形多动作训练
 
-当前训练策略按要求暂不训练转身，只使用 walk、rough、stair_up、stair_down
-四种参考动作，连续通过平地、MoRE 风格不平路、上下坡和楼梯。
+当前训练策略按要求暂不训练转身，只使用 walk、rough、pit、gap、stair_up、
+stair_down 六种参考动作，连续通过 MoRE 风格不平路、沟坑、间隙、坡道和楼梯。
 左/右转参考文件仍保留给后续独立转身课程使用，不再拼入直线地形路线：
 
 ```bash
@@ -28,12 +28,11 @@ minibatch（每个 12,288 条），AMP 每轮执行 2 次 4096 样本更新。
 稳定预训练，再把该 checkpoint 传给上面的完整课程入口；具体命令和晋级指标见
 [`multimotion/README.md`](multimotion/README.md)。
 旧的八动作（含 turn_left/turn_right）checkpoint 使用 8 维技能条件，不能直接加载到
-当前四动作策略；需要从四动作平地 warmup 新开训练。旧六动作 checkpoint 同样因
-技能 one-hot 维度不同而不兼容。
+当前六动作策略；需要从六动作平地 warmup 新开训练。
 
 多动作训练的 checkpoint、ONNX、指标和 W&B 文件统一保存在
 `logs/multimotion/<月-日-时:分:秒>/`，每次启动自动创建新的时间目录。
-每个训练机器人面前都是包含 rough、6°上/下坡和 stairs 的完整直线串联路线；启动时预生成
+每个训练机器人面前都是包含 rough、pit、gap、6°上/下坡和 stairs 的完整直线串联路线；启动时预生成
 多种随机地形顺序，episode 会随机分配路线并连续执行全部动作/地形段，走完整条路线
 后才成功重置。默认前 5000 轮全部从路线入口训练，随后用 10000 轮把随机后续阶段
 reset 的概率线性提高到 80%，避免尚未学会平地稳定行走时就被直接投放到困难地形；
@@ -61,8 +60,6 @@ uv run python scripts/play.py \
 
 动作数据来源、重定向复现、阶梯尺寸、Stage2 命令和实现说明见
 [`multimotion/README.md`](multimotion/README.md)。
-仅依赖 IMU 与肌腱长度实现跨地形过渡的论文选型、训练期特权监督和部署边界见
-[`docs/proprioceptive_terrain_transition.md`](docs/proprioceptive_terrain_transition.md)。
 
 ## 代码结构
 
@@ -235,7 +232,7 @@ uv run python squat_training/play.py \
 多动作
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/play.py \
-  --checkpoint logs/multimotion/08-01-10:12:33/model_final.pt \
+  --checkpoint logs/multimotion/08-06-10:56:09/model_7500.onnx \
   --stage multimotion \
   --device cuda \
   --viewer \
@@ -252,10 +249,12 @@ uv run python scripts/play.py \
   --viewer \
   --steps 0
 
-uv run python scripts/play.py \
-  --checkpoint logs/squat_sensor_policy/stage2/07-23-15:09:10/model_final.pt \
+uv run python squat_training/play.py \
+  --checkpoint logs/squat_sensor_policy/stage2/squat-moderate-dr-recovery-10k/model_final.onnx \
   --viewer \
-  --steps 0
+  --steps 0 \
+  --push-force-max 5.0
+
 
 
 ```
