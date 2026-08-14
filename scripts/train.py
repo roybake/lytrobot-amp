@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--terrain-types",
         nargs="+",
-        choices=("gap", "pit", "rough", "slope_up", "slope_down", "stairs"),
+        choices=("flat", "gap", "pit", "rough", "slope_up", "slope_down", "stairs"),
         default=None,
         help="MoRE-discoRL terrain lanes to attach to every batched world.",
     )
@@ -142,6 +142,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--terrain-course-variants", type=int, default=8)
     parser.add_argument("--terrain-course-lane-spacing", type=float, default=3.0)
+    parser.add_argument("--terrain-course-run-in", type=float, default=2.90)
+    parser.add_argument("--terrain-course-run-out", type=float, default=3.10)
     parser.add_argument("--terrain-course-base-height", type=float, default=0.30)
     parser.add_argument("--terrain-course-completion-reward", type=float, default=25.0)
     parser.add_argument(
@@ -316,6 +318,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stair-swing-clearance", type=float, default=0.08)
     parser.add_argument("--stair-swing-clearance-reward-coef", type=float, default=0.75)
     parser.add_argument("--stair-tread-support-reward-coef", type=float, default=1.25)
+    parser.add_argument(
+        "--stair-min-root-clearance",
+        type=float,
+        default=0.60,
+        help="Terminate a stair stage if the pelvis sinks this close to the tread surface.",
+    )
     parser.add_argument("--distal-joint-vel-sigma", type=float, default=2.0)
     parser.add_argument("--symmetry-reward-coef", type=float, default=1.20)
     parser.add_argument("--symmetry-foot-pos-sigma", type=float, default=0.08)
@@ -1174,20 +1182,25 @@ def main() -> None:
                 "--terrain-types stairs or --stair-terrain."
             )
         if args.serial_terrain_course:
-            raise ValueError(
-                "--reward-mode stairs is reserved for the independent non-serial "
-                "stair task."
-            )
-        if args.motion_names is not None and any(
+            names = {name.lower() for name in (args.motion_names or ())}
+            required = {"walk", "stair_up", "stair_down"}
+            if not required.issubset(names):
+                raise ValueError(
+                    "Serial --reward-mode stairs requires walk, stair_up, and "
+                    "stair_down motion names."
+                )
+        elif args.motion_names is not None and any(
             "stair" not in name.lower() for name in args.motion_names
         ):
             raise ValueError(
-                "--reward-mode stairs requires every --motion-names entry to be a stair clip."
+                "Non-serial --reward-mode stairs requires every motion to be a stair clip."
             )
         if args.stair_vertical_velocity_sigma <= 0.0:
             raise ValueError("--stair-vertical-velocity-sigma must be positive.")
         if args.stair_swing_clearance <= 0.0:
             raise ValueError("--stair-swing-clearance must be positive.")
+        if args.stair_min_root_clearance <= 0.0:
+            raise ValueError("--stair-min-root-clearance must be positive.")
     if args.motion_files is not None:
         clip_count = len(args.motion_files)
         for option, values in (
@@ -1282,6 +1295,8 @@ def main() -> None:
         serial_terrain_course=bool(args.serial_terrain_course),
         terrain_course_variants=args.terrain_course_variants,
         terrain_course_lane_spacing=args.terrain_course_lane_spacing,
+        terrain_course_run_in=args.terrain_course_run_in,
+        terrain_course_run_out=args.terrain_course_run_out,
         terrain_course_base_height=args.terrain_course_base_height,
         terrain_course_random_assignment=bool(args.terrain_course_random_assignment),
         terrain_course_completion_reward=args.terrain_course_completion_reward,
@@ -1343,6 +1358,7 @@ def main() -> None:
         stair_swing_clearance=args.stair_swing_clearance,
         stair_swing_clearance_reward_coef=args.stair_swing_clearance_reward_coef,
         stair_tread_support_reward_coef=args.stair_tread_support_reward_coef,
+        stair_min_root_clearance=args.stair_min_root_clearance,
         distal_joint_vel_sigma=args.distal_joint_vel_sigma,
         symmetry_reward_coef=args.symmetry_reward_coef,
         symmetry_foot_pos_sigma=args.symmetry_foot_pos_sigma,

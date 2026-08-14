@@ -12,7 +12,9 @@ def _has_arg(name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv)
 
 
-if __name__ == "__main__":
+def run_stage1() -> None:
+    """Run the canonical ordinary-walking Stage 1 configuration."""
+
     if not _has_arg("--stage"):
         sys.argv.extend(["--stage", "stage1"])
     if not _has_arg("--training-task"):
@@ -55,3 +57,7 @@ if __name__ == "__main__":
             sys.argv.extend([name, value])
 
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")
+
+
+if __name__ == "__main__":
+    run_stage1()

@@ -27,6 +27,7 @@ from .terrain import (
     load_model,
     randomized_course_orders,
     sample_course_start_stages,
+    serial_course_stair_cfg,
     terrain_geom_ids,
     terrain_height_at,
     terrain_kind_from_motion,
@@ -230,6 +231,8 @@ class LytRobotEnvCfg:
     serial_terrain_course: bool = False
     terrain_course_variants: int = 8
     terrain_course_lane_spacing: float = 3.0
+    terrain_course_run_in: float = 2.90
+    terrain_course_run_out: float = 3.10
     terrain_course_base_height: float = 0.30
     terrain_course_random_assignment: bool = True
     terrain_course_completion_reward: float = 25.0
@@ -292,6 +295,7 @@ class LytRobotEnvCfg:
     stair_swing_clearance: float = 0.08
     stair_swing_clearance_reward_coef: float = 0.75
     stair_tread_support_reward_coef: float = 1.25
+    stair_min_root_clearance: float = 0.60
     distal_joint_vel_sigma: float = 2.0
     symmetry_reward_coef: float = 1.20
     symmetry_foot_pos_sigma: float = 0.08
@@ -394,6 +398,8 @@ class LytRobotAmpEnv:
             serial_course=bool(cfg.serial_terrain_course),
             course_orders=course_orders,
             course_lane_spacing=cfg.terrain_course_lane_spacing,
+            course_run_in=cfg.terrain_course_run_in,
+            course_run_out=cfg.terrain_course_run_out,
             course_base_height=cfg.terrain_course_base_height,
             flat_lane_y=cfg.flat_lane_y,
             rough_lane_y=cfg.rough_lane_y,
@@ -446,8 +452,14 @@ class LytRobotAmpEnv:
             if not self.stair_cfg.enabled:
                 raise ValueError("The stairs reward mode requires enabled stair geometry.")
             if self.more_terrain_cfg.serial_course:
-                raise ValueError("The stairs reward mode does not support a serial terrain course.")
-            if not np.all(self.stair_motion_mask):
+                required = {"walk", "stair_up", "stair_down"}
+                missing = required - {name.lower() for name in motion_names}
+                if missing:
+                    raise ValueError(
+                        "Serial stairs reward requires walk, stair_up, and "
+                        f"stair_down motion clips; missing {sorted(missing)}."
+                    )
+            elif not np.all(self.stair_motion_mask):
                 raise ValueError("The stairs reward mode requires only stair motion clips.")
         motion_references = (
             self.motion.motions
@@ -484,6 +496,14 @@ class LytRobotAmpEnv:
                 f"terrain geometry: {missing_terrains}. Enable them with terrain_types."
             )
         self.course_motion_sequences = self._build_course_motion_sequences(motion_names)
+        self.course_stair_cfgs = (
+            tuple(
+                serial_course_stair_cfg(self.more_terrain_cfg, self.stair_cfg, variant)
+                for variant in range(len(self.more_terrain_cfg.normalized_course_orders))
+            )
+            if self.more_terrain_cfg.serial_course and "stairs" in terrain_types
+            else ()
+        )
         self.course_stage_scenario_names = tuple(
             course_stage_scenarios(order)
             for order in self.more_terrain_cfg.normalized_course_orders
@@ -1192,6 +1212,7 @@ class LytRobotAmpEnv:
                     stair_down=stair_down,
                     stair_down_offset=self.cfg.stair_down_offset,
                     course_variant=int(self.course_variant_ids[int(env_id)]),
+                    course_stage=(int(start_stages[row]) if serial_course else None),
                 )
                 qpos[:3] += offset
 
@@ -1774,6 +1795,7 @@ class LytRobotAmpEnv:
                 foot_world_pos,
                 foot_contact,
                 reference_targets.foot_contact[env_id],
+                env_id=env_id,
                 vertical_velocity=float(data.qvel[2]),
                 reference_vertical_velocity=float(reference_targets.root_lin_vel[env_id, 2]),
             )
@@ -1912,9 +1934,26 @@ class LytRobotAmpEnv:
             or root_height > max_root_height
             or up_z < self.cfg.min_upright_z
         )
+        stair_root_clearance = 0.0
+        stair_terrain_penetration = False
+        if self.cfg.reward_mode == "stairs" and self.stair_motion_mask[
+            self.motion_ids[env_id]
+        ]:
+            stair_surface = float(
+                self._stair_surface_height(
+                    np.asarray([data.qpos[0]], dtype=np.float32), env_id
+                )[0]
+            )
+            stair_root_clearance = root_height - stair_surface
+            stair_terrain_penetration = (
+                stair_root_clearance < float(self.cfg.stair_min_root_clearance)
+            )
+            fallen = fallen or stair_terrain_penetration
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": ref_root_height,
+            "stair_root_clearance_value": stair_root_clearance,
+            "stair_terrain_penetration": float(stair_terrain_penetration),
             "root_vel": root_vel,
             "forward_velocity": forward_velocity,
             "forward_velocity_error": forward_velocity_error,
@@ -1978,12 +2017,17 @@ class LytRobotAmpEnv:
         foot_contact: np.ndarray,
         reference_foot_contact: np.ndarray,
         *,
+        env_id: int = 0,
         vertical_velocity: float,
         reference_vertical_velocity: float,
     ) -> dict[str, float]:
         """Return stair-surface-aware support, clearance, and ascent/descent terms."""
 
-        if self.cfg.reward_mode != "stairs":
+        if self.cfg.reward_mode != "stairs" or (
+            hasattr(self, "motion_ids")
+            and hasattr(self, "stair_motion_mask")
+            and not self.stair_motion_mask[self.motion_ids[int(env_id)]]
+        ):
             return {
                 "stair_vertical_velocity_track": 0.0,
                 "stair_swing_clearance": 0.0,
@@ -1992,7 +2036,9 @@ class LytRobotAmpEnv:
             }
 
         world_pos = np.asarray(foot_world_pos, dtype=np.float32)
-        surface_height = terrain_height_at(world_pos[:, 0], self.stair_cfg)
+        surface_height = LytRobotAmpEnv._stair_surface_height(
+            self, world_pos[:, 0], env_id
+        )
         geom_clearance = world_pos[:, 2] - surface_height
         side_clearance = np.asarray(
             [np.min(geom_clearance[0:2]), np.min(geom_clearance[2:4])],
@@ -2045,6 +2091,23 @@ class LytRobotAmpEnv:
             "stair_tread_support": tread_support,
             "stair_min_swing_clearance_value": min_swing_clearance,
         }
+
+    def _stair_surface_height(
+        self,
+        x: np.ndarray | float,
+        env_id: int = 0,
+    ) -> np.ndarray:
+        """Return the exact analytic stair tread height used by this world."""
+
+        serial = bool(
+            getattr(getattr(self, "more_terrain_cfg", None), "serial_course", False)
+        )
+        if not serial:
+            return terrain_height_at(x, self.stair_cfg)
+        variant = int(self.course_variant_ids[int(env_id)])
+        return terrain_height_at(x, self.course_stair_cfgs[variant]) + float(
+            self.more_terrain_cfg.course_base_height
+        )
 
     def _side_foot_tracks(
         self,

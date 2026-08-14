@@ -191,7 +191,14 @@ def parse_args() -> argparse.Namespace:
         choices=("follow", "tracking", "free"),
         help="Viewer/recording camera mode. follow manually locks lookat to the pelvis every frame.",
     )
-    parser.add_argument("--record-dir", default=str(REPO_ROOT / "recording"))
+    parser.add_argument(
+        "--record-dir",
+        default=None,
+        help=(
+            "Recording root override. By default videos are stored beside the "
+            "checkpoint under logs/<task>/<stage>/recordings/."
+        ),
+    )
     parser.add_argument("--record-width", type=int, default=1920)
     parser.add_argument("--record-height", type=int, default=1080)
     parser.add_argument("--record-crf", type=int, default=12)
@@ -257,7 +264,7 @@ def make_env_cfg(
         getattr(args, "episode_timeout_jitter_steps", 0)
     )
     use_serial_course = (
-        resolved_stage == "multimotion"
+        bool(cfg.serial_terrain_course)
         if args.serial_terrain_course is None
         else bool(args.serial_terrain_course)
     )
@@ -308,18 +315,19 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
     if stage_arg in {"stage1", "stage2", "multimotion"}:
         return stage_arg
     parts = set(Path(checkpoint_path).expanduser().parts)
-    if "multimotion" in parts:
-        return "multimotion"
-    # Task metadata is authoritative.  Older no-stairs runs were stored below
-    # ``logs/sensor_policy/.../stage1``; checking that path first classified a
-    # multi-motion course as an ordinary flat Stage 1 policy.  Playback then
-    # disabled its serial terrain course and reset from a never-trained natural
-    # stand, which looks exactly like an actor that refuses to walk.
     training_task = str(checkpoint.get("training_task", "")).strip()
     env_cfg = checkpoint.get("env_config", {})
     if not training_task and isinstance(env_cfg, dict):
         training_task = str(env_cfg.get("training_task", "")).strip()
-    if training_task in {"multimotion", "multimotion_no_stairs"}:
+    if training_task == "multimotion":
+        return "multimotion"
+    if training_task in {"multimotion_no_stairs", "stairs_up_down"}:
+        if "stage2" in parts or (
+            isinstance(env_cfg, dict) and bool(env_cfg.get("domain_randomization", False))
+        ):
+            return "stage2"
+        return "stage1"
+    if "multimotion" in parts:
         return "multimotion"
     if "stage2" in parts:
         return "stage2"
@@ -337,7 +345,7 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
 def checkpoint_recording_path(
     checkpoint_path: str | Path,
     checkpoint: dict,
-    record_dir: str | Path,
+    record_dir: str | Path | None,
     stage: str,
 ) -> Path:
     checkpoint_path = Path(checkpoint_path).expanduser()
@@ -353,7 +361,21 @@ def checkpoint_recording_path(
     else:
         iteration = checkpoint_path.stem
 
-    output_dir = Path(record_dir).expanduser().resolve() / stage
+    path_parts = set(checkpoint_path.parts)
+    recording_stage = (
+        "stage2" if "stage2" in path_parts else "stage1" if "stage1" in path_parts else stage
+    )
+    checkpoint_stage_dir = checkpoint_path.parent.parent
+    if record_dir is None and checkpoint_stage_dir.name in {"stage1", "stage2"}:
+        output_dir = checkpoint_stage_dir.resolve() / "recordings"
+    elif record_dir is None:
+        output_dir = checkpoint_stage_dir.resolve() / recording_stage / "recordings"
+    else:
+        output_dir = (
+            Path(record_dir).expanduser().resolve()
+            / recording_stage
+            / "recordings"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     base_path = output_dir / f"{run_name}-{iteration}.mp4"
     if not base_path.exists():

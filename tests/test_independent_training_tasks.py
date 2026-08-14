@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import sys
 
+import mujoco
 import numpy as np
 import torch
 
+from scripts import train
 from scripts.train_multimotion import default_train_args as original_multimotion_args
 from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
 from scripts.train_stairs import default_train_args as stairs_args
@@ -31,30 +33,42 @@ def _option_values(args: list[str], option: str) -> list[str]:
     return args[start:end]
 
 
-def test_stair_free_multimotion_task_is_independent_and_has_no_stairs() -> None:
+def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None:
     args = no_stairs_args()
 
     assert _option_values(args, "--training-task") == ["multimotion_no_stairs"]
     assert _option_values(args, "--motion-names") == ["walk", "rough_walk"]
     assert set(_option_values(args, "--terrain-types")) == {
+        "flat",
         "rough",
         "slope_up",
         "slope_down",
     }
-    assert _option_values(args, "--log-group") == ["multimotion_no_stairs"]
     assert "--serial-terrain-course" in args
+    assert _option_values(args, "--terrain-course-variants") == ["6"]
+    assert "--terrain-course-random-assignment" in args
+    assert _option_values(args, "--terrain-course-random-start-prob") == ["0.0"]
     assert "--reward-mode" not in args
     assert not any(value.startswith("--stair-") for value in args)
     assert "--no-skill-conditioning" in args
     assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
-    assert "--no-use-reference-velocity" in args
     assert "--use-reference-velocity" not in args
-    assert float(_option_values(args, "--stand-start-prob")[0]) > 0.0
-    assert float(_option_values(args, "--startup-action-ramp-steps")[0]) > 0.0
-    assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
-    assert float(_option_values(args, "--foot-slip-velocity-threshold")[0]) > 0.0
-    assert float(_option_values(args, "--min-forward-progress-speed")[0]) >= 0.25
-    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
+
+    with patch.object(sys, "argv", ["train.py"]):
+        ordinary = vars(train.parse_args())
+    with patch.object(sys, "argv", ["train.py", *args]):
+        stair_free = vars(train.parse_args())
+    # PPO/AMP rollout and optimizer parameters still come directly from the
+    # ordinary walking parser/stage wrappers.
+    for key in (
+        "num_envs",
+        "num_steps",
+        "epochs",
+        "minibatches",
+        "amp_minibatch_size",
+        "amp_disc_updates",
+    ):
+        assert stair_free[key] == ordinary[key]
 
     # The original all-terrain entry point remains a separate four-clip task.
     original = original_multimotion_args()
@@ -71,17 +85,21 @@ def test_stair_free_multimotion_task_is_independent_and_has_no_stairs() -> None:
     assert "--skill-conditioning" not in original
 
 
-def test_dedicated_stair_task_uses_only_stair_clips_and_reward() -> None:
+def test_dedicated_stair_task_uses_one_continuous_route_and_reward() -> None:
     args = stairs_args()
 
     assert _option_values(args, "--training-task") == ["stairs_up_down"]
-    assert _option_values(args, "--motion-names") == ["stair_up", "stair_down"]
-    assert _option_values(args, "--motion-weights") == ["0.50", "0.50"]
+    assert _option_values(args, "--motion-names") == ["walk", "stair_up", "stair_down"]
+    assert _option_values(args, "--motion-weights") == ["0.50", "0.25", "0.25"]
     assert _option_values(args, "--terrain-types") == ["stairs"]
     assert float(_option_values(args, "--stair-step-height")[0]) == 0.13
     assert _option_values(args, "--reward-mode") == ["stairs"]
     assert _option_values(args, "--log-group") == ["stairs_up_down"]
-    assert "--serial-terrain-course" not in args
+    assert "--serial-terrain-course" in args
+    assert _option_values(args, "--terrain-course-random-start-prob") == ["0.0"]
+    assert _option_values(args, "--terrain-course-run-in") == ["3.10"]
+    assert _option_values(args, "--terrain-course-run-out") == ["3.10"]
+    assert "--terminate-incomplete-motion-end" in args
     assert "--no-skill-conditioning" in args
     assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
     assert float(_option_values(args, "--stair-swing-clearance-reward-coef")[0]) > 0.0
@@ -184,12 +202,11 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
             motion_weights=(0.5, 0.5),
             motion_loop=(True, False),
             skill_conditioning=False,
-            terrain_types=("rough", "slope_up", "slope_down"),
+            terrain_types=("flat", "rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
-            terrain_course_variants=1,
+            terrain_course_variants=6,
             num_envs=1,
             stand_start_prob=0.0,
-            motion_reset_prob=1.0,
             reset_noise_scale=0.0,
             reference_ctrl_blend=0.0,
             domain_randomization=False,
@@ -204,6 +221,7 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
         assert env.observation_metadata["actor_input_fields"] == ("imu", "tendon_length")
         assert env.observation_metadata["command_dim"] == 0
         assert env.stair_cfg.enabled is False
+        assert env.more_terrain_cfg.serial_course is True
     finally:
         env.close()
 
@@ -214,14 +232,17 @@ def test_stair_task_keeps_terrain_reward_outside_sensor_actor() -> None:
             model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
             training_task="stairs_up_down",
             motion_files=(
+                str(MOTION_DIR / "walk_omniretarget.npz"),
                 str(MOTION_DIR / "stair_up_omniretarget.npz"),
                 str(MOTION_DIR / "stair_down_omniretarget.npz"),
             ),
-            motion_names=("stair_up", "stair_down"),
-            motion_weights=(0.5, 0.5),
-            motion_loop=(False, False),
+            motion_names=("walk", "stair_up", "stair_down"),
+            motion_weights=(0.5, 0.25, 0.25),
+            motion_loop=(True, False, False),
             skill_conditioning=False,
             terrain_types=("stairs",),
+            serial_terrain_course=True,
+            terrain_course_variants=1,
             reward_mode="stairs",
             stair_step_height=0.13,
             stair_step_depth=0.58,
@@ -257,5 +278,64 @@ def test_stair_task_keeps_terrain_reward_outside_sensor_actor() -> None:
         ):
             assert key in info
             assert np.isfinite(info[key]).all()
+    finally:
+        env.close()
+
+
+def test_serial_stair_stage_terminates_when_pelvis_sinks_into_steps() -> None:
+    env = LytRobotAmpEnv(
+        LytRobotEnvCfg(
+            model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
+            motion_files=(
+                str(MOTION_DIR / "walk_omniretarget.npz"),
+                str(MOTION_DIR / "stair_up_omniretarget.npz"),
+                str(MOTION_DIR / "stair_down_omniretarget.npz"),
+            ),
+            motion_names=("walk", "stair_up", "stair_down"),
+            motion_weights=(0.5, 0.25, 0.25),
+            motion_loop=(True, False, False),
+            skill_conditioning=False,
+            terrain_types=("stairs",),
+            serial_terrain_course=True,
+            terrain_course_variants=1,
+            reward_mode="stairs",
+            stair_step_height=0.13,
+            stair_step_depth=0.22,
+            stair_step_count=3,
+            stair_start_x=-0.95,
+            stair_min_root_clearance=0.60,
+            num_envs=1,
+            stand_start_prob=0.0,
+            reset_noise_scale=0.0,
+            reference_ctrl_blend=0.0,
+            domain_randomization=False,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        env.course_stage_ids[0] = 1
+        env.motion_ids[0] = 1
+        env.motion_phase[0] = 0.0
+        stairs = env.course_stair_cfgs[0]
+        root_x = stairs.top_start + 0.5 * stairs.top_length
+        surface = float(
+            env._stair_surface_height(np.asarray([root_x], dtype=np.float32), 0)[0]
+        )
+        data = env.datas[0]
+        data.qpos[0] = root_x
+        data.qpos[1] = env.more_terrain_cfg.course_lane_ys[0]
+        data.qpos[2] = surface + env.cfg.stair_min_root_clearance - 0.08
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(env.model, data)
+        env.last_foot_world_pos[0] = env._foot_positions_world(data)
+
+        _, _, done, info = env.step(
+            np.zeros((1, env.action_dim), dtype=np.float32)
+        )
+
+        np.testing.assert_array_equal(done, [1.0])
+        np.testing.assert_array_equal(info["termination"], [1.0])
+        np.testing.assert_array_equal(info["stair_terrain_penetration"], [1.0])
+        assert info["stair_root_clearance_value"][0] < env.cfg.stair_min_root_clearance
     finally:
         env.close()

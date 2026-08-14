@@ -30,6 +30,7 @@ from .terrain import (
     load_model,
     randomized_course_orders,
     sample_course_start_stages,
+    serial_course_stair_cfg,
     terrain_geom_ids,
     terrain_kind_from_motion,
     terrain_spawn_offset,
@@ -216,6 +217,8 @@ class LytRobotWarpAmpEnv:
             serial_course=bool(cfg.serial_terrain_course),
             course_orders=course_orders,
             course_lane_spacing=cfg.terrain_course_lane_spacing,
+            course_run_in=cfg.terrain_course_run_in,
+            course_run_out=cfg.terrain_course_run_out,
             course_base_height=cfg.terrain_course_base_height,
             flat_lane_y=cfg.flat_lane_y,
             rough_lane_y=cfg.rough_lane_y,
@@ -276,8 +279,14 @@ class LytRobotWarpAmpEnv:
             if not self.stair_cfg.enabled:
                 raise ValueError("The stairs reward mode requires enabled stair geometry.")
             if self.more_terrain_cfg.serial_course:
-                raise ValueError("The stairs reward mode does not support a serial terrain course.")
-            if not np.all(self.stair_motion_mask_np):
+                required = {"walk", "stair_up", "stair_down"}
+                missing = required - {name.lower() for name in motion_names}
+                if missing:
+                    raise ValueError(
+                        "Serial stairs reward requires walk, stair_up, and "
+                        f"stair_down motion clips; missing {sorted(missing)}."
+                    )
+            elif not np.all(self.stair_motion_mask_np):
                 raise ValueError("The stairs reward mode requires only stair motion clips.")
         motion_references = (
             self.motion.motions
@@ -318,6 +327,14 @@ class LytRobotWarpAmpEnv:
                 f"terrain geometry: {missing_terrains}. Enable them with terrain_types."
             )
         self.course_motion_sequences_np = self._build_course_motion_sequences(motion_names)
+        self.course_stair_cfgs = (
+            tuple(
+                serial_course_stair_cfg(self.more_terrain_cfg, self.stair_cfg, variant)
+                for variant in range(len(self.more_terrain_cfg.normalized_course_orders))
+            )
+            if self.more_terrain_cfg.serial_course and "stairs" in terrain_types
+            else ()
+        )
         self.course_stage_scenario_names = tuple(
             course_stage_scenarios(order)
             for order in self.more_terrain_cfg.normalized_course_orders
@@ -426,6 +443,11 @@ class LytRobotWarpAmpEnv:
         self.course_motion_sequences = torch.as_tensor(
             self.course_motion_sequences_np,
             dtype=torch.long,
+            device=self.device,
+        )
+        self.stair_motion_mask = torch.as_tensor(
+            self.stair_motion_mask_np,
+            dtype=torch.bool,
             device=self.device,
         )
         self.course_stage_end_x = torch.as_tensor(
@@ -1392,6 +1414,7 @@ class LytRobotWarpAmpEnv:
                     stair_down=stair_down,
                     stair_down_offset=self.cfg.stair_down_offset,
                     course_variant=(int(variants[row]) if serial_course else 0),
+                    course_stage=(int(start_stages[row]) if serial_course else None),
                 )
                 qpos[row, :3] += offset
 
@@ -2087,9 +2110,25 @@ class LytRobotWarpAmpEnv:
             | (root_height > max_root_height)
             | (up_z < self.cfg.min_upright_z)
         )
+        if self.cfg.reward_mode == "stairs":
+            stair_active = self.stair_motion_mask[self.motion_ids]
+            stair_surface = self._stair_surface_height(self.qpos[:, 0:1])[:, 0]
+            stair_root_clearance = root_height - stair_surface
+            stair_terrain_penetration = stair_active & (
+                stair_root_clearance < float(self.cfg.stair_min_root_clearance)
+            )
+        else:
+            stair_active = torch.zeros_like(fallen)
+            stair_root_clearance = torch.zeros_like(root_height)
+            stair_terrain_penetration = torch.zeros_like(fallen)
+        fallen = fallen | stair_terrain_penetration
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": targets["root_height"],
+            "stair_root_clearance_value": torch.where(
+                stair_active, stair_root_clearance, torch.zeros_like(root_height)
+            ),
+            "stair_terrain_penetration": stair_terrain_penetration.to(torch.float32),
             "root_vel": root_vel,
             "forward_velocity": forward_velocity,
             "forward_velocity_error": forward_velocity_error,
@@ -2167,34 +2206,9 @@ class LytRobotWarpAmpEnv:
                 "stair_min_swing_clearance_value": zeros,
             }
 
-        foot_x = foot_world_pos[:, :, 0]
-        surface_height = torch.zeros_like(foot_x)
-        cursor = float(self.stair_cfg.ascent_start)
-        for index in range(int(self.stair_cfg.step_count)):
-            end = cursor + float(self.stair_cfg.step_depth)
-            height_value = float(index + 1) * float(self.stair_cfg.step_height)
-            inside = (foot_x >= cursor - 1.0e-6) & (foot_x <= end + 1.0e-6)
-            surface_height = torch.where(
-                inside, torch.full_like(surface_height, height_value), surface_height
-            )
-            cursor = end
-        top_end = cursor + float(self.stair_cfg.top_length)
-        top_height = float(self.stair_cfg.step_count) * float(self.stair_cfg.step_height)
-        inside_top = (foot_x >= cursor - 1.0e-6) & (foot_x <= top_end + 1.0e-6)
-        surface_height = torch.where(
-            inside_top, torch.full_like(surface_height, top_height), surface_height
+        surface_height = LytRobotWarpAmpEnv._stair_surface_height(
+            self, foot_world_pos[:, :, 0]
         )
-        cursor = top_end
-        for index in range(int(self.stair_cfg.step_count)):
-            end = cursor + float(self.stair_cfg.step_depth)
-            height_value = float(self.stair_cfg.step_count - index) * float(
-                self.stair_cfg.step_height
-            )
-            inside = (foot_x >= cursor - 1.0e-6) & (foot_x <= end + 1.0e-6)
-            surface_height = torch.where(
-                inside, torch.full_like(surface_height, height_value), surface_height
-            )
-            cursor = end
 
         geom_clearance = foot_world_pos[:, :, 2] - surface_height
         side_clearance = torch.stack(
@@ -2239,12 +2253,62 @@ class LytRobotWarpAmpEnv:
         vertical_velocity_track = torch.exp(
             -(vertical_velocity - reference_vertical_velocity).square() / (vertical_sigma**2)
         )
+        stair_active = (
+            self.stair_motion_mask[self.motion_ids]
+            if hasattr(self, "stair_motion_mask") and hasattr(self, "motion_ids")
+            else torch.ones_like(vertical_velocity_track, dtype=torch.bool)
+        )
         return {
-            "stair_vertical_velocity_track": vertical_velocity_track,
-            "stair_swing_clearance": swing_clearance,
-            "stair_tread_support": tread_support,
-            "stair_min_swing_clearance_value": min_swing_clearance,
+            "stair_vertical_velocity_track": torch.where(
+                stair_active, vertical_velocity_track, zeros
+            ),
+            "stair_swing_clearance": torch.where(stair_active, swing_clearance, zeros),
+            "stair_tread_support": torch.where(stair_active, tread_support, zeros),
+            "stair_min_swing_clearance_value": torch.where(
+                stair_active, min_swing_clearance, zeros
+            ),
         }
+
+    def _stair_surface_height(self, x: torch.Tensor) -> torch.Tensor:
+        """Torch stair height aligned with standalone or relocated course geoms."""
+
+        def height_for_cfg(values: torch.Tensor, cfg: StairTerrainCfg) -> torch.Tensor:
+            result = torch.zeros_like(values)
+            cursor = float(cfg.ascent_start)
+            for index in range(int(cfg.step_count)):
+                end = cursor + float(cfg.step_depth)
+                height = float(index + 1) * float(cfg.step_height)
+                inside = (values >= cursor - 1.0e-6) & (values <= end + 1.0e-6)
+                result = torch.where(inside, torch.full_like(result, height), result)
+                cursor = end
+            top_end = cursor + float(cfg.top_length)
+            top_height = float(cfg.step_count) * float(cfg.step_height)
+            inside = (values >= cursor - 1.0e-6) & (values <= top_end + 1.0e-6)
+            result = torch.where(inside, torch.full_like(result, top_height), result)
+            cursor = top_end
+            for index in range(int(cfg.step_count)):
+                end = cursor + float(cfg.step_depth)
+                height = float(cfg.step_count - index) * float(cfg.step_height)
+                inside = (values >= cursor - 1.0e-6) & (values <= end + 1.0e-6)
+                result = torch.where(inside, torch.full_like(result, height), result)
+                cursor = end
+            return result
+
+        serial = bool(
+            getattr(getattr(self, "more_terrain_cfg", None), "serial_course", False)
+        )
+        if not serial:
+            return height_for_cfg(x, self.stair_cfg)
+        result = torch.zeros_like(x)
+        for variant, cfg in enumerate(self.course_stair_cfgs):
+            candidate = height_for_cfg(x, cfg) + float(
+                self.more_terrain_cfg.course_base_height
+            )
+            variant_mask = self.course_variant_ids == int(variant)
+            while variant_mask.ndim < x.ndim:
+                variant_mask = variant_mask.unsqueeze(-1)
+            result = torch.where(variant_mask, candidate, result)
+        return result
 
     def _side_foot_tracks(
         self,

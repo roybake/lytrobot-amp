@@ -10,6 +10,8 @@ from unittest.mock import patch
 from scripts import train
 from scripts.train_multimotion import default_train_args as multimotion_args
 from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
+from scripts.train_multimotion_no_stairs_stage1 import main as no_stairs_stage1_main
+from scripts.train_multimotion_no_stairs_stage2 import main as no_stairs_stage2_main
 from scripts.train_stairs import default_train_args as stairs_args
 from scripts.two_stage_task import build_task_stage_args
 from sensor_training.train_multimotion import default_train_args as sensor_multimotion_args
@@ -25,12 +27,6 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
             "sensor_training/train_multimotion_stage1.py": ROOT / "logs" / "multimotion",
             "sensor_training/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
-            "scripts/train_multimotion_no_stairs_stage1.py": (
-                ROOT / "logs" / "multimotion" / "no_stairs"
-            ),
-            "scripts/train_multimotion_no_stairs_stage2.py": (
-                ROOT / "logs" / "multimotion" / "no_stairs"
-            ),
             "scripts/train_stairs_stage1.py": ROOT / "logs" / "stairs",
             "scripts/train_stairs_stage2.py": ROOT / "logs" / "stairs",
         }
@@ -40,6 +36,33 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             ) as mocked_run:
                 runpy.run_path(str(ROOT / launcher), run_name="__main__")
                 self.assertEqual(mocked_run.call_args.kwargs["log_root"], expected_root)
+
+    def test_stair_free_launchers_call_the_canonical_walking_stages(self) -> None:
+        cases = (
+            (
+                no_stairs_stage1_main,
+                "scripts.train_multimotion_no_stairs_stage1.run_stage1",
+            ),
+            (
+                no_stairs_stage2_main,
+                "scripts.train_multimotion_no_stairs_stage2.run_stage2",
+            ),
+        )
+        for launcher, target in cases:
+            with self.subTest(target=target), patch(target) as canonical_stage, patch.object(
+                sys, "argv", ["launcher.py", "--no-wandb"]
+            ):
+                launcher()
+                canonical_stage.assert_called_once_with()
+                self.assertEqual(
+                    sys.argv[sys.argv.index("--training-task") + 1],
+                    "multimotion_no_stairs",
+                )
+                self.assertEqual(
+                    Path(sys.argv[sys.argv.index("--log-root") + 1]),
+                    ROOT / "logs" / "multimotion" / "no_stairs",
+                )
+                self.assertIn("--no-wandb", sys.argv)
 
     def test_task_defaults_do_not_enable_domain_randomization(self) -> None:
         for args in (no_stairs_args(), stairs_args(), sensor_multimotion_args()):
@@ -122,7 +145,6 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
     def test_effective_parser_contract_for_every_new_two_stage_task(self) -> None:
         tasks = (
             ("multimotion", multimotion_args()),
-            ("multimotion_no_stairs", no_stairs_args()),
             ("stairs_up_down", stairs_args()),
         )
         for task_name, task_args in tasks:
