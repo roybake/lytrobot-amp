@@ -185,6 +185,8 @@ class LytRobotWarpAmpEnv:
             raise FileNotFoundError(f"Model XML not found: {self.model_path}")
 
         terrain_types = validate_terrain_types(cfg.terrain_types)
+        if cfg.reward_mode not in {"default", "stairs"}:
+            raise ValueError(f"Unknown reward mode: {cfg.reward_mode!r}.")
         if cfg.serial_terrain_course and not terrain_types:
             raise ValueError("serial terrain course requires at least one terrain type.")
         self.stair_cfg = StairTerrainCfg(
@@ -270,6 +272,13 @@ class LytRobotWarpAmpEnv:
         self.stair_down_motion_mask_np = np.asarray(
             ["stair_down" in name.lower() for name in motion_names], dtype=bool
         )
+        if cfg.reward_mode == "stairs":
+            if not self.stair_cfg.enabled:
+                raise ValueError("The stairs reward mode requires enabled stair geometry.")
+            if self.more_terrain_cfg.serial_course:
+                raise ValueError("The stairs reward mode does not support a serial terrain course.")
+            if not np.all(self.stair_motion_mask_np):
+                raise ValueError("The stairs reward mode requires only stair motion clips.")
         motion_references = (
             self.motion.motions
             if isinstance(self.motion, MotionLibrary)
@@ -1083,6 +1092,11 @@ class LytRobotWarpAmpEnv:
         progress = progress * progress * (3.0 - 2.0 * progress)
         return torch.where(stand_start, progress, torch.ones_like(progress))
 
+    def _motion_phase_progress(self) -> torch.Tensor:
+        """Scale reference-clock advancement without changing target blending."""
+
+        return self._stand_start_progress()
+
     def _blend_start_targets(
         self,
         targets: dict[str, torch.Tensor],
@@ -1308,14 +1322,13 @@ class LytRobotWarpAmpEnv:
         else:
             sampled_motion_ids = np.zeros(len(ids_np), dtype=np.int32)
             states = self.motion.sample_states(len(ids_np), self.rng)
-        use_stand_start = (
-            np.zeros(len(ids_np), dtype=bool)
-            if serial_course
-            else self.rng.random(len(ids_np))
-            < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        # Keep the GPU reset distribution aligned with CPU/deployment: a
+        # serial course may also begin from the natural standing pose.
+        use_stand_start = self.rng.random(len(ids_np)) < float(
+            np.clip(self.cfg.stand_start_prob, 0.0, 1.0)
         )
         use_motion_reset = (
-            np.ones(len(ids_np), dtype=bool)
+            ~use_stand_start
             if serial_course
             else ~use_stand_start
             & (
@@ -1540,7 +1553,7 @@ class LytRobotWarpAmpEnv:
         start_x = self.qpos[:, 0].clone()
         commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
         commanded_action = commanded_action * self._startup_action_ramp()
-        phase_scale = self._stand_start_progress()
+        phase_scale = self._motion_phase_progress()
         frame_counts = self.motion_frame_counts[self.motion_ids].to(torch.float32)
         next_phase = (
             self.motion_phase
@@ -1715,6 +1728,7 @@ class LytRobotWarpAmpEnv:
             targets,
             foot_pos,
             foot_vel,
+            foot_world_pos,
             foot_world_vel,
             foot_geom_contact,
             foot_contact,
@@ -1855,6 +1869,7 @@ class LytRobotWarpAmpEnv:
         targets: dict[str, torch.Tensor],
         foot_pos: torch.Tensor,
         foot_vel: torch.Tensor,
+        foot_world_pos: torch.Tensor,
         foot_world_vel: torch.Tensor,
         foot_geom_contact: torch.Tensor,
         foot_contact: torch.Tensor,
@@ -1926,12 +1941,27 @@ class LytRobotWarpAmpEnv:
             foot_geom_contact,
             targets["foot_contact"],
         )
+        foot_slip = self._foot_slip_penalty(
+            foot_world_vel,
+            foot_geom_contact,
+        )
         contact_track = torch.clamp(
             1.0 - torch.mean(torch.abs(foot_contact - targets["foot_contact"]), dim=1),
             0.0,
             1.0,
         )
         missed_contact = torch.mean(targets["foot_contact"] * (1.0 - foot_contact), dim=1)
+        stair_terms = (
+            self._stair_terrain_reward_terms(
+                foot_world_pos,
+                foot_contact,
+                targets["foot_contact"],
+                vertical_velocity=self.qvel[:, 2],
+                reference_vertical_velocity=targets["root_lin_vel"][:, 2],
+            )
+            if self.cfg.reward_mode == "stairs"
+            else {}
+        )
         position_action = torch.clamp(action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
         prev_position_action = torch.clamp(prev_action.to(dtype=torch.float32, device=self.device), -1.0, 1.0)
         ctrl_error = torch.mean(
@@ -1980,33 +2010,66 @@ class LytRobotWarpAmpEnv:
             position_action,
         )
 
-        reward = (
-            0.05
-            + 1.40 * pose_track
-            + 0.45 * vel_track
-            + 0.75 * height
-            + 0.90 * root_orientation
-            + 0.90 * root_vel
-            + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
-            + self.cfg.forward_progress_reward_coef * stable_forward_progress
-            - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
-            - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
-            + 1.25 * foot_pos_track
-            + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
-            + self.cfg.step_gap_coef * side_metrics["step_gap"]
-            + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
-            + self.cfg.foot_vel_reward_coef * foot_vel_track
-            + self.cfg.stance_foot_reward_coef * stance_foot_track
-            + self.cfg.contact_reward_coef * contact_track
-            + 0.45 * distal_vel_track
-            + self.cfg.symmetry_reward_coef * symmetry_track
-            + 0.35 * ctrl_track
-            - self.cfg.ctrl_penalty_coef * ctrl_penalty
-            - self.cfg.action_rate_penalty_coef * action_rate
-            - self.cfg.distal_action_penalty_coef * distal_action
-            - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
-            - self.cfg.missed_contact_penalty_coef * missed_contact
-        )
+        if self.cfg.reward_mode == "stairs":
+            reward = (
+                0.05
+                + 1.15 * pose_track
+                + 0.35 * vel_track
+                + 1.20 * height
+                + 1.00 * root_orientation
+                + 0.55 * root_vel
+                + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+                + self.cfg.forward_progress_reward_coef * stable_forward_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + 0.65 * foot_pos_track
+                + 0.40 * foot_vel_track
+                + 0.50 * stance_foot_track
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                + 0.35 * contact_track
+                + 0.35 * distal_vel_track
+                + 0.25 * ctrl_track
+                + self.cfg.stair_vertical_velocity_reward_coef
+                * stair_terms["stair_vertical_velocity_track"]
+                + self.cfg.stair_swing_clearance_reward_coef
+                * stair_terms["stair_swing_clearance"]
+                + self.cfg.stair_tread_support_reward_coef
+                * stair_terms["stair_tread_support"]
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+                - self.cfg.missed_contact_penalty_coef * missed_contact
+            )
+        else:
+            reward = (
+                0.05
+                + 1.40 * pose_track
+                + 0.45 * vel_track
+                + 0.75 * height
+                + 0.90 * root_orientation
+                + 0.90 * root_vel
+                + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+                + self.cfg.forward_progress_reward_coef * stable_forward_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + 1.25 * foot_pos_track
+                + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
+                + self.cfg.step_gap_coef * side_metrics["step_gap"]
+                + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
+                + self.cfg.foot_vel_reward_coef * foot_vel_track
+                + self.cfg.stance_foot_reward_coef * stance_foot_track
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                + self.cfg.contact_reward_coef * contact_track
+                + 0.45 * distal_vel_track
+                + self.cfg.symmetry_reward_coef * symmetry_track
+                + 0.35 * ctrl_track
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+                - self.cfg.missed_contact_penalty_coef * missed_contact
+            )
 
         bad_state = ~(
             torch.isfinite(self.qpos).all(dim=1)
@@ -2053,8 +2116,10 @@ class LytRobotWarpAmpEnv:
             "foot_vel": foot_vel_track,
             "stance_foot": stance_foot_track,
             "stance_foot_speed": stance_foot_speed,
+            "foot_slip": foot_slip,
             "contact": contact_track,
             "missed_contact": missed_contact,
+            **stair_terms,
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
             "foot_symmetry": foot_symmetry_track,
@@ -2081,6 +2146,105 @@ class LytRobotWarpAmpEnv:
         termination = bad_state | fallen
         components["termination"] = termination.to(torch.float32)
         return reward, dones, timed_out, components
+
+    def _stair_terrain_reward_terms(
+        self,
+        foot_world_pos: torch.Tensor,
+        foot_contact: torch.Tensor,
+        reference_foot_contact: torch.Tensor,
+        *,
+        vertical_velocity: torch.Tensor,
+        reference_vertical_velocity: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """GPU equivalent of the stair-surface-aware CPU reward terms."""
+
+        zeros = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        if self.cfg.reward_mode != "stairs":
+            return {
+                "stair_vertical_velocity_track": zeros,
+                "stair_swing_clearance": zeros,
+                "stair_tread_support": zeros,
+                "stair_min_swing_clearance_value": zeros,
+            }
+
+        foot_x = foot_world_pos[:, :, 0]
+        surface_height = torch.zeros_like(foot_x)
+        cursor = float(self.stair_cfg.ascent_start)
+        for index in range(int(self.stair_cfg.step_count)):
+            end = cursor + float(self.stair_cfg.step_depth)
+            height_value = float(index + 1) * float(self.stair_cfg.step_height)
+            inside = (foot_x >= cursor - 1.0e-6) & (foot_x <= end + 1.0e-6)
+            surface_height = torch.where(
+                inside, torch.full_like(surface_height, height_value), surface_height
+            )
+            cursor = end
+        top_end = cursor + float(self.stair_cfg.top_length)
+        top_height = float(self.stair_cfg.step_count) * float(self.stair_cfg.step_height)
+        inside_top = (foot_x >= cursor - 1.0e-6) & (foot_x <= top_end + 1.0e-6)
+        surface_height = torch.where(
+            inside_top, torch.full_like(surface_height, top_height), surface_height
+        )
+        cursor = top_end
+        for index in range(int(self.stair_cfg.step_count)):
+            end = cursor + float(self.stair_cfg.step_depth)
+            height_value = float(self.stair_cfg.step_count - index) * float(
+                self.stair_cfg.step_height
+            )
+            inside = (foot_x >= cursor - 1.0e-6) & (foot_x <= end + 1.0e-6)
+            surface_height = torch.where(
+                inside, torch.full_like(surface_height, height_value), surface_height
+            )
+            cursor = end
+
+        geom_clearance = foot_world_pos[:, :, 2] - surface_height
+        side_clearance = torch.stack(
+            (
+                torch.amin(geom_clearance[:, 0:2], dim=1),
+                torch.amin(geom_clearance[:, 2:4], dim=1),
+            ),
+            dim=1,
+        )
+        reference_contact = torch.clamp(reference_foot_contact, 0.0, 1.0)
+        actual_contact = torch.clamp(foot_contact, 0.0, 1.0)
+        stance_sum = torch.sum(reference_contact, dim=1)
+        support_height_track = torch.exp(-side_clearance.square() / (0.04**2))
+        tread_support = torch.sum(
+            reference_contact * actual_contact * support_height_track, dim=1
+        ) / stance_sum.clamp_min(1.0e-6)
+        tread_support = torch.where(
+            stance_sum > 1.0e-6, tread_support, torch.ones_like(tread_support)
+        )
+
+        swing_weight = 1.0 - reference_contact
+        swing_sum = torch.sum(swing_weight, dim=1)
+        clearance_target = max(float(self.cfg.stair_swing_clearance), 1.0e-6)
+        clearance_score = torch.clamp(side_clearance / clearance_target, 0.0, 1.0)
+        swing_clearance = torch.sum(swing_weight * clearance_score, dim=1) / swing_sum.clamp_min(
+            1.0e-6
+        )
+        swing_clearance = torch.where(
+            swing_sum > 1.0e-6, swing_clearance, torch.ones_like(swing_clearance)
+        )
+        masked_clearance = torch.where(
+            swing_weight > 1.0e-6,
+            side_clearance,
+            torch.full_like(side_clearance, float("inf")),
+        )
+        min_swing_clearance = torch.amin(masked_clearance, dim=1)
+        min_swing_clearance = torch.where(
+            swing_sum > 1.0e-6, min_swing_clearance, torch.zeros_like(min_swing_clearance)
+        )
+
+        vertical_sigma = max(float(self.cfg.stair_vertical_velocity_sigma), 1.0e-6)
+        vertical_velocity_track = torch.exp(
+            -(vertical_velocity - reference_vertical_velocity).square() / (vertical_sigma**2)
+        )
+        return {
+            "stair_vertical_velocity_track": vertical_velocity_track,
+            "stair_swing_clearance": swing_clearance,
+            "stair_tread_support": tread_support,
+            "stair_min_swing_clearance_value": min_swing_clearance,
+        }
 
     def _side_foot_tracks(
         self,
@@ -2191,6 +2355,32 @@ class LytRobotWarpAmpEnv:
             torch.zeros_like(stance_speed),
         )
         return stance_track, stance_speed
+
+    def _foot_slip_penalty(
+        self,
+        foot_world_vel: torch.Tensor,
+        foot_geom_contact: torch.Tensor,
+    ) -> torch.Tensor:
+        """Torch equivalent of the explicit contacting-foot slip cost."""
+
+        contact = torch.clamp(foot_geom_contact, 0.0, 1.0)
+        horizontal_speed = torch.linalg.vector_norm(
+            foot_world_vel[:, :, 0:2], dim=2
+        )
+        threshold = max(float(self.cfg.foot_slip_velocity_threshold), 0.0)
+        scale = max(float(self.cfg.stance_foot_vel_sigma), 1.0e-6)
+        violation = torch.clamp(
+            (horizontal_speed - threshold) / scale, 0.0, 4.0
+        )
+        contact_count = torch.sum(contact, dim=1)
+        penalty = torch.sum(violation * contact, dim=1) / contact_count.clamp_min(
+            1.0e-6
+        )
+        return torch.where(
+            contact_count > 1.0e-6,
+            penalty,
+            torch.zeros_like(penalty),
+        )
 
     def _symmetry_track(
         self,

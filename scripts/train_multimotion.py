@@ -6,6 +6,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent
+for path in (REPO_ROOT, REPO_ROOT / "src"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
 from lytrobot_amp.benchmark import (
     MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
@@ -15,8 +21,6 @@ from lytrobot_amp.benchmark import (
     TRAINING_TARGET_SPEED_MPS,
 )
 
-HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parent
 REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 PARALLEL_ENVS = 4096
 ROLLOUT_STEPS = 24
@@ -29,6 +33,8 @@ COURSE_RANDOM_START_RAMP_ITERATIONS = 10000
 
 def default_train_args() -> list[str]:
     return [
+        "--training-task",
+        "multimotion",
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
@@ -49,7 +55,7 @@ def default_train_args() -> list[str]:
         "false",
         "false",
         "false",
-        "--skill-conditioning",
+        "--no-skill-conditioning",
         # 4096 worlds x 24 steps = 98,304 transitions per rollout.  Eight PPO
         # minibatches keep each optimizer batch at 12,288 samples instead of
         # the overly coarse 24,576 produced by the generic four-way default.
@@ -127,7 +133,7 @@ def default_train_args() -> list[str]:
         "--slope-angle-deg",
         f"{MAX_SLOPE_DEG:g}",
         "--stair-step-height",
-        f"{STAIR_HEIGHT_RANGE_M[1]:g}",
+        f"{STAIR_HEIGHT_RANGE_M[0]:g}",
         "--stair-step-depth",
         f"{STAIR_TREAD_RANGE_M[0]:g}",
         "--stair-step-count",
@@ -162,7 +168,7 @@ def default_train_args() -> list[str]:
 
 def main() -> None:
     sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
-    from train import main as train_main
+    from sensor_training.train import main as train_main
 
     train_main()
 

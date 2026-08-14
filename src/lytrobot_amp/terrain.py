@@ -52,7 +52,7 @@ class StairTerrainCfg:
     """A straight run-in, ascent, top platform, descent, and run-out track."""
 
     enabled: bool = False
-    step_height: float = 0.08
+    step_height: float = 0.13
     step_depth: float = 0.30
     step_count: int = 5
     width: float = 2.0

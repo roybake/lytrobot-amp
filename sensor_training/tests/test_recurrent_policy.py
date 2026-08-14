@@ -72,6 +72,48 @@ class _DummySensorEnv:
 
 
 class RecurrentSensorPolicyTests(unittest.TestCase):
+    def test_resume_layout_check_ignores_squat_reward_only_metadata(self) -> None:
+        saved = {
+            "actor_obs_dim": 338,
+            "sensor_history_obs_dim": 336,
+            "actor_input_fields": (
+                "imu",
+                "tendon_length",
+                "feedback_corrected_phase",
+            ),
+            "phase_feedback": {
+                "reference_frequency_hz": 40.0,
+                "bottom_depth_threshold": 0.85,
+                "cycle_completion_bonus": 5.0,
+            },
+            "success_definition": "survived_episode_with_complete_cycle",
+        }
+        current = {
+            **saved,
+            "phase_feedback": {
+                **saved["phase_feedback"],
+                "cycle_completion_bonus": 25.0,
+                "terminate_on_cycle_completion": True,
+            },
+            "success_definition": "completed_cycle",
+        }
+
+        self.assertEqual(
+            SensorHistoryPPOAMPTrainer._sensor_observation_layout_signature(saved),
+            SensorHistoryPPOAMPTrainer._sensor_observation_layout_signature(current),
+        )
+
+        incompatible = {
+            **current,
+            "actor_obs_dim": 336,
+        }
+        self.assertNotEqual(
+            SensorHistoryPPOAMPTrainer._sensor_observation_layout_signature(saved),
+            SensorHistoryPPOAMPTrainer._sensor_observation_layout_signature(
+                incompatible
+            ),
+        )
+
     def _policy(self) -> SensorActorCritic:
         torch.manual_seed(7)
         return SensorActorCritic(

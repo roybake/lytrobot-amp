@@ -28,6 +28,7 @@ from .terrain import (
     randomized_course_orders,
     sample_course_start_stages,
     terrain_geom_ids,
+    terrain_height_at,
     terrain_kind_from_motion,
     terrain_spawn_offset,
     validate_terrain_types,
@@ -203,12 +204,13 @@ class LytRobotEnvCfg:
     motion_names: tuple[str, ...] = ()
     motion_weights: tuple[float, ...] = ()
     motion_loop: tuple[bool, ...] = ()
+    training_task: str = ""
     skill_conditioning: bool = True
     use_reference_velocity: bool = False
     terrain_types: tuple[str, ...] = ()
     terrain_asset_dir: str = ""
     stair_terrain: bool = False
-    stair_step_height: float = 0.08
+    stair_step_height: float = 0.13
     stair_step_depth: float = 0.30
     stair_step_count: int = 5
     stair_width: float = 2.0
@@ -247,6 +249,7 @@ class LytRobotEnvCfg:
     episode_steps: int = 1000
     episode_timeout_jitter_steps: int = 240
     target_velocity: float = 1.0
+    reward_mode: str = "default"
     forward_velocity_tracking_sigma: float = 0.25
     forward_velocity_reward_coef: float = 0.0
     forward_progress_reward_coef: float = 0.0
@@ -274,6 +277,8 @@ class LytRobotEnvCfg:
     stance_foot_vel_sigma: float = 0.15
     foot_vel_reward_coef: float = 0.35
     stance_foot_reward_coef: float = 1.00
+    foot_slip_velocity_threshold: float = 0.08
+    foot_slip_penalty_coef: float = 0.0
     contact_reward_coef: float = 0.70
     missed_contact_penalty_coef: float = 0.80
     side_foot_pos_sigma: float = 0.08
@@ -282,6 +287,11 @@ class LytRobotEnvCfg:
     side_foot_pos_coef: float = 0.0
     step_gap_coef: float = 0.0
     swing_advance_coef: float = 0.0
+    stair_vertical_velocity_sigma: float = 0.25
+    stair_vertical_velocity_reward_coef: float = 1.0
+    stair_swing_clearance: float = 0.08
+    stair_swing_clearance_reward_coef: float = 0.75
+    stair_tread_support_reward_coef: float = 1.25
     distal_joint_vel_sigma: float = 2.0
     symmetry_reward_coef: float = 1.20
     symmetry_foot_pos_sigma: float = 0.08
@@ -296,6 +306,20 @@ class LytRobotEnvCfg:
     stand_start_transition_min_steps: int = 80
     stand_start_transition_max_steps: int = 160
     stand_start_push_delay_steps: int = 100
+    # Used only by squat_training's phase-clock supervisor.  Other tasks do
+    # not read these fields and therefore retain their original phase logic.
+    squat_phase_feedback: bool = False
+    squat_phase_lag_tolerance: float = 0.08
+    squat_phase_min_scale: float = 0.0
+    squat_bottom_depth_threshold: float = 0.85
+    squat_stand_depth_threshold: float = 0.15
+    squat_upright_threshold: float = 0.75
+    squat_phase_stall_threshold: float = 0.25
+    squat_phase_max_stall_steps: int = 40
+    squat_phase_stall_penalty: float = 0.25
+    squat_phase_slowdown_penalty_coef: float = 2.0
+    squat_cycle_completion_bonus: float = 5.0
+    squat_terminate_on_cycle_completion: bool = False
     ctrl_penalty_coef: float = 0.040
     action_rate_penalty_coef: float = 0.100
     distal_action_penalty_coef: float = 0.030
@@ -339,6 +363,8 @@ class LytRobotAmpEnv:
             raise FileNotFoundError(f"Model XML not found: {self.model_path}")
 
         terrain_types = validate_terrain_types(cfg.terrain_types)
+        if cfg.reward_mode not in {"default", "stairs"}:
+            raise ValueError(f"Unknown reward mode: {cfg.reward_mode!r}.")
         if cfg.serial_terrain_course and not terrain_types:
             raise ValueError("serial terrain course requires at least one terrain type.")
         self.stair_cfg = StairTerrainCfg(
@@ -416,6 +442,13 @@ class LytRobotAmpEnv:
         self.stair_down_motion_mask = np.asarray(
             ["stair_down" in name.lower() for name in motion_names], dtype=bool
         )
+        if cfg.reward_mode == "stairs":
+            if not self.stair_cfg.enabled:
+                raise ValueError("The stairs reward mode requires enabled stair geometry.")
+            if self.more_terrain_cfg.serial_course:
+                raise ValueError("The stairs reward mode does not support a serial terrain course.")
+            if not np.all(self.stair_motion_mask):
+                raise ValueError("The stairs reward mode requires only stair motion clips.")
         motion_references = (
             self.motion.motions
             if isinstance(self.motion, MotionLibrary)
@@ -709,6 +742,11 @@ class LytRobotAmpEnv:
         progress = np.clip(raw, 0.0, 1.0)
         progress = progress * progress * (3.0 - 2.0 * progress)
         return np.where(self.stand_start, progress, 1.0).astype(np.float32)
+
+    def _motion_phase_progress(self) -> np.ndarray:
+        """Scale reference-clock advancement without changing target blending."""
+
+        return self._stand_start_progress()
 
     def _blend_start_targets(self, targets: MotionTargets) -> MotionTargets:
         progress = self._stand_start_progress()
@@ -1088,14 +1126,16 @@ class LytRobotAmpEnv:
             sampled_motion_ids = np.zeros(len(ids), dtype=np.int32)
             states = self.motion.sample_states(len(ids), self.rng)
         self.motion_ids[ids] = sampled_motion_ids
-        use_stand_start = (
-            np.zeros(len(ids), dtype=bool)
-            if serial_course
-            else self.rng.random(len(ids))
-            < float(np.clip(self.cfg.stand_start_prob, 0.0, 1.0))
+        # Serial-course deployment and non-serial flat playback both need to
+        # launch from the robot's natural standing pose.  Previously serial
+        # courses silently forced this mask to false, so a nonzero
+        # ``stand_start_prob`` never exposed the policy to its deployed start
+        # state.
+        use_stand_start = self.rng.random(len(ids)) < float(
+            np.clip(self.cfg.stand_start_prob, 0.0, 1.0)
         )
         use_motion_reset = (
-            np.ones(len(ids), dtype=bool)
+            ~use_stand_start
             if serial_course
             else ~use_stand_start
             & (
@@ -1354,7 +1394,7 @@ class LytRobotAmpEnv:
             "distal_action": [],
             "distal_action_rate": [],
         }
-        phase_scale = self._stand_start_progress()
+        phase_scale = self._motion_phase_progress()
         course_complete = np.zeros(self.num_envs, dtype=bool)
         course_suffix_complete = np.zeros(self.num_envs, dtype=bool)
         course_stage_advance = np.zeros(self.num_envs, dtype=bool)
@@ -1503,6 +1543,7 @@ class LytRobotAmpEnv:
                 reference_targets,
                 foot_pos,
                 foot_vel,
+                foot_world_pos,
                 foot_world_vel,
                 foot_geom_contact,
                 foot_contact,
@@ -1640,6 +1681,7 @@ class LytRobotAmpEnv:
         reference_targets: MotionTargets,
         foot_pos: np.ndarray,
         foot_vel: np.ndarray,
+        foot_world_pos: np.ndarray,
         foot_world_vel: np.ndarray,
         foot_geom_contact: np.ndarray,
         foot_contact: np.ndarray,
@@ -1717,11 +1759,26 @@ class LytRobotAmpEnv:
             foot_geom_contact,
             reference_targets.foot_contact[env_id],
         )
+        foot_slip = self._foot_slip_penalty(
+            foot_world_vel,
+            foot_geom_contact,
+        )
         contact_track = float(
             np.clip(1.0 - np.mean(np.abs(foot_contact - reference_targets.foot_contact[env_id])), 0.0, 1.0)
         )
         missed_contact = float(
             np.mean(reference_targets.foot_contact[env_id] * (1.0 - foot_contact))
+        )
+        stair_terms = (
+            self._stair_terrain_reward_terms(
+                foot_world_pos,
+                foot_contact,
+                reference_targets.foot_contact[env_id],
+                vertical_velocity=float(data.qvel[2]),
+                reference_vertical_velocity=float(reference_targets.root_lin_vel[env_id, 2]),
+            )
+            if self.cfg.reward_mode == "stairs"
+            else {}
         )
         position_action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         prev_position_action = np.clip(np.asarray(prev_action, dtype=np.float32), -1.0, 1.0)
@@ -1775,33 +1832,69 @@ class LytRobotAmpEnv:
             position_action,
         )
 
-        reward = (
-            0.05
-            + 1.40 * pose_track
-            + 0.45 * vel_track
-            + 0.75 * height
-            + 0.90 * root_orientation
-            + 0.90 * root_vel
-            + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
-            + self.cfg.forward_progress_reward_coef * stable_forward_progress
-            - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
-            - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
-            + 1.25 * foot_pos_track
-            + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
-            + self.cfg.step_gap_coef * side_metrics["step_gap"]
-            + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
-            + self.cfg.foot_vel_reward_coef * foot_vel_track
-            + self.cfg.stance_foot_reward_coef * stance_foot_track
-            + self.cfg.contact_reward_coef * contact_track
-            + 0.45 * distal_vel_track
-            + self.cfg.symmetry_reward_coef * symmetry_track
-            + 0.35 * ctrl_track
-            - self.cfg.ctrl_penalty_coef * ctrl_penalty
-            - self.cfg.action_rate_penalty_coef * action_rate
-            - self.cfg.distal_action_penalty_coef * distal_action
-            - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
-            - self.cfg.missed_contact_penalty_coef * missed_contact
-        )
+        if self.cfg.reward_mode == "stairs":
+            # Stair locomotion is intentionally less dominated by flat-ground
+            # pose symmetry.  It explicitly rewards matching vertical motion,
+            # clearing the next riser, and supporting the body on a tread.
+            reward = (
+                0.05
+                + 1.15 * pose_track
+                + 0.35 * vel_track
+                + 1.20 * height
+                + 1.00 * root_orientation
+                + 0.55 * root_vel
+                + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+                + self.cfg.forward_progress_reward_coef * stable_forward_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + 0.65 * foot_pos_track
+                + 0.40 * foot_vel_track
+                + 0.50 * stance_foot_track
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                + 0.35 * contact_track
+                + 0.35 * distal_vel_track
+                + 0.25 * ctrl_track
+                + self.cfg.stair_vertical_velocity_reward_coef
+                * stair_terms["stair_vertical_velocity_track"]
+                + self.cfg.stair_swing_clearance_reward_coef
+                * stair_terms["stair_swing_clearance"]
+                + self.cfg.stair_tread_support_reward_coef
+                * stair_terms["stair_tread_support"]
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+                - self.cfg.missed_contact_penalty_coef * missed_contact
+            )
+        else:
+            reward = (
+                0.05
+                + 1.40 * pose_track
+                + 0.45 * vel_track
+                + 0.75 * height
+                + 0.90 * root_orientation
+                + 0.90 * root_vel
+                + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
+                + self.cfg.forward_progress_reward_coef * stable_forward_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + 1.25 * foot_pos_track
+                + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
+                + self.cfg.step_gap_coef * side_metrics["step_gap"]
+                + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
+                + self.cfg.foot_vel_reward_coef * foot_vel_track
+                + self.cfg.stance_foot_reward_coef * stance_foot_track
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                + self.cfg.contact_reward_coef * contact_track
+                + 0.45 * distal_vel_track
+                + self.cfg.symmetry_reward_coef * symmetry_track
+                + 0.35 * ctrl_track
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+                - self.cfg.missed_contact_penalty_coef * missed_contact
+            )
 
         bad_state = not (
             np.isfinite(data.qpos).all()
@@ -1848,8 +1941,10 @@ class LytRobotAmpEnv:
             "foot_vel": foot_vel_track,
             "stance_foot": stance_foot_track,
             "stance_foot_speed": stance_foot_speed,
+            "foot_slip": foot_slip,
             "contact": contact_track,
             "missed_contact": missed_contact,
+            **stair_terms,
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
             "foot_symmetry": foot_symmetry_track,
@@ -1876,6 +1971,80 @@ class LytRobotAmpEnv:
         termination = bool(bad_state or fallen)
         components["termination"] = float(termination)
         return float(reward), done, bool(timed_out), components
+
+    def _stair_terrain_reward_terms(
+        self,
+        foot_world_pos: np.ndarray,
+        foot_contact: np.ndarray,
+        reference_foot_contact: np.ndarray,
+        *,
+        vertical_velocity: float,
+        reference_vertical_velocity: float,
+    ) -> dict[str, float]:
+        """Return stair-surface-aware support, clearance, and ascent/descent terms."""
+
+        if self.cfg.reward_mode != "stairs":
+            return {
+                "stair_vertical_velocity_track": 0.0,
+                "stair_swing_clearance": 0.0,
+                "stair_tread_support": 0.0,
+                "stair_min_swing_clearance_value": 0.0,
+            }
+
+        world_pos = np.asarray(foot_world_pos, dtype=np.float32)
+        surface_height = terrain_height_at(world_pos[:, 0], self.stair_cfg)
+        geom_clearance = world_pos[:, 2] - surface_height
+        side_clearance = np.asarray(
+            [np.min(geom_clearance[0:2]), np.min(geom_clearance[2:4])],
+            dtype=np.float32,
+        )
+        reference_contact = np.clip(
+            np.asarray(reference_foot_contact, dtype=np.float32), 0.0, 1.0
+        )
+        actual_contact = np.clip(np.asarray(foot_contact, dtype=np.float32), 0.0, 1.0)
+
+        stance_weight = reference_contact
+        stance_sum = float(np.sum(stance_weight))
+        # The contact mesh origin sits a few centimetres above/below the exact
+        # collision point. A bounded Gaussian around the tread surface keeps
+        # this term stable across foot and toe mesh origins.
+        support_height_track = np.exp(
+            -np.square(side_clearance) / (0.04**2)
+        ).astype(np.float32)
+        tread_support = (
+            float(np.sum(stance_weight * actual_contact * support_height_track) / stance_sum)
+            if stance_sum > 1.0e-6
+            else 1.0
+        )
+
+        swing_weight = 1.0 - reference_contact
+        swing_sum = float(np.sum(swing_weight))
+        clearance_target = max(float(self.cfg.stair_swing_clearance), 1.0e-6)
+        clearance_score = np.clip(side_clearance / clearance_target, 0.0, 1.0)
+        swing_clearance = (
+            float(np.sum(swing_weight * clearance_score) / swing_sum)
+            if swing_sum > 1.0e-6
+            else 1.0
+        )
+        min_swing_clearance = (
+            float(np.min(side_clearance[swing_weight > 1.0e-6]))
+            if swing_sum > 1.0e-6
+            else 0.0
+        )
+
+        vertical_sigma = max(float(self.cfg.stair_vertical_velocity_sigma), 1.0e-6)
+        vertical_velocity_track = float(
+            np.exp(
+                -((float(vertical_velocity) - float(reference_vertical_velocity)) ** 2)
+                / (vertical_sigma**2)
+            )
+        )
+        return {
+            "stair_vertical_velocity_track": vertical_velocity_track,
+            "stair_swing_clearance": swing_clearance,
+            "stair_tread_support": tread_support,
+            "stair_min_swing_clearance_value": min_swing_clearance,
+        }
 
     def _side_foot_tracks(
         self,
@@ -1984,6 +2153,33 @@ class LytRobotAmpEnv:
             else 0.0
         )
         return stance_track, stance_speed
+
+    def _foot_slip_penalty(
+        self,
+        foot_world_vel: np.ndarray,
+        foot_geom_contact: np.ndarray,
+    ) -> float:
+        """Return bounded tangential-speed violation for contacting foot geoms.
+
+        The existing stance reward is bounded in ``[0, 1]`` and therefore only
+        removes a bonus when a foot slides.  This non-negative term gives the
+        trainer an explicit cost whose coefficient can dominate persistent
+        slip without penalizing a swing foot that is clear of the ground.
+        """
+
+        contact = np.clip(
+            np.asarray(foot_geom_contact, dtype=np.float32), 0.0, 1.0
+        )
+        contact_count = float(np.sum(contact))
+        if contact_count <= 1.0e-6:
+            return 0.0
+        horizontal_speed = np.linalg.norm(
+            np.asarray(foot_world_vel, dtype=np.float32)[:, 0:2], axis=1
+        )
+        threshold = max(float(self.cfg.foot_slip_velocity_threshold), 0.0)
+        scale = max(float(self.cfg.stance_foot_vel_sigma), 1.0e-6)
+        violation = np.clip((horizontal_speed - threshold) / scale, 0.0, 4.0)
+        return float(np.sum(violation * contact) / contact_count)
 
     def _symmetry_track(
         self,

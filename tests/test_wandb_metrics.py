@@ -4,6 +4,7 @@ import unittest
 
 from scripts.train import (
     WANDB_EPISODE_LENGTH_KEY,
+    WANDB_EPISODE_REWARD_PER_STEP_KEY,
     WANDB_EPISODE_TOTAL_REWARD_KEY,
     filter_resume_wandb_warmup_metrics,
     prepare_wandb_metrics,
@@ -15,20 +16,23 @@ class WandbMetricTests(unittest.TestCase):
         source = {
             "global_step": 123.0,
             "mean_episode_reward": 42.5,
+            "mean_episode_reward_per_step": 0.5,
             "mean_episode_length": 88.0,
         }
 
         prepared = prepare_wandb_metrics(source)
 
         self.assertEqual(prepared[WANDB_EPISODE_TOTAL_REWARD_KEY], 42.5)
+        self.assertEqual(prepared[WANDB_EPISODE_REWARD_PER_STEP_KEY], 0.5)
         self.assertEqual(prepared[WANDB_EPISODE_LENGTH_KEY], 88.0)
-        self.assertEqual(prepared["mean_reward"], 42.5)
+        self.assertEqual(prepared["mean_reward"], 0.5)
         self.assertEqual(prepared["mean_length"], 88.0)
         self.assertEqual(
             source,
             {
                 "global_step": 123.0,
                 "mean_episode_reward": 42.5,
+                "mean_episode_reward_per_step": 0.5,
                 "mean_episode_length": 88.0,
             },
         )

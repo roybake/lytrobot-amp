@@ -15,8 +15,23 @@ def _has_arg(name: str) -> bool:
 if __name__ == "__main__":
     if not _has_arg("--stage"):
         sys.argv.extend(["--stage", "stage1"])
-    if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):
-        sys.argv.append("--no-domain-randomization")
+    if not _has_arg("--training-task"):
+        sys.argv.extend(["--training-task", "walk"])
+    domain_flags = (
+        "--domain-randomization",
+        "--no-domain-randomization",
+        "--warp-global-domain-randomization",
+        "--no-warp-global-domain-randomization",
+    )
+    sys.argv[:] = [
+        arg
+        for arg in sys.argv
+        if arg not in domain_flags
+        and not any(arg.startswith(f"{name}=") for name in domain_flags)
+    ]
+    sys.argv.extend(
+        ["--no-domain-randomization", "--no-warp-global-domain-randomization"]
+    )
     if not (_has_arg("--wandb") or _has_arg("--no-wandb")):
         sys.argv.append("--wandb")
     if not _has_arg("--device"):

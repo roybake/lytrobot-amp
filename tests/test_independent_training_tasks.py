@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+import sys
+
+import numpy as np
+import torch
+
+from scripts.train_multimotion import default_train_args as original_multimotion_args
+from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
+from scripts.train_stairs import default_train_args as stairs_args
+from scripts.train_multimotion_no_stairs import main as no_stairs_main
+from scripts.train_stairs import main as stairs_main
+from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
+from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+from lytrobot_amp.terrain import StairTerrainCfg
+from sensor_training.envs import SensorHistoryCpuAmpEnv
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
+
+
+def _option_values(args: list[str], option: str) -> list[str]:
+    start = args.index(option) + 1
+    end = start
+    while end < len(args) and not args[end].startswith("--"):
+        end += 1
+    return args[start:end]
+
+
+def test_stair_free_multimotion_task_is_independent_and_has_no_stairs() -> None:
+    args = no_stairs_args()
+
+    assert _option_values(args, "--training-task") == ["multimotion_no_stairs"]
+    assert _option_values(args, "--motion-names") == ["walk", "rough_walk"]
+    assert set(_option_values(args, "--terrain-types")) == {
+        "rough",
+        "slope_up",
+        "slope_down",
+    }
+    assert _option_values(args, "--log-group") == ["multimotion_no_stairs"]
+    assert "--serial-terrain-course" in args
+    assert "--reward-mode" not in args
+    assert not any(value.startswith("--stair-") for value in args)
+    assert "--no-skill-conditioning" in args
+    assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
+    assert "--no-use-reference-velocity" in args
+    assert "--use-reference-velocity" not in args
+    assert float(_option_values(args, "--stand-start-prob")[0]) > 0.0
+    assert float(_option_values(args, "--startup-action-ramp-steps")[0]) > 0.0
+    assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
+    assert float(_option_values(args, "--foot-slip-velocity-threshold")[0]) > 0.0
+    assert float(_option_values(args, "--min-forward-progress-speed")[0]) >= 0.25
+    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
+
+    # The original all-terrain entry point remains a separate four-clip task.
+    original = original_multimotion_args()
+    assert _option_values(original, "--training-task") == ["multimotion"]
+    assert _option_values(original, "--motion-names") == [
+        "walk",
+        "rough_walk",
+        "stair_up",
+        "stair_down",
+    ]
+    assert "stairs" in _option_values(original, "--terrain-types")
+    assert _option_values(original, "--log-group") == ["multimotion"]
+    assert "--no-skill-conditioning" in original
+    assert "--skill-conditioning" not in original
+
+
+def test_dedicated_stair_task_uses_only_stair_clips_and_reward() -> None:
+    args = stairs_args()
+
+    assert _option_values(args, "--training-task") == ["stairs_up_down"]
+    assert _option_values(args, "--motion-names") == ["stair_up", "stair_down"]
+    assert _option_values(args, "--motion-weights") == ["0.50", "0.50"]
+    assert _option_values(args, "--terrain-types") == ["stairs"]
+    assert float(_option_values(args, "--stair-step-height")[0]) == 0.13
+    assert _option_values(args, "--reward-mode") == ["stairs"]
+    assert _option_values(args, "--log-group") == ["stairs_up_down"]
+    assert "--serial-terrain-course" not in args
+    assert "--no-skill-conditioning" in args
+    assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
+    assert float(_option_values(args, "--stair-swing-clearance-reward-coef")[0]) > 0.0
+    assert float(_option_values(args, "--stair-tread-support-reward-coef")[0]) > 0.0
+    assert float(_option_values(args, "--stair-vertical-velocity-reward-coef")[0]) > 0.0
+
+
+def test_new_task_entrypoints_delegate_to_sensor_training_stack() -> None:
+    for entrypoint in (no_stairs_main, stairs_main):
+        with patch("sensor_training.train.main") as sensor_main:
+            with patch.object(sys, "argv", ["task.py", "--max-iterations", "7"]):
+                entrypoint()
+                delegated_argv = list(sys.argv)
+            sensor_main.assert_called_once_with()
+            assert "--no-skill-conditioning" in delegated_argv
+            assert _option_values(delegated_argv, "--reference-ctrl-blend") == ["0.0"]
+
+
+def test_stair_reward_tracks_tread_support_clearance_and_vertical_motion() -> None:
+    cfg = LytRobotEnvCfg(
+        reward_mode="stairs",
+        stair_swing_clearance=0.08,
+        stair_vertical_velocity_sigma=0.25,
+    )
+    stair_cfg = StairTerrainCfg(
+        enabled=True,
+        step_height=0.13,
+        step_depth=0.58,
+        step_count=3,
+        start_x=-0.95,
+    )
+    x = stair_cfg.ascent_start + 0.1
+    surface = stair_cfg.step_height
+    clear_foot = np.asarray(
+        [
+            [x, 0.0, surface],
+            [x, 0.0, surface],
+            [x, 0.0, surface + 0.08],
+            [x, 0.0, surface + 0.08],
+        ],
+        dtype=np.float32,
+    )
+    low_foot = clear_foot.copy()
+    low_foot[2:, 2] = surface
+    fake_cpu = SimpleNamespace(cfg=cfg, stair_cfg=stair_cfg)
+
+    matched = LytRobotAmpEnv._stair_terrain_reward_terms(
+        fake_cpu,
+        clear_foot,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        vertical_velocity=0.30,
+        reference_vertical_velocity=0.30,
+    )
+    missed = LytRobotAmpEnv._stair_terrain_reward_terms(
+        fake_cpu,
+        low_foot,
+        np.asarray([0.0, 0.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        vertical_velocity=-0.30,
+        reference_vertical_velocity=0.30,
+    )
+
+    assert matched["stair_vertical_velocity_track"] == 1.0
+    assert np.isclose(matched["stair_swing_clearance"], 1.0)
+    assert np.isclose(matched["stair_tread_support"], 1.0)
+    assert missed["stair_vertical_velocity_track"] < matched["stair_vertical_velocity_track"]
+    assert missed["stair_swing_clearance"] < matched["stair_swing_clearance"]
+    assert missed["stair_tread_support"] < matched["stair_tread_support"]
+
+    # Keep CPU validation and the production Torch/Warp reward numerically aligned.
+    fake_warp = SimpleNamespace(
+        cfg=cfg,
+        stair_cfg=stair_cfg,
+        num_envs=1,
+        device=torch.device("cpu"),
+    )
+    torch_terms = LytRobotWarpAmpEnv._stair_terrain_reward_terms(
+        fake_warp,
+        torch.from_numpy(clear_foot[None, ...]),
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([[1.0, 0.0]]),
+        vertical_velocity=torch.tensor([0.30]),
+        reference_vertical_velocity=torch.tensor([0.30]),
+    )
+    for key, expected in matched.items():
+        np.testing.assert_allclose(torch_terms[key].numpy(), [expected], atol=1.0e-6)
+
+
+def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
+    env = SensorHistoryCpuAmpEnv(
+        LytRobotEnvCfg(
+            model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
+            training_task="multimotion_no_stairs",
+            motion_files=(
+                str(MOTION_DIR / "walk_omniretarget.npz"),
+                str(MOTION_DIR / "rough_walk_omniretarget.npz"),
+            ),
+            motion_names=("walk", "rough_walk"),
+            motion_weights=(0.5, 0.5),
+            motion_loop=(True, False),
+            skill_conditioning=False,
+            terrain_types=("rough", "slope_up", "slope_down"),
+            serial_terrain_course=True,
+            terrain_course_variants=1,
+            num_envs=1,
+            stand_start_prob=0.0,
+            motion_reset_prob=1.0,
+            reset_noise_scale=0.0,
+            reference_ctrl_blend=0.0,
+            domain_randomization=False,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        observation = env.reset()
+        assert env.action_dim == 14
+        assert env.sensor_frame_dim == 42 + 14
+        assert observation.shape == (1, 336)
+        assert env.observation_metadata["actor_input_fields"] == ("imu", "tendon_length")
+        assert env.observation_metadata["command_dim"] == 0
+        assert env.stair_cfg.enabled is False
+    finally:
+        env.close()
+
+
+def test_stair_task_keeps_terrain_reward_outside_sensor_actor() -> None:
+    env = SensorHistoryCpuAmpEnv(
+        LytRobotEnvCfg(
+            model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
+            training_task="stairs_up_down",
+            motion_files=(
+                str(MOTION_DIR / "stair_up_omniretarget.npz"),
+                str(MOTION_DIR / "stair_down_omniretarget.npz"),
+            ),
+            motion_names=("stair_up", "stair_down"),
+            motion_weights=(0.5, 0.5),
+            motion_loop=(False, False),
+            skill_conditioning=False,
+            terrain_types=("stairs",),
+            reward_mode="stairs",
+            stair_step_height=0.13,
+            stair_step_depth=0.58,
+            stair_step_count=3,
+            stair_start_x=-0.95,
+            stair_down_offset=0.25,
+            num_envs=1,
+            stand_start_prob=0.0,
+            motion_reset_prob=1.0,
+            reset_noise_scale=0.0,
+            reference_ctrl_blend=0.0,
+            use_reference_velocity=True,
+            domain_randomization=False,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        observation = env.reset()
+        assert env.action_dim == 14
+        assert observation.shape == (1, 336)
+        assert env.observation_metadata["actor_input_fields"] == ("imu", "tendon_length")
+        assert env.observation_metadata["command_dim"] == 0
+        observation, reward, done, info = env.step(
+            np.zeros((1, env.action_dim), dtype=np.float32)
+        )
+        assert observation.shape == (1, 336)
+        assert np.isfinite(reward).all()
+        assert np.isfinite(done).all()
+        for key in (
+            "stair_vertical_velocity_track",
+            "stair_swing_clearance",
+            "stair_tread_support",
+        ):
+            assert key in info
+            assert np.isfinite(info[key]).all()
+    finally:
+        env.close()

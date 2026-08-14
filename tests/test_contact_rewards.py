@@ -5,6 +5,7 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+import torch
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.motion import CONTACT_GEOM_NAMES, resolve_contact_geom_ids
@@ -58,6 +59,57 @@ class ContactRewardTests(unittest.TestCase):
         )
         self.assertAlmostEqual(track, 0.0)
         self.assertAlmostEqual(speed, 0.0)
+
+    def test_contacting_foot_slip_has_explicit_bounded_penalty(self) -> None:
+        world_vel = np.zeros((4, 3), dtype=np.float32)
+        geom_contact = np.asarray([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+        self.assertAlmostEqual(
+            self.env._foot_slip_penalty(world_vel, geom_contact),
+            0.0,
+        )
+
+        world_vel[0, 0] = (
+            self.env.cfg.foot_slip_velocity_threshold
+            + self.env.cfg.stance_foot_vel_sigma
+        )
+        # One of the two contacting geoms violates the threshold by one scale.
+        self.assertAlmostEqual(
+            self.env._foot_slip_penalty(world_vel, geom_contact),
+            0.5,
+            places=6,
+        )
+
+        world_vel[:, 0] = 100.0
+        self.assertAlmostEqual(
+            self.env._foot_slip_penalty(world_vel, geom_contact),
+            4.0,
+            places=6,
+        )
+
+    def test_warp_and_cpu_slip_penalties_match(self) -> None:
+        from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+
+        world_vel = np.asarray(
+            [
+                [0.20, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.08, 0.08, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        geom_contact = np.asarray([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        expected = self.env._foot_slip_penalty(world_vel, geom_contact)
+        warp_env = LytRobotWarpAmpEnv.__new__(LytRobotWarpAmpEnv)
+        warp_env.cfg = self.env.cfg
+
+        actual = warp_env._foot_slip_penalty(
+            torch.from_numpy(world_vel[None, ...]),
+            torch.from_numpy(geom_contact[None, ...]),
+        )
+
+        self.assertAlmostEqual(float(actual[0]), expected, places=6)
 
     def test_local_velocity_tracking_ignores_stance_geometries(self) -> None:
         foot_vel = np.zeros((4, 3), dtype=np.float32)

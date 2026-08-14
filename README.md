@@ -8,6 +8,287 @@
 
 所有训练统一使用 14 个肌腱位置执行器，策略动作固定为 14 维位置目标修正量。
 
+## 统一策略输入约束
+
+项目所有训练入口统一构建传感器 GRU actor。行走、多动作和楼梯策略每个控制帧只包含
+42 维 IMU 和 14 维实际肌腱长度，共 56 维；不接收关节状态、根部真值、目标速度、
+技能标签或地形参数。蹲起是唯一例外：在相同的 336 维传感器历史后附加当前控制器的
+`sin/cos` 相位，因此为 338 维。该相位由肌腱长度估计的蹲起深度和 IMU 姿态反馈校正，
+不是仿真真值。训练环境维护 6 帧传感器历史，策略由 128 维 GRU 隐状态形成因果记忆。
+AMP、任务奖励和 asymmetric critic 可以使用训练期仿真真值，但这些值不会进入 actor
+或导出的 ONNX。普通行走策略日志写入 `logs/sensor_policy/`，全地形和无阶梯多动作日志
+统一写入 `logs/multimotion/`，独立阶梯训练写入 `logs/stairs/`；旧完整状态 checkpoint、
+旧 336 维无相位蹲起 checkpoint 与当前 338 维策略不兼容。
+
+## 所有任务的两阶段训练与测试命令
+
+所有正式任务遵守同一约束：Stage 1 强制关闭域随机化；Stage 2 必须加载同任务的
+Stage 1 checkpoint，并强制开启完整域随机化。Stage 2 包含逐环境的肌腱长度、动作延迟、
+观测/动作噪声和随机推力，还开启 Warp 批次共享的质量、惯量、摩擦和重力随机化，默认
+每 250 iteration 重采样共享参数。Stage 2 不能从随机权重启动，也不能用
+`--no-domain-randomization` 关闭随机化。
+
+训练和测试都默认随机：每次启动自动生成新的基础 seed，每个 episode/reset 再重采样
+episode seed。所以下面的正式命令不要添加 `--seed`。只有复现实验时才同时添加：
+
+```bash
+--seed 42 --no-episode-random-seed
+```
+
+以下命令都从项目根目录执行；将 `<run>` 替换为实际时间目录：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp
+```
+
+### 1. 普通行走
+
+Stage 1 训练：
+
+```bash
+uv run python scripts/train_stage1.py
+```
+
+Stage 1 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage1/<run>/model_final.pt \
+  --stage stage1 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python scripts/train_stage2.py \
+  --stage1-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt
+```
+
+Stage 2 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage2/<run>/model_final.pt \
+  --stage stage2 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+`sensor_training/train_stage1.py`、`sensor_training/train_stage2.py` 是同一传感器行走任务的
+兼容入口，不需要与上面的正式入口重复训练。
+
+### 2. 蹲起
+
+Stage 1 训练：
+
+```bash
+uv run python squat_training/train_stage1.py
+```
+
+Stage 1 有界面测试：
+
+```bash
+uv run python squat_training/play.py \
+  --checkpoint logs/squat_sensor_policy/stage1/<run>/model_final.pt \
+  --stage stage1 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python squat_training/train_stage2.py \
+  --stage1-checkpoint logs/squat_sensor_policy/stage1/<run>/model_final.pt
+```
+
+Stage 2 有界面测试：
+
+```bash
+uv run python squat_training/play.py \
+  --checkpoint logs/squat_sensor_policy/stage2/<run>/model_final.pt \
+  --stage stage2 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+### 3. 全地形多动作
+
+Stage 1 训练：
+
+```bash
+uv run python scripts/train_multimotion_stage1.py
+```
+
+Stage 1 有界面测试（默认同屏 3 台机器人和随机路线）：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/multimotion/stage1/<run>/model_final.pt \
+  --stage multimotion \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python scripts/train_multimotion_stage2.py \
+  --stage1-checkpoint logs/multimotion/stage1/<run>/model_final.pt
+```
+
+Stage 2 有界面测试（默认同屏 3 台机器人和随机路线）：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
+  --stage multimotion \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+`sensor_training/train_multimotion_stage1.py` 和
+`sensor_training/train_multimotion_stage2.py` 是该任务的兼容别名，使用相同日志目录。
+
+### 4. 无阶梯多动作
+
+Stage 1 训练：
+
+```bash
+uv run python scripts/train_multimotion_no_stairs_stage1.py
+```
+
+Stage 1 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/multimotion/no_stairs/stage1/<run>/model_final.pt \
+  --stage multimotion \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python scripts/train_multimotion_no_stairs_stage2.py \
+  --stage1-checkpoint \
+    logs/multimotion/no_stairs/stage1/<run>/model_final.pt
+```
+
+Stage 2 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/multimotion/no_stairs/stage2/<run>/model_final.pt \
+  --stage multimotion \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+### 5. 独立上下楼梯
+
+楼梯默认级高为 `0.13 m`，以下显式写出该值，便于核对实验配置。
+
+Stage 1 训练：
+
+```bash
+uv run python scripts/train_stairs_stage1.py \
+  --stair-step-height 0.13
+```
+
+Stage 1 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/stairs/stage1/<run>/model_final.pt \
+  --stage stage1 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python scripts/train_stairs_stage2.py \
+  --stage1-checkpoint logs/stairs/stage1/<run>/model_final.pt \
+  --stair-step-height 0.13
+```
+
+Stage 2 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/stairs/stage2/<run>/model_final.pt \
+  --stage stage2 \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+### 6. 多动作网络布局的平地预训练
+
+Stage 1 训练：
+
+```bash
+uv run python scripts/train_multimotion_walk_stage1.py
+```
+
+Stage 1 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint \
+    logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt \
+  --stage stage1 \
+  --no-serial-terrain-course \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+Stage 2 训练：
+
+```bash
+uv run python scripts/train_multimotion_walk_stage2.py \
+  --stage1-checkpoint \
+    logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt
+```
+
+Stage 2 有界面测试：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint \
+    logs/sensor_policy/multimotion_walk_warmup/stage2/<run>/model_final.pt \
+  --stage stage2 \
+  --no-serial-terrain-course \
+  --device cuda \
+  --viewer \
+  --steps 0
+```
+
+所有测试命令都强制打开 MuJoCo viewer，并用 `--steps 0` 持续运行到手动关闭窗口。
+Stage 2 checkpoint 测试默认继承训练配置中的域随机化；标称参数诊断可额外添加
+`--no-domain-randomization`，鲁棒性测试可显式添加 `--domain-randomization`。默认测试
+seed 每次启动、每次 reset 都不同；如需复现，在对应的有界面测试命令末尾同时添加
+`--seed 42 --no-episode-random-seed`，不要删除 `--viewer --steps 0`。
+
+正式实验不要直接运行无阶段后缀的任务脚本；它们只定义动作、地形、奖励和公共网络参数。
+恢复中断的 Stage 2 时使用 `--resume-checkpoint <stage2-checkpoint>`，不要同时传
+`--stage1-checkpoint`。所有训练只保留并原子更新 `model_final.pt` 和 `model_final.onnx`。
+
 ## 直线全地形多动作训练
 
 当前训练策略按要求暂不训练转身，只使用 walk、rough、pit、gap、stair_up、
@@ -16,37 +297,40 @@ stair_down 六种参考动作，连续通过 MoRE 风格不平路、沟坑、间
 
 ```bash
 cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_multimotion.py \
-  --num-envs 4096 \
-  --max-iterations 30000
+uv run python scripts/train_multimotion_stage1.py \
+  --num-envs 4096 --max-iterations 30000
+
+uv run python scripts/train_multimotion_stage2.py \
+  --stage1-checkpoint \
+    logs/multimotion/stage1/<run>/model_final.pt \
+  --num-envs 4096 --max-iterations 7500
 ```
 
 该入口已内置 4096 环境配置：每轮 24 步、98,304 条 transition，PPO 使用 8 个
 minibatch（每个 12,288 条），AMP 每轮执行 2 次 4096 样本更新。
 
-若从头训练，先用 `scripts/train_multimotion_walk.py` 完成兼容多动作网络布局的平地
+若需要额外平地课程，先用 `scripts/train_multimotion_walk_stage1.py` 完成兼容多动作网络布局的平地
 稳定预训练，再把该 checkpoint 传给上面的完整课程入口；具体命令和晋级指标见
 [`multimotion/README.md`](multimotion/README.md)。
 旧的八动作（含 turn_left/turn_right）checkpoint 使用 8 维技能条件，不能直接加载到
 当前六动作策略；需要从六动作平地 warmup 新开训练。
 
 多动作训练的 checkpoint、ONNX、指标和 W&B 文件统一保存在
-`logs/multimotion/<月-日-时:分:秒>/`，每次启动自动创建新的时间目录。
+`logs/multimotion/stage1|stage2/<月-日-时:分:秒>/`，每次启动自动创建新的时间目录。
 每个训练机器人面前都是包含 rough、pit、gap、6°上/下坡和 stairs 的完整直线串联路线；启动时预生成
 多种随机地形顺序，episode 会随机分配路线并连续执行全部动作/地形段，走完整条路线
 后才成功重置。默认前 5000 轮全部从路线入口训练，随后用 10000 轮把随机后续阶段
 reset 的概率线性提高到 80%，避免尚未学会平地稳定行走时就被直接投放到困难地形；
 成功率始终只统计从路线入口开始并完整走到终点的 episode。
-每次新 checkpoint 的 `.pt` 和 `.onnx` 都成功写入后，会自动删除该时间目录中
-旧的 `model_*` 权重；正常训练结束后只保留 `model_final.pt` 和
-`model_final.onnx`。
+周期保存、内存保护保存和正常退出始终原子覆盖同一组 `model_final.pt` 与
+`model_final.onnx`；`--save-interval` 只控制覆盖频率，不再生成按迭代编号的历史权重。
 
-可视化测试 `model_26000.pt`（打开 viewer 后会同步录屏）：
+可视化测试最新模型（打开 viewer 后会同步录屏）：
 
 ```bash
 cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/play.py \
-  --checkpoint logs/multimotion/07-30-11:52:12/model_26000.pt \
+uv run python sensor_training/play.py \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --stage multimotion \
   --device cuda \
   --viewer \
@@ -56,7 +340,8 @@ uv run python scripts/play.py \
 录像默认保存为
 `recording/multimotion/07-30-11-52-12-26000.mp4`；重复测试会追加编号，
 不会覆盖已有录像。多动作测试默认同屏显示 3 个机器人，每个机器人使用一条独立的
-随机顺序完整路线；可用 `--num-robots` 调整数量，用 `--seed` 复现路线顺序。
+随机顺序完整路线；可用 `--num-robots` 调整数量。需要复现路线顺序时同时使用
+`--seed N --no-episode-random-seed`。
 
 动作数据来源、重定向复现、阶梯尺寸、Stage2 命令和实现说明见
 [`multimotion/README.md`](multimotion/README.md)。
@@ -67,8 +352,14 @@ uv run python scripts/play.py \
 scripts/train.py              # 训练入口，默认打开 wandb
 scripts/train_stage1.py       # 第一阶段训练入口，GPU/Warp，关闭领域随机化
 scripts/train_stage2.py       # 第二阶段训练入口，GPU/Warp，开启领域随机化
+scripts/train_multimotion_stage*.py           # 全地形多动作两阶段入口
+scripts/train_multimotion_no_stairs_stage*.py # 去阶梯多动作两阶段入口
+scripts/train_stairs_stage*.py                # 独立上下楼梯两阶段入口
+scripts/two_stage_task.py                     # 两阶段强制参数与checkpoint衔接
 scripts/view_model.py         # 机器人 MJCF 本地 MuJoCo 可视化/加载测试
-scripts/play.py               # checkpoint headless/可视化播放
+sensor_training/play.py       # 行走、多动作和楼梯传感器 checkpoint 播放
+squat_training/play.py        # 蹲起传感器 checkpoint 播放
+scripts/play.py               # 上述播放入口共用的底层实现
 src/lytrobot_amp/env.py       # MuJoCo 向量环境、动作映射、奖励和终止
 src/lytrobot_amp/env_warp.py  # MuJoCo Warp GPU batched 环境
 src/lytrobot_amp/motion.py    # robot/reference_data/walk1.npz 到机器人下肢关节的参考数据映射
@@ -100,69 +391,24 @@ uv sync
 
 ## 正常训练
 
-训练必须使用 GPU/Warp：`--device cuda --sim-backend warp`。stage1 默认 1024 环境、30000 iteration；stage2 默认 4096 环境、7500 iteration，两者都是 7.3728 亿个 policy sample，避免 stage2 因环境数扩大而误跑 4 倍样本。每个 iteration 写本地日志，W&B 默认每 10 轮上报一次。第一阶段不启用领域随机化，权重写入 `logs/stage1/<run>/`。两个阶段训练默认开启 episode 级随机 seed；需要完全复现实验时可加 `--no-episode-random-seed`。
+训练必须使用 GPU/Warp：`--device cuda --sim-backend warp`。Stage 1 默认 30000
+iteration，Stage 2 通常默认 7500 iteration；任务入口默认使用 4096 个环境。每个
+iteration 写本地日志，W&B 默认每 10 轮上报一次。第一阶段强制关闭域随机化，第二阶段
+强制加载 checkpoint 并开启域随机化。每次训练启动和每个 episode 默认使用新随机 seed；
+需要复现时必须同时传 `--seed N --no-episode-random-seed`。完整命令统一放在本文开头
+“所有任务的两阶段训练与测试命令”。
 
 训练默认启用 Warp CUDA Graph，求解器使用 `iterations=10`、`ls_iterations=20`，每个 world 预留 32 个 contact 和 64 个 constraint。可分别用 `--no-warp-cuda-graph`、`--solver-iterations`、`--solver-ls-iterations`、`--warp-nconmax`、`--warp-njmax` 做回退或容量调试。默认不主动 sleep；与桌面共用 GPU 时可显式增加 `--iteration-sleep-ms 10`。
 
 机器人 STL 只用于显示和惯量，碰撞仅保留双脚掌和脚趾的 4 个简化 box。旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期训练主内存增长问题；当前版本默认关闭周期性 Python GC，但仍保留 32GB RSS 安全停止保护，必要时可通过 `--memory-cleanup-interval` 恢复定期回收。
 
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_stage1.py
-
-only IMU+
-cd /home/yeah/code/LYTrobot_amp
-uv run python sensor_training/train_stage1.py
-
-蹲起
-uv run python squat_training/train_stage1.py
-
-多动作
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_multimotion.py --max-iterations 30000
-
-uv run python scripts/train_multimotion.py \
-  --resume-checkpoint logs/multimotion_walk_warmup/<运行目录>/model_final.pt \
-  --resume-reset-progress \
-  --resume-reset-optimizer \
-  --num-envs 4096 \
-  --max-iterations 30000
-```
-
-第二阶段是独立训练入口，在第一阶段基础配置上启用领域随机化，默认同样开启 wandb，权重写入 `logs/stage2/<run>/`：
-
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/06-26-08:03:21/model_final.pt
-
-only IMU+
-cd /home/yeah/code/LYTrobot_amp
-uv run python sensor_training/train_stage2.py \
-  --stage1-checkpoint logs/sensor_policy/stage1/<运行目录>/model_final.pt
-
-蹲起
-  uv run python squat_training/train_stage2.py \
-  --stage1-checkpoint logs/squat_sensor_policy/stage1/07-17-08:46:52/model_final.pt
-```
-
-`--stage1-checkpoint` 用来指定第一阶段权重，例如 `model_1000.pt` 或 `model_final.pt`，并把第二阶段的 iteration 与 `global_step` 从 0 重新计数。蹲起 Stage2 还会重置优化器，并根据成功率、下蹲深度和异常终止率自适应调整域随机化强度；不要把旧 Stage2 checkpoint 传给这个参数。也可以使用等价别名 `--stage1-model`。如果需要恢复第二阶段自身的中断训练，使用底层参数 `--resume-checkpoint logs/stage2/<run>/model_<iter>.pt`，此时会保留第二阶段已有的训练进度、域随机化强度和优化器状态。
-
-也可以显式调用统一入口：
-
-```bash
-uv run python scripts/train.py \
-  --stage stage2 \
-  --domain-randomization \
-  --device cuda \
-  --sim-backend warp
-```
+`--stage1-checkpoint` 用来指定第一阶段权重 `model_final.pt`，并把第二阶段的 iteration 与 `global_step` 从 0 重新计数。蹲起 Stage2 还会重置优化器，并根据成功率、下蹲深度和异常终止率自适应调整域随机化强度；不要把旧 Stage2 checkpoint 传给这个参数。也可以使用等价别名 `--stage1-model`。如果需要恢复第二阶段自身的中断训练，使用底层参数 `--resume-checkpoint logs/sensor_policy/stage2/<run>/model_final.pt`，此时会保留第二阶段已有的训练进度、域随机化强度和优化器状态。旧版训练产生的编号 checkpoint 仍可加载，但新训练不会再生成。
 
 第二阶段默认随机化包括：负重质量、各 body 质量、肌腱长度比例、地面摩擦系数、重力加速度 `9.75~9.85m/s^2`、随机方向/大小推力、观测噪声、动作噪声、`2~5ms` action delay。范围均可用命令行覆盖，例如：
 
 ```bash
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/<stage1_run>/model_final.pt \
+  --stage1-checkpoint logs/sensor_policy/stage1/<stage1_run>/model_final.pt \
   --payload-mass-min 0.0 \
   --payload-mass-max 3.0 \
   --body-mass-scale-min 0.85 \
@@ -185,7 +431,7 @@ uv run python scripts/train_stage2.py \
 
 ```bash
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/<stage1_run>/model_final.pt \
+  --stage1-checkpoint logs/sensor_policy/stage1/<stage1_run>/model_final.pt \
   --stand-start-prob 0.5 \
   --stand-start-phase-delay-steps 25 \
   --stand-start-transition-min-steps 80 \
@@ -196,68 +442,14 @@ uv run python scripts/train_stage2.py \
 测试样机起步效果时建议强制从静止起步开始：
 
 ```bash
-uv run python scripts/play.py \
-  --checkpoint logs/stage2/06-30-09:08:47/model_14750.pt\
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage2/<run>/model_final.pt \
   --device cuda \
   --viewer \
   --steps 0 \
   --stand-start-prob 1.0
 ```
 
-
-指定模型可视化测试命令：
-stage1
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python sensor_training/play.py \
-  --checkpoint logs/sensor_policy/stage1/07-08-09:14:39/model_30000.pt \
- --device cuda \
-  --viewer \
-  --steps 0
-
-uv run python scripts/play.py \
-  --checkpoint logs/sensor_policy/stage1<run>/model_final.onnx \
-  --viewer \
-  --steps 0
-
-蹲起
-uv run python squat_training/play.py \
-  --checkpoint logs/squat_sensor_policy/stage2/07-23-15:09:10/model_final.pt \
-  --no-domain-randomization \
-  --seed 42 \
-  --no-episode-random-seed \
-  --viewer \
-  --steps 0
-
-多动作
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/play.py \
-  --checkpoint logs/multimotion/08-06-10:56:09/model_7500.onnx \
-  --stage multimotion \
-  --device cuda \
-  --viewer \
-  --steps 0
-```
-06-18-10:01:10/model_final.pt stage1最好
-
-stage2
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/play.py \
-  --checkpoint logs/stage2/06-30-09:08:47/model_15000.pt \
-  --device cuda \
-  --viewer \
-  --steps 0
-
-uv run python squat_training/play.py \
-  --checkpoint logs/squat_sensor_policy/stage2/squat-moderate-dr-recovery-10k/model_final.onnx \
-  --viewer \
-  --steps 0 \
-  --push-force-max 5.0
-
-
-
-```
 
 使用 `--viewer` 打开 MuJoCo 测试时会自动录制 MP4，按任务保存到
 `recording/stage1/`、`recording/stage2/` 或 `recording/multimotion/`。
@@ -269,16 +461,14 @@ recording/stage1/06-06-21-19-41-2049.mp4
 
 默认录制为 1080p、30fps、H.264、`yuv420p`、`faststart` MP4，兼容 PPT 和微信播放。MuJoCo 窗口和录屏镜头都会始终跟随机器人 `pelvis` 移动。重复测试同一个权重时会自动追加 `-2`、`-3`，避免覆盖已有视频。
 
-Headless 加载测试命令：
-
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/view_model.py \
-  --model robot/MJCFmodelposition.xml \
-  --headless \
-  --steps 200
-```
-
+所有 checkpoint 播放入口统一采用持续重复测试语义：只要 viewer 没有关闭就一直运行。
+循环动作直接继续下一个周期；非循环动作、完整多地形路线或单次蹲起完成后，从稳定的
+动作起点开始下一轮；真实摔倒也会重置后继续测试。viewer 模式省略 `--steps` 时等价于
+`--steps 0`，显式传入正整数才限制步数。回放默认禁用普通 episode 超时、reset noise
+和随机参考相位，但每次启动及每次 reset 仍使用新随机 seed；需要专项测试随机参考相位
+恢复时可显式传入 `--motion-reset-prob 1.0`。
+终端汇总中的 `repetitions` 表示动作/路线完成次数，`terminations` 表示真实失稳次数，
+两者不会再混为平均奖励。
 
 首次在线记录前需要：
 
@@ -295,7 +485,7 @@ uv run python scripts/train_stage1.py \
   --motion-reset-prob 0.5 \
   --action-residual-scale 0.5 \
   --distal-action-scale 1.0 \
-  --reference-ctrl-blend 1.0 \
+  --reference-ctrl-blend 0.0 \
   --disc-learning-rate 3e-5 \
   --amp-grad-penalty-coef 2.0 \
   --amp-label-smoothing 0.20 \
@@ -324,9 +514,8 @@ uv run python scripts/train_stage1.py \
 日志和权重写入 `logs/<stage>/<时间>/`，包括：
 
 - `params/config.json`
-- `model_500.pt`
-- `model_<iter>.pt`
 - `model_final.pt`
+- `model_final.onnx`
 
 ## 从已有 checkpoint 稳定化续训
 
@@ -335,7 +524,7 @@ uv run python scripts/train_stage1.py \
 ```bash
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/train_stage1.py \
-  --resume-checkpoint logs/06-06-21:19:41/model_2049.pt \
+  --resume-checkpoint logs/06-06-21:19:41/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-07-stabilize-ankle-stage1 \
   --learning-rate 1e-4 \
@@ -350,7 +539,7 @@ uv run python scripts/train_stage1.py \
 
 ```bash
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/06-07-stabilize-ankle-stage1/model_<best>.pt \
+  --stage1-checkpoint logs/sensor_policy/stage1/06-07-stabilize-ankle-stage1/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-07-stabilize-ankle-stage2 \
   --learning-rate 7e-5 \
@@ -361,13 +550,13 @@ uv run python scripts/train_stage2.py \
   --save-interval 25
 ```
 
-`--max-iterations` 是最终 iteration 编号上限，不是额外训练轮数；从 `model_2049.pt` 恢复且设置 `2600` 时，会训练 `2050..2599`。重点观察 wandb 中的 `task_action_rate`、`task_distal_action_rate`、`task_stance_foot`、`task_stance_foot_speed`、`task_missed_contact`、`task_distal_vel`、`mean_length` 和 `mean_amp_reward`。
+`--max-iterations` 是最终 iteration 编号上限，不是额外训练轮数；恢复时会从 `model_final.pt` 内记录的 iteration 继续，设置 `2600` 表示训练到 iteration 2599。重点观察 wandb 中的 `task_action_rate`、`task_distal_action_rate`、`task_stance_foot`、`task_stance_foot_speed`、`task_missed_contact`、`task_distal_vel`、`mean_length` 和 `mean_amp_reward`。
 
 针对当前支撑脚前后蹭动，先从与第二阶段兼容的 14 维 position stage1 策略低学习率续训约 4000 iteration：
 
 ```bash
 uv run python scripts/train_stage1.py \
-  --resume-checkpoint logs/stage1/06-18-10:01:10/model_final.pt \
+  --resume-checkpoint logs/sensor_policy/stage1/06-18-10:01:10/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-30-no-slip-stage1 \
   --learning-rate 5e-5 \
@@ -380,7 +569,7 @@ uv run python scripts/train_stage1.py \
 
 ```bash
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint logs/stage1/06-30-no-slip-stage1/model_<best>.pt \
+  --stage1-checkpoint logs/sensor_policy/stage1/06-30-no-slip-stage1/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-30-no-slip-stage2 \
   --learning-rate 3e-5 \
@@ -389,57 +578,9 @@ uv run python scripts/train_stage2.py \
   --save-interval 100
 ```
 
-## GPU 冒烟测试
-
-冒烟测试也跑 GPU/Warp，并且必须关闭 wandb：
-
-```bash
-cd /home/yeah/code/LYTrobot_amp
-WANDB_MODE=disabled uv run python scripts/train_stage1.py \
-  --num-envs 64 \
-  --max-iterations 1 \
-  --num-steps 4 \
-  --epochs 1 \
-  --minibatches 1 \
-  --amp-minibatch-size 64 \
-  --amp-disc-updates 1 \
-  --save-interval 1 \
-  --no-wandb \
-  --log-root logs/smoke_gpu
-```
-
-第二阶段随机化冒烟：
-
-```bash
-cd /home/yeah/code/LYTrobot_amp
-WANDB_MODE=disabled uv run python scripts/train_stage2.py \
-  --num-envs 64 \
-  --max-iterations 1 \
-  --num-steps 4 \
-  --epochs 1 \
-  --minibatches 1 \
-  --amp-minibatch-size 64 \
-  --amp-disc-updates 1 \
-  --save-interval 1 \
-  --no-wandb \
-  --log-root logs/smoke_gpu
-```
-
-CPU 后端仅保留为模型加载/调试路径，不作为训练方案。
-
 ## 模型文件可视化测试
 
 不依赖训练 checkpoint，直接加载 `robot/MJCFmodelposition.xml` 做 MuJoCo 模型测试。
-
-Headless 加载和仿真测试：
-
-```bash
-cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/view_model.py \
-  --model robot/MJCFmodelposition.xml \
-  --headless \
-  --steps 200
-```
 
 本地打开 MuJoCo viewer：
 
@@ -454,58 +595,29 @@ uv run python scripts/view_model.py \
 
 ## 播放 checkpoint
 
-每次保存都会同时生成同名的 PyTorch 完整训练 checkpoint（`.pt`）和 ONNX
-确定性 Actor（`.onnx`）。新模型成功写入并通过 ONNX 校验后，当前 run 目录中的旧
-`model_*.pt/.onnx` 会自动删除，因此始终只保留最新的一对模型。`.pt` 可用于续训和
-MuJoCo 播放，`.onnx` 内嵌环境/网络配置元数据，可直接用于 MuJoCo 播放。
+每次保存都会原子覆盖 `model_final.pt`（PyTorch 完整训练 checkpoint）和
+`model_final.onnx`（确定性 Actor）。只有两者都成功写入并通过 ONNX 校验后才替换旧版本，
+因此每个新 run 目录始终只保留最新的一对模型。`.pt` 可用于续训和 MuJoCo 播放，
+`.onnx` 内嵌环境/网络配置元数据，可直接用于 MuJoCo 播放。
 
-Headless 检查：
-
-```bash
-python scripts/play.py \
-  --checkpoint logs/smoke_gpu/stage1/<run>/model_final.pt \
-  --steps 200 \
-  --device cuda
-```
-
-有图形环境时可打开 MuJoCo viewer：
+PyTorch checkpoint 有界面测试：
 
 ```bash
-python scripts/play.py \
-  --checkpoint logs/stage2/<run>/model_final.pt \
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage2/<run>/model_final.pt \
+  --stage stage2 \
   --device cuda \
-  --viewer
+  --viewer --steps 0
 ```
 
-ONNX 模型使用同一个播放入口（传感器策略仍使用 `sensor_training/play.py`）：
+ONNX 模型使用同一个传感器播放入口：
 
 ```bash
-python scripts/play.py \
-  --checkpoint logs/stage2/<run>/model_final.onnx \
-  --viewer
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage2/<run>/model_final.onnx \
+  --stage stage2 --viewer --steps 0
 ```
 
 这条命令也会自动生成 `recording/stage2/<run>-<iteration>.mp4`。测试第一阶段
 checkpoint 时会保存到 `recording/stage1/`；多动作 checkpoint 会自动识别并保存到
 `recording/multimotion/`，也可以通过 `--stage multimotion` 显式指定。
-
-## 已验证
-
-本机已完成以下检查：
-
-```text
-python -m compileall -q src scripts tests
-python -m unittest discover -s tests -v
-python robot/Launch.py --headless --steps 20
-stage1 GPU/Warp 冒烟训练通过，保存 model_1.pt/model_final.pt
-stage2 GPU/Warp 领域随机化冒烟训练通过，保存 model_1.pt/model_final.pt
-旧 position stage1 checkpoint 使用新足端奖励续训加载通过
-stage1/stage2 model_final.pt 播放加载通过
-```
-
-已生成的冒烟目录：
-
-```text
-logs/smoke_gpu/stage1/stage1-base-smoke/
-logs/smoke_gpu/stage2/stage2-domain-rand-smoke_1/
-```

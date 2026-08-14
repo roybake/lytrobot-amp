@@ -10,6 +10,7 @@ import gc
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -22,17 +23,19 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+for path in (REPO_ROOT, SRC_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import torch
 
 from lytrobot_amp import __version__
 from lytrobot_amp.env import LytRobotEnvCfg
-from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
+from sensor_training.ppo_config import SensorPPOAMPConfig as PPOAMPConfig
+from sensor_training.trainer import SensorHistoryPPOAMPTrainer as PPOAMPTrainer
 
 try:
-    from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+    from sensor_training.envs import SensorHistoryWarpAmpEnv as LytRobotWarpAmpEnv
 except Exception as exc:  # pragma: no cover - optional backend import guard.
     LytRobotWarpAmpEnv = None
     WARP_IMPORT_ERROR = exc
@@ -55,7 +58,15 @@ RESOURCE_METRIC_KEYS = (
 TRAIN_LOG_PROGRESS_RE = re.compile(r"\[TRAIN\]\s+iter=(\d+)\s+step=(\d+)")
 
 WANDB_EPISODE_TOTAL_REWARD_KEY = "episode/total_reward"
+WANDB_EPISODE_REWARD_PER_STEP_KEY = "episode/reward_per_step"
 WANDB_EPISODE_LENGTH_KEY = "episode/length"
+LATEST_MODEL_FILENAME = "model_final.pt"
+
+
+def latest_model_path(log_dir: str | Path) -> Path:
+    """Return the single canonical checkpoint path used by every save trigger."""
+
+    return Path(log_dir) / LATEST_MODEL_FILENAME
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,9 +89,15 @@ def parse_args() -> argparse.Namespace:
         help="One loop flag per --motion-files clip.",
     )
     parser.add_argument(
+        "--training-task",
+        default="",
+        help="Stable task identity stored in sensor checkpoints to prevent cross-task resume.",
+    )
+    parser.add_argument(
         "--skill-conditioning",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
+        help="Disabled for all sensor-only actors; skill labels are training-only.",
     )
     parser.add_argument(
         "--use-reference-velocity",
@@ -100,7 +117,7 @@ def parse_args() -> argparse.Namespace:
         default=str(REPO_ROOT / "robot" / "terrains" / "more_discolrl"),
     )
     parser.add_argument("--stair-terrain", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--stair-step-height", type=float, default=0.08)
+    parser.add_argument("--stair-step-height", type=float, default=0.13)
     parser.add_argument("--stair-step-depth", type=float, default=0.30)
     parser.add_argument("--stair-step-count", type=int, default=5)
     parser.add_argument("--stair-width", type=float, default=2.0)
@@ -166,7 +183,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--log-root", default=str(REPO_ROOT / "logs"))
+    parser.add_argument("--log-root", default=str(REPO_ROOT / "logs" / "sensor_policy"))
     parser.add_argument(
         "--log-group",
         default=None,
@@ -186,8 +203,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load checkpoint weights but restart iteration/global_step from zero.",
     )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Process seed. Omit it to generate a fresh random seed for every "
+            "training launch."
+        ),
+    )
+    parser.add_argument(
+        "--episode-random-seed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resample episode RNG state after every reset (default: enabled). "
+            "Use with --seed and --no-episode-random-seed for a reproducible run."
+        ),
+    )
     parser.add_argument("--device", default="cuda", choices=("cuda",))
     parser.add_argument("--sim-backend", default="warp", choices=("warp",))
     parser.add_argument("--torch-threads", type=int, default=0)
@@ -204,6 +237,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp-njmax", type=int, default=128)
     parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-velocity", type=float, default=1.0)
+    parser.add_argument(
+        "--reward-mode",
+        choices=("default", "stairs"),
+        default="default",
+        help=(
+            "Reward composition to use. The stairs profile adds vertical-motion, "
+            "tread-support, and terrain-relative swing-clearance objectives."
+        ),
+    )
     parser.add_argument("--forward-velocity-tracking-sigma", type=float, default=0.25)
     parser.add_argument("--forward-velocity-reward-coef", type=float, default=0.0)
     parser.add_argument("--forward-progress-reward-coef", type=float, default=0.0)
@@ -232,17 +274,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-reset-prob", type=float, default=0.5)
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
     parser.add_argument("--distal-action-scale", type=float, default=1.0)
-    parser.add_argument("--reference-ctrl-blend", type=float, default=1.0)
+    parser.add_argument(
+        "--reference-ctrl-blend",
+        type=float,
+        default=0.0,
+        help=(
+            "Must remain 0 for sensor-only actors so the reference motion cannot "
+            "leak through the actuator control base."
+        ),
+    )
     parser.add_argument(
         "--motion-transition-blend-steps",
         type=int,
         default=0,
         help="Control steps used to blend the reference target after a serial-course motion switch.",
     )
+    parser.add_argument("--fall-height", type=float, default=0.45)
+    parser.add_argument("--max-height", type=float, default=1.55)
+    parser.add_argument(
+        "--min-upright-z",
+        type=float,
+        default=0.45,
+        help="Minimum pelvis local-z/world-z alignment before an episode is terminated.",
+    )
     parser.add_argument("--foot-vel-tracking-sigma", type=float, default=1.0)
     parser.add_argument("--stance-foot-vel-sigma", type=float, default=0.15)
     parser.add_argument("--foot-vel-reward-coef", type=float, default=0.35)
     parser.add_argument("--stance-foot-reward-coef", type=float, default=1.00)
+    parser.add_argument("--foot-slip-velocity-threshold", type=float, default=0.08)
+    parser.add_argument("--foot-slip-penalty-coef", type=float, default=0.0)
     parser.add_argument("--contact-reward-coef", type=float, default=0.70)
     parser.add_argument("--missed-contact-penalty-coef", type=float, default=0.80)
     parser.add_argument("--side-foot-pos-sigma", type=float, default=0.08)
@@ -251,6 +311,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-foot-pos-coef", type=float, default=0.0)
     parser.add_argument("--step-gap-coef", type=float, default=0.0)
     parser.add_argument("--swing-advance-coef", type=float, default=0.0)
+    parser.add_argument("--stair-vertical-velocity-sigma", type=float, default=0.25)
+    parser.add_argument("--stair-vertical-velocity-reward-coef", type=float, default=1.0)
+    parser.add_argument("--stair-swing-clearance", type=float, default=0.08)
+    parser.add_argument("--stair-swing-clearance-reward-coef", type=float, default=0.75)
+    parser.add_argument("--stair-tread-support-reward-coef", type=float, default=1.25)
     parser.add_argument("--distal-joint-vel-sigma", type=float, default=2.0)
     parser.add_argument("--symmetry-reward-coef", type=float, default=1.20)
     parser.add_argument("--symmetry-foot-pos-sigma", type=float, default=0.08)
@@ -265,6 +330,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=80)
     parser.add_argument("--stand-start-transition-max-steps", type=int, default=160)
     parser.add_argument("--stand-start-push-delay-steps", type=int, default=100)
+    parser.add_argument(
+        "--squat-phase-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the squat-only tendon/IMU feedback supervisor that slows or "
+            "freezes the controller phase when the physical motion lags."
+        ),
+    )
+    parser.add_argument("--squat-phase-lag-tolerance", type=float, default=0.08)
+    parser.add_argument("--squat-phase-min-scale", type=float, default=0.0)
+    parser.add_argument("--squat-bottom-depth-threshold", type=float, default=0.85)
+    parser.add_argument("--squat-stand-depth-threshold", type=float, default=0.15)
+    parser.add_argument("--squat-upright-threshold", type=float, default=0.75)
+    parser.add_argument("--squat-phase-stall-threshold", type=float, default=0.25)
+    parser.add_argument("--squat-phase-max-stall-steps", type=int, default=40)
+    parser.add_argument("--squat-phase-stall-penalty", type=float, default=0.25)
+    parser.add_argument(
+        "--squat-phase-slowdown-penalty-coef", type=float, default=2.0
+    )
+    parser.add_argument("--squat-cycle-completion-bonus", type=float, default=5.0)
+    parser.add_argument(
+        "--squat-terminate-on-cycle-completion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "End a squat episode successfully as soon as one physical "
+            "stand-squat-stand cycle is completed."
+        ),
+    )
     parser.add_argument("--ctrl-penalty-coef", type=float, default=0.040)
     parser.add_argument("--action-rate-penalty-coef", type=float, default=0.100)
     parser.add_argument("--distal-action-penalty-coef", type=float, default=0.030)
@@ -358,7 +453,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-action-std", type=float, default=0.05)
     parser.add_argument("--max-action-std", type=float, default=0.60)
     parser.add_argument("--episode-metric-window", type=int, default=4096)
-    parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=500,
+        help="Iterations between atomic overwrites of model_final.pt/.onnx.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--resource-log-interval", type=int, default=50)
     parser.add_argument("--wandb-log-interval", type=int, default=10)
@@ -423,7 +523,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Keep reward/episode/task metrics out of wandb until mean_episode_length reaches this value.",
     )
-    parser.add_argument("--wandb-tags", default="lytrobot,bpo,amp,walk")
+    parser.add_argument(
+        "--wandb-tags",
+        default="lytrobot,bpo,amp,walk,imu,tendon,recurrent,gru,sensor-only",
+    )
     return parser.parse_args()
 
 
@@ -588,7 +691,9 @@ def _setup_wandb_metrics() -> None:
     # -- Episode rewards (headline numbers) ---------------------------------
     for m in (
         WANDB_EPISODE_TOTAL_REWARD_KEY,
+        WANDB_EPISODE_REWARD_PER_STEP_KEY,
         "mean_episode_reward", "mean_reward",
+        "mean_episode_reward_per_step", "rollout_episode_reward_per_step",
         "mean_task_reward", "mean_amp_reward",
         "rollout_episode_reward", "rollout_mean_reward",
         "rollout_mean_task_reward", "rollout_mean_amp_reward",
@@ -650,11 +755,13 @@ def _setup_wandb_metrics() -> None:
 
 
 def prepare_wandb_metrics(metrics: dict[str, float]) -> dict[str, float]:
-    """Add stable W&B episode curves without changing CSV/log metric names.
+    """Add stable W&B episode curves with a length-normalized headline.
 
     ``episode/total_reward`` is the mean cumulative reward of completed
-    episodes, not the per-step rollout reward.  Keep the historical flat
-    aliases so old dashboards and checkpoints remain comparable.
+    episodes. ``episode/reward_per_step`` removes episode-length variation and
+    is the preferred task-quality curve. ``mean_reward`` intentionally aliases
+    the normalized curve so the default W&B chart cannot be dominated by
+    changing episode duration.
     """
     prepared = dict(metrics)
 
@@ -662,8 +769,17 @@ def prepare_wandb_metrics(metrics: dict[str, float]) -> dict[str, float]:
     if episode_reward is not None:
         episode_reward = float(episode_reward)
         prepared["mean_episode_reward"] = episode_reward
-        prepared["mean_reward"] = episode_reward
         prepared[WANDB_EPISODE_TOTAL_REWARD_KEY] = episode_reward
+
+    episode_reward_per_step = prepared.get("mean_episode_reward_per_step")
+    if episode_reward_per_step is not None:
+        episode_reward_per_step = float(episode_reward_per_step)
+        prepared["mean_reward"] = episode_reward_per_step
+        prepared[WANDB_EPISODE_REWARD_PER_STEP_KEY] = episode_reward_per_step
+    elif episode_reward is not None:
+        # Legacy logs do not contain a normalized reward, so preserve their
+        # historical meaning instead of inventing a denominator.
+        prepared["mean_reward"] = episode_reward
 
     episode_length = prepared.get("mean_episode_length", prepared.get("mean_length"))
     if episode_length is not None:
@@ -743,11 +859,13 @@ def _log_wandb_bootstrap(run, *, start_iteration: int, global_step: int) -> None
         "iteration": float(start_iteration),
         "mean_reward": 0.0,
         "mean_episode_reward": 0.0,
+        "mean_episode_reward_per_step": 0.0,
         "mean_task_reward": 0.0,
         "mean_amp_reward": 0.0,
         "mean_length": 0.0,
         "mean_episode_length": 0.0,
         "rollout_mean_reward": 0.0,
+        "rollout_episode_reward_per_step": 0.0,
         "rollout_mean_task_reward": 0.0,
         "rollout_mean_amp_reward": 0.0,
         "run_bootstrap": 1.0,
@@ -955,6 +1073,45 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
+    if args.seed is None:
+        args.seed = secrets.randbits(32)
+    if args.skill_conditioning:
+        raise ValueError(
+            "All training actors are sensor-only; --skill-conditioning is not allowed."
+        )
+    if abs(float(args.reference_ctrl_blend)) > 1.0e-12:
+        raise ValueError(
+            "All training actors require --reference-ctrl-blend 0 so reference "
+            "targets cannot enter the deployed control path."
+        )
+    if args.squat_phase_feedback:
+        if args.squat_phase_lag_tolerance < 0.0:
+            raise ValueError("--squat-phase-lag-tolerance must be non-negative.")
+        if not 0.0 <= args.squat_phase_min_scale <= 1.0:
+            raise ValueError("--squat-phase-min-scale must be in [0, 1].")
+        if not (
+            0.0
+            <= args.squat_stand_depth_threshold
+            < args.squat_bottom_depth_threshold
+            <= 1.0
+        ):
+            raise ValueError(
+                "Squat thresholds require 0 <= stand depth < bottom depth <= 1."
+            )
+        if not 0.0 <= args.squat_upright_threshold <= 1.0:
+            raise ValueError("--squat-upright-threshold must be in [0, 1].")
+        if not 0.0 <= args.squat_phase_stall_threshold <= 1.0:
+            raise ValueError("--squat-phase-stall-threshold must be in [0, 1].")
+        if args.squat_phase_max_stall_steps <= 0:
+            raise ValueError("--squat-phase-max-stall-steps must be positive.")
+        if args.squat_phase_stall_penalty < 0.0:
+            raise ValueError("--squat-phase-stall-penalty must be non-negative.")
+        if args.squat_phase_slowdown_penalty_coef < 0.0:
+            raise ValueError(
+                "--squat-phase-slowdown-penalty-coef must be non-negative."
+            )
+        if args.squat_cycle_completion_bonus < 0.0:
+            raise ValueError("--squat-cycle-completion-bonus must be non-negative.")
     if args.serial_terrain_course and not (
         args.forward_velocity_reward_coef > 0.0
         or args.forward_progress_reward_coef > 0.0
@@ -997,6 +1154,40 @@ def main() -> None:
         raise ValueError("--forward-progress-grace-steps must be non-negative.")
     if args.fall_penalty < 0.0:
         raise ValueError("--fall-penalty must be non-negative.")
+    if args.fall_height <= 0.0:
+        raise ValueError("--fall-height must be positive.")
+    if args.max_height <= args.fall_height:
+        raise ValueError("--max-height must be greater than --fall-height.")
+    if not -1.0 <= args.min_upright_z <= 1.0:
+        raise ValueError("--min-upright-z must be in [-1, 1].")
+    if args.stance_foot_vel_sigma <= 0.0:
+        raise ValueError("--stance-foot-vel-sigma must be positive.")
+    if args.foot_slip_velocity_threshold < 0.0:
+        raise ValueError("--foot-slip-velocity-threshold must be non-negative.")
+    if args.foot_slip_penalty_coef < 0.0:
+        raise ValueError("--foot-slip-penalty-coef must be non-negative.")
+    if args.reward_mode == "stairs":
+        terrain_types = set(args.terrain_types or ())
+        if "stairs" not in terrain_types and not args.stair_terrain:
+            raise ValueError(
+                "--reward-mode stairs requires stair geometry via "
+                "--terrain-types stairs or --stair-terrain."
+            )
+        if args.serial_terrain_course:
+            raise ValueError(
+                "--reward-mode stairs is reserved for the independent non-serial "
+                "stair task."
+            )
+        if args.motion_names is not None and any(
+            "stair" not in name.lower() for name in args.motion_names
+        ):
+            raise ValueError(
+                "--reward-mode stairs requires every --motion-names entry to be a stair clip."
+            )
+        if args.stair_vertical_velocity_sigma <= 0.0:
+            raise ValueError("--stair-vertical-velocity-sigma must be positive.")
+        if args.stair_swing_clearance <= 0.0:
+            raise ValueError("--stair-swing-clearance must be positive.")
     if args.motion_files is not None:
         clip_count = len(args.motion_files)
         for option, values in (
@@ -1010,11 +1201,22 @@ def main() -> None:
                     f"got {len(values)}."
                 )
     # Fail before creating a log directory, starting W&B, or initializing the
-    # simulator. Long runs commonly replace numbered snapshots with
-    # model_final.pt during graceful shutdown.
+    # simulator. Every save trigger atomically overwrites the same latest model.
     args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint)
+    if args.stage == "stage2" and args.resume_checkpoint is None:
+        raise ValueError(
+            "Stage 2 requires a Stage 1 checkpoint or an interrupted Stage 2 "
+            "checkpoint; use a task-specific Stage 2 launcher."
+        )
     if args.domain_randomization is None:
         args.domain_randomization = args.stage == "stage2"
+    if args.stage == "stage2" and not args.domain_randomization:
+        raise ValueError("Stage 2 requires domain randomization and cannot disable it.")
+    if args.stage == "stage2" and not args.warp_global_domain_randomization:
+        raise ValueError(
+            "Stage 2 requires Warp shared-parameter domain randomization and "
+            "cannot disable it."
+        )
     if args.max_iterations is None:
         args.max_iterations = 7500 if args.stage == "stage2" else 30000
     if not args.domain_randomization:
@@ -1054,6 +1256,7 @@ def main() -> None:
         motion_names=tuple(args.motion_names or ()),
         motion_weights=tuple(args.motion_weights or ()),
         motion_loop=tuple(value == "true" for value in (args.motion_loop or ())),
+        training_task=str(args.training_task),
         skill_conditioning=bool(args.skill_conditioning),
         use_reference_velocity=bool(args.use_reference_velocity),
         terrain_types=tuple(args.terrain_types or ()),
@@ -1097,6 +1300,7 @@ def main() -> None:
         warp_njmax=args.warp_njmax,
         warp_cuda_graph=args.warp_cuda_graph,
         target_velocity=args.target_velocity,
+        reward_mode=args.reward_mode,
         forward_velocity_tracking_sigma=args.forward_velocity_tracking_sigma,
         forward_velocity_reward_coef=args.forward_velocity_reward_coef,
         forward_progress_reward_coef=args.forward_progress_reward_coef,
@@ -1117,10 +1321,15 @@ def main() -> None:
         distal_action_scale=args.distal_action_scale,
         reference_ctrl_blend=args.reference_ctrl_blend,
         motion_transition_blend_steps=args.motion_transition_blend_steps,
+        fall_height=args.fall_height,
+        max_height=args.max_height,
+        min_upright_z=args.min_upright_z,
         foot_vel_tracking_sigma=args.foot_vel_tracking_sigma,
         stance_foot_vel_sigma=args.stance_foot_vel_sigma,
         foot_vel_reward_coef=args.foot_vel_reward_coef,
         stance_foot_reward_coef=args.stance_foot_reward_coef,
+        foot_slip_velocity_threshold=args.foot_slip_velocity_threshold,
+        foot_slip_penalty_coef=args.foot_slip_penalty_coef,
         contact_reward_coef=args.contact_reward_coef,
         missed_contact_penalty_coef=args.missed_contact_penalty_coef,
         side_foot_pos_sigma=args.side_foot_pos_sigma,
@@ -1129,6 +1338,11 @@ def main() -> None:
         side_foot_pos_coef=args.side_foot_pos_coef,
         step_gap_coef=args.step_gap_coef,
         swing_advance_coef=args.swing_advance_coef,
+        stair_vertical_velocity_sigma=args.stair_vertical_velocity_sigma,
+        stair_vertical_velocity_reward_coef=args.stair_vertical_velocity_reward_coef,
+        stair_swing_clearance=args.stair_swing_clearance,
+        stair_swing_clearance_reward_coef=args.stair_swing_clearance_reward_coef,
+        stair_tread_support_reward_coef=args.stair_tread_support_reward_coef,
         distal_joint_vel_sigma=args.distal_joint_vel_sigma,
         symmetry_reward_coef=args.symmetry_reward_coef,
         symmetry_foot_pos_sigma=args.symmetry_foot_pos_sigma,
@@ -1143,6 +1357,22 @@ def main() -> None:
         stand_start_transition_min_steps=args.stand_start_transition_min_steps,
         stand_start_transition_max_steps=args.stand_start_transition_max_steps,
         stand_start_push_delay_steps=args.stand_start_push_delay_steps,
+        squat_phase_feedback=bool(args.squat_phase_feedback),
+        squat_phase_lag_tolerance=args.squat_phase_lag_tolerance,
+        squat_phase_min_scale=args.squat_phase_min_scale,
+        squat_bottom_depth_threshold=args.squat_bottom_depth_threshold,
+        squat_stand_depth_threshold=args.squat_stand_depth_threshold,
+        squat_upright_threshold=args.squat_upright_threshold,
+        squat_phase_stall_threshold=args.squat_phase_stall_threshold,
+        squat_phase_max_stall_steps=args.squat_phase_max_stall_steps,
+        squat_phase_stall_penalty=args.squat_phase_stall_penalty,
+        squat_phase_slowdown_penalty_coef=(
+            args.squat_phase_slowdown_penalty_coef
+        ),
+        squat_cycle_completion_bonus=args.squat_cycle_completion_bonus,
+        squat_terminate_on_cycle_completion=bool(
+            args.squat_terminate_on_cycle_completion
+        ),
         ctrl_penalty_coef=args.ctrl_penalty_coef,
         action_rate_penalty_coef=args.action_rate_penalty_coef,
         distal_action_penalty_coef=args.distal_action_penalty_coef,
@@ -1470,6 +1700,7 @@ def main() -> None:
                     f"iter={iteration:05d} "
                     f"step={int(metrics['global_step'])} "
                     f"ep_reward={metrics['mean_episode_reward']:.4f} "
+                    f"ep_rps={metrics['mean_episode_reward_per_step']:.4f} "
                     f"task={metrics['mean_task_reward']:.4f} "
                     f"amp={metrics['mean_amp_reward']:.4f} "
                     f"ep_len={metrics['mean_episode_length']:.2f} "
@@ -1479,6 +1710,10 @@ def main() -> None:
                     f"term={metrics['termination_fraction']:.3f} "
                     f"bad={metrics.get('task_invalid_state', 0.0):.6f} "
                     f"stall={metrics.get('task_insufficient_progress', 0.0):.6f} "
+                    f"pstall={metrics.get('task_phase_stalled', 0.0):.3f} "
+                    f"pfail={metrics.get('task_phase_stall_timeout', 0.0):.6f} "
+                    f"cycle={metrics.get('task_squat_cycle_completed', 0.0):.6f} "
+                    f"cmiss={metrics.get('task_incomplete_squat_cycle', 0.0):.6f} "
                     f"miss={metrics.get('task_incomplete_motion_end', 0.0):.6f} "
                     f"stage={metrics.get('task_course_stage', 0.0):.3f} "
                     f"start={metrics.get('task_course_start_stage', 0.0):.3f} "
@@ -1517,7 +1752,7 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats()
                 process_rss_mb = resource_metrics.get("process_rss_mb", 0.0)
                 if args.max_process_rss_mb > 0.0 and process_rss_mb >= args.max_process_rss_mb:
-                    emergency_path = log_dir / f"model_memory_guard_{iteration + 1}.pt"
+                    emergency_path = latest_model_path(log_dir)
                     emergency_pt, emergency_onnx = trainer.save(emergency_path, iteration=iteration)
                     run_logger.emit(
                         "[MEMORY_GUARD] "
@@ -1545,8 +1780,7 @@ def main() -> None:
                     wandb_metrics["resume_wandb_warmup"] = 0.0
                     run.log(wandb_metrics, step=int(wandb_metrics["global_step"]))
             if (iteration + 1) % max(args.save_interval, 1) == 0:
-                ckpt_step = iteration + 1
-                ckpt_path = log_dir / f"model_{ckpt_step}.pt"
+                ckpt_path = latest_model_path(log_dir)
                 saved_pt, saved_onnx = trainer.save(ckpt_path, iteration=iteration)
                 run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
             if args.iteration_sleep_ms > 0.0:
@@ -1554,7 +1788,7 @@ def main() -> None:
                 time.sleep(args.iteration_sleep_ms / 1000.0)
     finally:
         trainer.global_step = last_global_step
-        final_path = log_dir / "model_final.pt"
+        final_path = latest_model_path(log_dir)
         try:
             saved_pt, saved_onnx = trainer.save(final_path, iteration=last_iteration)
         except ValueError as exc:

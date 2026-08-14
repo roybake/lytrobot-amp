@@ -49,7 +49,7 @@ def default_train_args() -> list[str]:
 
 def main() -> None:
     sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
-    from train import main as train_main
+    from sensor_training.train import main as train_main
 
     train_main()
 

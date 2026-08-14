@@ -151,7 +151,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(terrains, {"rough", "slope_up", "slope_down", "stairs"})
         self.assertEqual(value("--rough-terrain-height"), MAX_ROUGH_HEIGHT_DIFFERENCE_M)
         self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
-        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[1])
+        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[0])
         self.assertEqual(value("--stair-step-depth"), STAIR_TREAD_RANGE_M[0])
         self.assertEqual(value("--specific-cot-limit"), MAX_SPECIFIC_COT_J_PER_KG_M)
         self.assertGreater(value("--specific-cot-penalty-coef"), 0.0)

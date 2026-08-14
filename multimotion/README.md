@@ -102,7 +102,7 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
 地形实现支持 gap、pit、rough、6°上/下坡和 stairs；当前训练入口只把 rough、
 6°上/下坡和 stairs 拼入 LYT 连续串联路线。gap、pit 数据与实现仍保留用于离线参考
 验证，不参与当前多动作训练。
-正式训练把 rough 最大高度差限制为 0.05 m，并使用 3 级、台阶高 0.20 m、
+正式训练把 rough 最大高度差限制为 0.05 m，并使用 3 级、台阶高 0.13 m、
 踏面 0.22 m 的最难考核楼梯；原始 CMU 楼梯参考数据仍来自 0.13 m 高、
 0.58 m 深的重定向标定。环境会把参考骨盆升降幅度缩放到实际台阶总高度，并使用
 相对参考高度的摔倒边界；踏面长度差异仍由策略通过观测和残差动作适应。
@@ -124,35 +124,39 @@ Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8
 关节真值、足端状态或地形标签：
 
 ```bash
-uv run python sensor_training/train_multimotion.py \
-  --num-envs 1024 \
-  --max-iterations 30000
+uv run python scripts/train_multimotion_stage1.py \
+  --num-envs 4096 --max-iterations 30000
+
+uv run python scripts/train_multimotion_stage2.py \
+  --stage1-checkpoint \
+    logs/multimotion/stage1/<run>/model_final.pt \
+  --num-envs 4096 --max-iterations 7500
 ```
 
 对应 checkpoint 必须使用传感器播放入口：
 
 ```bash
 uv run python sensor_training/play.py \
-  --checkpoint logs/sensor_policy/multimotion/<时间目录>/model_final.pt \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --stage multimotion \
   --device cuda \
   --viewer \
   --steps 0
 ```
 
-下面的 `scripts/train_multimotion.py` 是完整仿真状态观测版本，不满足严格的
-“仅 IMU + 肌腱长度”部署要求。
+`scripts/train_multimotion.py` 现在也是传感器任务公共配置，但不负责选择阶段；正式训练
+应使用带 `_stage1.py` / `_stage2.py` 后缀的入口，以保证域随机化状态正确。
 
 第一阶段：
 
 ```bash
-uv run python scripts/train_multimotion_walk.py \
+uv run python scripts/train_multimotion_walk_stage1.py \
   --num-envs 4096 \
   --max-iterations 5000
 
-uv run python scripts/train_multimotion.py \
+uv run python scripts/train_multimotion_stage1.py \
   --resume-checkpoint \
-    logs/multimotion_walk_warmup/<平地稳定运行目录>/model_final.pt \
+    logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt \
   --resume-reset-progress \
   --resume-reset-optimizer \
   --num-envs 4096 \
@@ -179,8 +183,9 @@ transition；PPO 划分为 8 个 12,288 样本 minibatch，AMP 使用 4096 样�
 `play.py` 的目标速度不会改变已经训练好的策略：
 
 ```bash
-uv run python scripts/train_multimotion.py \
-  --resume-checkpoint logs/multimotion/<旧时间目录>/model_final.pt \
+uv run python scripts/train_multimotion_stage1.py \
+  --resume-checkpoint \
+    logs/multimotion/stage1/<旧运行目录>/model_final.pt \
   --resume-reset-progress \
   --resume-reset-optimizer \
   --num-envs 4096 \
@@ -190,21 +195,18 @@ uv run python scripts/train_multimotion.py \
 续训时应观察 `task_forward_velocity` 和 `mean_episode_success_rate`，不要只看总奖励；
 前者应明显离开 0，后者最终应大于 0 后再用于完整路线播放。
 
-模型权重、ONNX、训练指标和 W&B 日志统一写入
-`logs/multimotion/<月-日-时:分:秒>/`。默认不再使用固定动作名作为目录，
-所以每次训练都会和其他训练入口一样生成独立的时间目录。
+模型权重、ONNX、训练指标和 W&B 日志分别写入
+`logs/multimotion/stage1/<月-日-时:分:秒>/` 和
+`logs/multimotion/stage2/<月-日-时:分:秒>/`，两个阶段不会混写。
 每次 checkpoint 成功写入后都会删除旧的 `.pt` 和 `.onnx`，因此训练目录中
 始终只保留最新的一对模型文件。
 
 第二阶段领域随机化：
 
 ```bash
-uv run python scripts/train_multimotion.py \
-  --stage stage2 \
-  --resume-checkpoint \
-    logs/multimotion/<第一阶段时间目录>/model_final.pt \
-  --resume-reset-progress \
-  --resume-reset-optimizer \
+uv run python scripts/train_multimotion_stage2.py \
+  --stage1-checkpoint \
+    logs/multimotion/stage1/<run>/model_final.pt \
   --num-envs 4096 \
   --max-iterations 7500
 ```
@@ -218,7 +220,7 @@ uv run python scripts/train_multimotion.py \
 ```bash
 cd /home/yeah/code/LYTrobot_amp
 uv run python scripts/play.py \
-  --checkpoint logs/multimotion/07-30-11:52:12/model_26000.pt \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --stage multimotion \
   --device cuda \
   --viewer \
@@ -229,6 +231,8 @@ uv run python scripts/play.py \
 `07-30-11-52-12-26000.mp4`。省略 `--stage multimotion` 时也会根据 checkpoint
 路径和多动作环境配置自动识别；重复测试同一权重会追加 `-2`、`-3`，避免覆盖。
 可用 `--num-robots` 覆盖同屏数量；`--seed` 固定三条路线的随机排列。
+完整路线结束后会从路线起点自动开始下一轮；只要 viewer 未关闭就持续测试。真实摔倒
+只会计入 `terminations` 并触发稳定起点重置，不会结束整个播放进程。
 
 训练机制包括：
 

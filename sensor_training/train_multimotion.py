@@ -48,7 +48,7 @@ def default_train_args() -> list[str]:
     _replace_option_values(
         args,
         "--stair-step-height",
-        [f"{STAIR_HEIGHT_RANGE_M[1]:.2f}"],
+        [f"{STAIR_HEIGHT_RANGE_M[0]:.2f}"],
     )
     _replace_option_values(
         args,
@@ -76,28 +76,19 @@ def default_train_args() -> list[str]:
     # around measured tendon lengths and terrain adaptation comes from the GRU.
     _replace_option_values(args, "--reference-ctrl-blend", ["0.0"])
     _replace_option_values(args, "--motion-transition-blend-steps", ["0"])
-    args.extend(
-        [
-            "--domain-randomization",
-            "--dr-curriculum-mode",
-            "adaptive",
-            "--dr-curriculum-initial-scale",
-            "0.0",
-            "--warp-global-domain-randomization",
-            "--global-dr-resample-interval",
-            "250",
-        ]
-    )
     tag_index = args.index("--wandb-tags") + 1
     args[tag_index] = (
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
         "asymmetric-critic,residual-moe,sensor-only,"
         "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
-        "acceptance,sim2real,adaptive-dr"
+        "acceptance,sim2real"
     )
     # SensorHistoryEnv never exposes the skill one-hot, and persisting this as
     # false makes the checkpoint configuration accurately describe the actor.
-    args.append("--no-skill-conditioning")
+    if "--skill-conditioning" in args:
+        args[args.index("--skill-conditioning")] = "--no-skill-conditioning"
+    elif "--no-skill-conditioning" not in args:
+        args.append("--no-skill-conditioning")
     return args
 
 

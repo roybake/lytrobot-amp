@@ -21,3 +21,8 @@ MUJOCO_LOG.TXT
 
 # Local editor state
 .vscode/*.log
+
+# Local secrets
+.env
+.env.*
+!.env.example

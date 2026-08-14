@@ -7,6 +7,7 @@ import argparse
 from dataclasses import fields
 import json
 from pathlib import Path
+import secrets
 import sys
 
 import numpy as np
@@ -42,12 +43,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--flat-steps", type=int, default=2000)
     parser.add_argument("--course-steps", type=int, default=6000)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Omit to generate a fresh seed for each acceptance run.",
+    )
+    parser.add_argument(
+        "--episode-random-seed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
 
-def checkpoint_env_cfg(checkpoint: dict, *, seed: int) -> LytRobotEnvCfg:
+def checkpoint_env_cfg(
+    checkpoint: dict,
+    *,
+    seed: int,
+    randomize_episode_seed: bool = True,
+) -> LytRobotEnvCfg:
     saved = checkpoint.get("env_config")
     if not isinstance(saved, dict):
         raise ValueError("Checkpoint has no env_config metadata.")
@@ -58,7 +74,7 @@ def checkpoint_env_cfg(checkpoint: dict, *, seed: int) -> LytRobotEnvCfg:
             setattr(cfg, key, value)
     cfg.num_envs = 1
     cfg.seed = int(seed)
-    cfg.randomize_episode_seed = False
+    cfg.randomize_episode_seed = bool(randomize_episode_seed)
     cfg.domain_randomization = False
     cfg.domain_randomization_scale = 0.0
     cfg.reset_noise_scale = 0.0
@@ -280,6 +296,8 @@ def evaluate_course(
 
 def main() -> None:
     args = parse_args()
+    if args.seed is None:
+        args.seed = secrets.randbits(32)
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     device = torch.device(
@@ -287,11 +305,19 @@ def main() -> None:
         if not str(args.device).startswith("cuda") or torch.cuda.is_available()
         else "cpu"
     )
-    cfg = checkpoint_env_cfg(checkpoint, seed=args.seed)
+    cfg = checkpoint_env_cfg(
+        checkpoint,
+        seed=args.seed,
+        randomize_episode_seed=args.episode_random_seed,
+    )
     flat = evaluate_flat(checkpoint, cfg, device, args.flat_steps)
     course_cases = []
     for stair_height, stair_tread in STAIR_ASSESSMENT_CASES:
-        cfg = checkpoint_env_cfg(checkpoint, seed=args.seed)
+        cfg = checkpoint_env_cfg(
+            checkpoint,
+            seed=args.seed,
+            randomize_episode_seed=args.episode_random_seed,
+        )
         course_cases.append(
             evaluate_course(
                 checkpoint,
@@ -327,6 +353,8 @@ def main() -> None:
     report = {
         "passed": result.passed,
         "checkpoint": str(checkpoint_path),
+        "seed": int(args.seed),
+        "episode_random_seed": bool(args.episode_random_seed),
         "sensor_input": checkpoint["sensor_observation"],
         "criteria": {
             "minimum_speed_kmh": MIN_WALKING_SPEED_KMH,

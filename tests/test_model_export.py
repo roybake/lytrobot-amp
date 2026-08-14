@@ -14,6 +14,7 @@ import torch
 
 from lytrobot_amp.networks import ActorCritic
 from lytrobot_amp.ppo_amp import PPOAMPTrainer
+from scripts.train import LATEST_MODEL_FILENAME, latest_model_path
 
 
 class ModelExportTests(unittest.TestCase):
@@ -88,6 +89,13 @@ class ModelExportTests(unittest.TestCase):
                 sorted(path.name for path in root.glob("model_*")),
                 ["model_final.onnx", "model_final.pt"],
             )
+
+    def test_all_training_saves_share_one_canonical_latest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            self.assertEqual(LATEST_MODEL_FILENAME, "model_final.pt")
+            self.assertEqual(latest_model_path(root), root / "model_final.pt")
 
     def test_failed_new_export_preserves_previous_model_pair(self) -> None:
         trainer = self._trainer()

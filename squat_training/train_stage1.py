@@ -24,9 +24,21 @@ if __name__ == "__main__":
     for name, value in defaults.items():
         if not _has_arg(name):
             sys.argv.extend([name, value])
-    if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):
-        sys.argv.append("--no-domain-randomization")
+    domain_flags = (
+        "--domain-randomization",
+        "--no-domain-randomization",
+        "--warp-global-domain-randomization",
+        "--no-warp-global-domain-randomization",
+    )
+    sys.argv[:] = [
+        arg
+        for arg in sys.argv
+        if arg not in domain_flags
+        and not any(arg.startswith(f"{name}=") for name in domain_flags)
+    ]
+    sys.argv.extend(
+        ["--no-domain-randomization", "--no-warp-global-domain-randomization"]
+    )
     if not (_has_arg("--wandb") or _has_arg("--no-wandb")):
         sys.argv.append("--wandb")
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")
-

@@ -504,3 +504,43 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
             )
     finally:
         env.close()
+
+
+def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None:
+    names = ("walk", "rough_walk")
+    paths = tuple(
+        str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
+    )
+    env = LytRobotAmpEnv(
+        LytRobotEnvCfg(
+            motion_files=paths,
+            motion_names=names,
+            motion_loop=(True, False),
+            terrain_types=("rough", "slope_up", "slope_down"),
+            serial_terrain_course=True,
+            terrain_course_variants=1,
+            terrain_course_random_start_prob=0.0,
+            num_envs=2,
+            stand_start_prob=1.0,
+            motion_reset_prob=1.0,
+            reset_noise_scale=0.0,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        env.reset()
+        np.testing.assert_array_equal(env.stand_start, [True, True])
+        np.testing.assert_array_equal(env.motion_phase, [0.0, 0.0])
+        np.testing.assert_allclose(
+            [data.qvel for data in env.datas],
+            np.zeros((env.num_envs, env.model.nv)),
+            atol=1.0e-7,
+        )
+        # The natural pose is placed on the selected course lane/datum.
+        np.testing.assert_allclose(
+            [data.qpos[2] for data in env.datas],
+            env.motion.model_qpos0[2] + env.more_terrain_cfg.course_base_height,
+            atol=1.0e-7,
+        )
+    finally:
+        env.close()

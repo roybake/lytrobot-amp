@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from lytrobot_amp.env import LytRobotEnvCfg
 from lytrobot_amp.motion import MotionReference
 from squat_training.envs import SquatCpuAmpEnv, SquatRewardMixin, SquatSensorHistoryCpuAmpEnv
+from squat_training.play import squat_play_defaults
+from squat_training import train as squat_train
+from squat_training.train import squat_training_defaults
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +27,37 @@ SHALLOW_ROOT_MAX = 0.873674750328064
 
 
 class SquatTaskTests(unittest.TestCase):
+    def test_training_defaults_bound_recurrent_policy_updates(self) -> None:
+        defaults = squat_training_defaults()
+
+        self.assertEqual(defaults["--learning-rate"], "1e-4")
+        self.assertEqual(defaults["--max-learning-rate"], "1e-4")
+        self.assertEqual(defaults["--target-kl"], "0.01")
+        self.assertEqual(defaults["--target-kl-stop-multiplier"], "1.5")
+        self.assertEqual(defaults["--clip-coef"], "0.10")
+        self.assertEqual(defaults["--epochs"], "2")
+        self.assertEqual(defaults["--stand-start-prob"], "1.0")
+        self.assertEqual(defaults["--motion-reset-prob"], "0.0")
+        self.assertEqual(defaults["--min-upright-z"], "0.65")
+        self.assertEqual(defaults["--squat-cycle-completion-bonus"], "5.0")
+
+    def test_playback_starts_from_stable_standing(self) -> None:
+        defaults = squat_play_defaults()
+
+        self.assertEqual(defaults["--stand-start-prob"], "1.0")
+        self.assertEqual(defaults["--target-velocity"], "0.0")
+
+    def test_training_requires_survival_after_a_completed_cycle(self) -> None:
+        with (
+            patch.object(sys, "argv", ["train.py"]),
+            patch.object(squat_train.base_train, "main") as base_main,
+        ):
+            squat_train.main()
+
+            base_main.assert_called_once_with()
+            self.assertIn("--no-squat-terminate-on-cycle-completion", sys.argv)
+            self.assertNotIn("--squat-terminate-on-cycle-completion", sys.argv)
+
     def test_omniretarget_result_keeps_both_feet_planted(self) -> None:
         import mujoco
 
@@ -75,7 +112,7 @@ class SquatTaskTests(unittest.TestCase):
             self.assertGreater(float(qpos[0, 2] - qpos[120, 2]), 0.12)
             self.assertGreater(float(qpos[-1, 2] - qpos[120, 2]), 0.12)
 
-    def test_actor_receives_sensor_history_and_internal_phase_clock(self) -> None:
+    def test_actor_receives_sensor_history_and_feedback_corrected_phase(self) -> None:
         env = SquatSensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
                 model_xml=str(MODEL),
@@ -86,6 +123,8 @@ class SquatTaskTests(unittest.TestCase):
                 motion_reset_prob=0.0,
                 reset_noise_scale=0.0,
                 episode_timeout_jitter_steps=0,
+                squat_phase_feedback=True,
+                squat_terminate_on_cycle_completion=True,
             )
         )
         try:
@@ -93,18 +132,421 @@ class SquatTaskTests(unittest.TestCase):
             self.assertEqual(env.imu_layout.dim, 42)
             self.assertEqual(env.base_env.position_action_dim, 14)
             self.assertEqual(env.sensor_frame_dim, 56)
+            self.assertEqual(env.policy_frame_dim, 58)
+            self.assertEqual(env.sensor_history_obs_dim, 336)
             self.assertEqual(env.obs_dim, 338)
             self.assertEqual(env.amp_obs_dim, 270)
             self.assertEqual(observation.shape, (1, 338))
-            self.assertEqual(env.observation_metadata["command_dim"], 2)
+            np.testing.assert_allclose(observation[0, -2:], [0.0, 1.0], atol=1.0e-6)
+            self.assertEqual(env.observation_metadata["command_dim"], 0)
+            self.assertEqual(env.observation_metadata["command_fields"], ())
             self.assertEqual(
                 env.observation_metadata["policy_inputs"],
-                ("imu", "tendon_length", "internal_phase"),
+                ("imu", "tendon_length", "sin_phase", "cos_phase"),
             )
             self.assertEqual(env.observation_metadata["posture_sensor_inputs"], ("imu", "tendon_length"))
-            np.testing.assert_allclose(observation[0, -2:], (0.0, 1.0), atol=1.0e-6)
+            self.assertEqual(
+                env.observation_metadata["phase_source"],
+                "controller_clock_feedback_corrected",
+            )
+            self.assertEqual(
+                env.observation_metadata["phase_feedback_inputs"],
+                ("tendon_length", "imu_gravity_direction"),
+            )
+            self.assertTrue(env.observation_metadata["phase_feedback"]["enabled"])
+            self.assertEqual(
+                len(env.observation_metadata["phase_feedback"]["depth_direction"]),
+                14,
+            )
+            self.assertEqual(
+                len(env.observation_metadata["phase_feedback"]["stand_tendon_length"]),
+                14,
+            )
+            self.assertEqual(
+                env.observation_metadata["phase_feedback"]["stall_threshold"],
+                0.25,
+            )
+            self.assertEqual(
+                env.observation_metadata["phase_feedback"]["max_stall_steps"],
+                40,
+            )
+            self.assertEqual(
+                env.observation_metadata["success_definition"],
+                "completed_stand_squat_stand_cycle",
+            )
+            self.assertTrue(
+                env.observation_metadata["phase_feedback"][
+                    "terminate_on_cycle_completion"
+                ]
+            )
+            self.assertFalse(env.observation_metadata["strict_sensor_only"])
         finally:
             env.close()
+
+    def test_phase_feedback_blocks_turns_until_sensor_posture_is_reached(self) -> None:
+        import mujoco
+
+        env = SquatCpuAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(MODEL),
+                motion_file=str(REFERENCE),
+                num_envs=1,
+                target_velocity=0.0,
+                stand_start_prob=0.0,
+                motion_reset_prob=0.0,
+                reset_noise_scale=0.0,
+                episode_timeout_jitter_steps=0,
+                squat_phase_feedback=True,
+            )
+        )
+        try:
+            data = env.datas[0]
+            stand_qpos, stand_qvel = env.motion.state_at(0)
+            bottom_qpos, bottom_qvel = env.motion.state_at(120)
+
+            data.qpos[:] = stand_qpos
+            data.qvel[:] = stand_qvel
+            mujoco.mj_forward(env.model, data)
+            env.motion_phase[:] = 119.5
+            blocked_bottom = env._squat_feedback_phase_scale()
+            self.assertEqual(float(blocked_bottom[0]), 0.0)
+            self.assertLess(float(env.squat_depth_sensor_progress[0]), 0.15)
+            self.assertEqual(float(env._motion_phase_progress()[0]), 0.0)
+            # Feedback must affect only clock advancement, not the shared
+            # stand-start target interpolation used by rewards and controls.
+            self.assertEqual(float(env._stand_start_progress()[0]), 1.0)
+
+            data.qpos[:] = bottom_qpos
+            data.qvel[:] = bottom_qvel
+            mujoco.mj_forward(env.model, data)
+            allowed_bottom = env._squat_feedback_phase_scale()
+            self.assertGreater(float(allowed_bottom[0]), 0.99)
+            self.assertGreater(float(env.squat_depth_sensor_progress[0]), 0.85)
+
+            env.motion_phase[:] = 239.5
+            blocked_stand = env._squat_feedback_phase_scale()
+            self.assertEqual(float(blocked_stand[0]), 0.0)
+
+            data.qpos[:] = stand_qpos
+            data.qvel[:] = stand_qvel
+            mujoco.mj_forward(env.model, data)
+            allowed_stand = env._squat_feedback_phase_scale()
+            self.assertGreater(float(allowed_stand[0]), 0.99)
+            self.assertLess(float(env.squat_depth_sensor_progress[0]), 0.15)
+        finally:
+            env.close()
+
+    def test_cycle_state_requires_stand_bottom_stand_and_resets_stall_budget(self) -> None:
+        env = SquatCpuAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(MODEL),
+                motion_file=str(REFERENCE),
+                num_envs=1,
+                target_velocity=0.0,
+                motion_reset_prob=0.0,
+                reset_noise_scale=0.0,
+                squat_phase_feedback=True,
+            )
+        )
+        try:
+            completed, episode_success = env._update_squat_cycle_state(
+                np.asarray([0.05], dtype=np.float32),
+                np.asarray([1.0], dtype=np.float32),
+            )
+            self.assertEqual(float(completed), 0.0)
+            self.assertEqual(float(episode_success), 0.0)
+            self.assertEqual(int(env.squat_cycle_stage[0]), 1)
+
+            completed, _ = env._update_squat_cycle_state(
+                np.asarray([0.90], dtype=np.float32),
+                np.asarray([1.0], dtype=np.float32),
+            )
+            self.assertEqual(float(completed), 0.0)
+            self.assertEqual(int(env.squat_cycle_stage[0]), 2)
+
+            env.squat_phase_stall_steps[0] = 7
+            completed, episode_success = env._update_squat_cycle_state(
+                np.asarray([0.05], dtype=np.float32),
+                np.asarray([1.0], dtype=np.float32),
+            )
+            self.assertEqual(float(completed), 1.0)
+            self.assertEqual(float(episode_success), 1.0)
+            self.assertEqual(int(env.squat_cycle_stage[0]), 1)
+            self.assertEqual(int(env.squat_cycle_count[0]), 1)
+            self.assertEqual(int(env.squat_phase_stall_steps[0]), 0)
+        finally:
+            env.close()
+
+    def test_completed_cycle_immediately_ends_as_success(self) -> None:
+        import mujoco
+
+        env = SquatCpuAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(MODEL),
+                motion_file=str(REFERENCE),
+                num_envs=1,
+                target_velocity=0.0,
+                stand_start_prob=0.0,
+                motion_reset_prob=0.0,
+                reset_noise_scale=0.0,
+                episode_timeout_jitter_steps=0,
+                squat_phase_feedback=True,
+                squat_terminate_on_cycle_completion=True,
+            )
+        )
+        try:
+            stand_qpos, _stand_qvel = env.motion.state_at(0)
+            env.datas[0].qpos[:] = stand_qpos
+            env.datas[0].qvel[:] = 0.0
+            mujoco.mj_forward(env.model, env.datas[0])
+            env.motion_phase[:] = 239.0
+            env.squat_cycle_stage[:] = 2
+
+            _obs, _reward, done, info = env.step(
+                np.zeros((1, env.action_dim), dtype=np.float32)
+            )
+
+            self.assertEqual(float(done[0]), 1.0)
+            self.assertEqual(float(info["time_outs"][0]), 1.0)
+            self.assertEqual(float(info["successes"][0]), 1.0)
+            self.assertEqual(float(info["squat_cycle_completed"][0]), 1.0)
+        finally:
+            env.close()
+
+    def test_completed_cycle_does_not_end_default_survival_episode(self) -> None:
+        import mujoco
+
+        env = SquatCpuAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(MODEL),
+                motion_file=str(REFERENCE),
+                num_envs=1,
+                target_velocity=0.0,
+                stand_start_prob=0.0,
+                motion_reset_prob=0.0,
+                reset_noise_scale=0.0,
+                episode_timeout_jitter_steps=0,
+                squat_phase_feedback=True,
+                squat_terminate_on_cycle_completion=False,
+            )
+        )
+        try:
+            stand_qpos, _stand_qvel = env.motion.state_at(0)
+            env.datas[0].qpos[:] = stand_qpos
+            env.datas[0].qvel[:] = 0.0
+            mujoco.mj_forward(env.model, env.datas[0])
+            env.motion_phase[:] = 239.0
+            env.squat_cycle_stage[:] = 2
+
+            _obs, _reward, done, info = env.step(
+                np.zeros((1, env.action_dim), dtype=np.float32)
+            )
+
+            self.assertEqual(float(done[0]), 0.0)
+            self.assertEqual(float(info["time_outs"][0]), 0.0)
+            self.assertEqual(float(info["successes"][0]), 0.0)
+            self.assertEqual(float(info["squat_cycle_completed"][0]), 1.0)
+            self.assertEqual(float(info["squat_episode_success"][0]), 1.0)
+        finally:
+            env.close()
+
+    def test_stalled_phase_cannot_earn_positive_reward_and_times_out_as_failure(self) -> None:
+        cfg = LytRobotEnvCfg(
+            symmetry_reward_coef=0.75,
+            squat_phase_max_stall_steps=2,
+            squat_phase_stall_penalty=0.25,
+        )
+        parts = {
+            "root_height_value": SHALLOW_ROOT_MAX,
+            "reference_root_height_value": SHALLOW_ROOT_MAX,
+            "pose_track": 1.0,
+            "height": 1.0,
+            "root_orientation": 1.0,
+            "root_vel": 1.0,
+            "vel_track": 1.0,
+            "distal_vel": 1.0,
+            "foot_pos": 1.0,
+            "stance_foot": 1.0,
+            "contact": 1.0,
+            "symmetry": 1.0,
+            "ctrl_track": 1.0,
+            "ctrl_penalty": 0.0,
+            "action_rate": 0.0,
+            "distal_action": 0.0,
+            "distal_action_rate": 0.0,
+            "missed_contact": 0.0,
+            "termination": 0.0,
+        }
+
+        class RewardSource:
+            def _compute_reward_done(self):
+                return (
+                    0.0,
+                    bool(getattr(self, "base_done", False)),
+                    bool(getattr(self, "base_timed_out", False)),
+                    dict(self.parts),
+                )
+
+        class RewardHarness(SquatRewardMixin, RewardSource):
+            pass
+
+        harness = RewardHarness()
+        harness.cfg = cfg
+        harness.motion = type(
+            "Motion",
+            (),
+            {
+                "frame_count": 240,
+                "reference_root_height": np.asarray(
+                    [SHALLOW_ROOT_MIN, SHALLOW_ROOT_MAX]
+                ),
+            },
+        )()
+        harness.motion_phase = np.asarray([60.0], dtype=np.float32)
+        harness.parts = parts
+        harness._squat_phase_feedback_ready = True
+        harness.squat_phase_feedback_scale = np.asarray([0.0], dtype=np.float32)
+        harness.squat_phase_stalled = np.asarray([True])
+        harness.squat_phase_stall_steps = np.asarray([1], dtype=np.int32)
+        harness.squat_cycle_stage = np.asarray([0], dtype=np.int32)
+        harness.squat_cycle_count = np.asarray([0], dtype=np.int32)
+        harness.squat_depth_sensor_progress = np.asarray([0.5], dtype=np.float32)
+        harness._squat_feedback_measurements = lambda: (
+            np.asarray([0.5], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+        )
+
+        reward, done, timed_out, reward_parts = harness._compute_reward_done()
+        self.assertLess(float(reward), 0.0)
+        self.assertFalse(done)
+        self.assertFalse(timed_out)
+        self.assertEqual(float(reward_parts["phase_stalled"]), 1.0)
+        self.assertEqual(float(reward_parts["phase_stall_timeout"]), 0.0)
+
+        harness.squat_phase_stall_steps[:] = 2
+        reward, done, timed_out, reward_parts = harness._compute_reward_done()
+        self.assertLess(float(reward), -10.0)
+        self.assertTrue(done)
+        self.assertFalse(timed_out)
+        self.assertEqual(float(reward_parts["phase_stall_timeout"]), 1.0)
+        self.assertEqual(float(reward_parts["termination"]), 1.0)
+
+        harness.squat_phase_feedback_scale[:] = 1.0
+        harness.squat_phase_stalled[:] = False
+        harness.squat_phase_stall_steps[:] = 0
+        harness.base_done = True
+        harness.base_timed_out = True
+        reward, done, timed_out, reward_parts = harness._compute_reward_done()
+        self.assertLess(float(reward), -10.0)
+        self.assertTrue(done)
+        self.assertFalse(timed_out)
+        self.assertEqual(float(reward_parts["incomplete_squat_cycle"]), 1.0)
+
+    def test_squat_success_requires_completed_cycle_on_successful_end(self) -> None:
+        class StepSource:
+            def step(self, _action):
+                return (
+                    np.zeros((2, 1), dtype=np.float32),
+                    np.zeros(2, dtype=np.float32),
+                    np.ones(2, dtype=np.float32),
+                    {
+                        "time_outs": np.ones(2, dtype=np.float32),
+                        "squat_episode_success": np.asarray(
+                            [1.0, 0.0], dtype=np.float32
+                        ),
+                    },
+                )
+
+        class StepHarness(SquatRewardMixin, StepSource):
+            pass
+
+        _, _, _, info = StepHarness().step(np.zeros((2, 1), dtype=np.float32))
+        np.testing.assert_array_equal(info["successes"], [1.0, 0.0])
+
+    def test_torch_stall_timeout_matches_warp_vector_semantics(self) -> None:
+        cfg = LytRobotEnvCfg(
+            symmetry_reward_coef=0.75,
+            squat_phase_max_stall_steps=2,
+            squat_phase_stall_penalty=0.25,
+            squat_terminate_on_cycle_completion=True,
+        )
+        scalar_parts = {
+            "root_height_value": SHALLOW_ROOT_MAX,
+            "reference_root_height_value": SHALLOW_ROOT_MAX,
+            "pose_track": 1.0,
+            "height": 1.0,
+            "root_orientation": 1.0,
+            "root_vel": 1.0,
+            "vel_track": 1.0,
+            "distal_vel": 1.0,
+            "foot_pos": 1.0,
+            "stance_foot": 1.0,
+            "contact": 1.0,
+            "symmetry": 1.0,
+            "ctrl_track": 1.0,
+            "ctrl_penalty": 0.0,
+            "action_rate": 0.0,
+            "distal_action": 0.0,
+            "distal_action_rate": 0.0,
+            "missed_contact": 0.0,
+            "termination": 0.0,
+        }
+
+        class RewardSource:
+            def _compute_reward_done(self):
+                parts = {
+                    key: torch.full((2,), value, dtype=torch.float32)
+                    for key, value in self.scalar_parts.items()
+                }
+                return (
+                    torch.zeros(2),
+                    torch.zeros(2, dtype=torch.bool),
+                    torch.zeros(2, dtype=torch.bool),
+                    parts,
+                )
+
+        class RewardHarness(SquatRewardMixin, RewardSource):
+            pass
+
+        harness = RewardHarness()
+        harness.cfg = cfg
+        harness.motion = type(
+            "Motion",
+            (),
+            {
+                "frame_count": 240,
+                "reference_root_height": np.asarray(
+                    [SHALLOW_ROOT_MIN, SHALLOW_ROOT_MAX]
+                ),
+            },
+        )()
+        harness.motion_phase = torch.asarray([60.0, 60.0])
+        harness.scalar_parts = scalar_parts
+        harness._squat_phase_feedback_ready = True
+        harness.squat_phase_feedback_scale = torch.asarray([0.0, 1.0])
+        harness.squat_phase_stalled = torch.asarray([True, False])
+        harness.squat_phase_stall_steps = torch.asarray([2, 0])
+        harness.squat_cycle_stage = torch.asarray([0, 2], dtype=torch.long)
+        harness.squat_cycle_count = torch.zeros(2, dtype=torch.long)
+        harness.squat_depth_sensor_progress = torch.full((2,), 0.5)
+        harness._squat_feedback_measurements = lambda: (
+            torch.asarray([0.5, 0.05]),
+            torch.ones(2),
+        )
+
+        reward, done, timed_out, reward_parts = harness._compute_reward_done()
+        self.assertLess(float(reward[0]), -10.0)
+        self.assertGreater(float(reward[1]), 0.0)
+        torch.testing.assert_close(done, torch.asarray([True, True]))
+        torch.testing.assert_close(timed_out, torch.asarray([False, True]))
+        torch.testing.assert_close(
+            reward_parts["phase_stall_timeout"],
+            torch.asarray([1.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            reward_parts["squat_cycle_completed"],
+            torch.asarray([0.0, 1.0]),
+        )
 
     def test_explicit_double_support_labels_survive_motion_loading(self) -> None:
         import mujoco

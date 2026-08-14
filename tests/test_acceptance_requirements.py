@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+from unittest.mock import patch
 
 import mujoco
 import numpy as np
@@ -29,10 +31,21 @@ from lytrobot_amp.terrain import (
     serial_course_boxes,
     terrain_height_from_model,
 )
-from scripts.evaluate_acceptance import assessment_course_cfg
+from scripts.evaluate_acceptance import assessment_course_cfg, checkpoint_env_cfg, parse_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_acceptance_seed_defaults_are_random() -> None:
+    with patch.object(sys, "argv", ["evaluate_acceptance.py", "--checkpoint", "model.pt"]):
+        args = parse_args()
+    assert args.seed is None
+    assert args.episode_random_seed is True
+
+    cfg = checkpoint_env_cfg({"env_config": {}}, seed=123)
+    assert cfg.seed == 123
+    assert cfg.randomize_episode_seed is True
 
 
 def test_acceptance_constants_match_contract() -> None:

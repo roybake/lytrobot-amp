@@ -19,6 +19,26 @@ from .ppo_config import SensorPPOAMPConfig
 
 
 class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
+    @staticmethod
+    def _sensor_observation_layout_signature(metadata: object) -> dict:
+        """Keep resume checks strict for actor inputs, not reward semantics.
+
+        ``sensor_observation`` also records squat task diagnostics.  A reward
+        coefficient or the policy for ending a successful episode changes the
+        learning objective, but neither changes a saved actor's input layout.
+        Treat only those explicitly listed fields as mutable across resumes.
+        """
+
+        if not isinstance(metadata, dict):
+            return {}
+        signature = copy.deepcopy(metadata)
+        signature.pop("success_definition", None)
+        phase_feedback = signature.get("phase_feedback")
+        if isinstance(phase_feedback, dict):
+            phase_feedback.pop("cycle_completion_bonus", None)
+            phase_feedback.pop("terminate_on_cycle_completion", None)
+        return signature
+
     def __init__(
         self,
         env,
@@ -34,6 +54,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.log_dir = Path(log_dir)
         self.rng = np.random.default_rng(cfg.seed + 1000)
 
+        policy_frame_dim = int(
+            getattr(env, "policy_frame_dim", env.sensor_frame_dim)
+        )
         self.actor_critic = SensorActorCritic(
             obs_dim=env.obs_dim,
             action_dim=env.action_dim,
@@ -42,7 +65,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             init_std=cfg.init_std,
             min_action_std=cfg.min_action_std,
             max_action_std=cfg.max_action_std,
-            sensor_frame_dim=env.sensor_frame_dim,
+            sensor_frame_dim=policy_frame_dim,
             recurrent_hidden_dim=cfg.recurrent_hidden_dim,
             num_experts=cfg.num_experts,
             gate_hidden_dims=cfg.gate_hidden_dims,
@@ -612,9 +635,21 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "Checkpoint has no sensor_observation metadata; use a checkpoint produced by sensor_training."
             )
         current_metadata = self.env.observation_metadata
-        if saved_metadata != current_metadata:
+        if (
+            self._sensor_observation_layout_signature(saved_metadata)
+            != self._sensor_observation_layout_signature(current_metadata)
+        ):
             raise ValueError(
-                "Checkpoint sensor observation layout does not match the current sensor_training layout."
+                "Checkpoint sensor observation layout does not match the current "
+                "sensor_training layout. Actor inputs, history length, IMU layout, "
+                "or phase features changed."
+            )
+        saved_task = str(checkpoint.get("training_task", "")).strip()
+        current_task = str(getattr(self.env.cfg, "training_task", "")).strip()
+        if saved_task and current_task and saved_task != current_task:
+            raise ValueError(
+                "Checkpoint belongs to a different independent training task: "
+                f"saved={saved_task!r}, current={current_task!r}."
             )
         next_iteration = super().load(path, load_optimizers=load_optimizers)
         self.recurrent_state.zero_()
@@ -624,11 +659,22 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
     def _checkpoint_payload(self, iteration: int) -> dict:
         checkpoint = super()._checkpoint_payload(iteration)
         checkpoint.update({
+            "training_task": str(getattr(self.env.cfg, "training_task", "")),
             "sensor_observation": self.env.observation_metadata,
             "sensor_policy_architecture": {
                 "name": "proprioceptive_gru_context_residual_moe",
                 "recurrent": True,
-                "sensor_frame_dim": self.env.sensor_frame_dim,
+                # Legacy key retained for playback/evaluation loaders.  For
+                # squat it includes the current sin/cos phase appended after
+                # the newest physical sensor frame.
+                "sensor_frame_dim": int(
+                    getattr(
+                        self.env,
+                        "policy_frame_dim",
+                        self.env.sensor_frame_dim,
+                    )
+                ),
+                "physical_sensor_frame_dim": self.env.sensor_frame_dim,
                 "recurrent_hidden_dim": self.cfg.recurrent_hidden_dim,
                 "num_experts": self.cfg.num_experts,
                 "gate_hidden_dims": list(self.cfg.gate_hidden_dims),
@@ -691,6 +737,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "amp_obs_dim": checkpoint["amp_obs_dim"],
             "ppo_amp_config": checkpoint["ppo_amp_config"],
             "env_config": checkpoint["env_config"],
+            "training_task": checkpoint.get("training_task", ""),
             "common_joint_names": checkpoint["common_joint_names"],
             "sensor_observation": checkpoint["sensor_observation"],
             "sensor_policy_architecture": checkpoint["sensor_policy_architecture"],

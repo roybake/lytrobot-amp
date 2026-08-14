@@ -38,6 +38,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         args = default_train_args()
 
         self.assertEqual(args[args.index("--log-group") + 1], "multimotion")
+        self.assertEqual(args[args.index("--training-task") + 1], "multimotion")
         self.assertIn("--no-skill-conditioning", args)
         tags = args[args.index("--wandb-tags") + 1].split(",")
         self.assertIn("sensor-only", tags)
@@ -45,13 +46,10 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         self.assertIn("tendon", tags)
         self.assertIn("--use-reference-velocity", args)
         self.assertNotIn("--no-use-reference-velocity", args)
-        self.assertIn("--domain-randomization", args)
-        self.assertEqual(args[args.index("--dr-curriculum-mode") + 1], "adaptive")
-        self.assertIn("--warp-global-domain-randomization", args)
-        self.assertGreater(
-            float(args[args.index("--global-dr-resample-interval") + 1]),
-            0.0,
-        )
+        # The task definition is stage-neutral.  Stage 1/2 launchers append
+        # the exact domain-randomization contract.
+        self.assertNotIn("--domain-randomization", args)
+        self.assertNotIn("--warp-global-domain-randomization", args)
 
         def value(option: str) -> float:
             return float(args[args.index(option) + 1])
@@ -72,7 +70,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             MAX_ROUGH_HEIGHT_DIFFERENCE_M,
         )
         self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
-        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[1])
+        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[0])
         self.assertEqual(value("--stair-step-depth"), STAIR_TREAD_RANGE_M[0])
         self.assertEqual(
             value("--specific-cot-limit"),

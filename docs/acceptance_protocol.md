@@ -55,7 +55,7 @@ specific_CoT = energy / (robot_mass * forward_distance)
 
 ```bash
 uv run python scripts/evaluate_acceptance.py \
-  --checkpoint logs/sensor_policy/multimotion/<run>/model_final.pt \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --device cuda
 ```
 

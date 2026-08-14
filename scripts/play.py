@@ -104,8 +104,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
     parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
-    parser.add_argument("--steps", type=int, default=1000, help="Number of policy steps to run. Use 0 for no limit.")
-    parser.add_argument("--target-velocity", type=float, default=1.0)
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of policy steps to run. Viewer playback defaults to no limit; "
+            "headless playback defaults to 1000. Use 0 explicitly for no limit."
+        ),
+    )
+    parser.add_argument(
+        "--target-velocity",
+        type=float,
+        default=None,
+        help="Reward diagnostic target; defaults to the checkpoint training target.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--seed",
@@ -113,7 +126,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Playback RNG seed. Omit it to randomize each run; set it to reproduce one play test.",
     )
-    parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--episode-random-seed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Resample RNG state after every test reset. This is enabled by "
+            "default unless a fixed --seed is supplied."
+        ),
+    )
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument(
         "--num-robots",
@@ -136,6 +157,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--push-force-min", type=float, default=None)
     parser.add_argument("--push-force-max", type=float, default=None)
+    parser.add_argument(
+        "--episode-steps",
+        type=int,
+        default=2_147_483_647,
+        help="Per-episode timeout used during playback; defaults to effectively unlimited.",
+    )
+    parser.add_argument(
+        "--episode-timeout-jitter-steps",
+        type=int,
+        default=0,
+        help="Playback timeout jitter; disabled by default for repeatable action tests.",
+    )
+    parser.add_argument(
+        "--motion-reset-prob",
+        type=float,
+        default=0.0,
+        help="Probability of resetting at a random reference phase; playback starts at phase zero by default.",
+    )
+    parser.add_argument(
+        "--squat-terminate-on-cycle-completion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--stand-start-prob", type=float, default=None)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=None)
@@ -155,20 +199,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_step_limit(steps: int | None, *, viewer: bool) -> int:
+    """Keep interactive tests alive until closed, while bounding headless runs."""
+
+    if steps is None:
+        return 0 if viewer else 1000
+    return int(steps)
+
+
 def make_env_cfg(
     args: argparse.Namespace,
     checkpoint: dict,
     stage: str | None = None,
 ) -> LytRobotEnvCfg:
+    checkpoint_env_cfg = checkpoint.get("env_config", {})
+    saved_target_velocity = (
+        float(checkpoint_env_cfg.get("target_velocity", 1.0))
+        if isinstance(checkpoint_env_cfg, dict)
+        else 1.0
+    )
+    target_velocity = (
+        saved_target_velocity
+        if args.target_velocity is None
+        else float(args.target_velocity)
+    )
     cfg = LytRobotEnvCfg(
         model_xml=args.model_xml,
         motion_file=args.motion_file,
         num_envs=1,
-        target_velocity=args.target_velocity,
+        target_velocity=target_velocity,
         reset_noise_scale=0.0,
         stand_start_prob=0.0,
     )
-    checkpoint_env_cfg = checkpoint.get("env_config", {})
     if isinstance(checkpoint_env_cfg, dict):
         valid_fields = {field.name for field in fields(LytRobotEnvCfg)}
         for key, value in checkpoint_env_cfg.items():
@@ -184,8 +246,16 @@ def make_env_cfg(
         raise ValueError("--num-robots must be positive.")
     cfg.num_envs = int(robot_count)
     cfg.seed = int(args.seed)
-    cfg.target_velocity = args.target_velocity
+    cfg.target_velocity = target_velocity
     cfg.reset_noise_scale = 0.0
+    # Playback is an endurance/repetition test, not a training-state sampler.
+    # Start every reset at the action's phase-zero state and leave the episode
+    # alive until a real termination or a task-defined successful completion.
+    cfg.motion_reset_prob = float(getattr(args, "motion_reset_prob", 0.0))
+    cfg.episode_steps = int(getattr(args, "episode_steps", 2_147_483_647))
+    cfg.episode_timeout_jitter_steps = int(
+        getattr(args, "episode_timeout_jitter_steps", 0)
+    )
     use_serial_course = (
         resolved_stage == "multimotion"
         if args.serial_terrain_course is None
@@ -201,26 +271,36 @@ def make_env_cfg(
         # Playback is a strict full-route evaluation, never a curriculum reset.
         cfg.terrain_course_random_start_prob = 0.0
         cfg.stand_start_prob = 0.0
-    if args.stand_start_prob is not None:
+    elif getattr(args, "stand_start_prob", None) is None:
+        cfg.stand_start_prob = 1.0
+    if getattr(args, "stand_start_prob", None) is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
-    if args.stand_start_phase_delay_steps is not None:
+    if getattr(args, "stand_start_phase_delay_steps", None) is not None:
         cfg.stand_start_phase_delay_steps = int(args.stand_start_phase_delay_steps)
-    if args.stand_start_transition_min_steps is not None:
+    if getattr(args, "stand_start_transition_min_steps", None) is not None:
         cfg.stand_start_transition_min_steps = int(args.stand_start_transition_min_steps)
-    if args.stand_start_transition_max_steps is not None:
+    if getattr(args, "stand_start_transition_max_steps", None) is not None:
         cfg.stand_start_transition_max_steps = int(args.stand_start_transition_max_steps)
-    if args.stand_start_push_delay_steps is not None:
+    if getattr(args, "stand_start_push_delay_steps", None) is not None:
         cfg.stand_start_push_delay_steps = int(args.stand_start_push_delay_steps)
-    if args.domain_randomization is not None:
+    if getattr(args, "domain_randomization", None) is not None:
         cfg.domain_randomization = bool(args.domain_randomization)
-    if args.push_force_min is not None:
+    if getattr(args, "push_force_min", None) is not None:
         cfg.push_force_min = float(args.push_force_min)
-    if args.push_force_max is not None:
+    if getattr(args, "push_force_max", None) is not None:
         cfg.push_force_max = float(args.push_force_max)
-    if args.episode_random_seed is not None:
+    if getattr(args, "squat_terminate_on_cycle_completion", None) is not None:
+        cfg.squat_terminate_on_cycle_completion = bool(
+            args.squat_terminate_on_cycle_completion
+        )
+    if getattr(args, "episode_random_seed", None) is not None:
         cfg.randomize_episode_seed = bool(args.episode_random_seed)
     elif getattr(args, "seed_was_provided", False):
         cfg.randomize_episode_seed = False
+    else:
+        # Playback randomness is a runtime contract, not checkpoint state.
+        # This also keeps old deterministic checkpoints random by default.
+        cfg.randomize_episode_seed = True
     return cfg
 
 
@@ -230,11 +310,21 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
     parts = set(Path(checkpoint_path).expanduser().parts)
     if "multimotion" in parts:
         return "multimotion"
+    # Task metadata is authoritative.  Older no-stairs runs were stored below
+    # ``logs/sensor_policy/.../stage1``; checking that path first classified a
+    # multi-motion course as an ordinary flat Stage 1 policy.  Playback then
+    # disabled its serial terrain course and reset from a never-trained natural
+    # stand, which looks exactly like an actor that refuses to walk.
+    training_task = str(checkpoint.get("training_task", "")).strip()
+    env_cfg = checkpoint.get("env_config", {})
+    if not training_task and isinstance(env_cfg, dict):
+        training_task = str(env_cfg.get("training_task", "")).strip()
+    if training_task in {"multimotion", "multimotion_no_stairs"}:
+        return "multimotion"
     if "stage2" in parts:
         return "stage2"
     if "stage1" in parts:
         return "stage1"
-    env_cfg = checkpoint.get("env_config", {})
     if isinstance(env_cfg, dict):
         motion_files = env_cfg.get("motion_files", ())
         if isinstance(motion_files, (list, tuple)) and len(motion_files) > 1:
@@ -454,6 +544,7 @@ class MujocoVideoRecorder:
 
 def main() -> None:
     args = parse_args()
+    args.steps = resolve_step_limit(args.steps, viewer=bool(args.viewer))
     args.seed_was_provided = args.seed is not None
     if args.seed is None:
         args.seed = secrets.randbits(32)
@@ -575,9 +666,17 @@ def main() -> None:
 
     rewards: list[float] = []
     forward_velocities: list[float] = []
+    stance_foot_speeds: list[float] = []
+    completed_episodes = 0
+    termination_count = 0
+    timeout_count = 0
+    success_count = 0
+    squat_cycle_count = 0
+    motion_repetition_count = 0
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
+            previous_motion_phase = np.asarray(env.motion_phase).copy()
             if is_onnx:
                 action = policy.act_inference(obs, episode_start=episode_start)
             else:
@@ -598,10 +697,53 @@ def main() -> None:
                     action = policy.act_inference(obs_tensor).cpu().numpy()
             obs, reward, done, _info = env.step(action)
             episode_start = np.asarray(done, dtype=np.float32)
+            completed = episode_start > 0.5
+            completed_episodes += int(np.count_nonzero(completed))
+            if "termination" in _info:
+                termination_count += int(
+                    np.count_nonzero(
+                        completed
+                        & (np.asarray(_info["termination"], dtype=np.float32) > 0.5)
+                    )
+                )
+            if "time_outs" in _info:
+                timeout_count += int(
+                    np.count_nonzero(
+                        completed
+                        & (np.asarray(_info["time_outs"], dtype=np.float32) > 0.5)
+                    )
+                )
+            if "successes" in _info:
+                success_count += int(
+                    np.count_nonzero(
+                        completed
+                        & (np.asarray(_info["successes"], dtype=np.float32) > 0.5)
+                    )
+                )
+            if "squat_cycle_completed" in _info:
+                squat_cycle_count += int(
+                    np.count_nonzero(
+                        np.asarray(
+                            _info["squat_cycle_completed"], dtype=np.float32
+                        )
+                        > 0.5
+                    )
+                )
+            current_motion_phase = np.asarray(env.motion_phase)
+            motion_repetition_count += int(
+                np.count_nonzero(
+                    (~completed)
+                    & (current_motion_phase + 1.0e-6 < previous_motion_phase)
+                )
+            )
             rewards.extend(float(value) for value in reward)
             if "forward_velocity" in _info:
                 forward_velocities.extend(
                     float(value) for value in _info["forward_velocity"]
+                )
+            if "stance_foot_speed" in _info:
+                stance_foot_speeds.extend(
+                    float(value) for value in _info["stance_foot_speed"]
                 )
             step_count += 1
             if viewer is not None:
@@ -626,10 +768,18 @@ def main() -> None:
     mean_forward_velocity = sum(forward_velocities) / max(
         len(forward_velocities), 1
     )
+    mean_stance_foot_speed = sum(stance_foot_speeds) / max(
+        len(stance_foot_speeds), 1
+    )
     print(
         f"[PLAY] policy_steps={step_count} robot_samples={len(rewards)} "
         f"mean_reward={mean_reward:.4f} "
-        f"mean_forward_velocity={mean_forward_velocity:.4f}m/s"
+        f"mean_forward_velocity={mean_forward_velocity:.4f}m/s "
+        f"mean_stance_foot_speed={mean_stance_foot_speed:.4f}m/s "
+        f"episodes={completed_episodes} terminations={termination_count} "
+        f"timeouts={timeout_count} successes={success_count} "
+        f"repetitions={motion_repetition_count + timeout_count} "
+        f"squat_cycles={squat_cycle_count}"
     )
 
 

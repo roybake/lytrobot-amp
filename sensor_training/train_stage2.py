@@ -34,9 +34,15 @@ if __name__ == "__main__":
         if _has_arg("--resume-checkpoint"):
             raise SystemExit("Use only one of --stage1-checkpoint/--stage1-model or --resume-checkpoint.")
         sys.argv.extend(["--resume-checkpoint", stage1_checkpoint, "--resume-reset-progress"])
+    elif not _has_arg("--resume-checkpoint"):
+        raise SystemExit(
+            "Stage 2 requires --stage1-checkpoint <path>; use "
+            "--resume-checkpoint only to continue Stage 2."
+        )
 
     defaults = {
         "--stage": "stage2",
+        "--training-task": "walk",
         "--device": "cuda",
         "--sim-backend": "warp",
         "--num-envs": "4096",
@@ -52,8 +58,21 @@ if __name__ == "__main__":
     for name, value in defaults.items():
         if not _has_arg(name):
             sys.argv.extend([name, value])
-    if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):
-        sys.argv.append("--domain-randomization")
+    domain_flags = (
+        "--domain-randomization",
+        "--no-domain-randomization",
+        "--warp-global-domain-randomization",
+        "--no-warp-global-domain-randomization",
+    )
+    sys.argv[:] = [
+        arg
+        for arg in sys.argv
+        if arg not in domain_flags
+        and not any(arg.startswith(f"{name}=") for name in domain_flags)
+    ]
+    sys.argv.extend(["--domain-randomization", "--warp-global-domain-randomization"])
+    if not _has_arg("--global-dr-resample-interval"):
+        sys.argv.extend(["--global-dr-resample-interval", "250"])
     if not (_has_arg("--wandb") or _has_arg("--no-wandb")):
         sys.argv.append("--wandb")
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")

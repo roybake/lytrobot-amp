@@ -664,12 +664,25 @@ class PPOAMPTrainer:
             rollout_episode_rewards = np.concatenate(completed_episode_rewards).astype(np.float32, copy=False)
             rollout_episode_reward = float(rollout_episode_rewards.mean())
         else:
+            rollout_episode_rewards = np.zeros(0, dtype=np.float32)
             rollout_episode_reward = 0.0
         if len(completed_episode_lengths) > 0:
             rollout_episode_lengths = np.concatenate(completed_episode_lengths).astype(np.float32, copy=False)
             rollout_episode_length = float(rollout_episode_lengths.mean())
         else:
+            rollout_episode_lengths = np.zeros(0, dtype=np.float32)
             rollout_episode_length = 0.0
+        rollout_episode_reward_per_step = (
+            float(
+                np.mean(
+                    rollout_episode_rewards
+                    / np.maximum(rollout_episode_lengths, 1.0)
+                )
+            )
+            if len(completed_episode_rewards) > 0
+            and rollout_episode_rewards.shape == rollout_episode_lengths.shape
+            else 0.0
+        )
         mean_episode_reward = (
             float(np.mean(self.completed_episode_rewards)) if len(self.completed_episode_rewards) > 0 else 0.0
         )
@@ -679,6 +692,20 @@ class PPOAMPTrainer:
         mean_episode_success_rate = (
             float(np.mean(self.completed_episode_successes))
             if len(self.completed_episode_successes) > 0
+            else 0.0
+        )
+        mean_episode_reward_per_step = (
+            float(
+                np.mean(
+                    np.asarray(self.completed_episode_rewards, dtype=np.float32)
+                    / np.maximum(
+                        np.asarray(self.completed_episode_lengths, dtype=np.float32),
+                        1.0,
+                    )
+                )
+            )
+            if len(self.completed_episode_rewards) > 0
+            and len(self.completed_episode_rewards) == len(self.completed_episode_lengths)
             else 0.0
         )
         completed_count = dones.sum()
@@ -717,14 +744,19 @@ class PPOAMPTrainer:
         env_steps_per_second = float(self.cfg.num_steps * self.env.num_envs) / rollout_seconds
         metrics: dict[str, float] = {
             "global_step": float(self.global_step),
-            "mean_reward": mean_episode_reward,
+            # Keep the conventional headline curve independent of changing
+            # episode length.  The cumulative value remains available under
+            # the explicit mean_episode_reward key.
+            "mean_reward": mean_episode_reward_per_step,
             "mean_length": mean_episode_length,
             "mean_episode_reward": mean_episode_reward,
+            "mean_episode_reward_per_step": mean_episode_reward_per_step,
             "mean_episode_length": mean_episode_length,
             "rollout_mean_reward": rollout_reward,
             "rollout_mean_task_reward": mean_task_reward,
             "rollout_mean_amp_reward": mean_amp_reward,
             "rollout_episode_reward": rollout_episode_reward,
+            "rollout_episode_reward_per_step": rollout_episode_reward_per_step,
             "rollout_episode_length": rollout_episode_length,
             "mean_task_reward": mean_task_reward,
             "mean_amp_reward": mean_amp_reward,

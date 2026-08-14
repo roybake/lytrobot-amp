@@ -31,17 +31,41 @@ if __name__ == "__main__":
         if any(arg == "--resume-checkpoint" or arg.startswith("--resume-checkpoint=") for arg in sys.argv):
             raise SystemExit("Use only one of --stage1-checkpoint/--stage1-model or --resume-checkpoint.")
         sys.argv.extend(["--resume-checkpoint", stage1_checkpoint, "--resume-reset-progress"])
+    elif not any(
+        arg == "--resume-checkpoint" or arg.startswith("--resume-checkpoint=")
+        for arg in sys.argv
+    ):
+        raise SystemExit(
+            "Stage 2 requires --stage1-checkpoint <path>; use "
+            "--resume-checkpoint only to continue Stage 2."
+        )
 
     if not any(arg == "--stage" or arg.startswith("--stage=") for arg in sys.argv):
         sys.argv.extend(["--stage", "stage2"])
     if not any(
-        arg == "--domain-randomization"
-        or arg.startswith("--domain-randomization=")
-        or arg == "--no-domain-randomization"
-        or arg.startswith("--no-domain-randomization=")
+        arg == "--training-task" or arg.startswith("--training-task=")
         for arg in sys.argv
     ):
-        sys.argv.append("--domain-randomization")
+        sys.argv.extend(["--training-task", "walk"])
+    domain_flags = (
+        "--domain-randomization",
+        "--no-domain-randomization",
+        "--warp-global-domain-randomization",
+        "--no-warp-global-domain-randomization",
+    )
+    sys.argv[:] = [
+        arg
+        for arg in sys.argv
+        if arg not in domain_flags
+        and not any(arg.startswith(f"{name}=") for name in domain_flags)
+    ]
+    sys.argv.extend(["--domain-randomization", "--warp-global-domain-randomization"])
+    if not any(
+        arg == "--global-dr-resample-interval"
+        or arg.startswith("--global-dr-resample-interval=")
+        for arg in sys.argv
+    ):
+        sys.argv.extend(["--global-dr-resample-interval", "250"])
     if not any(
         arg == "--wandb"
         or arg.startswith("--wandb=")

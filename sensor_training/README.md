@@ -1,6 +1,6 @@
 # IMU + 肌腱长度独立训练
 
-动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。
+动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。通用 `scripts/train.py` 也已直接绑定本目录的传感器环境和 recurrent trainer。行走、多动作和楼梯入口遵守本页的严格传感器输入约束；蹲起入口复用同一网络，但按任务要求额外附加反馈校正的二维 `sin/cos` 相位。
 
 sensor stage1 默认与 `scripts/train_stage1.py` 使用相同的奖励系数和训练模式；stage2 入口会显式追加鲁棒训练和速度奖励相关参数。环境收到动作时仍统一裁剪到 `[-1, 1]`。
 
@@ -48,18 +48,30 @@ uv run python sensor_training/train_stage1.py
 uv run python sensor_training/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt
 
-uv run python sensor_training/train_multimotion.py \
-  --num-envs 1024 \
-  --max-iterations 30000
+uv run python sensor_training/train_multimotion_stage1.py \
+  --num-envs 4096 --max-iterations 30000
+
+uv run python sensor_training/train_multimotion_stage2.py \
+  --stage1-checkpoint \
+    logs/multimotion/stage1/<run>/model_final.pt \
+  --num-envs 4096 --max-iterations 7500
 ```
+
+所有 Stage 1 入口关闭域随机化，所有 Stage 2 入口必须加载对应任务的 Stage 1
+checkpoint，并强制开启逐环境随机化以及定期重采样的 Warp 共享质量、惯量、摩擦和
+重力参数。训练与测试每次启动以及每个 episode/reset 默认重采样 seed；仅在复现实验时
+同时传入 `--seed N --no-episode-random-seed`。多动作 Stage 2 另外使用自适应随机化
+强度课程。
+全地形多动作也可使用完全等价的
+`scripts/train_multimotion_stage1.py` / `scripts/train_multimotion_stage2.py`。
 
 多场景入口的平地与普通行走参考保留 CMU 69_01 经机器人尺度重定向后的原始速度
 `0.8623 m/s`（`3.10 km/h`）；转弯和楼梯同样保留各自的原始参考速度。该训练目标
 有意低于现有 `5 km/h` 验收门槛，当前阶段优先验证自然节奏下的稳定性；后续若恢复
 高速指标，应在稳定模型上增加独立的速度课程。
 默认串联路线仅覆盖平地、5 cm 不平路、6°上/下坡和上下楼；楼梯按最难边界
-`0.20 m` 级高、`0.22 m` 踏面训练。无导航命令时左/右转在本体观测上不可辨识，因此
-转向参考不混入这个直线地形策略的 AMP 教师分布。默认启用从 0 强度开始的自适应领域随机化，
+`0.13 m` 级高、`0.22 m` 踏面训练。无导航命令时左/右转在本体观测上不可辨识，因此
+转向参考不混入这个直线地形策略的 AMP 教师分布。自适应领域随机化只在 Stage 2 启用，
 并定期重采样共享质量、摩擦和重力参数。能耗奖励使用执行器绝对机械功
 `sum(abs(force * velocity))` 积分，并惩罚超过 `0.8 J/kg/m` 的比能耗。
 
@@ -67,7 +79,7 @@ uv run python sensor_training/train_multimotion.py \
 
 ```bash
 uv run python scripts/evaluate_acceptance.py \
-  --checkpoint logs/sensor_policy/multimotion/<run>/model_final.pt \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --device cuda
 ```
 
@@ -79,7 +91,7 @@ uv run python scripts/evaluate_acceptance.py \
 
 ```bash
 uv run python sensor_training/train_stage1.py \
-  --resume-checkpoint logs/sensor_policy/stage1/<run>/model_<best>.pt \
+  --resume-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt \
   --resume-reset-optimizer \
   --run-name sensor-stage1-speed-ft \
   --learning-rate 2e-5 \
@@ -116,7 +128,11 @@ uv run python sensor_training/play.py \
   --viewer
 
 uv run python sensor_training/play.py \
-  --checkpoint logs/sensor_policy/multimotion/<run>/model_final.pt \
+  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
   --stage multimotion \
   --viewer
 ```
+
+viewer 默认无限重复测试，直到手动关闭窗口；无需额外传 `--steps 0`。每次重置从稳定
+动作起点开始，普通 episode 超时和随机动作相位默认关闭。需要有限测试时显式传入
+`--steps <N>`，需要随机相位恢复测试时显式传入 `--motion-reset-prob 1.0`。

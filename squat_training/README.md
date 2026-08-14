@@ -44,15 +44,41 @@ uv run python squat_training/retargeting/build_training_reference.py \
 
 ## 策略输入与训练
 
-Actor 不接收关节角、关节速度或速度指令。每帧姿态反馈只有 7 个三轴加速度计、7 个三轴陀螺仪和 14 个肌腱长度，共 `42 + 14 = 56` 维；当前帧加前 5 帧历史组成 `56 × 6 = 336` 维。控制器再附加软件内部深蹲时钟的 `sin(phase), cos(phase)` 两维，因此 Actor 总输入为 `338` 维。相位不是实机姿态传感器，部署时由控制周期和参考轨迹发生器生成。AMP 判别器继续使用原训练代码的特权运动特征。
+Actor 不接收关节角、关节速度、速度指令或仿真根部真值。每帧姿态反馈只有 7 个三轴加速度计、7 个三轴陀螺仪和 14 个肌腱长度，共 `42 + 14 = 56` 维；当前帧加前 5 帧历史组成 `56 × 6 = 336` 维。其后附加控制器当前相位的 `sin/cos` 两维，总观测为 `338` 维；GRU 每步读取最新 56 维传感器和当前 2 维相位，共 58 维。AMP 判别器继续使用训练期特权运动特征。
 
-蹲起环境使用独立奖励 profile，不复用行走任务的摆动脚和交替步态奖励。任务奖励由参考姿态/骨盆高度/运动速度跟踪、双脚固定与持续接触、左右同步性和动作平滑性组成；失去足底接触会受罚，跌倒额外扣除 10 分，保证即使其余跟踪项满分时终止步奖励仍为负。训练日志中的 `task_squat_track` 和 `task_support_track` 分别表示蹲起轨迹跟踪质量与双支撑质量。
+相位不是盲目固定时钟。训练环境以 14 个实际肌腱长度在“站立→最低点”的参考肌腱方向上投影，得到物理下蹲深度，并用骨盆 IMU 重力方向检查躯干直立性：
+
+- 实际动作落后参考深度超过 `0.08` 时逐步减慢相位；
+- 未达到 `0.85` 深度时不允许从下蹲切换到起立；
+- 未恢复到 `0.15` 深度以内时不允许开始下一次下蹲；
+- IMU 直立度低于 `0.75` 时冻结相位。
+
+为了防止策略通过冻结参考相位延长回合并反复领取静态跟踪奖励，推进倍率低于
+`0.25` 的控制步会被记为停滞步，且该步任务奖励保证为负。每个物理蹲起周期最多
+允许累计 40 个停滞步（40 Hz 下为 1 秒）；超过预算会以失败终止。完成一次由传感器
+确认的“站立→深度至少 0.85→恢复到 0.15 以内”周期只记录完成事件，默认不会立即
+结束 episode。策略必须在整个回合内持续站稳并完成至少一次蹲起，普通 timeout 才算
+成功；完成蹲起后又摔倒仍然是失败。
+推进倍率在 `(0.25, 1)` 内时还会按 `2 × (1-scale)`
+连续扣除减速代价；到回合上限仍未完成周期会作为异常终止处理，而不是可 bootstrap
+的正常 timeout。
+
+策略观测、奖励参考和执行目标共用这一反馈校正后的相位。实机控制器必须采用相同的肌腱长度归一化和 IMU 姿态估计，并在稳定站立启动时同时复位相位与 GRU 状态。训练日志额外记录 `task_phase_feedback_scale`、`task_phase_feedback_frozen` 和 `task_sensor_depth_progress`。
+checkpoint 和 ONNX 元数据中的 `sensor_observation.phase_feedback` 会保存控制周期、参考频率、站立肌腱长度、归一化半宽、深度投影方向、参考深度曲线和全部门控阈值，实机端应直接读取这些值，避免手工复制参数造成训练/部署不一致。
+
+默认入口会启用 `--squat-phase-feedback`。阈值可用 `--squat-phase-lag-tolerance`、`--squat-phase-min-scale`、`--squat-bottom-depth-threshold`、`--squat-stand-depth-threshold`、`--squat-upright-threshold`、`--squat-phase-stall-threshold`、`--squat-phase-max-stall-steps`、`--squat-phase-stall-penalty` 和 `--squat-phase-slowdown-penalty-coef` 调整。由于观测从 336 维变为 338 维，旧无相位 checkpoint 不能恢复，必须从 Stage 1 重新训练。
+
+蹲起环境使用独立奖励 profile，不复用行走任务的摆动脚和交替步态奖励。任务奖励由参考姿态/骨盆高度/运动速度跟踪、双脚固定与持续接触、左右同步性和动作平滑性组成。默认完整周期奖励为 5 分，跌倒或失败终止额外扣除 50 分；训练从稳定站立开始，躯干直立终止阈值提高到 `0.65`，保证生存优先于蹲起次数。训练日志中的 `task_squat_track` 和 `task_support_track` 分别表示蹲起轨迹跟踪质量与双支撑质量。
 
 第一阶段关闭域随机化：
 
 ```bash
 uv run python squat_training/train_stage1.py
 ```
+
+两个阶段都使用蹲起专用的保守更新边界：初始/最大学习率 `1e-4`、KL 目标 `0.01`、
+KL 硬停止 `0.015`、BPO ratio 范围 `0.10`，每轮只更新 2 个 epoch。命令行显式传参
+仍可覆盖这些默认值。
 
 第二阶段从第一阶段权重开始，并启用质量、摩擦、肌腱长度、重力、传感噪声、动作延迟和外力随机化：
 
@@ -61,11 +87,15 @@ uv run python squat_training/train_stage2.py \
   --stage1-checkpoint logs/squat_sensor_policy/stage1/<run-name>/model_final.pt
 ```
 
-Stage2 默认重置优化器并使用 `1e-4` 学习率。域随机化每 250 轮评估一次：成功率和下蹲深度达标且异常终止率足够低时强度增加 `0.025`，性能明显下降时回退，不再按训练轮数强行增加。外力最终范围仍为 0–80 N，但间隔放宽为 75–200 个控制步；20% 回合从站立状态开始。
+Stage2 默认重置优化器并使用 `1e-4` 学习率。域随机化每 250 轮评估一次：成功率和下蹲深度达标且异常终止率足够低时强度增加 `0.025`，性能明显下降时回退，不再按训练轮数强行增加。外力最终范围仍为 0–80 N，但间隔放宽为 75–200 个控制步；所有默认回合都从稳定站立状态开始，随机化动力学和扰动而不随机化部署初态。
 
-Warp 的质量、惯量、地面摩擦和重力属于整个批次共享参数，默认保持标称值，避免单次随机抽样同时改变全部 4096 个环境。逐环境的肌腱长度、动作延迟，以及逐步的观测/动作噪声和外力仍参与随机化。只有明确传入 `--warp-global-domain-randomization` 才启用共享参数抽样。
+Warp 的质量、惯量、地面摩擦和重力属于整个批次共享参数。Stage 2 现在强制启用这些
+共享参数的域随机化，并默认每 250 iteration 重采样；逐环境的肌腱长度、动作延迟，
+以及逐步的观测/动作噪声和外力也同时参与随机化。Stage 1 仍强制使用标称参数。
+训练与测试每次启动以及每个 episode/reset 默认重采样 seed；仅在复现实验时同时传入
+`--seed N --no-episode-random-seed`。
 
-训练时重点观察 `bottom_depth_success_rate`、`episode_success_rate`、`rollout_episode_success_rate`、`termination_fraction` 和 `domain_randomization_scale`。`episode_success_rate` 是最近已完成回合的滑动成功率，`rollout_episode_success_rate` 是当前 rollout 的即时值；前者不会再因一次 24 步 rollout 没有自然结束的回合而突然归零。
+训练时重点观察 `mean_reward`、`episode/reward_per_step`、`bottom_depth_success_rate`、`episode_success_rate`、`rollout_episode_success_rate`、`task_phase_stalled`、`task_phase_stall_timeout`、`task_incomplete_squat_cycle`、`task_squat_cycle_completed`、`termination_fraction` 和 `domain_randomization_scale`。`mean_reward` 与 `episode/reward_per_step` 都是按控制步归一化的主奖励曲线，已消除回合长度对累计奖励的直接放大；原累计值只保留在 `mean_episode_reward` 和 `episode/total_reward`。`episode_success_rate` 是最近已完成回合中真正完成蹲起周期的滑动成功率，`rollout_episode_success_rate` 是当前 rollout 的即时值。
 
 短程验证和回放：
 
@@ -73,9 +103,21 @@ Warp 的质量、惯量、地面摩擦和重力属于整个批次共享参数，
 uv run python squat_training/train_stage1.py \
   --num-envs 32 --num-steps 4 --max-iterations 1 --no-wandb --run-name smoke
 uv run python squat_training/play.py \
-  --checkpoint <checkpoint.pt> \
-  --no-domain-randomization --seed 42 --no-episode-random-seed
+  --checkpoint <checkpoint.pt> --viewer --steps 0
 ```
+
+上面的正常测试默认使用随机 seed，并让 Stage 2 checkpoint 保持域随机化。固定种子、
+标称参数的复现诊断可额外添加
+`--no-domain-randomization --seed 42 --no-episode-random-seed`。
+
+`play.py` 默认从稳定站立进入动作。只有专门评估任意动作相位恢复能力时，才显式传入
+`--stand-start-prob 0.0`；这不是正常蹲起的部署条件。默认 viewer 回放关闭普通 episode
+超时，并反复执行站立→下蹲→起立，直到关闭 viewer 或达到显式的 `--steps`。旧的
+“单周期成功即结束”checkpoint 会在每次站起后从稳定站立开始下一轮；使用当前训练配置
+生成的生存型 checkpoint 则保持同一个物理状态连续循环。终端汇总中的 `squat_cycles`
+是实际完成的蹲起次数，`terminations` 是真实失稳次数。可显式传入
+`--no-squat-terminate-on-cycle-completion` 对旧模型执行无物理重置的极限测试，但旧模型
+没有接受过这种训练，不能将该结果当作正常回放能力。
 
 不经过策略网络，将 14 自由度 OmniRetarget 结果映射到完整机器人 MJCF 后直接可视化：
 
