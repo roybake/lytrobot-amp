@@ -17,6 +17,7 @@ import numpy as np
 
 
 MORE_TERRAIN_TYPES = (
+    "flat",
     "gap",
     "pit",
     "rough",
@@ -30,9 +31,11 @@ MORE_TERRAIN_TYPES = (
 # Keep turns in the motion library for dedicated turn training, but do not put
 # discontinuous turn references in the all-terrain route.
 COURSE_PREFIX_MOTIONS = ("walk",)
+COURSE_SUFFIX_MOTIONS = ("walk",)
 COURSE_TERRAIN_LENGTHS = {
     # Match the forward travel of the corresponding retargeted clips so
     # reference-stage changes remain spatially aligned with terrain seams.
+    "flat": 3.10,
     "rough": 3.10,
     "slope_up": 3.10,
     "slope_down": 3.10,
@@ -99,7 +102,7 @@ class MoreTerrainCfg:
     course_orders: tuple[tuple[str, ...], ...] = ()
     course_lane_spacing: float = 3.0
     course_run_in: float = 2.90
-    course_run_out: float = 0.30
+    course_run_out: float = 3.10
     course_base_height: float = 0.30
     course_completion_tolerance: float = 1.0
 
@@ -235,7 +238,9 @@ def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
 
     result = list(COURSE_PREFIX_MOTIONS)
     for kind in order:
-        if kind == "stairs":
+        if kind == "flat":
+            result.append("walk")
+        elif kind == "stairs":
             result.extend(("stair_up", "stair_down"))
         elif kind == "gap":
             result.append("gap_cross")
@@ -249,6 +254,7 @@ def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
             result.append("pit_walk")
         else:
             raise ValueError(f"Unknown course terrain kind: {kind!r}.")
+    result.extend(COURSE_SUFFIX_MOTIONS)
     return tuple(result)
 
 
@@ -272,6 +278,7 @@ def course_stage_end_positions(
             result.extend((float(segment.center_x), float(segment.end_x)))
         else:
             result.append(float(segment.end_x))
+    result.append(course_end_x(cfg, variant))
     return tuple(result)
 
 
@@ -284,6 +291,7 @@ def course_stage_scenarios(order: Sequence[str]) -> tuple[str, ...]:
             result.extend(("stair_up", "stair_down"))
         else:
             result.append(str(kind))
+    result.extend(("flat",) * len(COURSE_SUFFIX_MOTIONS))
     return tuple(result)
 
 
@@ -423,6 +431,53 @@ def stair_boxes(cfg: StairTerrainCfg) -> list[tuple[str, np.ndarray, np.ndarray]
     return boxes
 
 
+def serial_course_stair_cfg(
+    cfg: MoreTerrainCfg,
+    stairs: StairTerrainCfg,
+    variant: int,
+) -> StairTerrainCfg:
+    """Return the world-frame staircase compiled into one course lane.
+
+    Reward and failure checks must use exactly the same relocated staircase as
+    the collision geometry.  Keeping this calculation in one place prevents a
+    serial-course policy from being rewarded against the old standalone stair
+    coordinates while its feet collide with a different surface.
+    """
+
+    _validate_more(cfg)
+    _validate_stairs(stairs)
+    segment = next(
+        (item for item in course_segments(cfg, variant) if item.kind == "stairs"),
+        None,
+    )
+    if segment is None:
+        raise ValueError(f"serial-course variant {variant} has no stairs segment.")
+    flight_length = stairs.step_count * stairs.step_depth
+    half_length = segment.center_x - segment.start_x
+    if flight_length >= half_length:
+        raise ValueError("serial stair half-segment is shorter than one stair flight.")
+    requested_run_in = max(float(stairs.ascent_start), 1.0e-3)
+    ascent_run_in = min(
+        requested_run_in,
+        max(half_length - flight_length - 1.0e-3, 1.0e-3),
+    )
+    top_length = segment.center_x - (
+        segment.start_x + ascent_run_in + flight_length
+    )
+    return StairTerrainCfg(
+        enabled=True,
+        step_height=stairs.step_height,
+        step_depth=stairs.step_depth,
+        step_count=stairs.step_count,
+        width=cfg.lane_width,
+        run_in=ascent_run_in,
+        top_length=top_length,
+        run_out=1.0e-3,
+        start_x=segment.start_x,
+        center_y=cfg.course_lane_ys[int(variant)],
+    )
+
+
 def more_boxes(cfg: MoreTerrainCfg) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """Return the box fixtures copied from MoRE-discoRL's gap and pit scenes."""
 
@@ -524,41 +579,14 @@ def serial_course_boxes(
                 # end, about 1.3 m after the stair-down reference had already
                 # begun lowering the pelvis.
                 add_platform(name + "_base", segment.start_x, segment.end_x, lane_y)
-                step_depth = stairs.step_depth
-                flight_length = stairs.step_count * step_depth
-                half_length = segment.center_x - segment.start_x
-                if flight_length >= half_length:
-                    raise ValueError(
-                        "serial stair half-segment is shorter than one stair flight."
-                    )
-                requested_run_in = max(float(stairs.ascent_start), 1.0e-3)
-                ascent_run_in = min(
-                    requested_run_in,
-                    max(half_length - flight_length - 1.0e-3, 1.0e-3),
-                )
-                top_length = segment.center_x - (
-                    segment.start_x + ascent_run_in + flight_length
-                )
-                local_stairs = StairTerrainCfg(
-                    enabled=True,
-                    step_height=stairs.step_height,
-                    step_depth=step_depth,
-                    step_count=stairs.step_count,
-                    width=cfg.lane_width,
-                    run_in=ascent_run_in,
-                    top_length=top_length,
-                    run_out=1.0e-3,
-                    start_x=segment.start_x,
-                    center_y=lane_y,
-                )
+                local_stairs = serial_course_stair_cfg(cfg, stairs, variant)
                 for stair_name, center, half_size in stair_boxes(local_stairs):
                     shifted = center.copy()
                     shifted[2] += cfg.course_base_height
                     boxes.append((f"{name}_{stair_name}", shifted, half_size))
-            elif segment.kind == "pit":
-                # MoRE's pit is a narrow elevated safe platform surrounded by
-                # the lower global floor; keeping its top at the course datum
-                # permits arbitrary ordering without height discontinuities.
+            elif segment.kind in {"flat", "pit"}:
+                # Flat and MoRE's narrow pit safe platform both stay at the
+                # common course datum, permitting arbitrary terrain ordering.
                 add_platform(name, segment.start_x, segment.end_x, lane_y)
             elif segment.kind in {"rough", "slope_up", "slope_down"}:
                 # Added as a heightfield or rotated ramp below.
@@ -929,11 +957,47 @@ def terrain_spawn_offset(
     stair_down: bool = False,
     stair_down_offset: float = 0.0,
     course_variant: int = 0,
+    course_stage: int | None = None,
 ) -> np.ndarray:
     """Return the world translation applied to a local retargeted trajectory."""
 
     if more.serial_course:
         lane_y = more.course_lane_ys[int(course_variant)]
+        if course_stage is not None:
+            stage_x: list[float] = [0.30]
+            stage_z: list[float] = [more.course_base_height]
+            for segment in course_segments(more, int(course_variant)):
+                if segment.kind == "stairs":
+                    stage_x.extend(
+                        [segment.start_x, segment.center_x + stair_down_offset]
+                    )
+                    stage_z.extend(
+                        [more.course_base_height, more.course_base_height]
+                    )
+                else:
+                    local_x = {
+                        "flat": 0.30,
+                        "rough": 0.30,
+                        "pit": 0.25,
+                        "gap": 0.515,
+                        "slope_up": 0.0,
+                        "slope_down": 0.0,
+                    }[segment.kind]
+                    stage_x.append(segment.start_x + local_x)
+                    stage_z.append(
+                        0.0
+                        if segment.kind in {"gap", "pit"}
+                        else more.course_base_height
+                    )
+            last_x = course_segments(more, int(course_variant))[-1].end_x
+            stage_x.append(last_x + 0.30)
+            stage_z.append(more.course_base_height)
+            index = int(course_stage)
+            if not 0 <= index < len(stage_x):
+                raise IndexError(
+                    f"course stage {index} outside [0, {len(stage_x)})."
+                )
+            return np.asarray([stage_x[index], lane_y, stage_z[index]], dtype=np.float32)
         if kind == "flat":
             return np.asarray(
                 [0.30, lane_y, more.course_base_height], dtype=np.float32

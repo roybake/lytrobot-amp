@@ -28,10 +28,14 @@ def test_multimotion_recording_group_is_inferred_from_checkpoint_metadata() -> N
     assert infer_stage("relocated/model_final.pt", checkpoint, "auto") == "multimotion"
 
 
-def test_no_stairs_task_metadata_overrides_legacy_stage1_log_path() -> None:
+def test_no_stairs_serial_metadata_keeps_two_stage_group() -> None:
     checkpoint = {
         "training_task": "multimotion_no_stairs",
-        "env_config": {"training_task": "multimotion_no_stairs"},
+        "env_config": {
+            "training_task": "multimotion_no_stairs",
+            "motion_files": ("walk.npz", "rough_walk.npz"),
+            "serial_terrain_course": True,
+        },
     }
 
     assert (
@@ -40,7 +44,37 @@ def test_no_stairs_task_metadata_overrides_legacy_stage1_log_path() -> None:
             checkpoint,
             "auto",
         )
-        == "multimotion"
+        == "stage1"
+    )
+
+
+def test_no_stairs_policy_uses_checkpoint_two_stage_group() -> None:
+    checkpoint = {
+        "training_task": "multimotion_no_stairs",
+        "env_config": {
+            "training_task": "multimotion_no_stairs",
+            "motion_files": None,
+            "serial_terrain_course": True,
+            "domain_randomization": False,
+        },
+    }
+
+    assert (
+        infer_stage(
+            "logs/multimotion/no_stairs/stage1/run/model_final.pt",
+            checkpoint,
+            "auto",
+        )
+        == "stage1"
+    )
+    checkpoint["env_config"]["domain_randomization"] = True
+    assert (
+        infer_stage(
+            "logs/multimotion/no_stairs/stage2/run/model_final.pt",
+            checkpoint,
+            "auto",
+        )
+        == "stage2"
     )
 
 
@@ -54,8 +88,31 @@ def test_multimotion_recording_path_uses_portable_run_name(tmp_path: Path) -> No
         infer_stage(checkpoint_path, {}, "auto"),
     )
 
-    assert output == tmp_path / "multimotion" / "07-30-11-52-12-26000.mp4"
+    assert output == (
+        tmp_path / "multimotion" / "recordings" / "07-30-11-52-12-26000.mp4"
+    )
     assert output.parent.is_dir()
+
+
+def test_default_recording_path_lives_in_task_stage_logs(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "logs" / "stairs" / "stage2" / "run" / "model_final.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+
+    output = checkpoint_recording_path(
+        checkpoint_path,
+        {"iteration": 7500},
+        None,
+        "stage2",
+    )
+
+    assert output == (
+        tmp_path
+        / "logs"
+        / "stairs"
+        / "stage2"
+        / "recordings"
+        / "run-7500.mp4"
+    )
 
 
 def test_play_can_disable_checkpoint_serial_course() -> None:
@@ -82,6 +139,43 @@ def test_play_can_disable_checkpoint_serial_course() -> None:
     cfg = make_env_cfg(args, checkpoint, "multimotion")
 
     assert cfg.serial_terrain_course is False
+
+
+def test_stair_playback_preserves_full_route_and_disables_stage_jumps() -> None:
+    args = SimpleNamespace(
+        model_xml="robot.xml",
+        motion_file="walk.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=None,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/stairs/stage1/run/model.pt",
+        stage="stage1",
+    )
+    checkpoint = {
+        "training_task": "stairs_up_down",
+        "env_config": {
+            "training_task": "stairs_up_down",
+            "serial_terrain_course": True,
+            "terrain_course_random_start_prob": 0.8,
+            "stand_start_prob": 0.5,
+        },
+    }
+
+    cfg = make_env_cfg(args, checkpoint, "stage1")
+
+    assert cfg.serial_terrain_course is True
+    assert cfg.terrain_course_random_start_prob == 0.0
+    assert cfg.stand_start_prob == 0.0
+    assert cfg.motion_reset_prob == 0.0
 
 
 def test_all_playback_uses_deterministic_phase_zero_and_no_timeout() -> None:

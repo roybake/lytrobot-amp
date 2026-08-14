@@ -36,7 +36,6 @@ def squat_play_defaults() -> dict[str, str]:
         # recovery test; they made normal viewer playback repeatedly sample
         # unsupported crouched states and eventually fall.
         "--stand-start-prob": "1.0",
-        "--record-dir": str(REPO_ROOT / "recording" / "squat_sensor_policy"),
     }
 
 

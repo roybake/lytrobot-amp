@@ -24,7 +24,9 @@ def _take_option(argv: list[str], name: str) -> str | None:
     return None
 
 
-if __name__ == "__main__":
+def run_stage2() -> None:
+    """Run the canonical ordinary-walking Stage 2 configuration."""
+
     stage1_checkpoint = _take_option(sys.argv, "--stage1-checkpoint")
     stage1_checkpoint = stage1_checkpoint or _take_option(sys.argv, "--stage1-model")
     if stage1_checkpoint is not None:
@@ -88,3 +90,7 @@ if __name__ == "__main__":
     if not any(arg == "--save-interval" or arg.startswith("--save-interval=") for arg in sys.argv):
         sys.argv.extend(["--save-interval", "500"])
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")
+
+
+if __name__ == "__main__":
+    run_stage2()

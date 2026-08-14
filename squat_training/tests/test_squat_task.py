@@ -46,6 +46,7 @@ class SquatTaskTests(unittest.TestCase):
 
         self.assertEqual(defaults["--stand-start-prob"], "1.0")
         self.assertEqual(defaults["--target-velocity"], "0.0")
+        self.assertNotIn("--record-dir", defaults)
 
     def test_training_requires_survival_after_a_completed_cycle(self) -> None:
         with (

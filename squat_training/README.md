@@ -125,6 +125,8 @@ uv run python squat_training/play.py \
 uv run python squat_training/play_reference.py
 ```
 
-所有训练日志写入 `logs/squat_sensor_policy/`，录像写入 `recording/squat_sensor_policy/`。
+所有训练日志写入 `logs/squat_sensor_policy/`，录像按 checkpoint 阶段写入
+`logs/squat_sensor_policy/stage1/recordings/` 或
+`logs/squat_sensor_policy/stage2/recordings/`。
 W&B 的 `episode` 分组中会记录 `episode/total_reward`（已完成回合的平均累计总回报）
 和 `episode/length`（已完成回合的平均长度），两条曲线统一使用 `global_step` 作为横轴。

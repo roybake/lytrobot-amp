@@ -24,6 +24,7 @@ from lytrobot_amp.terrain import (
     MoreTerrainCfg,
     StairTerrainCfg,
     course_motion_sequence,
+    course_end_x,
     course_stage_end_positions,
     course_segments,
     load_model,
@@ -31,6 +32,8 @@ from lytrobot_amp.terrain import (
     randomized_course_orders,
     sample_course_start_stages,
     serial_course_boxes,
+    serial_course_stair_cfg,
+    terrain_height_at,
     terrain_height_from_model,
 )
 from scripts.play import playback_pelvis_body_ids, sync_multi_robot_state
@@ -78,6 +81,15 @@ def test_course_variants_are_reproducible_full_random_permutations() -> None:
     assert len({order[0] for order in orders}) > 1
 
 
+def test_stair_free_course_has_all_six_random_block_orders() -> None:
+    terrain_types = ("flat", "rough", "slope_up", "slope_down")
+    orders = randomized_course_orders(terrain_types, 6, 2026)
+
+    assert len(set(orders)) == 6
+    assert all(set(order) == set(terrain_types) for order in orders)
+    assert all(order.index("slope_down") == order.index("slope_up") + 1 for order in orders)
+
+
 def test_straight_course_excludes_turns_and_uses_geometry_boundaries() -> None:
     more, _stairs = course_cfg(variants=3)
     for variant, order in enumerate(more.normalized_course_orders):
@@ -88,7 +100,8 @@ def test_straight_course_excludes_turns_and_uses_geometry_boundaries() -> None:
         assert "turn_right" not in sequence
         assert len(boundaries) == len(sequence)
         assert boundaries[0] == more.course_run_in
-        assert boundaries[-1] == course_segments(more, variant)[-1].end_x
+        assert sequence[-1] == "walk"
+        assert boundaries[-1] == course_end_x(more, variant)
 
 
 def test_serial_stair_descent_begins_at_ascent_descent_stage_split() -> None:
@@ -111,6 +124,52 @@ def test_serial_stair_descent_begins_at_ascent_descent_stage_split() -> None:
     )
     descent_start = float(first_descent[0][0] - first_descent[1][0])
     assert descent_start == pytest.approx(stair_segment.center_x)
+
+
+def test_serial_stair_reward_surface_matches_compiled_collision_surface() -> None:
+    more = MoreTerrainCfg(
+        enabled=True,
+        terrain_types=("stairs",),
+        serial_course=True,
+        course_orders=(("stairs",),),
+        course_run_in=3.10,
+        course_run_out=3.10,
+    )
+    stairs = StairTerrainCfg(
+        enabled=True,
+        step_height=0.13,
+        step_depth=0.22,
+        step_count=3,
+        start_x=-0.95,
+    )
+    local = serial_course_stair_cfg(more, stairs, 0)
+    x = np.asarray(
+        [
+            local.ascent_start + 0.5 * local.step_depth,
+            local.top_start + 0.5 * local.top_length,
+            local.descent_start + 0.5 * local.step_depth,
+        ]
+    )
+    expected = terrain_height_at(x, local) + more.course_base_height
+    model = load_model(ROOT / "robot" / "MJCFmodelposition.xml", stairs, more)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    actual = terrain_height_from_model(
+        model,
+        data,
+        x,
+        np.full_like(x, more.course_lane_ys[0]),
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-6)
+    stair_geom_ids = [
+        geom_id
+        for geom_id in range(model.ngeom)
+        if "stair" in (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+    ]
+    assert stair_geom_ids
+    assert np.all(model.geom_contype[stair_geom_ids] == 1)
+    assert np.all(model.geom_conaffinity[stair_geom_ids] == 1)
 
 
 def test_course_curriculum_starts_preserve_full_route_population() -> None:
@@ -452,9 +511,11 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
         _, _, done, info = env.step(
             np.zeros((env.num_envs, env.action_dim), dtype=np.float32)
         )
-        np.testing.assert_array_equal(done, [1.0, 1.0, 1.0])
+        # The final walk clip loops on the physical run-out instead of ending
+        # the episode at an internal reference seam.
+        np.testing.assert_array_equal(done, [0.0, 0.0, 0.0])
         np.testing.assert_array_equal(info["course_complete"], [0.0, 0.0, 0.0])
-        np.testing.assert_array_equal(info["incomplete_motion_end"], [1.0, 1.0, 1.0])
+        np.testing.assert_array_equal(info["incomplete_motion_end"], [0.0, 0.0, 0.0])
 
         env.course_stage_ids[:] = last_stage
         env.motion_ids[:] = env.course_motion_sequences[

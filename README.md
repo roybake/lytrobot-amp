@@ -16,7 +16,7 @@
 `sin/cos` 相位，因此为 338 维。该相位由肌腱长度估计的蹲起深度和 IMU 姿态反馈校正，
 不是仿真真值。训练环境维护 6 帧传感器历史，策略由 128 维 GRU 隐状态形成因果记忆。
 AMP、任务奖励和 asymmetric critic 可以使用训练期仿真真值，但这些值不会进入 actor
-或导出的 ONNX。普通行走策略日志写入 `logs/sensor_policy/`，全地形和无阶梯多动作日志
+或导出的 ONNX。普通行走策略日志写入 `logs/sensor_policy/`，全地形和无阶梯串联课程日志
 统一写入 `logs/multimotion/`，独立阶梯训练写入 `logs/stairs/`；旧完整状态 checkpoint、
 旧 336 维无相位蹲起 checkpoint 与当前 338 维策略不兼容。
 
@@ -40,6 +40,10 @@ episode seed。所以下面的正式命令不要添加 `--seed`。只有复现�
 ```bash
 cd /home/yeah/code/LYTrobot_amp
 ```
+
+所有带 `--viewer` 的动作测试会自动录像。录像不再写到仓库根目录，而是按任务和阶段
+分别保存到对应的 `logs/<task>/stage1/recordings/` 或
+`logs/<task>/stage2/recordings/`，同名文件会自动追加序号且不会覆盖。
 
 ### 1. 普通行走
 
@@ -158,7 +162,11 @@ uv run python sensor_training/play.py \
 `sensor_training/train_multimotion_stage1.py` 和
 `sensor_training/train_multimotion_stage2.py` 是该任务的兼容别名，使用相同日志目录。
 
-### 4. 无阶梯多动作
+### 4. 无阶梯随机串联行走
+
+该入口沿用普通行走的传感器 Actor、奖励主体、PPO/AMP 参数和两阶段流程；路线包含
+平地、不平路面、6° 上坡和 6° 下坡，四类地形以 6 种随机串联顺序训练。每次测试启动
+也会使用新的随机 seed 生成路线；单个 episode 始终从入口连续走到出口，中途不跳段。
 
 Stage 1 训练：
 
@@ -171,7 +179,7 @@ Stage 1 有界面测试：
 ```bash
 uv run python sensor_training/play.py \
   --checkpoint logs/multimotion/no_stairs/stage1/<run>/model_final.pt \
-  --stage multimotion \
+  --stage stage1 \
   --device cuda \
   --viewer \
   --steps 0
@@ -190,7 +198,7 @@ Stage 2 有界面测试：
 ```bash
 uv run python sensor_training/play.py \
   --checkpoint logs/multimotion/no_stairs/stage2/<run>/model_final.pt \
-  --stage multimotion \
+  --stage stage2 \
   --device cuda \
   --viewer \
   --steps 0
@@ -198,7 +206,10 @@ uv run python sensor_training/play.py \
 
 ### 5. 独立上下楼梯
 
-楼梯默认级高为 `0.13 m`，以下显式写出该值，便于核对实验配置。
+楼梯默认级高为 `0.13 m`。训练路线固定为“地面平地走近 → 连续上楼 → 顶部继续前进
+→ 连续下楼 → 平地走出”，上楼和下楼不作为两个独立 episode。测试强制从路线入口
+开始，关闭随机阶段 reset，机器人状态在动作阶段切换时不会被搬运或跳变。阶梯碰撞、
+奖励和失败检测共用同一套世界坐标表面；骨盆陷入踏面以下会立即终止，不能靠穿模得分。
 
 Stage 1 训练：
 
@@ -338,7 +349,7 @@ uv run python sensor_training/play.py \
 ```
 
 录像默认保存为
-`recording/multimotion/07-30-11-52-12-26000.mp4`；重复测试会追加编号，
+`logs/multimotion/stage2/recordings/<run>-<iteration>.mp4`；重复测试会追加编号，
 不会覆盖已有录像。多动作测试默认同屏显示 3 个机器人，每个机器人使用一条独立的
 随机顺序完整路线；可用 `--num-robots` 调整数量。需要复现路线顺序时同时使用
 `--seed N --no-episode-random-seed`。
@@ -353,8 +364,8 @@ scripts/train.py              # 训练入口，默认打开 wandb
 scripts/train_stage1.py       # 第一阶段训练入口，GPU/Warp，关闭领域随机化
 scripts/train_stage2.py       # 第二阶段训练入口，GPU/Warp，开启领域随机化
 scripts/train_multimotion_stage*.py           # 全地形多动作两阶段入口
-scripts/train_multimotion_no_stairs_stage*.py # 去阶梯多动作两阶段入口
-scripts/train_stairs_stage*.py                # 独立上下楼梯两阶段入口
+scripts/train_multimotion_no_stairs_stage*.py # 平地/不平路/上下坡随机串联两阶段入口
+scripts/train_stairs_stage*.py                # 连续平地-上楼-下楼-平地两阶段入口
 scripts/two_stage_task.py                     # 两阶段强制参数与checkpoint衔接
 scripts/view_model.py         # 机器人 MJCF 本地 MuJoCo 可视化/加载测试
 sensor_training/play.py       # 行走、多动作和楼梯传感器 checkpoint 播放
@@ -451,12 +462,12 @@ uv run python sensor_training/play.py \
 ```
 
 
-使用 `--viewer` 打开 MuJoCo 测试时会自动录制 MP4，按任务保存到
-`recording/stage1/`、`recording/stage2/` 或 `recording/multimotion/`。
-命名来自权重所在 run 和 iteration，例如：
+使用 `--viewer` 打开 MuJoCo 测试时会自动录制 MP4，默认从 checkpoint 路径识别任务
+和阶段，保存到该任务的 `logs/<task>/stage1|stage2/recordings/`。命名来自权重所在
+run 和 iteration，例如：
 
 ```text
-recording/stage1/06-06-21-19-41-2049.mp4
+logs/sensor_policy/stage1/recordings/06-06-21-19-41-2049.mp4
 ```
 
 默认录制为 1080p、30fps、H.264、`yuv420p`、`faststart` MP4，兼容 PPT 和微信播放。MuJoCo 窗口和录屏镜头都会始终跟随机器人 `pelvis` 移动。重复测试同一个权重时会自动追加 `-2`、`-3`，避免覆盖已有视频。
@@ -618,6 +629,6 @@ uv run python sensor_training/play.py \
   --stage stage2 --viewer --steps 0
 ```
 
-这条命令也会自动生成 `recording/stage2/<run>-<iteration>.mp4`。测试第一阶段
-checkpoint 时会保存到 `recording/stage1/`；多动作 checkpoint 会自动识别并保存到
-`recording/multimotion/`，也可以通过 `--stage multimotion` 显式指定。
+这条命令也会自动生成
+`logs/sensor_policy/stage2/recordings/<run>-<iteration>.mp4`。其他动作同样保存到各自
+checkpoint 所在任务的 `stage1/recordings/` 或 `stage2/recordings/`。

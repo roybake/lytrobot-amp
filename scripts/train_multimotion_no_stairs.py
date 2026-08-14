@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Train an independent multi-motion policy without staircase geometry/clips."""
+"""Train ordinary sensor walking over a randomized stair-free serial course."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    TRAINING_TARGET_SPEED_MPS,
-)
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
@@ -20,9 +13,15 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from lytrobot_amp.benchmark import (
+    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
+    MAX_SLOPE_DEG,
+    TRAINING_TARGET_SPEED_MPS,
+)
+
 
 def default_train_args() -> list[str]:
-    """Return self-contained defaults for the stair-free multi-motion task."""
+    """Add only the terrain-course requirements to ordinary walking defaults."""
 
     return [
         "--training-task",
@@ -40,123 +39,55 @@ def default_train_args() -> list[str]:
         "true",
         "false",
         "--no-skill-conditioning",
-        "--num-envs",
-        "4096",
-        "--num-steps",
-        "24",
-        "--epochs",
-        "4",
-        "--minibatches",
-        "8",
-        "--amp-minibatch-size",
-        "4096",
-        "--amp-disc-updates",
-        "2",
-        "--episode-metric-window",
-        "4096",
-        "--warp-nconmax",
-        "32",
-        "--warp-njmax",
-        "128",
-        # A fixed invisible command is learnable by the sensor-only actor and
-        # avoids chasing the clip's 0.62--1.10 m/s within-cycle speed ripple.
-        "--no-use-reference-velocity",
+        "--reference-ctrl-blend",
+        "0.0",
         "--target-velocity",
         f"{TRAINING_TARGET_SPEED_MPS:g}",
         "--forward-velocity-tracking-sigma",
-        "0.35",
+        "0.20",
         "--forward-velocity-reward-coef",
-        "4.0",
+        "2.0",
         "--forward-progress-reward-coef",
-        "2.0",
+        "1.0",
         "--forward-velocity-deficit-penalty-coef",
-        "4.0",
+        "1.5",
         "--forward-velocity-excess-penalty-coef",
-        "5.0",
+        "3.0",
         "--min-forward-progress-speed",
-        "0.25",
-        "--forward-progress-grace-steps",
-        "200",
-        "--forward-progress-window-steps",
-        "50",
-        "--forward-progress-termination-penalty",
-        "8.0",
+        "0.10",
         "--fall-penalty",
-        "20.0",
+        "10.0",
         "--terminate-incomplete-motion-end",
-        "--side-foot-pos-coef",
-        "0.50",
-        "--step-gap-coef",
-        "0.50",
-        "--swing-advance-coef",
-        "1.0",
-        "--stance-foot-vel-sigma",
-        "0.12",
-        "--stance-foot-reward-coef",
-        "2.0",
-        "--foot-slip-velocity-threshold",
-        "0.08",
-        "--foot-slip-penalty-coef",
-        "2.0",
-        "--contact-reward-coef",
-        "1.0",
-        "--missed-contact-penalty-coef",
-        "1.2",
-        "--symmetry-reward-coef",
-        "0.50",
         "--terrain-types",
+        "flat",
         "rough",
         "slope_up",
         "slope_down",
         "--serial-terrain-course",
+        # flat、rough 与成对上下坡构成 3 个随机块，共 6 种唯一顺序。
         "--terrain-course-variants",
-        "8",
+        "6",
+        "--terrain-course-random-assignment",
         "--terrain-course-random-start-prob",
         "0.0",
-        "--terrain-course-random-start-warmup-iterations",
-        "5000",
-        "--terrain-course-random-start-ramp-iterations",
-        "10000",
         "--terrain-course-stage-reward",
-        "10.0",
+        "5.0",
+        "--terrain-course-run-out",
+        "3.10",
         "--rough-terrain-height",
         f"{MAX_ROUGH_HEIGHT_DIFFERENCE_M:g}",
         "--slope-angle-deg",
         f"{MAX_SLOPE_DEG:g}",
-        "--specific-cot-limit",
-        f"{MAX_SPECIFIC_COT_J_PER_KG_M:g}",
-        "--specific-cot-penalty-coef",
-        # Energy regularization is introduced only after a stable gait exists;
-        # applying it from scratch rewards short, low-energy falling episodes.
-        "0.0",
-        "--motion-reset-prob",
-        "1.0",
-        # The actor receives no selected reference or skill command. Actions
-        # are corrections around measured tendon lengths, so the control base
-        # also cannot leak the simulator-selected motion into the policy path.
-        "--reference-ctrl-blend",
-        "0.0",
         "--motion-transition-blend-steps",
-        "0",
-        "--startup-action-ramp-steps",
-        "25",
-        "--stand-start-prob",
-        "0.50",
-        "--stand-start-phase-delay-steps",
-        "20",
-        "--stand-start-transition-min-steps",
-        "80",
-        "--stand-start-transition-max-steps",
-        "120",
+        "15",
         "--episode-steps",
-        "1400",
-        "--log-group",
-        "multimotion_no_stairs",
+        "1800",
+        "--log-root",
+        str(REPO_ROOT / "logs" / "multimotion" / "no_stairs"),
         "--wandb-tags",
         (
-            "lytrobot,bpo,amp,multimotion,independent,no-stair-terrain,"
-            "imu,tendon,recurrent,gru,sensor-only,asymmetric-critic,"
-            "flat,rough,slope-up,slope-down"
+            "lytrobot,bpo,amp,walk,no-stairs,serial-course,random-order,"
+            "flat,rough,slope-up,slope-down,imu,tendon,recurrent,gru,sensor-only"
         ),
     ]
 
