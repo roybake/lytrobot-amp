@@ -223,6 +223,24 @@ def build_task(
         loop=np.asarray(False),
         metadata=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
     )
+    if source_metadata.get("profile") == "no_stairs_fast_small_step":
+        from analyze_gait import analyze_reference
+
+        gait = analyze_reference(output, model_xml)
+        metadata.update(
+            {
+                "profile": "no_stairs_fast_small_step",
+                "measured_forward_speed_mps": gait["mean_forward_speed_mps"],
+                "mean_step_length_m": gait["mean_step_length_m"],
+                "cadence_steps_per_min": gait["cadence_steps_per_min"],
+                "stance_slip_mean_mps": gait["stance_slip_mean_mps"],
+                "stance_slip_p95_mps": gait["stance_slip_p95_mps"],
+            }
+        )
+        with np.load(output) as archive:
+            payload = {key: archive[key] for key in archive.files if key != "metadata"}
+        payload["metadata"] = np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+        np.savez_compressed(output, **payload)
     print(
         f"{task}: {len(qpos)} frames, root_z=[{qpos[:, 2].min():.3f}, "
         f"{qpos[:, 2].max():.3f}], support_clearance="

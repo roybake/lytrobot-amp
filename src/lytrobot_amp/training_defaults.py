@@ -7,6 +7,9 @@ from __future__ import annotations
 # retargeting it to the LYT model.
 ORIGINAL_RETARGETED_WALK_SPEED_MPS = 0.8622949262039437
 TRAINING_TARGET_SPEED_MPS = ORIGINAL_RETARGETED_WALK_SPEED_MPS
+# This profile deliberately has its own reference directory and must not leak
+# into the ordinary multi-motion or stair tasks.
+NO_STAIRS_FAST_TARGET_SPEED_MPS = 5.0 / 3.6
 
 ROUGH_TERRAIN_HEIGHT_M = 0.05
 SLOPE_ANGLE_DEG = 6.0

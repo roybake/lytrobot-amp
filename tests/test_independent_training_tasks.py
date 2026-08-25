@@ -49,6 +49,10 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
 
     assert _option_values(args, "--training-task") == ["multimotion_no_stairs"]
     assert _option_values(args, "--motion-names") == ["walk", "rough_walk"]
+    assert [Path(value) for value in _option_values(args, "--motion-files")] == [
+        MOTION_DIR / "walk_omniretarget.npz",
+        MOTION_DIR / "rough_walk_omniretarget.npz",
+    ]
     assert set(_option_values(args, "--terrain-types")) == {
         "flat",
         "rough",

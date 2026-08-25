@@ -70,7 +70,13 @@ def infer_contacts(
     return contacts
 
 
-def prepare(name: str, source_dir: Path, output_dir: Path) -> Path:
+def prepare(
+    name: str,
+    source_dir: Path,
+    output_dir: Path,
+    target_step_length: float | None = None,
+    baseline_step_length: float | None = None,
+) -> Path:
     subject, trial, start, end, stride, loop = CLIPS[name]
     asf = source_dir / f"{subject}.asf"
     amc = source_dir / f"{trial}.amc"
@@ -80,6 +86,30 @@ def prepare(name: str, source_dir: Path, output_dir: Path) -> Path:
     full, _ = convert(asf, amc, 0, frame_count - 1, 1)
     indices = np.arange(start, end + 1, stride, dtype=np.int64)
     keypoints, yaw = canonicalize(np.asarray(full)[indices])
+
+    # Translate every joint by the same per-frame pelvis correction.  This
+    # shortens only the horizontal progression of a gait cycle while preserving
+    # every human bone length, phase and local pose.  It is intentionally not
+    # a world-X skeleton scale.  OmniRetarget subsequently resolves the small
+    # remaining foot-sticking/tracking trade-off with its interaction-mesh SQP.
+    if target_step_length is not None:
+        if name != "walk":
+            raise ValueError("--target-step-length is only valid for walk.")
+        if not 0.0 < target_step_length:
+            raise ValueError("--target-step-length must be positive.")
+        pelvis_x = keypoints[:, 0, 0].copy()
+        demonstrated_distance = float(pelvis_x[-1] - pelvis_x[0])
+        if demonstrated_distance <= 0.0:
+            raise ValueError("walk pelvis does not progress in canonical X.")
+        if baseline_step_length is None or not np.isfinite(baseline_step_length):
+            raise ValueError(
+                "a measured robot baseline step length is required for small-step walk"
+            )
+        # Calibrate spatial scaling against actual robot-foot heel strikes from
+        # the baseline reference, rather than treating pelvis travel as a step.
+        spatial_scale = float(target_step_length) / float(baseline_step_length)
+        correction = (spatial_scale - 1.0) * (pelvis_x - pelvis_x[0])
+        keypoints[..., 0] += correction[:, None]
 
     source_frequency = 120.0
     frequency = source_frequency / stride
@@ -126,12 +156,17 @@ def prepare(name: str, source_dir: Path, output_dir: Path) -> Path:
         ),
         task=np.asarray(name),
         loop=np.asarray(loop),
+        small_step_target_m=np.float32(target_step_length)
+        if target_step_length is not None
+        else np.float32(np.nan),
         source_ground_z=np.float32(ground),
     )
     print(
         f"{name}: frames={len(keypoints)}, fps={frequency:g}, scale={scale:.4f}, "
         f"distance={np.linalg.norm(root_xy[-1] - root_xy[0]) * scale:.3f}m, "
-        f"yaw={np.rad2deg(yaw[-1] - yaw[0]):.1f}deg -> {output}"
+        f"yaw={np.rad2deg(yaw[-1] - yaw[0]):.1f}deg"
+        + (f", small_step_target={target_step_length:.3f}m" if target_step_length else "")
+        + f" -> {output}"
     )
     return output
 
@@ -140,10 +175,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, default=HERE / "source_data")
     parser.add_argument("--output-dir", type=Path, default=HERE / "prepared")
+    parser.add_argument(
+        "--target-step-length", type=float, default=None,
+        help="optional walk pelvis-progression target in metres; default preserves old clips",
+    )
+    parser.add_argument(
+        "--baseline-reference", type=Path,
+        default=REPO_ROOT / "robot" / "reference_data" / "multimotion" / "walk_omniretarget.npz",
+        help="robot reference used to calibrate target step length",
+    )
     parser.add_argument("--clips", nargs="+", choices=tuple(CLIPS), default=tuple(CLIPS))
     args = parser.parse_args()
+    baseline_step_length = None
+    if args.target_step_length is not None:
+        from analyze_gait import analyze_reference
+        baseline_step_length = float(analyze_reference(args.baseline_reference)["mean_step_length_m"])
+        print(f"baseline robot step length={baseline_step_length:.4f}m")
     for name in args.clips:
-        prepare(name, args.source_dir, args.output_dir)
+        prepare(name, args.source_dir, args.output_dir, args.target_step_length, baseline_step_length)
 
 
 if __name__ == "__main__":

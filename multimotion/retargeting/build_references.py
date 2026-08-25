@@ -833,6 +833,7 @@ def build(
         retargeter = str(archive["retargeter"])
         retargeter_commit = str(archive["retargeter_commit"])
         cost = float(np.asarray(archive["cost"]).item())
+        small_step_target = float(np.asarray(archive.get("small_step_target_m", np.nan)))
     if raw.shape[1] != 21:
         raise ValueError(f"{raw_path}: expected OmniRetarget nq=21, got {raw.shape}.")
     # Prepared cyclic clips contain an explicit duplicate endpoint. The final
@@ -905,6 +906,8 @@ def build(
             target_walk_speed,
         )
     qvel = velocities(model, qpos, frequency, loop)
+    if np.isfinite(small_step_target):
+        from analyze_gait import analyze_reference  # local tool, imported only for fast clips
     metadata = {
         "task": task,
         "loop": loop,
@@ -947,6 +950,26 @@ def build(
         loop=np.asarray(loop),
         metadata=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
     )
+    if np.isfinite(small_step_target):
+        # Analyse the just-written robot motion (not the human input) and
+        # persist auditable measurements required by the fast-walk profile.
+        gait = analyze_reference(output, model_xml)
+        metadata.update(
+            {
+                "profile": "no_stairs_fast_small_step",
+                "target_forward_speed_mps": float(target_walk_speed),
+                "measured_forward_speed_mps": gait["mean_forward_speed_mps"],
+                "mean_step_length_m": gait["mean_step_length_m"],
+                "cadence_steps_per_min": gait["cadence_steps_per_min"],
+                "stance_slip_mean_mps": gait["stance_slip_mean_mps"],
+                "stance_slip_p95_mps": gait["stance_slip_p95_mps"],
+                "small_step_target_m": small_step_target,
+            }
+        )
+        with np.load(output) as archive:
+            payload = {key: archive[key] for key in archive.files if key != "metadata"}
+        payload["metadata"] = np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+        np.savez_compressed(output, **payload)
     print(
         f"{task}: {len(qpos)} frames @ {frequency:g}Hz, "
         f"root_z=[{qpos[:, 2].min():.3f}, {qpos[:, 2].max():.3f}], "

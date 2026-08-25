@@ -18,7 +18,10 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lytrobot_amp.training_defaults import TRAINING_TARGET_SPEED_MPS  # noqa: E402
+from lytrobot_amp.training_defaults import (  # noqa: E402
+    NO_STAIRS_FAST_TARGET_SPEED_MPS,
+    TRAINING_TARGET_SPEED_MPS,
+)
 
 MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
@@ -130,15 +133,20 @@ def main() -> None:
     parser.add_argument("--model-xml", type=Path, default=MODEL_XML)
     parser.add_argument("--motion-dir", type=Path, default=MOTION_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument(
+        "--no-stairs-fast", action="store_true",
+        help="validate only fast walk and rough_walk with small-step thresholds",
+    )
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.model_xml))
+    clip_names = ("walk", "rough_walk") if args.no_stairs_fast else CLIPS
     clips = {
         clip: clip_metrics(
             model,
             args.motion_dir / f"{clip}_omniretarget.npz",
         )
-        for clip in CLIPS
+        for clip in clip_names
     }
     failures: list[str] = []
     warnings: list[str] = []
@@ -174,24 +182,35 @@ def main() -> None:
             and metrics["support_clearance_min_m"] < -0.003
         ):
             failures.append(f"{clip}: support foot penetrates terrain by over 3 mm")
-    for turn in ("turn_left", "turn_right"):
+    for turn in (() if args.no_stairs_fast else ("turn_left", "turn_right")):
         if clips[turn]["duration_s"] < 3.5:
             failures.append(f"{turn}: duration remains too short")
         if clips[turn]["maximum_yaw_rate_deg_s"] > 50.0:
             failures.append(f"{turn}: yaw rate exceeds 50 deg/s")
         if abs(clips[turn]["yaw_change_deg"]) > 90.0 + 0.1:
             failures.append(f"{turn}: turn angle exceeds 90 degrees")
-    if clips["turn_left"]["yaw_change_deg"] <= 0.0:
+    if not args.no_stairs_fast and clips["turn_left"]["yaw_change_deg"] <= 0.0:
         failures.append("turn_left: expected positive Z-up yaw")
-    if clips["turn_right"]["yaw_change_deg"] >= 0.0:
+    if not args.no_stairs_fast and clips["turn_right"]["yaw_change_deg"] >= 0.0:
         failures.append("turn_right: expected negative Z-up yaw")
-    for locomotion in ("walk", "rough_walk", "pit_walk", "gap_cross"):
+    target_speed = NO_STAIRS_FAST_TARGET_SPEED_MPS if args.no_stairs_fast else TRAINING_TARGET_SPEED_MPS
+    for locomotion in ("walk", "rough_walk") if args.no_stairs_fast else ("walk", "rough_walk", "pit_walk", "gap_cross"):
         speed = float(clips[locomotion]["mean_forward_speed_mps"])
-        if abs(speed - TRAINING_TARGET_SPEED_MPS) > 0.02:
+        if abs(speed - target_speed) > 0.02:
             failures.append(
                 f"{locomotion}: forward speed {speed:.3f} m/s does not match "
-                f"{TRAINING_TARGET_SPEED_MPS:.3f} m/s"
+                f"{target_speed:.3f} m/s"
             )
+    if args.no_stairs_fast:
+        from analyze_gait import analyze_reference
+
+        for clip in ("walk", "rough_walk"):
+            gait = analyze_reference(args.motion_dir / f"{clip}_omniretarget.npz", args.model_xml)
+            clips[clip].update(gait)
+            if not 0.46 <= float(gait["mean_step_length_m"]) <= 0.50:
+                failures.append(f"{clip}: step length is outside 0.46--0.50 m")
+            if not 170.0 <= float(gait["cadence_steps_per_min"]) <= 180.0:
+                failures.append(f"{clip}: cadence is outside 170--180 steps/min")
     report = {
         "passed": not failures,
         "warnings": warnings,
@@ -203,7 +222,7 @@ def main() -> None:
             "stair_maximum_joint_step_rad": MAX_JOINT_STEP_RAD,
             "stair_maximum_joint_speed_rad_s": MAX_JOINT_SPEED_RAD_S,
             "output_frequency_hz": 40.0,
-            "locomotion_target_speed_mps": TRAINING_TARGET_SPEED_MPS,
+            "locomotion_target_speed_mps": target_speed,
             "locomotion_speed_tolerance_mps": 0.02,
         },
         "clips": clips,
