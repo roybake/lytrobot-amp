@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -198,6 +199,43 @@ def test_course_random_start_probability_setters_validate_bounds() -> None:
             env.set_terrain_course_random_start_prob(-0.01)
         with pytest.raises(ValueError):
             env.set_terrain_course_random_start_prob(1.01)
+
+
+def test_warp_course_phase_sync_matches_spatial_progress_and_skips_loops() -> None:
+    env = object.__new__(LytRobotWarpAmpEnv)
+    env.num_envs = 2
+    env.device = torch.device("cpu")
+    env.more_terrain_cfg = SimpleNamespace(serial_course=True)
+    env.cfg = LytRobotEnvCfg(
+        terrain_course_phase_sync=True,
+        terrain_course_phase_lookahead=0.10,
+    )
+    env.course_stage_ids = torch.tensor([1, 0], dtype=torch.long)
+    env.course_variant_ids = torch.zeros(2, dtype=torch.long)
+    env.course_stage_end_x = torch.tensor([[3.0, 5.0]])
+    env.qpos = torch.zeros((2, 7), dtype=torch.float32)
+    env.qpos[:, 0] = torch.tensor([3.0, 0.3])
+    env.motion_ids = torch.tensor([1, 0], dtype=torch.long)
+    env.motion_loop = torch.tensor([True, False])
+    env.motion_phase = torch.zeros(2, dtype=torch.float32)
+
+    requested = torch.tensor([98.0, 98.0])
+    frame_counts = torch.tensor([100.0, 100.0])
+    synced, limited, progress = env._sync_serial_course_phase(
+        requested,
+        frame_counts,
+    )
+
+    torch.testing.assert_close(synced, torch.tensor([9.9, 98.0]))
+    torch.testing.assert_close(progress, torch.tensor([0.0, 0.1]))
+    torch.testing.assert_close(limited, torch.tensor([True, False]))
+
+    env.motion_phase[:] = torch.tensor([20.0, 20.0])
+    held, _, _ = env._sync_serial_course_phase(
+        torch.tensor([21.0, 21.0]),
+        frame_counts,
+    )
+    torch.testing.assert_close(held, torch.tensor([20.0, 21.0]))
 
 
 def test_warp_partial_reset_uses_authoritative_per_world_reset(
@@ -581,6 +619,7 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
             serial_terrain_course=True,
             terrain_course_variants=1,
             terrain_course_random_start_prob=0.0,
+            terrain_course_phase_sync=True,
             num_envs=2,
             stand_start_prob=1.0,
             motion_reset_prob=1.0,
@@ -603,5 +642,38 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
             env.motion.model_qpos0[2] + env.more_terrain_cfg.course_base_height,
             atol=1.0e-7,
         )
+
+        # A finite rough-terrain clip may not run to its final frame while the
+        # robot is still at the stage entrance. This is the regression that
+        # previously caused widespread incomplete_motion_end failures.
+        env.course_stage_ids[:] = 1
+        env.motion_ids[:] = env.course_motion_sequences[:, 1]
+        for env_id, data in enumerate(env.datas):
+            data.qpos[0] = env.course_stage_end_x[env.course_variant_ids[env_id], 0]
+        frame_counts = env.motion.frame_counts[env.motion_ids].astype(np.float32)
+        requested = frame_counts - 1.01
+        synced, limited, progress = env._sync_serial_course_phase(
+            requested,
+            frame_counts,
+        )
+        assert np.all(limited)
+        assert np.all(progress < 0.01)
+        np.testing.assert_array_less(
+            synced,
+            0.11 * (frame_counts - 1.0),
+        )
+        env.motion_phase[:] = 20.0
+        held, _, _ = env._sync_serial_course_phase(
+            np.full(env.num_envs, 21.0, dtype=np.float32),
+            frame_counts,
+        )
+        np.testing.assert_allclose(held, 20.0)
+
+        # Looping approach/exit walking clips remain free-running.
+        env.course_stage_ids[:] = 0
+        env.motion_ids[:] = env.course_motion_sequences[:, 0]
+        unchanged, limited, _ = env._sync_serial_course_phase(requested, frame_counts)
+        np.testing.assert_allclose(unchanged, requested)
+        assert not np.any(limited)
     finally:
         env.close()

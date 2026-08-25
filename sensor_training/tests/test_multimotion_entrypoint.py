@@ -7,14 +7,13 @@ import numpy as np
 import torch
 
 from lytrobot_amp.env import LytRobotEnvCfg
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    MIN_WALKING_SPEED_MPS,
+from lytrobot_amp.training_defaults import (
+    MULTIMOTION_STAIR_STEP_DEPTH_M,
+    MULTIMOTION_STAIR_STEP_HEIGHT_M,
+    ROUGH_TERRAIN_HEIGHT_M,
+    SLOPE_ANGLE_DEG,
+    STAIR_STAGE2_STEP_HEIGHT_M,
     TRAINING_TARGET_SPEED_MPS,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
 )
 from sensor_training.envs import (
     SensorHistoryCpuAmpEnv,
@@ -59,7 +58,6 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             TRAINING_TARGET_SPEED_MPS,
             places=6,
         )
-        self.assertLess(value("--target-velocity"), MIN_WALKING_SPEED_MPS)
         self.assertEqual(value("--fall-penalty"), 10.0)
         self.assertEqual(value("--startup-action-ramp-steps"), 0.0)
         self.assertEqual(args.count("--target-velocity"), 1)
@@ -67,15 +65,12 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         self.assertEqual(value("--motion-transition-blend-steps"), 0.0)
         self.assertEqual(
             value("--rough-terrain-height"),
-            MAX_ROUGH_HEIGHT_DIFFERENCE_M,
+            ROUGH_TERRAIN_HEIGHT_M,
         )
-        self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
-        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[0])
-        self.assertEqual(value("--stair-step-depth"), STAIR_TREAD_RANGE_M[0])
-        self.assertEqual(
-            value("--specific-cot-limit"),
-            MAX_SPECIFIC_COT_J_PER_KG_M,
-        )
+        self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
+        self.assertEqual(value("--stair-step-height"), MULTIMOTION_STAIR_STEP_HEIGHT_M)
+        self.assertEqual(value("--stair-step-depth"), MULTIMOTION_STAIR_STEP_DEPTH_M)
+        self.assertNotIn("--specific-cot-limit", args)
         terrain_start = args.index("--terrain-types") + 1
         terrain_end = next(
             index
@@ -111,10 +106,10 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 ),
                 serial_terrain_course=True,
                 terrain_course_variants=1,
-                rough_terrain_height=MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-                slope_angle_deg=MAX_SLOPE_DEG,
-                stair_step_height=STAIR_HEIGHT_RANGE_M[1],
-                stair_step_depth=STAIR_TREAD_RANGE_M[0],
+                rough_terrain_height=ROUGH_TERRAIN_HEIGHT_M,
+                slope_angle_deg=SLOPE_ANGLE_DEG,
+                stair_step_height=STAIR_STAGE2_STEP_HEIGHT_M,
+                stair_step_depth=MULTIMOTION_STAIR_STEP_DEPTH_M,
                 num_envs=1,
                 stand_start_prob=0.0,
                 motion_reset_prob=1.0,

@@ -19,12 +19,11 @@ from scripts.train_multimotion import (
     ROLLOUT_STEPS,
     default_train_args,
 )
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
+from lytrobot_amp.training_defaults import (
+    MULTIMOTION_STAIR_STEP_DEPTH_M,
+    MULTIMOTION_STAIR_STEP_HEIGHT_M,
+    ROUGH_TERRAIN_HEIGHT_M,
+    SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
 )
 
@@ -65,6 +64,9 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertGreater(value("--side-foot-pos-coef"), 0.0)
         self.assertGreater(value("--step-gap-coef"), 0.0)
         self.assertGreater(value("--swing-advance-coef"), 0.0)
+        self.assertGreater(value("--foot-slip-penalty-coef"), 0.0)
+        self.assertIn("--terrain-course-phase-sync", args)
+        self.assertGreater(value("--terrain-course-phase-lookahead"), 0.0)
         self.assertEqual(value("--motion-transition-blend-steps"), 15.0)
         self.assertGreater(value("--terrain-course-stage-reward"), 0.0)
         self.assertGreater(value("--terrain-course-random-start-prob"), 0.0)
@@ -139,7 +141,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(integer("--warp-nconmax"), 32)
         self.assertEqual(integer("--warp-njmax"), 128)
 
-    def test_multimotion_defaults_cover_acceptance_terrain_and_energy_limits(self) -> None:
+    def test_multimotion_defaults_cover_training_terrain_without_energy_penalty(self) -> None:
         args = default_train_args()
 
         def value(option: str) -> float:
@@ -149,12 +151,12 @@ class MultimotionLogPathTests(unittest.TestCase):
         end = next(index for index in range(start, len(args)) if args[index].startswith("--"))
         terrains = set(args[start:end])
         self.assertEqual(terrains, {"rough", "slope_up", "slope_down", "stairs"})
-        self.assertEqual(value("--rough-terrain-height"), MAX_ROUGH_HEIGHT_DIFFERENCE_M)
-        self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
-        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[0])
-        self.assertEqual(value("--stair-step-depth"), STAIR_TREAD_RANGE_M[0])
-        self.assertEqual(value("--specific-cot-limit"), MAX_SPECIFIC_COT_J_PER_KG_M)
-        self.assertGreater(value("--specific-cot-penalty-coef"), 0.0)
+        self.assertEqual(value("--rough-terrain-height"), ROUGH_TERRAIN_HEIGHT_M)
+        self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
+        self.assertEqual(value("--stair-step-height"), MULTIMOTION_STAIR_STEP_HEIGHT_M)
+        self.assertEqual(value("--stair-step-depth"), MULTIMOTION_STAIR_STEP_DEPTH_M)
+        self.assertNotIn("--specific-cot-limit", args)
+        self.assertEqual(value("--specific-cot-penalty-coef"), 0.0)
 
     def test_multimotion_group_creates_timestamp_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

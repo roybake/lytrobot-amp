@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -61,12 +62,54 @@ WANDB_EPISODE_TOTAL_REWARD_KEY = "episode/total_reward"
 WANDB_EPISODE_REWARD_PER_STEP_KEY = "episode/reward_per_step"
 WANDB_EPISODE_LENGTH_KEY = "episode/length"
 LATEST_MODEL_FILENAME = "model_final.pt"
+BEST_MODEL_FILENAME = "model_best.pt"
+BEST_MODEL_SUMMARY_FILENAME = "model_best.json"
 
 
 def latest_model_path(log_dir: str | Path) -> Path:
-    """Return the single canonical checkpoint path used by every save trigger."""
+    """Return the canonical latest-state checkpoint path."""
 
     return Path(log_dir) / LATEST_MODEL_FILENAME
+
+
+def best_model_path(log_dir: str | Path) -> Path:
+    """Return the canonical checkpoint selected by task-completion quality."""
+
+    return Path(log_dir) / BEST_MODEL_FILENAME
+
+
+def validate_locomotion_actor_input_contract(env) -> None:
+    """Fail closed if a locomotion Actor receives anything but IMU/tendon data."""
+
+    training_task = str(getattr(env.cfg, "training_task", "")).strip().lower()
+    # Squat has its own explicit feedback-corrected phase input contract.  All
+    # walking, multimotion and terrain tasks must remain strictly sensor-only.
+    if training_task == "squat":
+        return
+
+    metadata = env.observation_metadata
+    privileged = metadata.get("privileged_training_context", {})
+    expected_fields = ("imu", "tendon_length")
+    sensor_dim = int(metadata.get("imu_dim_per_frame", -1)) + int(
+        metadata.get("tendon_length_dim_per_frame", -1)
+    )
+    valid = (
+        tuple(metadata.get("actor_input_fields", ())) == expected_fields
+        and tuple(metadata.get("command_fields", ())) == ()
+        and int(metadata.get("command_dim", -1)) == 0
+        and bool(metadata.get("strict_sensor_only", False))
+        and isinstance(privileged, dict)
+        and privileged.get("actor_input") is False
+        and int(metadata.get("actor_frame_dim", -1)) == sensor_dim
+        and int(getattr(env, "sensor_frame_dim", -1)) == sensor_dim
+        and int(getattr(env, "policy_frame_dim", sensor_dim)) == sensor_dim
+    )
+    if not valid:
+        raise ValueError(
+            "Locomotion Actor inputs must be exactly IMU and tendon length; "
+            "commands, terrain/course state, reference motion and privileged "
+            "training context are forbidden."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +196,22 @@ def parse_args() -> argparse.Namespace:
         help="Dense reward paid whenever a serial-course stage is completed.",
     )
     parser.add_argument("--terrain-course-stage-tolerance", type=float, default=0.35)
+    parser.add_argument(
+        "--terrain-course-phase-sync",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep finite terrain-motion phases aligned with physical progress "
+            "so a slow learner is not terminated merely because its reference "
+            "clock reached the final frame first."
+        ),
+    )
+    parser.add_argument(
+        "--terrain-course-phase-lookahead",
+        type=float,
+        default=0.10,
+        help="Normalized spatial look-ahead for synchronized non-looping course phases.",
+    )
     parser.add_argument(
         "--terrain-course-random-start-prob",
         type=float,
@@ -467,6 +526,12 @@ def parse_args() -> argparse.Namespace:
         default=500,
         help="Iterations between atomic overwrites of model_final.pt/.onnx.",
     )
+    parser.add_argument(
+        "--best-checkpoint-window",
+        type=int,
+        default=250,
+        help="Rolling iterations used to rank model_best by task completion quality.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--resource-log-interval", type=int, default=50)
     parser.add_argument("--wandb-log-interval", type=int, default=10)
@@ -725,6 +790,15 @@ def _setup_wandb_metrics() -> None:
         "dr_window_termination_fraction", "dr_curriculum_decision",
         "terrain_course_random_start_probability",
         "terrain_course_random_start_target_probability",
+        "checkpoint_window_iterations",
+        "checkpoint_score_full_success",
+        "checkpoint_score_suffix_completion",
+        "checkpoint_score_stage_completion",
+        "checkpoint_score_stage_progress",
+        "checkpoint_score_reward_per_step",
+        "checkpoint_score_termination",
+        "checkpoint_score_foot_slip",
+        "checkpoint_best_iteration",
     ):
         wandb.define_metric(m, summary="last")
 
@@ -824,6 +898,184 @@ def terrain_course_random_start_prob_at_iteration(
         return target
     progress = (float(iteration) - float(warmup)) / float(ramp)
     return target * float(np.clip(progress, 0.0, 1.0))
+
+
+class BestCheckpointTracker:
+    """Rank checkpoints by task completion over a stable rolling window.
+
+    Serial courses are ranked lexicographically: full-route success first,
+    then suffix/stage completion and actual progress beyond the sampled start
+    stage. Reward only breaks ties, so a high AMP score cannot displace a
+    checkpoint that completes more of the physical route.
+    """
+
+    _SUMMARY_VERSION = 1
+    _METRIC_KEYS = (
+        "completed_episode_count",
+        "successful_episode_count",
+        "task_course_suffix_complete",
+        "task_course_stage_completion",
+        "task_course_stage",
+        "task_course_start_stage",
+        "task_course_stage_progress",
+        "rollout_episode_reward_per_step",
+        "rollout_mean_reward",
+        "termination_fraction",
+        "task_foot_slip",
+    )
+
+    def __init__(
+        self,
+        log_dir: str | Path,
+        *,
+        serial_course: bool,
+        window_size: int,
+    ) -> None:
+        self.log_dir = Path(log_dir)
+        self.serial_course = bool(serial_course)
+        self.window_size = max(int(window_size), 1)
+        self._window: deque[dict[str, float]] = deque(maxlen=self.window_size)
+        self.best_score: tuple[float, ...] | None = None
+        self.best_iteration = -1
+        self._load_existing_best()
+
+    @staticmethod
+    def _finite_value(metrics: dict[str, float], key: str) -> float:
+        try:
+            value = float(metrics.get(key, 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return value if np.isfinite(value) else 0.0
+
+    def _load_existing_best(self) -> None:
+        summary_path = self.log_dir / BEST_MODEL_SUMMARY_FILENAME
+        pt_path = best_model_path(self.log_dir)
+        if not (summary_path.is_file() and pt_path.is_file() and pt_path.with_suffix(".onnx").is_file()):
+            return
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if (
+                int(summary.get("version", -1)) != self._SUMMARY_VERSION
+                or bool(summary.get("serial_course")) != self.serial_course
+            ):
+                return
+            score = tuple(float(value) for value in summary["score"])
+            if not score or not all(np.isfinite(value) for value in score):
+                return
+            self.best_score = score
+            self.best_iteration = int(summary["iteration"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+    def observe(self, metrics: dict[str, float]) -> None:
+        self._window.append(
+            {key: self._finite_value(metrics, key) for key in self._METRIC_KEYS}
+        )
+
+    def selection_metrics(self) -> dict[str, float]:
+        if not self._window:
+            return {
+                "checkpoint_window_iterations": 0.0,
+                "checkpoint_score_full_success": 0.0,
+                "checkpoint_score_suffix_completion": 0.0,
+                "checkpoint_score_stage_completion": 0.0,
+                "checkpoint_score_stage_progress": 0.0,
+                "checkpoint_score_reward_per_step": 0.0,
+                "checkpoint_score_termination": 0.0,
+                "checkpoint_score_foot_slip": 0.0,
+                "checkpoint_best_iteration": float(self.best_iteration),
+            }
+
+        rows = tuple(self._window)
+        completed = sum(row["completed_episode_count"] for row in rows)
+        successful = sum(row["successful_episode_count"] for row in rows)
+
+        def mean(key: str) -> float:
+            return float(sum(row[key] for row in rows) / len(rows))
+
+        rollout_episode_reward = mean("rollout_episode_reward_per_step")
+        reward_per_step = (
+            rollout_episode_reward
+            if any(abs(row["rollout_episode_reward_per_step"]) > 1.0e-12 for row in rows)
+            else mean("rollout_mean_reward")
+        )
+        return {
+            "checkpoint_window_iterations": float(len(rows)),
+            "checkpoint_score_full_success": float(successful / max(completed, 1.0)),
+            "checkpoint_score_suffix_completion": mean("task_course_suffix_complete"),
+            "checkpoint_score_stage_completion": mean("task_course_stage_completion"),
+            "checkpoint_score_stage_progress": max(
+                mean("task_course_stage")
+                - mean("task_course_start_stage")
+                + mean("task_course_stage_progress"),
+                0.0,
+            ),
+            "checkpoint_score_reward_per_step": reward_per_step,
+            "checkpoint_score_termination": mean("termination_fraction"),
+            "checkpoint_score_foot_slip": mean("task_foot_slip"),
+            "checkpoint_best_iteration": float(self.best_iteration),
+        }
+
+    def score(self) -> tuple[float, ...]:
+        values = self.selection_metrics()
+        if not self.serial_course:
+            return (
+                values["checkpoint_score_reward_per_step"],
+                -values["checkpoint_score_termination"],
+                -values["checkpoint_score_foot_slip"],
+            )
+        return (
+            values["checkpoint_score_full_success"],
+            values["checkpoint_score_suffix_completion"],
+            values["checkpoint_score_stage_completion"],
+            values["checkpoint_score_stage_progress"],
+            -values["checkpoint_score_termination"],
+            -values["checkpoint_score_foot_slip"],
+            values["checkpoint_score_reward_per_step"],
+        )
+
+    def is_improvement(self) -> bool:
+        if not self._window:
+            return False
+        if self.serial_course:
+            values = self.selection_metrics()
+            # Do not publish a failed, entrance-only controller as
+            # ``model_best``.  A serial-course best model must have physically
+            # crossed at least one stage boundary in the comparison window.
+            if not (
+                values["checkpoint_score_full_success"] > 0.0
+                or values["checkpoint_score_suffix_completion"] > 0.0
+                or values["checkpoint_score_stage_completion"] > 0.0
+            ):
+                return False
+        # A resumed run must rebuild a complete comparison window before it
+        # can replace an established best checkpoint with noisy early samples.
+        if self.best_score is not None and len(self._window) < self.window_size:
+            return False
+        candidate = self.score()
+        return self.best_score is None or candidate > self.best_score
+
+    def commit(self, iteration: int) -> None:
+        score = self.score()
+        selection = self.selection_metrics()
+        selection["checkpoint_best_iteration"] = float(iteration)
+        summary = {
+            "version": self._SUMMARY_VERSION,
+            "iteration": int(iteration),
+            "serial_course": self.serial_course,
+            "window_size": self.window_size,
+            "score": list(score),
+            "selection_metrics": selection,
+        }
+        summary_path = self.log_dir / BEST_MODEL_SUMMARY_FILENAME
+        temporary_path = summary_path.with_suffix(summary_path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, summary_path)
+        self.best_score = score
+        self.best_iteration = int(iteration)
 
 
 def adaptive_domain_randomization_step(
@@ -1152,8 +1404,12 @@ def main() -> None:
         raise ValueError(
             "--terrain-course-random-start-ramp-iterations must be non-negative."
         )
+    if args.best_checkpoint_window <= 0:
+        raise ValueError("--best-checkpoint-window must be positive.")
     if args.terrain_course_stage_reward < 0.0:
         raise ValueError("--terrain-course-stage-reward must be non-negative.")
+    if not 0.0 <= args.terrain_course_phase_lookahead <= 1.0:
+        raise ValueError("--terrain-course-phase-lookahead must be in [0, 1].")
     if args.min_forward_progress_speed > 0.0 and args.forward_progress_window_steps <= 0:
         raise ValueError(
             "--forward-progress-window-steps must be positive when the forward-progress guard is enabled."
@@ -1303,6 +1559,8 @@ def main() -> None:
         terrain_course_stage_reward=args.terrain_course_stage_reward,
         terrain_course_stage_tolerance=args.terrain_course_stage_tolerance,
         terrain_course_random_start_prob=initial_course_random_start_prob,
+        terrain_course_phase_sync=bool(args.terrain_course_phase_sync),
+        terrain_course_phase_lookahead=args.terrain_course_phase_lookahead,
         num_envs=args.num_envs,
         seed=args.seed,
         randomize_episode_seed=bool(args.episode_random_seed),
@@ -1468,6 +1726,11 @@ def main() -> None:
     assert sim_backend == "warp"
     assert LytRobotWarpAmpEnv is not None
     env = LytRobotWarpAmpEnv(env_cfg, device=device)
+    try:
+        validate_locomotion_actor_input_contract(env)
+    except Exception:
+        env.close()
+        raise
     trainer = PPOAMPTrainer(env, ppo_cfg, device=device, log_dir=log_dir)
 
     # Optional: useful for debugging gradients, but expensive during long GPU/Warp runs.
@@ -1591,6 +1854,17 @@ def main() -> None:
         log_dir / "train.log",
         log_interval=args.log_interval,
     )
+    best_checkpoint = BestCheckpointTracker(
+        log_dir,
+        serial_course=bool(args.serial_terrain_course),
+        window_size=args.best_checkpoint_window,
+    )
+    if best_checkpoint.best_score is not None:
+        run_logger.emit(
+            f"[INFO] restored best-checkpoint score from iteration "
+            f"{best_checkpoint.best_iteration}",
+            force=True,
+        )
     dr_window_completed = 0.0
     dr_window_successful = 0.0
     dr_window_bottom_gate = 0.0
@@ -1704,6 +1978,8 @@ def main() -> None:
             metrics["dr_window_depth_success_rate"] = float(last_dr_window_depth_success)
             metrics["dr_window_termination_fraction"] = float(last_dr_window_termination)
             metrics["dr_curriculum_decision"] = float(dr_decision)
+            best_checkpoint.observe(metrics)
+            metrics.update(best_checkpoint.selection_metrics())
             metrics.update({key: float("nan") for key in RESOURCE_METRIC_KEYS})
             resource_metrics = {}
             if args.resource_log_interval > 0 and iteration % args.resource_log_interval == 0:
@@ -1733,6 +2009,8 @@ def main() -> None:
                     f"miss={metrics.get('task_incomplete_motion_end', 0.0):.6f} "
                     f"stage={metrics.get('task_course_stage', 0.0):.3f} "
                     f"start={metrics.get('task_course_start_stage', 0.0):.3f} "
+                    f"stagep={metrics.get('task_course_stage_progress', 0.0):.3f} "
+                    f"phasecap={metrics.get('task_course_phase_sync_limited', 0.0):.3f} "
                     f"advance={metrics.get('task_course_stage_completion', 0.0):.6f} "
                     f"suffix={metrics.get('task_course_suffix_complete', 0.0):.6f} "
                     f"startp={metrics['terrain_course_random_start_probability']:.3f} "
@@ -1799,6 +2077,21 @@ def main() -> None:
                 ckpt_path = latest_model_path(log_dir)
                 saved_pt, saved_onnx = trainer.save(ckpt_path, iteration=iteration)
                 run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
+                if best_checkpoint.is_improvement():
+                    best_pt, best_onnx = trainer.save(
+                        best_model_path(log_dir),
+                        iteration=iteration,
+                    )
+                    best_checkpoint.commit(iteration)
+                    score_metrics = best_checkpoint.selection_metrics()
+                    run_logger.emit(
+                        "[INFO] saved best models: "
+                        f"{best_pt}, {best_onnx} "
+                        f"success={score_metrics['checkpoint_score_full_success']:.4f} "
+                        f"suffix={score_metrics['checkpoint_score_suffix_completion']:.6f} "
+                        f"progress={score_metrics['checkpoint_score_stage_progress']:.4f}",
+                        force=True,
+                    )
             if args.iteration_sleep_ms > 0.0:
                 torch.cuda.synchronize()
                 time.sleep(args.iteration_sleep_ms / 1000.0)
@@ -1814,6 +2107,16 @@ def main() -> None:
             )
         else:
             run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
+            if best_checkpoint.is_improvement():
+                best_pt, best_onnx = trainer.save(
+                    best_model_path(log_dir),
+                    iteration=last_iteration,
+                )
+                best_checkpoint.commit(last_iteration)
+                run_logger.emit(
+                    f"[INFO] saved best models: {best_pt}, {best_onnx}",
+                    force=True,
+                )
         run_logger.close()
         env.close()
         if run is not None:

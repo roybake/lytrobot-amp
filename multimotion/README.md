@@ -17,8 +17,7 @@
 
 平地 walk 及其派生的 rough、pit、gap 参考保留 CMU 69_01 经 LYT 尺度映射后的
 原始重定向速度 `0.8623 m/s`，不再把时间轴压缩到 `1.4 m/s`。转身与上下楼继续
-使用各自片段的原始速度。现有 `5 km/h` 外部验收门槛保持不变，因此原始速度训练
-用于先解决稳定性，不能单独通过该速度验收项。
+使用各自片段的原始速度，当前训练先解决自然节奏下的稳定性。
 
 原始 ASF/AMC 文件位于 `retargeting/source_data/`，训练文件位于 `robot/reference_data/multimotion/`。CMU 数据库允许研究和商业项目使用，但不能直接转售转换后的数据；使用时应按 CMU 页面要求致谢。来源页面：
 
@@ -52,10 +51,14 @@ uv run --project squat_training/retargeting \
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_terrain_references.py
 
-# 5. 自动验收：腿部无负几何距离、转身峰值 <= 50 deg/s、
+# 5. 自动校验：腿部无负几何距离、转身峰值 <= 50 deg/s、
 #    支撑期满足脚跟 -> 全脚掌 -> 脚趾
 uv run python multimotion/retargeting/validate_references.py
 ```
+
+接触 IK 对踝、距下关节和脚趾使用单帧局部可信域与时间连续性约束，防止欠约束
+求解跳到另一组接触姿态。独立楼梯训练所用参考会额外校验：单帧关节跳变不超过
+`0.80 rad`、关节速度不超过 `18 rad/s`；超过任一限制时禁止进入楼梯训练。
 
 每个最终 NPZ 都包含 `qpos`、`qvel`、`joint_names`、`frequency`、`foot_contact`、`foot_roll_phase`、`foot_roll_mode`、`task`、`loop` 和 JSON `metadata`；metadata 保留源帧、源网址、OmniRetarget 版本、最终代价及腿间距/脚底接触误差。
 
@@ -77,7 +80,7 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py
 - `recording/reference/multimotion_foot_contact_slow.mp4`（0.5×脚部慢放）
 - `recording/reference/multimotion_heel_sole_toe.png`（三阶段接触对照）
 - `recording/reference/multimotion_left_right_turns.png`（左右转起止姿态对照）
-- `recording/reference/multimotion_validation.json`（逐动作数值验收）
+- `recording/reference/multimotion_validation.json`（逐动作数值校验）
 
 视频使用训练时相同的 LYT 模型与地形参数：楼梯位于 `y=0 m`，平地位于 `y=3 m`，rough/pit/gap 依次位于 `y=6/9/12 m`。画面左上角标注动作与来源，MuJoCo 接触点用于检查脚底落点。交互播放或只查看指定动作：
 
@@ -103,7 +106,7 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
 6°上/下坡和 stairs 拼入 LYT 连续串联路线。gap、pit 数据与实现仍保留用于离线参考
 验证，不参与当前多动作训练。
 正式训练把 rough 最大高度差限制为 0.05 m，并使用 3 级、台阶高 0.13 m、
-踏面 0.22 m 的最难考核楼梯；原始 CMU 楼梯参考数据仍来自 0.13 m 高、
+踏面 0.22 m 的训练楼梯；原始 CMU 楼梯参考数据仍来自 0.13 m 高、
 0.58 m 深的重定向标定。环境会把参考骨盆升降幅度缩放到实际台阶总高度，并使用
 相对参考高度的摔倒边界；踏面长度差异仍由策略通过观测和残差动作适应。
 

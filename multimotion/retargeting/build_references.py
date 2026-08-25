@@ -28,7 +28,7 @@ from lytrobot_amp.terrain import (  # noqa: E402
     terrain_kind_from_motion,
     terrain_spawn_offset,
 )
-from lytrobot_amp.benchmark import TRAINING_TARGET_SPEED_MPS  # noqa: E402
+from lytrobot_amp.training_defaults import TRAINING_TARGET_SPEED_MPS  # noqa: E402
 from prepare_walk1 import (  # noqa: E402
     HEEL_PHASE_END,
     ROLL_FLAT,
@@ -84,6 +84,14 @@ CONTACT_CLEARANCE = 0.0015
 HEEL_STRIKE_TOE_LIFT = 0.025
 TOE_OFF_HEEL_LIFT = 0.020
 SWING_CLEARANCE = 0.003
+# The contact IK is deliberately local.  Without a per-frame trust region the
+# under-constrained ankle/subtalar/toe chain can jump to another valid IK branch
+# while keeping the sole on the same surface.  Those jumps used to reach
+# 0.9 rad in one 40 Hz frame and taught the policy an unrecoverable impulse.
+CONTACT_IK_JOINT_TRUST_REGION = 0.30
+CONTACT_IK_SUPPORT_WEIGHT = 60.0
+CONTACT_IK_NOMINAL_WEIGHT = 0.20
+CONTACT_IK_TEMPORAL_WEIGHT = 0.10
 # Signed MuJoCo geometry distance: zero is touching and negative is overlap.
 # The post-pass removes all negative distances without unnecessarily widening
 # already valid stair poses (which can lower a swing heel into the next tread).
@@ -381,6 +389,7 @@ def refine_contacts_and_collisions(
     roll_mode: np.ndarray,
     task: str,
     model_xml: Path,
+    loop: bool,
 ) -> tuple[np.ndarray, dict[str, float | int | list[float]]]:
     """Full-model IK for leg clearance and ordered heel/sole/toe contact."""
 
@@ -429,7 +438,10 @@ def refine_contacts_and_collisions(
     roll_errors: list[float] = []
     heel_order_values: list[float] = []
     toe_order_values: list[float] = []
-    previous = np.concatenate(([refined[-1, 2]], refined[-1, joint_indices]))
+    previous_frame = refined[-1] if loop else refined[0]
+    previous = np.concatenate(
+        ([previous_frame[2]], previous_frame[joint_indices])
+    )
 
     for frame in range(len(refined)):
         nominal_pose = refined[frame].copy()
@@ -463,8 +475,24 @@ def refine_contacts_and_collisions(
         nominal_variables = np.concatenate(
             ([nominal_root], nominal_pose[joint_indices])
         )
-        variable_lower = np.concatenate(([nominal_root - 0.05], joint_lower))
-        variable_upper = np.concatenate(([nominal_root + 0.05], joint_upper))
+        variable_lower = np.concatenate(
+            (
+                [nominal_root - 0.05],
+                np.maximum(
+                    joint_lower,
+                    nominal_variables[1:] - CONTACT_IK_JOINT_TRUST_REGION,
+                ),
+            )
+        )
+        variable_upper = np.concatenate(
+            (
+                [nominal_root + 0.05],
+                np.minimum(
+                    joint_upper,
+                    nominal_variables[1:] + CONTACT_IK_JOINT_TRUST_REGION,
+                ),
+            )
+        )
 
         def residual(variables: np.ndarray) -> np.ndarray:
             pose = nominal_pose.copy()
@@ -497,13 +525,15 @@ def refine_contacts_and_collisions(
             )
             return np.concatenate(
                 (
-                    30.0 * support_error,
+                    CONTACT_IK_SUPPORT_WEIGHT * support_error,
                     4.0 * support_x_error,
                     18.0 * ground_penetration,
                     [0.18 * (variables[0] - nominal_root)],
-                    0.035 * (variables[1:] - nominal_variables[1:]),
+                    CONTACT_IK_NOMINAL_WEIGHT
+                    * (variables[1:] - nominal_variables[1:]),
                     [0.03 * (variables[0] - previous[0])],
-                    0.012 * (variables[1:] - previous[1:]),
+                    CONTACT_IK_TEMPORAL_WEIGHT
+                    * (variables[1:] - previous[1:]),
                 )
             )
 
@@ -863,6 +893,7 @@ def build(
         roll_mode,
         task,
         model_xml,
+        loop,
     )
     clip_joint_limits(model, qpos)
     retargeted_forward_speed = forward_speed(qpos, frequency, loop)

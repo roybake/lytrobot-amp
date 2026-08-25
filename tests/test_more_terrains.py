@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 import mujoco
 import numpy as np
 
-from lytrobot_amp.benchmark import (
+from lytrobot_amp.training_defaults import (
     ORIGINAL_RETARGETED_WALK_SPEED_MPS,
     TRAINING_TARGET_SPEED_MPS,
 )
@@ -226,6 +226,20 @@ def test_forward_locomotion_references_preserve_original_retargeted_speed() -> N
             )
         else:
             assert metadata["derived_from"] == "walk_omniretarget.npz"
+
+
+def test_multimotion_references_have_no_single_frame_ik_impulses() -> None:
+    paths = (
+        ROOT / "robot" / "reference_data" / "walk_cmu_69_01_omniretarget.npz",
+        MOTION_DIR / "stair_up_omniretarget.npz",
+        MOTION_DIR / "stair_down_omniretarget.npz",
+    )
+    for path in paths:
+        with np.load(path) as archive:
+            qpos = np.asarray(archive["qpos"], dtype=np.float64)
+            qvel = np.asarray(archive["qvel"], dtype=np.float64)
+        assert np.max(np.abs(np.diff(qpos[:, 7:], axis=0))) <= 0.80
+        assert np.max(np.abs(qvel[:, 6:])) <= 18.0
 
 
 def test_cpu_environment_loads_and_steps_all_eight_skills() -> None:

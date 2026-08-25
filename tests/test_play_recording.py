@@ -4,11 +4,43 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.play import (
+    best_checkpoint_quality_warning,
     checkpoint_recording_path,
     infer_stage,
     make_env_cfg,
     resolve_step_limit,
 )
+
+
+def test_incomplete_best_checkpoint_reports_that_it_is_not_ready(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model_best.onnx"
+    checkpoint.touch()
+    (tmp_path / "model_best.json").write_text(
+        '{"selection_metrics": {'
+        '"checkpoint_score_full_success": 0.0, '
+        '"checkpoint_score_stage_completion": 0.0, '
+        '"checkpoint_score_stage_progress": 0.14}}',
+        encoding="utf-8",
+    )
+
+    warning = best_checkpoint_quality_warning(checkpoint)
+
+    assert warning is not None
+    assert "best-so-far" in warning
+    assert "not deployment-ready" in warning
+
+
+def test_stage_completing_best_checkpoint_has_no_quality_warning(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model_best.pt"
+    checkpoint.touch()
+    (tmp_path / "model_best.json").write_text(
+        '{"selection_metrics": {'
+        '"checkpoint_score_full_success": 0.0, '
+        '"checkpoint_score_stage_completion": 0.001}}',
+        encoding="utf-8",
+    )
+
+    assert best_checkpoint_quality_warning(checkpoint) is None
 
 
 def test_multimotion_recording_group_is_inferred_from_checkpoint_path() -> None:
@@ -113,6 +145,20 @@ def test_default_recording_path_lives_in_task_stage_logs(tmp_path: Path) -> None
         / "recordings"
         / "run-7500.mp4"
     )
+
+
+def test_best_checkpoint_recording_uses_selected_iteration(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "logs" / "stairs" / "stage1" / "run" / "model_best.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+
+    output = checkpoint_recording_path(
+        checkpoint_path,
+        {"iteration": 12500},
+        None,
+        "stage1",
+    )
+
+    assert output.name == "run-12500.mp4"
 
 
 def test_play_can_disable_checkpoint_serial_course() -> None:

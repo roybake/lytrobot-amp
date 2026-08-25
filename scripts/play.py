@@ -26,7 +26,7 @@ import numpy as np
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.networks import ActorCritic
-from lytrobot_amp.terrain import load_multi_robot_model
+from lytrobot_amp.terrain import course_end_x, course_segments, load_multi_robot_model
 
 
 class OnnxPolicy:
@@ -97,6 +97,32 @@ def load_onnx_metadata(path: str | Path) -> dict:
     if not isinstance(metadata, dict):
         raise ValueError("Invalid lytrobot_amp.metadata in ONNX model.")
     return metadata
+
+
+def best_checkpoint_quality_warning(path: str | Path) -> str | None:
+    """Explain when ``model_best`` is only the least-bad incomplete policy."""
+
+    checkpoint_path = Path(path).expanduser()
+    if checkpoint_path.stem != "model_best":
+        return None
+    summary_path = checkpoint_path.with_name("model_best.json")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        metrics = summary["selection_metrics"]
+        success = float(metrics.get("checkpoint_score_full_success", 0.0))
+        stage_completion = float(
+            metrics.get("checkpoint_score_stage_completion", 0.0)
+        )
+        stage_progress = float(metrics.get("checkpoint_score_stage_progress", 0.0))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if success > 0.0 or stage_completion > 0.0:
+        return None
+    return (
+        "model_best is best-so-far but has completed no route or terrain stage "
+        f"(success={success:.4f}, stage_completion={stage_completion:.6f}, "
+        f"stage_progress={stage_progress:.4f}); it is not deployment-ready."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -356,7 +382,7 @@ def checkpoint_recording_path(
     match = re.fullmatch(r"(?:model|modle)_(\d+)", checkpoint_path.stem)
     if match is not None:
         iteration = match.group(1)
-    elif checkpoint_path.stem == "model_final" and "iteration" in checkpoint:
+    elif checkpoint_path.stem in {"model_final", "model_best"} and "iteration" in checkpoint:
         iteration = str(int(checkpoint["iteration"]))
     else:
         iteration = checkpoint_path.stem
@@ -581,6 +607,9 @@ def main() -> None:
         checkpoint = torch.load(checkpoint_path, map_location=args.device)
     else:
         raise ValueError("--checkpoint must be a .pt or .onnx model file.")
+    quality_warning = best_checkpoint_quality_warning(checkpoint_path)
+    if quality_warning is not None:
+        print(f"[WARN] {quality_warning}")
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
     stage = infer_stage(args.checkpoint, checkpoint, args.stage)
 
@@ -621,6 +650,9 @@ def main() -> None:
                 gate_hidden_dims=tuple(sensor_architecture["gate_hidden_dims"]),
                 expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),
                 residual_scale=float(sensor_architecture["residual_scale"]),
+                privileged_context_dim=int(
+                    sensor_architecture.get("privileged_context_dim", 0)
+                ),
             ).to(args.device)
             recurrent_state = policy.initial_state(env.num_envs)
         else:
@@ -649,6 +681,19 @@ def main() -> None:
     if env.cfg.serial_terrain_course:
         for index, order in enumerate(env.more_terrain_cfg.normalized_course_orders):
             print(f"[COURSE {index + 1}] {' -> '.join(order)}")
+            sections = [
+                f"run_in[0.00,{env.more_terrain_cfg.course_run_in:.2f}]"
+            ]
+            sections.extend(
+                f"{segment.kind}[{segment.start_x:.2f},{segment.end_x:.2f}]"
+                for segment in course_segments(env.more_terrain_cfg, index)
+            )
+            sections.append(
+                "run_out"
+                f"[{course_segments(env.more_terrain_cfg, index)[-1].end_x:.2f},"
+                f"{course_end_x(env.more_terrain_cfg, index):.2f}]"
+            )
+            print(f"[COURSE {index + 1} LAYOUT] {' | '.join(sections)}")
 
     obs = env.reset()
     episode_start = np.ones(env.num_envs, dtype=np.float32)
@@ -695,9 +740,21 @@ def main() -> None:
     success_count = 0
     squat_cycle_count = 0
     motion_repetition_count = 0
+    root_x = np.asarray([data.qpos[0] for data in env.datas], dtype=np.float32)
+    episode_origin_x = root_x.copy()
+    max_forward_displacement = np.zeros(env.num_envs, dtype=np.float32)
+    furthest_course_stage = np.zeros(env.num_envs, dtype=np.int32)
+    furthest_course_stage_progress = np.zeros(env.num_envs, dtype=np.float32)
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
+            root_x = np.asarray(
+                [data.qpos[0] for data in env.datas], dtype=np.float32
+            )
+            max_forward_displacement = np.maximum(
+                max_forward_displacement,
+                root_x - episode_origin_x,
+            )
             previous_motion_phase = np.asarray(env.motion_phase).copy()
             if is_onnx:
                 action = policy.act_inference(obs, episode_start=episode_start)
@@ -767,6 +824,21 @@ def main() -> None:
                 stance_foot_speeds.extend(
                     float(value) for value in _info["stance_foot_speed"]
                 )
+            if "course_stage" in _info:
+                furthest_course_stage = np.maximum(
+                    furthest_course_stage,
+                    np.asarray(_info["course_stage"], dtype=np.int32),
+                )
+            if "course_stage_progress" in _info:
+                furthest_course_stage_progress = np.maximum(
+                    furthest_course_stage_progress,
+                    np.asarray(_info["course_stage_progress"], dtype=np.float32),
+                )
+            if np.any(completed):
+                reset_x = np.asarray(
+                    [data.qpos[0] for data in env.datas], dtype=np.float32
+                )
+                episode_origin_x[completed] = reset_x[completed]
             step_count += 1
             if viewer is not None:
                 if not viewer.is_running():
@@ -801,7 +873,11 @@ def main() -> None:
         f"episodes={completed_episodes} terminations={termination_count} "
         f"timeouts={timeout_count} successes={success_count} "
         f"repetitions={motion_repetition_count + timeout_count} "
-        f"squat_cycles={squat_cycle_count}"
+        f"squat_cycles={squat_cycle_count} "
+        f"max_forward_displacement={float(np.max(max_forward_displacement)):.3f}m "
+        f"furthest_course_stage={int(np.max(furthest_course_stage))} "
+        "furthest_stage_progress="
+        f"{float(np.max(furthest_course_stage_progress)):.3f}"
     )
 
 

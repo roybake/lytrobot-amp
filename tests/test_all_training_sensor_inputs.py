@@ -85,3 +85,33 @@ def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None
     assert metadata["actor_frame_dim"] == 42 + 14
     assert metadata["actor_obs_dim"] == (42 + 14) * 6
     assert metadata["privileged_training_context"]["actor_input"] is False
+
+
+def test_locomotion_training_fails_closed_on_non_sensor_actor_input() -> None:
+    metadata = {
+        "imu_dim_per_frame": 42,
+        "tendon_length_dim_per_frame": 14,
+        "actor_frame_dim": 56,
+        "actor_input_fields": ("imu", "tendon_length"),
+        "command_fields": (),
+        "command_dim": 0,
+        "strict_sensor_only": True,
+        "privileged_training_context": {"actor_input": False},
+    }
+    env = SimpleNamespace(
+        cfg=SimpleNamespace(training_task="walk"),
+        observation_metadata=metadata,
+        sensor_frame_dim=56,
+    )
+    train.validate_locomotion_actor_input_contract(env)
+
+    env.observation_metadata = {
+        **metadata,
+        "actor_input_fields": ("imu", "tendon_length", "terrain_id"),
+    }
+    try:
+        train.validate_locomotion_actor_input_contract(env)
+    except ValueError as exc:
+        assert "exactly IMU and tendon length" in str(exc)
+    else:  # pragma: no cover - failure branch for a regressed guard.
+        raise AssertionError("Terrain state unexpectedly reached the locomotion Actor.")

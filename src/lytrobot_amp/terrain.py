@@ -25,7 +25,7 @@ MORE_TERRAIN_TYPES = (
     "slope_down",
     "stairs",
 )
-# The acceptance course is a straight, narrow terrain lane.  Ninety-degree
+# The serial course is a straight, narrow terrain lane.  Ninety-degree
 # turning clips cannot be concatenated in that lane without composing their
 # world-frame poses (and the resulting S turn would leave the 2 m corridor).
 # Keep turns in the motion library for dedicated turn training, but do not put

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import re
 import time
 import uuid
 
@@ -909,11 +910,19 @@ class PPOAMPTrainer:
 
     @staticmethod
     def _remove_stale_models(directory: Path, current_stem: str) -> None:
-        """Keep only the newest successfully written PT/ONNX model pair."""
+        """Remove legacy numbered saves while preserving canonical checkpoints.
+
+        ``model_final`` is the latest resumable state and ``model_best`` is the
+        best evaluation candidate.  They serve different purposes and must be
+        allowed to coexist.
+        """
 
         for suffix in (".pt", ".onnx"):
             for candidate in directory.glob(f"model_*{suffix}"):
-                if candidate.stem != current_stem:
+                if (
+                    candidate.stem != current_stem
+                    and re.fullmatch(r"model_\d+", candidate.stem) is not None
+                ):
                     candidate.unlink(missing_ok=True)
 
     def _save_checkpoint_pair(self, path: str | Path, checkpoint: dict) -> tuple[Path, Path]:

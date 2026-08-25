@@ -11,8 +11,19 @@ import torch
 
 from scripts import train
 from scripts.train_multimotion import default_train_args as original_multimotion_args
-from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
-from scripts.train_stairs import default_train_args as stairs_args
+from scripts.train_multimotion_no_stairs import (
+    COURSE_RANDOM_START_PROBABILITY as NO_STAIRS_RANDOM_START_PROBABILITY,
+    COURSE_RANDOM_START_RAMP_ITERATIONS as NO_STAIRS_RANDOM_START_RAMP_ITERATIONS,
+    COURSE_RANDOM_START_WARMUP_ITERATIONS as NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS,
+    default_train_args as no_stairs_args,
+)
+from scripts.train_stairs import (
+    COURSE_RANDOM_START_PROBABILITY as STAIRS_RANDOM_START_PROBABILITY,
+    COURSE_RANDOM_START_RAMP_ITERATIONS as STAIRS_RANDOM_START_RAMP_ITERATIONS,
+    COURSE_RANDOM_START_WARMUP_ITERATIONS as STAIRS_RANDOM_START_WARMUP_ITERATIONS,
+    WALK_REFERENCE as STAIRS_WALK_REFERENCE,
+    default_train_args as stairs_args,
+)
 from scripts.train_multimotion_no_stairs import main as no_stairs_main
 from scripts.train_stairs import main as stairs_main
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
@@ -47,7 +58,26 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert "--serial-terrain-course" in args
     assert _option_values(args, "--terrain-course-variants") == ["6"]
     assert "--terrain-course-random-assignment" in args
-    assert _option_values(args, "--terrain-course-random-start-prob") == ["0.0"]
+    assert float(_option_values(args, "--terrain-course-random-start-prob")[0]) == (
+        NO_STAIRS_RANDOM_START_PROBABILITY
+    )
+    assert NO_STAIRS_RANDOM_START_PROBABILITY <= 0.25
+    assert float(
+        _option_values(args, "--terrain-course-random-start-warmup-iterations")[0]
+    ) == NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS
+    assert NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS >= 18000
+    assert float(
+        _option_values(args, "--terrain-course-random-start-ramp-iterations")[0]
+    ) == NO_STAIRS_RANDOM_START_RAMP_ITERATIONS
+    assert "--terrain-course-phase-sync" in args
+    assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
+    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
+    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 3.0
+    assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 2.0
+    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 2.5
+    assert float(_option_values(args, "--stance-foot-reward-coef")[0]) == 1.0
+    assert float(_option_values(args, "--contact-reward-coef")[0]) == 0.70
+    assert float(_option_values(args, "--symmetry-reward-coef")[0]) == 0.50
     assert "--reward-mode" not in args
     assert not any(value.startswith("--stair-") for value in args)
     assert "--no-skill-conditioning" in args
@@ -90,21 +120,42 @@ def test_dedicated_stair_task_uses_one_continuous_route_and_reward() -> None:
 
     assert _option_values(args, "--training-task") == ["stairs_up_down"]
     assert _option_values(args, "--motion-names") == ["walk", "stair_up", "stair_down"]
+    assert Path(_option_values(args, "--motion-files")[0]) == STAIRS_WALK_REFERENCE
     assert _option_values(args, "--motion-weights") == ["0.50", "0.25", "0.25"]
     assert _option_values(args, "--terrain-types") == ["stairs"]
     assert float(_option_values(args, "--stair-step-height")[0]) == 0.13
+    assert float(_option_values(args, "--stair-step-depth")[0]) == 0.32
     assert _option_values(args, "--reward-mode") == ["stairs"]
     assert _option_values(args, "--log-group") == ["stairs_up_down"]
     assert "--serial-terrain-course" in args
-    assert _option_values(args, "--terrain-course-random-start-prob") == ["0.0"]
+    assert float(_option_values(args, "--terrain-course-random-start-prob")[0]) == (
+        STAIRS_RANDOM_START_PROBABILITY
+    )
+    assert STAIRS_RANDOM_START_PROBABILITY <= 0.35
+    assert float(
+        _option_values(args, "--terrain-course-random-start-warmup-iterations")[0]
+    ) == STAIRS_RANDOM_START_WARMUP_ITERATIONS
+    assert STAIRS_RANDOM_START_WARMUP_ITERATIONS >= 15000
+    assert float(
+        _option_values(args, "--terrain-course-random-start-ramp-iterations")[0]
+    ) == STAIRS_RANDOM_START_RAMP_ITERATIONS
+    assert "--terrain-course-phase-sync" in args
+    assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
+    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
+    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 1.5
+    assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 0.75
+    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.0
+    assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) == 0.5
     assert _option_values(args, "--terrain-course-run-in") == ["3.10"]
     assert _option_values(args, "--terrain-course-run-out") == ["3.10"]
     assert "--terminate-incomplete-motion-end" in args
     assert "--no-skill-conditioning" in args
     assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
-    assert float(_option_values(args, "--stair-swing-clearance-reward-coef")[0]) > 0.0
-    assert float(_option_values(args, "--stair-tread-support-reward-coef")[0]) > 0.0
-    assert float(_option_values(args, "--stair-vertical-velocity-reward-coef")[0]) > 0.0
+    assert float(_option_values(args, "--stair-swing-clearance-reward-coef")[0]) == 0.75
+    assert float(_option_values(args, "--stair-tread-support-reward-coef")[0]) == 1.25
+    assert float(_option_values(args, "--stair-vertical-velocity-reward-coef")[0]) == 1.0
+    assert float(_option_values(args, "--task-reward-lerp")[0]) == 0.5
+    assert float(_option_values(args, "--min-action-std")[0]) == 0.05
 
 
 def test_new_task_entrypoints_delegate_to_sensor_training_stack() -> None:

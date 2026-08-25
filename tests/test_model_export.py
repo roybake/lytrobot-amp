@@ -14,7 +14,13 @@ import torch
 
 from lytrobot_amp.networks import ActorCritic
 from lytrobot_amp.ppo_amp import PPOAMPTrainer
-from scripts.train import LATEST_MODEL_FILENAME, latest_model_path
+from scripts.train import (
+    BEST_MODEL_FILENAME,
+    BestCheckpointTracker,
+    LATEST_MODEL_FILENAME,
+    best_model_path,
+    latest_model_path,
+)
 
 
 class ModelExportTests(unittest.TestCase):
@@ -96,6 +102,71 @@ class ModelExportTests(unittest.TestCase):
 
             self.assertEqual(LATEST_MODEL_FILENAME, "model_final.pt")
             self.assertEqual(latest_model_path(root), root / "model_final.pt")
+            self.assertEqual(BEST_MODEL_FILENAME, "model_best.pt")
+            self.assertEqual(best_model_path(root), root / "model_best.pt")
+
+    def test_latest_and_best_model_pairs_coexist(self) -> None:
+        trainer = self._trainer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_pt, final_onnx = trainer._save_checkpoint_pair(
+                latest_model_path(root), self._checkpoint(1)
+            )
+            best_pt, best_onnx = trainer._save_checkpoint_pair(
+                best_model_path(root), self._checkpoint(2)
+            )
+            trainer._save_checkpoint_pair(latest_model_path(root), self._checkpoint(3))
+
+            for path in (final_pt, final_onnx, best_pt, best_onnx):
+                self.assertTrue(path.exists())
+
+    def test_serial_best_checkpoint_prioritizes_completion_over_reward(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = BestCheckpointTracker(
+                directory,
+                serial_course=True,
+                window_size=1,
+            )
+            tracker.observe(
+                {
+                    "rollout_mean_reward": 100.0,
+                    "task_course_stage": 1.0,
+                    "task_course_start_stage": 0.0,
+                }
+            )
+            tracker.commit(10)
+            tracker.observe(
+                {
+                    "rollout_mean_reward": -10.0,
+                    "task_course_suffix_complete": 0.01,
+                }
+            )
+            self.assertTrue(tracker.is_improvement())
+
+    def test_serial_best_checkpoint_rejects_entrance_only_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = BestCheckpointTracker(
+                directory,
+                serial_course=True,
+                window_size=1,
+            )
+            tracker.observe(
+                {
+                    "rollout_mean_reward": 100.0,
+                    "task_course_stage": 0.0,
+                    "task_course_stage_progress": 0.95,
+                    "task_course_stage_completion": 0.0,
+                }
+            )
+            self.assertFalse(tracker.is_improvement())
+
+            tracker.observe(
+                {
+                    "rollout_mean_reward": 1.0,
+                    "task_course_stage_completion": 0.001,
+                }
+            )
+            self.assertTrue(tracker.is_improvement())
 
     def test_failed_new_export_preserves_previous_model_pair(self) -> None:
         trainer = self._trainer()

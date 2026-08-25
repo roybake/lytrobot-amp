@@ -142,10 +142,11 @@ def run_task_stage(
     *,
     stage: str,
     log_root: str | Path,
+    task_defaults: list[str] | None = None,
 ) -> None:
     script = Path(task_script).expanduser().resolve()
     stage_args = build_task_stage_args(
-        sys.argv[1:],
+        [*(task_defaults or ()), *sys.argv[1:]],
         stage=stage,
         log_root=log_root,
     )

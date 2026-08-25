@@ -179,6 +179,7 @@ def build_task(
         roll_mode,
         task,
         model_xml,
+        False,
     )
     clip_joint_limits(base_model, qpos)
     support_correction = enforce_support_clearance(qpos, contact, task, model_xml)

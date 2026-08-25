@@ -7,6 +7,12 @@ import runpy
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.train_multimotion_no_stairs import default_stair_free_course_args
+
 
 def _take_option(argv: list[str], name: str) -> str | None:
     for index, arg in enumerate(argv[1:], start=1):
@@ -26,6 +32,11 @@ def _take_option(argv: list[str], name: str) -> str | None:
 
 def run_stage2() -> None:
     """Run the canonical ordinary-walking Stage 2 configuration."""
+
+    # Keep explicit CLI overrides last while making the ordinary walking task
+    # use the same randomized stair-free course as Stage 1.
+    user_args = sys.argv[1:]
+    sys.argv[1:] = [*default_stair_free_course_args(), *user_args]
 
     stage1_checkpoint = _take_option(sys.argv, "--stage1-checkpoint")
     stage1_checkpoint = stage1_checkpoint or _take_option(sys.argv, "--stage1-model")

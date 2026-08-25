@@ -45,6 +45,8 @@ cd /home/yeah/code/LYTrobot_amp
 分别保存到对应的 `logs/<task>/stage1/recordings/` 或
 `logs/<task>/stage2/recordings/`，同名文件会自动追加序号且不会覆盖。
 
+
+
 ### 1. 普通行走
 
 Stage 1 训练：
@@ -166,7 +168,8 @@ uv run python sensor_training/play.py \
 
 该入口沿用普通行走的传感器 Actor、奖励主体、PPO/AMP 参数和两阶段流程；路线包含
 平地、不平路面、6° 上坡和 6° 下坡，四类地形以 6 种随机串联顺序训练。每次测试启动
-也会使用新的随机 seed 生成路线；单个 episode 始终从入口连续走到出口，中途不跳段。
+也会使用新的随机 seed 生成路线。训练经过入口预热后逐步加入随机后续阶段 reset，避免
+后段地形样本饥饿；测试和完整路线成功率仍强制从入口连续走到出口。
 
 Stage 1 训练：
 
@@ -178,7 +181,7 @@ Stage 1 有界面测试：
 
 ```bash
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/no_stairs/stage1/<run>/model_final.pt \
+  --checkpoint logs/multimotion/no_stairs/stage1/08-18-08:42:56/model_final.onnx\
   --stage stage1 \
   --device cuda \
   --viewer \
@@ -190,7 +193,7 @@ Stage 2 训练：
 ```bash
 uv run python scripts/train_multimotion_no_stairs_stage2.py \
   --stage1-checkpoint \
-    logs/multimotion/no_stairs/stage1/<run>/model_final.pt
+    logs/multimotion/no_stairs/stage1/<run>/model_best.pt
 ```
 
 Stage 2 有界面测试：
@@ -206,10 +209,15 @@ uv run python sensor_training/play.py \
 
 ### 5. 独立上下楼梯
 
-楼梯默认级高为 `0.13 m`。训练路线固定为“地面平地走近 → 连续上楼 → 顶部继续前进
+Stage 1 楼梯默认级高/踏深为 `0.13/0.32 m`，Stage 2 切换到更困难的
+`0.20/0.22 m`。训练路线固定为“地面平地走近 → 连续上楼 → 顶部继续前进
 → 连续下楼 → 平地走出”，上楼和下楼不作为两个独立 episode。测试强制从路线入口
 开始，关闭随机阶段 reset，机器人状态在动作阶段切换时不会被搬运或跳变。阶梯碰撞、
 奖励和失败检测共用同一套世界坐标表面；骨盆陷入踏面以下会立即终止，不能靠穿模得分。
+Stage 1 前 `15000` 轮只从路线入口训练稳定步态，再用 `7500` 轮把非零阶段 reset
+概率线性升到 `0.35`，避免楼梯失败样本过早淹没平地行走能力。`model_best` 只有在滚动
+窗口内真实跨过至少一个路线阶段后才会生成；仅有入口进度但从未跨阶段的策略只保留为
+`model_final`，不会再被误标为最佳模型。
 
 Stage 1 训练：
 
@@ -222,7 +230,7 @@ Stage 1 有界面测试：
 
 ```bash
 uv run python sensor_training/play.py \
-  --checkpoint logs/stairs/stage1/<run>/model_final.pt \
+  --checkpoint logs/stairs/stage1/08-19-15:47:30/model_final.onnx \
   --stage stage1 \
   --device cuda \
   --viewer \
@@ -233,7 +241,7 @@ Stage 2 训练：
 
 ```bash
 uv run python scripts/train_stairs_stage2.py \
-  --stage1-checkpoint logs/stairs/stage1/<run>/model_final.pt \
+  --stage1-checkpoint logs/stairs/stage1/<run>/model_best.pt \
   --stair-step-height 0.13
 ```
 
@@ -261,7 +269,7 @@ Stage 1 有界面测试：
 ```bash
 uv run python sensor_training/play.py \
   --checkpoint \
-    logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt \
+    logs/multimotion/no_stairs/stage1/08-18-08:42:56/model_best.onnx\
   --stage stage1 \
   --no-serial-terrain-course \
   --device cuda \
@@ -298,7 +306,8 @@ seed 每次启动、每次 reset 都不同；如需复现，在对应的有界�
 
 正式实验不要直接运行无阶段后缀的任务脚本；它们只定义动作、地形、奖励和公共网络参数。
 恢复中断的 Stage 2 时使用 `--resume-checkpoint <stage2-checkpoint>`，不要同时传
-`--stage1-checkpoint`。所有训练只保留并原子更新 `model_final.pt` 和 `model_final.onnx`。
+`--stage1-checkpoint`。所有训练原子更新最新状态 `model_final.pt/.onnx`，并额外保留按
+任务完成质量选择的 `model_best.pt/.onnx` 和选择依据 `model_best.json`。
 
 ## 直线全地形多动作训练
 
@@ -313,7 +322,7 @@ uv run python scripts/train_multimotion_stage1.py \
 
 uv run python scripts/train_multimotion_stage2.py \
   --stage1-checkpoint \
-    logs/multimotion/stage1/<run>/model_final.pt \
+    logs/multimotion/stage1/<run>/model_best.pt \
   --num-envs 4096 --max-iterations 7500
 ```
 
@@ -333,8 +342,9 @@ minibatch（每个 12,288 条），AMP 每轮执行 2 次 4096 样本更新。
 后才成功重置。默认前 5000 轮全部从路线入口训练，随后用 10000 轮把随机后续阶段
 reset 的概率线性提高到 80%，避免尚未学会平地稳定行走时就被直接投放到困难地形；
 成功率始终只统计从路线入口开始并完整走到终点的 episode。
-周期保存、内存保护保存和正常退出始终原子覆盖同一组 `model_final.pt` 与
-`model_final.onnx`；`--save-interval` 只控制覆盖频率，不再生成按迭代编号的历史权重。
+周期保存、内存保护保存和正常退出始终原子覆盖最新的 `model_final.pt/.onnx`；每个保存
+周期还会按完整路线成功率、阶段进度、奖励和滑移更新 `model_best.pt/.onnx`，不再生成
+按迭代编号的历史权重。
 
 可视化测试最新模型（打开 viewer 后会同步录屏）：
 
@@ -527,6 +537,9 @@ uv run python scripts/train_stage1.py \
 - `params/config.json`
 - `model_final.pt`
 - `model_final.onnx`
+- `model_best.pt`
+- `model_best.onnx`
+- `model_best.json`
 
 ## 从已有 checkpoint 稳定化续训
 
@@ -607,8 +620,9 @@ uv run python scripts/view_model.py \
 ## 播放 checkpoint
 
 每次保存都会原子覆盖 `model_final.pt`（PyTorch 完整训练 checkpoint）和
-`model_final.onnx`（确定性 Actor）。只有两者都成功写入并通过 ONNX 校验后才替换旧版本，
-因此每个新 run 目录始终只保留最新的一对模型。`.pt` 可用于续训和 MuJoCo 播放，
+`model_final.onnx`（确定性 Actor），并在任务完成质量提高时原子更新
+`model_best.pt/.onnx`。只有 PT/ONNX 两者都成功写入并通过 ONNX 校验后才替换旧版本。
+`.pt` 可用于续训和 MuJoCo 播放，
 `.onnx` 内嵌环境/网络配置元数据，可直接用于 MuJoCo 播放。
 
 PyTorch checkpoint 有界面测试：

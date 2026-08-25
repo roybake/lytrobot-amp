@@ -13,7 +13,13 @@ from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_
 from scripts.train_multimotion_no_stairs_stage1 import main as no_stairs_stage1_main
 from scripts.train_multimotion_no_stairs_stage2 import main as no_stairs_stage2_main
 from scripts.train_stairs import default_train_args as stairs_args
+from scripts.train_stage1 import run_stage1
+from scripts.train_stage2 import run_stage2
 from scripts.two_stage_task import build_task_stage_args
+from lytrobot_amp.training_defaults import (
+    STAIR_STAGE2_STEP_DEPTH_M,
+    STAIR_STAGE2_STEP_HEIGHT_M,
+)
 from sensor_training.train_multimotion import default_train_args as sensor_multimotion_args
 
 
@@ -21,6 +27,40 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TwoStageTrainingTaskTests(unittest.TestCase):
+    def test_ordinary_stages_default_to_randomized_stair_free_course(self) -> None:
+        cases = (
+            (run_stage1, "scripts.train_stage1.runpy.run_path", []),
+            (
+                run_stage2,
+                "scripts.train_stage2.runpy.run_path",
+                ["--stage1-checkpoint", "/tmp/stage1.pt"],
+            ),
+        )
+        expected_terrains = {"flat", "rough", "slope_up", "slope_down"}
+        for launcher, run_path_target, extra_args in cases:
+            with self.subTest(launcher=launcher.__name__), patch.object(
+                sys,
+                "argv",
+                ["launcher.py", *extra_args, "--no-wandb"],
+            ), patch(run_path_target):
+                launcher()
+                effective_argv = list(sys.argv)
+
+            with patch.object(sys, "argv", ["train.py", *effective_argv[1:]]):
+                parsed = train.parse_args()
+
+            self.assertEqual(parsed.training_task, "walk")
+            self.assertEqual(set(parsed.terrain_types), expected_terrains)
+            self.assertTrue(parsed.serial_terrain_course)
+            self.assertEqual(parsed.terrain_course_variants, 6)
+            self.assertTrue(parsed.terrain_course_random_assignment)
+            self.assertEqual(parsed.rough_terrain_height, 0.05)
+            self.assertEqual(parsed.slope_angle_deg, 6.0)
+            self.assertEqual(parsed.episode_steps, 1800)
+            self.assertEqual(parsed.motion_names, ["walk", "rough_walk"])
+            self.assertFalse(parsed.skill_conditioning)
+            self.assertEqual(parsed.reference_ctrl_blend, 0.0)
+
     def test_task_launchers_use_the_requested_log_trees(self) -> None:
         expected_roots = {
             "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion",
@@ -36,6 +76,22 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             ) as mocked_run:
                 runpy.run_path(str(ROOT / launcher), run_name="__main__")
                 self.assertEqual(mocked_run.call_args.kwargs["log_root"], expected_root)
+
+    def test_stair_stage2_defaults_to_hardest_assessment_geometry(self) -> None:
+        with patch("scripts.two_stage_task.run_task_stage") as mocked_run:
+            runpy.run_path(
+                str(ROOT / "scripts" / "train_stairs_stage2.py"),
+                run_name="__main__",
+            )
+        defaults = mocked_run.call_args.kwargs["task_defaults"]
+        self.assertEqual(
+            float(defaults[defaults.index("--stair-step-height") + 1]),
+            STAIR_STAGE2_STEP_HEIGHT_M,
+        )
+        self.assertEqual(
+            float(defaults[defaults.index("--stair-step-depth") + 1]),
+            STAIR_STAGE2_STEP_DEPTH_M,
+        )
 
     def test_stair_free_launchers_call_the_canonical_walking_stages(self) -> None:
         cases = (

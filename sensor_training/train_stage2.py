@@ -7,6 +7,12 @@ import runpy
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.train_multimotion_no_stairs import default_stair_free_course_args
+
 
 def _has_arg(name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv)
@@ -29,6 +35,9 @@ def _take_option(name: str) -> str | None:
 
 
 if __name__ == "__main__":
+    user_args = sys.argv[1:]
+    sys.argv[1:] = [*default_stair_free_course_args(), *user_args]
+
     stage1_checkpoint = _take_option("--stage1-checkpoint") or _take_option("--stage1-model")
     if stage1_checkpoint is not None:
         if _has_arg("--resume-checkpoint"):

@@ -6,15 +6,21 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from lytrobot_amp.benchmark import (
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
+from lytrobot_amp.training_defaults import (
+    STAIR_STAGE1_STEP_DEPTH_M,
+    STAIR_STAGE1_STEP_HEIGHT_M,
 )
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
+WALK_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk_cmu_69_01_omniretarget.npz"
+# Preserve the entrance gait before exposing the policy to isolated stair
+# resets.  The former 70%/4k schedule made stair failures dominate the batch
+# before flat walking was stable and the learned gait collapsed after one step.
+COURSE_RANDOM_START_PROBABILITY = 0.35
+COURSE_RANDOM_START_WARMUP_ITERATIONS = 15000
+COURSE_RANDOM_START_RAMP_ITERATIONS = 7500
 for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -27,7 +33,7 @@ def default_train_args() -> list[str]:
         "--training-task",
         "stairs_up_down",
         "--motion-files",
-        str(REFERENCE_DIR / "walk_omniretarget.npz"),
+        str(WALK_REFERENCE),
         str(REFERENCE_DIR / "stair_up_omniretarget.npz"),
         str(REFERENCE_DIR / "stair_down_omniretarget.npz"),
         "--motion-names",
@@ -86,6 +92,14 @@ def default_train_args() -> list[str]:
         "2.0",
         "--fall-penalty",
         "10.0",
+        "--stance-foot-reward-coef",
+        "1.0",
+        "--foot-slip-penalty-coef",
+        "0.5",
+        "--contact-reward-coef",
+        "0.7",
+        "--missed-contact-penalty-coef",
+        "0.8",
         "--stair-vertical-velocity-sigma",
         "0.25",
         "--stair-vertical-velocity-reward-coef",
@@ -105,7 +119,14 @@ def default_train_args() -> list[str]:
         "1",
         "--no-terrain-course-random-assignment",
         "--terrain-course-random-start-prob",
-        "0.0",
+        f"{COURSE_RANDOM_START_PROBABILITY:g}",
+        "--terrain-course-random-start-warmup-iterations",
+        str(COURSE_RANDOM_START_WARMUP_ITERATIONS),
+        "--terrain-course-random-start-ramp-iterations",
+        str(COURSE_RANDOM_START_RAMP_ITERATIONS),
+        "--terrain-course-phase-sync",
+        "--terrain-course-phase-lookahead",
+        "0.10",
         "--terrain-course-stage-reward",
         "5.0",
         "--terrain-course-run-in",
@@ -113,19 +134,21 @@ def default_train_args() -> list[str]:
         "--terrain-course-run-out",
         "3.10",
         "--stair-step-height",
-        f"{STAIR_HEIGHT_RANGE_M[0]:g}",
+        f"{STAIR_STAGE1_STEP_HEIGHT_M:g}",
         "--stair-step-depth",
-        f"{STAIR_TREAD_RANGE_M[0]:g}",
+        f"{STAIR_STAGE1_STEP_DEPTH_M:g}",
         "--stair-step-count",
         "3",
         "--stair-start-x",
         "-0.95",
         "--stair-down-offset",
         "0.25",
-        "--specific-cot-limit",
-        f"{MAX_SPECIFIC_COT_J_PER_KG_M:g}",
         "--specific-cot-penalty-coef",
-        "1.0",
+        "0.0",
+        "--task-reward-lerp",
+        "0.50",
+        "--min-action-std",
+        "0.05",
         "--motion-reset-prob",
         "1.0",
         "--terminate-incomplete-motion-end",

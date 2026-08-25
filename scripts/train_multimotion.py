@@ -12,12 +12,11 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
+from lytrobot_amp.training_defaults import (
+    MULTIMOTION_STAIR_STEP_DEPTH_M,
+    MULTIMOTION_STAIR_STEP_HEIGHT_M,
+    ROUGH_TERRAIN_HEIGHT_M,
+    SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
 )
 
@@ -104,6 +103,14 @@ def default_train_args() -> list[str]:
         "--fall-penalty",
         "10.0",
         "--terminate-incomplete-motion-end",
+        "--stance-foot-reward-coef",
+        "2.0",
+        "--foot-slip-penalty-coef",
+        "2.0",
+        "--contact-reward-coef",
+        "1.0",
+        "--missed-contact-penalty-coef",
+        "1.2",
         "--side-foot-pos-coef",
         "0.50",
         "--step-gap-coef",
@@ -126,26 +133,31 @@ def default_train_args() -> list[str]:
         str(COURSE_RANDOM_START_WARMUP_ITERATIONS),
         "--terrain-course-random-start-ramp-iterations",
         str(COURSE_RANDOM_START_RAMP_ITERATIONS),
+        "--terrain-course-phase-sync",
+        "--terrain-course-phase-lookahead",
+        "0.10",
         "--terrain-course-stage-reward",
         "5.0",
         "--rough-terrain-height",
-        f"{MAX_ROUGH_HEIGHT_DIFFERENCE_M:g}",
+        f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
-        f"{MAX_SLOPE_DEG:g}",
+        f"{SLOPE_ANGLE_DEG:g}",
         "--stair-step-height",
-        f"{STAIR_HEIGHT_RANGE_M[0]:g}",
+        f"{MULTIMOTION_STAIR_STEP_HEIGHT_M:g}",
         "--stair-step-depth",
-        f"{STAIR_TREAD_RANGE_M[0]:g}",
+        f"{MULTIMOTION_STAIR_STEP_DEPTH_M:g}",
         "--stair-step-count",
         "3",
         "--stair-start-x",
         "-0.95",
         "--stair-down-offset",
         "0.25",
-        "--specific-cot-limit",
-        f"{MAX_SPECIFIC_COT_J_PER_KG_M:g}",
         "--specific-cot-penalty-coef",
-        "2.0",
+        "0.0",
+        "--task-reward-lerp",
+        "0.60",
+        "--min-action-std",
+        "0.08",
         "--motion-reset-prob",
         "1.0",
         "--motion-transition-blend-steps",
@@ -161,7 +173,7 @@ def default_train_args() -> list[str]:
         "--wandb-tags",
         (
             "lytrobot,bpo,amp,multimotion,more,serial-course,random-order,"
-            "flat,rough,slope-up,slope-down,stairs,acceptance"
+            "flat,rough,slope-up,slope-down,stairs"
         ),
     ]
 

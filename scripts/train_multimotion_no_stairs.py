@@ -13,19 +13,27 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
+from lytrobot_amp.training_defaults import (
+    ROUGH_TERRAIN_HEIGHT_M,
+    SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
 )
 
 
-def default_train_args() -> list[str]:
-    """Add only the terrain-course requirements to ordinary walking defaults."""
+# Keep most worlds on the deployable, full route.  Earlier runs started an
+# 80% suffix curriculum at iteration 5k; the measured mean velocity then fell
+# from about 0.30 m/s to zero and stage completion never recovered.  A late,
+# low-probability suffix replay still gives every terrain direct samples while
+# preventing those short resets from overwhelming entrance-to-exit walking.
+COURSE_RANDOM_START_PROBABILITY = 0.25
+COURSE_RANDOM_START_WARMUP_ITERATIONS = 18000
+COURSE_RANDOM_START_RAMP_ITERATIONS = 8000
+
+
+def default_stair_free_course_args() -> list[str]:
+    """Return the shared walk/rough configuration required by the serial course."""
 
     return [
-        "--training-task",
-        "multimotion_no_stairs",
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
@@ -46,11 +54,11 @@ def default_train_args() -> list[str]:
         "--forward-velocity-tracking-sigma",
         "0.20",
         "--forward-velocity-reward-coef",
-        "2.0",
+        "3.0",
         "--forward-progress-reward-coef",
-        "1.0",
+        "2.0",
         "--forward-velocity-deficit-penalty-coef",
-        "1.5",
+        "2.5",
         "--forward-velocity-excess-penalty-coef",
         "3.0",
         "--min-forward-progress-speed",
@@ -69,19 +77,60 @@ def default_train_args() -> list[str]:
         "6",
         "--terrain-course-random-assignment",
         "--terrain-course-random-start-prob",
-        "0.0",
+        f"{COURSE_RANDOM_START_PROBABILITY:g}",
+        "--terrain-course-random-start-warmup-iterations",
+        str(COURSE_RANDOM_START_WARMUP_ITERATIONS),
+        "--terrain-course-random-start-ramp-iterations",
+        str(COURSE_RANDOM_START_RAMP_ITERATIONS),
+        "--terrain-course-phase-sync",
+        "--terrain-course-phase-lookahead",
+        "0.10",
         "--terrain-course-stage-reward",
         "5.0",
         "--terrain-course-run-out",
         "3.10",
         "--rough-terrain-height",
-        f"{MAX_ROUGH_HEIGHT_DIFFERENCE_M:g}",
+        f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
-        f"{MAX_SLOPE_DEG:g}",
+        f"{SLOPE_ANGLE_DEG:g}",
         "--motion-transition-blend-steps",
         "15",
         "--episode-steps",
         "1800",
+    ]
+
+
+def default_train_args() -> list[str]:
+    """Add the stair-free task identity and rewards to the shared course."""
+
+    return [
+        "--training-task",
+        "multimotion_no_stairs",
+        *default_stair_free_course_args(),
+        # Keep slip suppression, but do not let static stance/contact shaping
+        # outscore sustained forward locomotion.
+        "--stance-foot-reward-coef",
+        "1.0",
+        "--foot-slip-penalty-coef",
+        "2.0",
+        "--contact-reward-coef",
+        "0.70",
+        "--missed-contact-penalty-coef",
+        "1.0",
+        "--side-foot-pos-coef",
+        "0.50",
+        "--step-gap-coef",
+        "0.50",
+        "--swing-advance-coef",
+        "0.75",
+        "--symmetry-reward-coef",
+        "0.50",
+        "--specific-cot-penalty-coef",
+        "0.0",
+        "--task-reward-lerp",
+        "0.65",
+        "--min-action-std",
+        "0.08",
         "--log-root",
         str(REPO_ROOT / "logs" / "multimotion" / "no_stairs"),
         "--wandb-tags",

@@ -18,10 +18,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lytrobot_amp.benchmark import (  # noqa: E402
-    MIN_WALKING_SPEED_MPS,
-    TRAINING_TARGET_SPEED_MPS,
-)
+from lytrobot_amp.training_defaults import TRAINING_TARGET_SPEED_MPS  # noqa: E402
 
 MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
@@ -46,6 +43,8 @@ BODY_PAIRS = (
     ("toe_r", "foot_l"),
     ("toe_r", "toe_l"),
 )
+MAX_JOINT_STEP_RAD = 0.80
+MAX_JOINT_SPEED_RAD_S = 18.0
 
 
 def geom_for_body(model: mujoco.MjModel, name: str) -> int:
@@ -104,6 +103,8 @@ def clip_metrics(model: mujoco.MjModel, motion_path: Path) -> dict[str, object]:
         "mean_forward_speed_mps": forward_displacement / max(duration, 1.0e-6),
         "yaw_change_deg": float(np.rad2deg(yaw[-1] - yaw[0])),
         "maximum_yaw_rate_deg_s": float(np.rad2deg(np.max(np.abs(qvel[:, 5])))),
+        "maximum_joint_step_rad": float(np.max(np.abs(np.diff(qpos[:, 7:], axis=0)))),
+        "maximum_joint_speed_rad_s": float(np.max(np.abs(qvel[:, 6:]))),
         "minimum_cross_leg_distance_m": float(distances.min()),
         "penetration_frames": int(np.count_nonzero(np.min(distances, axis=1) < -1.0e-5)),
         "heel_phase_toe_minus_heel_min_m": float(
@@ -155,6 +156,20 @@ def main() -> None:
         if metrics["unsupported_gap_contact_frames"] != 0:
             failures.append(f"{clip}: a support foot lands in the gap")
         if (
+            clip in {"stair_up", "stair_down"}
+            and metrics["maximum_joint_step_rad"] > MAX_JOINT_STEP_RAD
+        ):
+            failures.append(
+                f"{clip}: one-frame joint step exceeds {MAX_JOINT_STEP_RAD:.2f} rad"
+            )
+        if (
+            clip in {"stair_up", "stair_down"}
+            and metrics["maximum_joint_speed_rad_s"] > MAX_JOINT_SPEED_RAD_S
+        ):
+            failures.append(
+                f"{clip}: joint speed exceeds {MAX_JOINT_SPEED_RAD_S:.1f} rad/s"
+            )
+        if (
             metrics["support_clearance_min_m"] is not None
             and metrics["support_clearance_min_m"] < -0.003
         ):
@@ -177,13 +192,6 @@ def main() -> None:
                 f"{locomotion}: forward speed {speed:.3f} m/s does not match "
                 f"{TRAINING_TARGET_SPEED_MPS:.3f} m/s"
             )
-    if TRAINING_TARGET_SPEED_MPS < MIN_WALKING_SPEED_MPS:
-        warnings.append(
-            "Native reference speed "
-            f"{TRAINING_TARGET_SPEED_MPS:.3f} m/s is below the external "
-            f"acceptance minimum {MIN_WALKING_SPEED_MPS:.3f} m/s."
-        )
-
     report = {
         "passed": not failures,
         "warnings": warnings,
@@ -192,13 +200,11 @@ def main() -> None:
             "turn_maximum_yaw_rate_deg_s": 50.0,
             "turn_maximum_angle_deg": 90.0,
             "heel_then_toe_tolerance_m": 0.002,
+            "stair_maximum_joint_step_rad": MAX_JOINT_STEP_RAD,
+            "stair_maximum_joint_speed_rad_s": MAX_JOINT_SPEED_RAD_S,
             "output_frequency_hz": 40.0,
             "locomotion_target_speed_mps": TRAINING_TARGET_SPEED_MPS,
             "locomotion_speed_tolerance_mps": 0.02,
-            "locomotion_minimum_speed_mps": MIN_WALKING_SPEED_MPS,
-            "training_speed_meets_acceptance_minimum": (
-                TRAINING_TARGET_SPEED_MPS >= MIN_WALKING_SPEED_MPS
-            ),
         },
         "clips": clips,
         "failures": failures,

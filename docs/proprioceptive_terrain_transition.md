@@ -96,5 +96,5 @@ uv run python sensor_training/train_multimotion.py \
   --max-iterations 1 --no-wandb --run-name proprio-context-smoke
 ```
 
-短程 smoke 只验证数值、接口、checkpoint 和 CUDA 路径，不证明策略已经收敛。正式结论必须
-使用独立随机种子完成长训练，并运行 `scripts/evaluate_acceptance.py` 的完整路线评测。
+短程 smoke 只验证数值、接口、checkpoint 和 CUDA 路径，不证明策略已经收敛。完整训练
+应使用独立随机种子，并通过播放入口检查机器人能否连续走完整条路线。

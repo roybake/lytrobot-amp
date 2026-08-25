@@ -7,12 +7,21 @@ import runpy
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.train_multimotion_no_stairs import default_stair_free_course_args
+
 
 def _has_arg(name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv)
 
 
 if __name__ == "__main__":
+    user_args = sys.argv[1:]
+    sys.argv[1:] = [*default_stair_free_course_args(), *user_args]
+
     if not _has_arg("--stage"):
         sys.argv.extend(["--stage", "stage1"])
     if not _has_arg("--training-task"):

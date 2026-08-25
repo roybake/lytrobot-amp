@@ -1119,6 +1119,56 @@ class LytRobotWarpAmpEnv:
 
         return self._stand_start_progress()
 
+    def _sync_serial_course_phase(
+        self,
+        next_phase: torch.Tensor,
+        frame_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Torch/Warp equivalent of spatially synchronized course phases."""
+
+        limited = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        progress = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        if (
+            not self.more_terrain_cfg.serial_course
+            or not self.cfg.terrain_course_phase_sync
+        ):
+            return next_phase, limited, progress
+
+        stage_ids = self.course_stage_ids
+        variants = self.course_variant_ids
+        stage_end = self.course_stage_end_x[variants, stage_ids]
+        previous_stage = torch.clamp(stage_ids - 1, min=0)
+        previous_end = self.course_stage_end_x[variants, previous_stage]
+        stage_start = torch.where(
+            stage_ids > 0,
+            previous_end,
+            torch.zeros_like(previous_end),
+        )
+        stage_length = torch.clamp(stage_end - stage_start, min=1.0e-6)
+        progress = torch.clamp(
+            (self.qpos[:, 0] - stage_start) / stage_length, 0.0, 1.0
+        )
+        lookahead = float(
+            np.clip(self.cfg.terrain_course_phase_lookahead, 0.0, 1.0)
+        )
+        phase_limit = torch.clamp(progress + lookahead, 0.0, 1.0) * torch.clamp(
+            frame_counts - 1.0, min=0.0
+        )
+        # Never rewind the motion clock after a temporary backward step.
+        phase_limit = torch.maximum(phase_limit, self.motion_phase)
+        active_looping = self.motion_loop[self.motion_ids]
+        synced = torch.where(
+            active_looping,
+            next_phase,
+            torch.minimum(next_phase, phase_limit),
+        )
+        limited = (~active_looping) & (synced < next_phase - 1.0e-6)
+        return synced, limited, progress
+
     def _blend_start_targets(
         self,
         targets: dict[str, torch.Tensor],
@@ -1587,12 +1637,21 @@ class LytRobotWarpAmpEnv:
         )
         course_suffix_complete = torch.zeros_like(course_complete)
         course_stage_advance = torch.zeros_like(course_complete)
+        course_phase_sync_limited = torch.zeros_like(course_complete)
+        course_stage_progress = torch.zeros_like(
+            self.qpos[:, 0], dtype=torch.float32
+        )
         incomplete_motion_end_candidate = torch.zeros_like(course_complete)
         incomplete_motion_required_x = torch.full_like(
             self.qpos[:, 0], float("inf")
         )
         if self.more_terrain_cfg.serial_course:
-            motion_complete = next_phase >= frame_counts - 1.0
+            (
+                next_phase,
+                course_phase_sync_limited,
+                course_stage_progress,
+            ) = self._sync_serial_course_phase(next_phase, frame_counts)
+            reference_complete = next_phase >= frame_counts - 1.0
             active_looping = self.motion_loop[self.motion_ids].clone()
             last_stage = self.course_motion_sequences.shape[1] - 1
             at_last_stage = self.course_stage_ids >= last_stage
@@ -1600,19 +1659,26 @@ class LytRobotWarpAmpEnv:
                 self.course_finish_x
                 - self.more_terrain_cfg.course_completion_tolerance
             )
-            course_suffix_complete = (
-                motion_complete
-                & at_last_stage
-                & reached_finish
-            )
-            course_complete = course_suffix_complete & (
-                self.course_start_stage_ids == 0
-            )
             stage_end_x = self.course_stage_end_x[
                 self.course_variant_ids, self.course_stage_ids
             ]
             reached_stage_end = self.qpos[:, 0] >= (
                 stage_end_x - float(self.cfg.terrain_course_stage_tolerance)
+            )
+            physical_stage_complete = torch.where(
+                at_last_stage, reached_finish, reached_stage_end
+            )
+            phase_synced_nonloop = (
+                bool(self.cfg.terrain_course_phase_sync) & ~active_looping
+            )
+            motion_complete = reference_complete & (
+                ~phase_synced_nonloop | physical_stage_complete
+            )
+            course_suffix_complete = (
+                motion_complete & at_last_stage & reached_finish
+            )
+            course_complete = course_suffix_complete & (
+                self.course_start_stage_ids == 0
             )
             # Keep the current action active until the robot has physically
             # reached its expected course boundary.
@@ -1814,6 +1880,10 @@ class LytRobotWarpAmpEnv:
                 "mechanical_energy": mechanical_energy,
                 "specific_cot": specific_cot,
                 "specific_cot_excess": specific_cot_excess,
+                "course_phase_sync_limited": course_phase_sync_limited.to(
+                    torch.float32
+                ),
+                "course_stage_progress": course_stage_progress,
             }
         )
         if self.more_terrain_cfg.serial_course:
@@ -2047,9 +2117,9 @@ class LytRobotWarpAmpEnv:
                 - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
                 + 0.65 * foot_pos_track
                 + 0.40 * foot_vel_track
-                + 0.50 * stance_foot_track
+                + self.cfg.stance_foot_reward_coef * stance_foot_track
                 - self.cfg.foot_slip_penalty_coef * foot_slip
-                + 0.35 * contact_track
+                + self.cfg.contact_reward_coef * contact_track
                 + 0.35 * distal_vel_track
                 + 0.25 * ctrl_track
                 + self.cfg.stair_vertical_velocity_reward_coef

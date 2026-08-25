@@ -13,13 +13,12 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
         sys.path.insert(0, str(path))
 
 from scripts.train_multimotion import default_train_args as base_multimotion_args
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
+from lytrobot_amp.training_defaults import (
+    MULTIMOTION_STAIR_STEP_DEPTH_M,
+    MULTIMOTION_STAIR_STEP_HEIGHT_M,
+    ROUGH_TERRAIN_HEIGHT_M,
+    SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
 )
 
 
@@ -43,17 +42,17 @@ def default_train_args() -> list[str]:
     _replace_option_values(
         args,
         "--rough-terrain-height",
-        [f"{MAX_ROUGH_HEIGHT_DIFFERENCE_M:.2f}"],
+        [f"{ROUGH_TERRAIN_HEIGHT_M:.2f}"],
     )
     _replace_option_values(
         args,
         "--stair-step-height",
-        [f"{STAIR_HEIGHT_RANGE_M[0]:.2f}"],
+        [f"{MULTIMOTION_STAIR_STEP_HEIGHT_M:.2f}"],
     )
     _replace_option_values(
         args,
         "--stair-step-depth",
-        [f"{STAIR_TREAD_RANGE_M[0]:.2f}"],
+        [f"{MULTIMOTION_STAIR_STEP_DEPTH_M:.2f}"],
     )
     _replace_option_values(
         args,
@@ -63,14 +62,9 @@ def default_train_args() -> list[str]:
     _replace_option_values(
         args,
         "--slope-angle-deg",
-        [f"{MAX_SLOPE_DEG:.1f}"],
+        [f"{SLOPE_ANGLE_DEG:.1f}"],
     )
-    _replace_option_values(
-        args,
-        "--specific-cot-limit",
-        [f"{MAX_SPECIFIC_COT_J_PER_KG_M:.2f}"],
-    )
-    _replace_option_values(args, "--specific-cot-penalty-coef", ["2.0"])
+    _replace_option_values(args, "--specific-cot-penalty-coef", ["0.0"])
     # The deployed control path must not receive the simulator-selected motion
     # reference.  With zero blend, actions remain 14 tendon target corrections
     # around measured tendon lengths and terrain adaptation comes from the GRU.
@@ -81,7 +75,7 @@ def default_train_args() -> list[str]:
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
         "asymmetric-critic,residual-moe,sensor-only,"
         "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
-        "acceptance,sim2real"
+        "sim2real"
     )
     # SensorHistoryEnv never exposes the skill one-hot, and persisting this as
     # false makes the checkpoint configuration accurately describe the actor.

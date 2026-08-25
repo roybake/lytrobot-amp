@@ -122,7 +122,7 @@ def _bounded_specific_cot_excess(
 ) -> float | np.ndarray:
     """Return a bounded relative CoT violation in ``[0, 1]``.
 
-    Normalizing the raw excess by the tiny acceptance limit makes nearly every
+    Normalizing the raw excess by a small configured limit makes nearly every
     early-training transition hit the same large penalty.  A negative per-step
     reward then teaches the policy to end the episode as quickly as possible.
     Normalizing by the measured CoT preserves zero penalty at or below the
@@ -239,6 +239,11 @@ class LytRobotEnvCfg:
     terrain_course_stage_reward: float = 0.0
     terrain_course_stage_tolerance: float = 0.35
     terrain_course_random_start_prob: float = 0.0
+    # Keep finite, non-looping terrain references spatially aligned with the
+    # robot. Without this guard the reference clip can end while a learning
+    # policy is still short of the physical stage boundary.
+    terrain_course_phase_sync: bool = False
+    terrain_course_phase_lookahead: float = 0.10
     num_envs: int = 4096
     seed: int = 42
     randomize_episode_seed: bool = False
@@ -767,6 +772,58 @@ class LytRobotAmpEnv:
         """Scale reference-clock advancement without changing target blending."""
 
         return self._stand_start_progress()
+
+    def _sync_serial_course_phase(
+        self,
+        next_phase: np.ndarray,
+        frame_counts: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Limit non-looping references to the robot's physical stage progress.
+
+        A small look-ahead keeps the controller predictive. Looping approach
+        and exit clips retain their normal clock because they can safely replay
+        until the corresponding boundary is reached.
+        """
+
+        limited = np.zeros(self.num_envs, dtype=bool)
+        progress = np.zeros(self.num_envs, dtype=np.float32)
+        if (
+            not self.more_terrain_cfg.serial_course
+            or not self.cfg.terrain_course_phase_sync
+            or not isinstance(self.motion, MotionLibrary)
+        ):
+            return next_phase, limited, progress
+
+        stage_ids = self.course_stage_ids
+        variants = self.course_variant_ids
+        stage_end = self.course_stage_end_x[variants, stage_ids]
+        previous_stage = np.maximum(stage_ids - 1, 0)
+        previous_end = self.course_stage_end_x[variants, previous_stage]
+        stage_start = np.where(stage_ids > 0, previous_end, 0.0).astype(
+            np.float32
+        )
+        root_x = np.asarray(
+            [data.qpos[0] for data in self.datas], dtype=np.float32
+        )
+        stage_length = np.maximum(stage_end - stage_start, 1.0e-6)
+        progress = np.clip((root_x - stage_start) / stage_length, 0.0, 1.0)
+        lookahead = float(
+            np.clip(self.cfg.terrain_course_phase_lookahead, 0.0, 1.0)
+        )
+        phase_limit = np.clip(progress + lookahead, 0.0, 1.0) * np.maximum(
+            frame_counts - 1.0, 0.0
+        )
+        # Spatial synchronization may pause advancement but must never rewind
+        # the reference when the robot briefly steps backward.
+        phase_limit = np.maximum(phase_limit, self.motion_phase)
+        active_looping = self.motion.motion_loop[self.motion_ids]
+        synced = np.where(
+            active_looping,
+            next_phase,
+            np.minimum(next_phase, phase_limit),
+        ).astype(np.float32)
+        limited = (~active_looping) & (synced < next_phase - 1.0e-6)
+        return synced, limited, progress.astype(np.float32)
 
     def _blend_start_targets(self, targets: MotionTargets) -> MotionTargets:
         progress = self._stand_start_progress()
@@ -1419,6 +1476,8 @@ class LytRobotAmpEnv:
         course_complete = np.zeros(self.num_envs, dtype=bool)
         course_suffix_complete = np.zeros(self.num_envs, dtype=bool)
         course_stage_advance = np.zeros(self.num_envs, dtype=bool)
+        course_phase_sync_limited = np.zeros(self.num_envs, dtype=bool)
+        course_stage_progress = np.zeros(self.num_envs, dtype=np.float32)
         incomplete_motion_end_candidate = np.zeros(self.num_envs, dtype=bool)
         incomplete_motion_required_x = np.full(self.num_envs, np.inf, dtype=np.float32)
         incomplete_motion_end_flags = np.zeros(self.num_envs, dtype=bool)
@@ -1427,7 +1486,12 @@ class LytRobotAmpEnv:
             frame_counts = self.motion.frame_counts[self.motion_ids].astype(np.float32)
             next_phase = self.motion_phase + frequencies * self.dt * phase_scale
             if self.more_terrain_cfg.serial_course:
-                motion_complete = next_phase >= frame_counts - 1.0
+                (
+                    next_phase,
+                    course_phase_sync_limited,
+                    course_stage_progress,
+                ) = self._sync_serial_course_phase(next_phase, frame_counts)
+                reference_complete = next_phase >= frame_counts - 1.0
                 active_looping = self.motion.motion_loop[self.motion_ids].copy()
                 last_stage = self.course_motion_sequences.shape[1] - 1
                 at_last_stage = self.course_stage_ids >= last_stage
@@ -1437,14 +1501,6 @@ class LytRobotAmpEnv:
                     self.course_finish_x
                     - self.more_terrain_cfg.course_completion_tolerance
                 )
-                course_suffix_complete = (
-                    motion_complete
-                    & at_last_stage
-                    & reached_finish
-                )
-                course_complete = course_suffix_complete & (
-                    self.course_start_stage_ids == 0
-                )
                 stage_end_x = self.course_stage_end_x[
                     self.course_variant_ids, self.course_stage_ids
                 ]
@@ -1452,6 +1508,21 @@ class LytRobotAmpEnv:
                     [data.qpos[0] for data in self.datas], dtype=np.float32
                 ) >= (
                     stage_end_x - float(self.cfg.terrain_course_stage_tolerance)
+                )
+                physical_stage_complete = np.where(
+                    at_last_stage, reached_finish, reached_stage_end
+                )
+                phase_synced_nonloop = (
+                    bool(self.cfg.terrain_course_phase_sync) & ~active_looping
+                )
+                motion_complete = reference_complete & (
+                    ~phase_synced_nonloop | physical_stage_complete
+                )
+                course_suffix_complete = (
+                    motion_complete & at_last_stage & reached_finish
+                )
+                course_complete = course_suffix_complete & (
+                    self.course_start_stage_ids == 0
                 )
                 # Do not let the reference sequence run through every terrain
                 # while a high-reward policy remains near the starting line.
@@ -1614,6 +1685,12 @@ class LytRobotAmpEnv:
                     "mechanical_energy": mechanical_energy,
                     "specific_cot": specific_cot,
                     "specific_cot_excess": specific_cot_excess,
+                    "course_phase_sync_limited": float(
+                        course_phase_sync_limited[env_id]
+                    ),
+                    "course_stage_progress": float(
+                        course_stage_progress[env_id]
+                    ),
                 }
             )
             if self.more_terrain_cfg.serial_course:
@@ -1871,9 +1948,9 @@ class LytRobotAmpEnv:
                 - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
                 + 0.65 * foot_pos_track
                 + 0.40 * foot_vel_track
-                + 0.50 * stance_foot_track
+                + self.cfg.stance_foot_reward_coef * stance_foot_track
                 - self.cfg.foot_slip_penalty_coef * foot_slip
-                + 0.35 * contact_track
+                + self.cfg.contact_reward_coef * contact_track
                 + 0.35 * distal_vel_track
                 + 0.25 * ctrl_track
                 + self.cfg.stair_vertical_velocity_reward_coef
