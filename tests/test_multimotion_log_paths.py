@@ -67,7 +67,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertGreater(value("--foot-slip-penalty-coef"), 0.0)
         self.assertIn("--terrain-course-phase-sync", args)
         self.assertGreater(value("--terrain-course-phase-lookahead"), 0.0)
-        self.assertEqual(value("--motion-transition-blend-steps"), 15.0)
+        self.assertEqual(value("--motion-transition-blend-steps"), 30.0)
         self.assertGreater(value("--terrain-course-stage-reward"), 0.0)
         self.assertGreater(value("--terrain-course-random-start-prob"), 0.0)
         self.assertLess(value("--terrain-course-random-start-prob"), 1.0)
@@ -138,8 +138,8 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(rollout_batch, 98_304)
         self.assertEqual(rollout_batch % PPO_MINIBATCHES, 0)
         self.assertEqual(rollout_batch // PPO_MINIBATCHES, 12_288)
-        self.assertEqual(integer("--warp-nconmax"), 32)
-        self.assertEqual(integer("--warp-njmax"), 128)
+        self.assertEqual(integer("--warp-nconmax"), 128)
+        self.assertEqual(integer("--warp-njmax"), 512)
 
     def test_multimotion_defaults_cover_training_terrain_without_energy_penalty(self) -> None:
         args = default_train_args()

@@ -121,12 +121,8 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             action_dim=4,
             sensor_frame_dim=3,
             recurrent_hidden_dim=8,
-            num_experts=3,
             actor_hidden_dims=(8,),
             critic_hidden_dims=(8,),
-            gate_hidden_dims=(8,),
-            expert_hidden_dims=(8,),
-            residual_scale=0.25,
         )
 
     def test_recurrent_encoder_uses_only_latest_sensor_frame(self) -> None:
@@ -152,18 +148,16 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
 
         torch.testing.assert_close(reset_next, clean_next)
 
-    def test_residual_moe_is_softly_weighted_and_keeps_action_dimension(self) -> None:
+    def test_single_actor_mlp_keeps_action_dimension_without_experts(self) -> None:
         policy = self._policy()
         hidden = torch.randn(5, 8)
 
-        mean, weights, residual = policy._actor_outputs(hidden)
+        mean = policy._actor_mean(hidden)
 
         self.assertEqual(tuple(mean.shape), (5, 4))
-        self.assertEqual(tuple(weights.shape), (5, 3))
-        self.assertEqual(tuple(residual.shape), (5, 4))
-        torch.testing.assert_close(weights.sum(dim=-1), torch.ones(5))
-        self.assertTrue(torch.all((weights > 0.0) & (weights < 1.0)))
         self.assertTrue(torch.all(mean.abs() <= 1.0))
+        self.assertFalse(hasattr(policy, "gate"))
+        self.assertFalse(hasattr(policy, "experts"))
 
     def test_sequence_backpropagates_through_recurrent_state(self) -> None:
         policy = self._policy()
@@ -173,10 +167,10 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
         starts[0] = 1.0
         hidden = policy.initial_state(3)
 
-        log_prob, _entropy, values, _median, _next, weights, residual, _context = (
+        log_prob, _entropy, values, _median, _next, _context = (
             policy.evaluate_sequence(observations, hidden, starts, actions)
         )
-        loss = -(log_prob.mean() + values.mean()) + weights.square().mean() + residual.square().mean()
+        loss = -(log_prob.mean() + values.mean())
         loss.backward()
 
         self.assertIsNotNone(policy.recurrent.weight_hh.grad)
@@ -191,11 +185,8 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             num_minibatches=1,
             amp_enabled=False,
             recurrent_hidden_dim=8,
-            num_experts=2,
             actor_hidden_dims=(8,),
             critic_hidden_dims=(8,),
-            gate_hidden_dims=(8,),
-            expert_hidden_dims=(8,),
         )
         trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
 
@@ -210,9 +201,6 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
         )
         metrics = trainer.update_policy(rollout)
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
-        self.assertIn("gate_change_loss", metrics)
-        self.assertIn("expert_load_balance_loss", metrics)
-        self.assertIn("residual_l2_loss", metrics)
         self.assertIn("privileged_context_loss", metrics)
         self.assertEqual(
             tuple(rollout["privileged_contexts"].shape),
@@ -228,8 +216,6 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             privileged_context_dim=5,
             actor_hidden_dims=(8,),
             critic_hidden_dims=(8,),
-            gate_hidden_dims=(8,),
-            expert_hidden_dims=(8,),
         )
         observations = torch.randn(3, 2, 18)
         actions = torch.zeros(3, 2, 4)
@@ -273,10 +259,13 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             "action_dim": 4,
             "amp_obs_dim": 5,
             "ppo_amp_config": {},
-            "env_config": {},
+            "env_config": {"timestep": 0.005, "decimation": 2},
             "common_joint_names": [],
             "sensor_observation": {},
-            "sensor_policy_architecture": {"recurrent": True},
+            "sensor_policy_architecture": {
+                "name": "proprioceptive_gru_context_mlp",
+                "recurrent": True,
+            },
         }
         observation = np.random.default_rng(4).normal(size=(2, 18)).astype(np.float32)
 

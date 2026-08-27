@@ -22,10 +22,12 @@
   </compiler>
   <default>
     <joint limited="true" damping="0.1" armature="0.01" stiffness="1.5"></joint>
-    <!-- Geoms are non-colliding by default. Foot and toe STL mesh geoms opt
-         into collision below so ground contact uses the detailed model. -->
-    <geom rgba="0.8 0.6 .4 1" margin="0.001" condim="1" group="0"
-          contype="0" conaffinity="0"></geom>
+    <!-- Every robot geom collides with static terrain, but robot geoms do not
+         collide with one another.  A predictive margin plus a hard contact
+         impedance prevents visible tunnelling during fast impacts. -->
+    <geom rgba="0.8 0.6 .4 1" margin="0.005" condim="3" group="0"
+          contype="0" conaffinity="1" friction="1 .1 .1"
+          solref="0.005 1" solimp="0.95 0.99 0.001"></geom>
     <site size="0.003" rgba="1 0 0 0.2"></site>
     <tendon width="0.003" rgba=".95 .3 .3 1" limited="false"></tendon>
     <motor ctrllimited="true" ctrlrange="-1.0 1.0"/>
@@ -162,8 +164,7 @@
             <body name="foot_r" pos="-0.0086471 0.00034291 -0.015818">
               <!-- <inertial pos="0.0240457 -0.00247806 -0.00449045" quat="-0.0993991 0.680621 -0.0671711 0.722747" mass="0.112355" diaginertia="0.000223132 0.000216083 2.78473e-05"/> -->
               <joint name="subtalar_angle_r" pos="0 0 0" axis="0.762058 0.313439 0.566589" range="-1 1"/>
-              <geom name="foot_r" type="mesh" rgba="1 1 1 1" mesh="foot_r" density="2718.18"
-                    condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+              <geom name="foot_r" type="mesh" rgba="1 1 1 1" mesh="foot_r" density="2718.18"/>
               <site name="foot_r_IMU" pos="0.05889385 -0.00476238  0.008022"/>
               <site name="r13" pos="-0.042778129 -0.000869093 -0.013825398"/>
               <site name="r14" pos="0.062004826 0.01668013 0.014081972"/>
@@ -171,8 +172,7 @@
               <body name="toe_r" pos="0.11963 -0.012783 -0.01619">
                 <!-- <inertial pos="0.0172758 0.00821531 -0.00133844" quat="0.186455 0.726911 0.0994713 0.653407" mass="0.00196755" diaginertia="2.29527e-07 2.2752e-07 2.30713e-08"/> -->
                 <joint name="mtp_angle_r" pos="0 0 0" axis="-0.375959 -0.926408 -0.02056" range="-1 1"/>
-                <geom name="toe_r" type="mesh" rgba="0.698039 0.698039 0.698039 1" mesh="toe_r" density="2718.18"
-                      condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+                <geom name="toe_r" type="mesh" rgba="0.698039 0.698039 0.698039 1" mesh="toe_r" density="2718.18"/>
               </body>
             </body>
           </body>
@@ -262,8 +262,7 @@
             <body name="foot_l" pos="-0.0086471 -0.00034291 -0.015818">
               <!-- <inertial pos="0.0240471 0.00247979 -0.0044882" quat="0.0994478 0.680587 0.0672607 0.722764" mass="0.112365" diaginertia="0.000223101 0.000216049 2.78436e-05"/> -->
               <joint name="subtalar_angle_l" pos="0 0 0" axis="-0.762058 0.313439 -0.566589" range="-1 1"/>
-              <geom name="foot_l" type="mesh" rgba="1 1 1 1" mesh="foot_l" density="2718.18"
-                    condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+              <geom name="foot_l" type="mesh" rgba="1 1 1 1" mesh="foot_l" density="2718.18"/>
               <site name="foot_l_IMU" pos="0.05889385 0.00476238  0.008022"/>
               <site name="l13" pos="-0.042778129 0.000869093 -0.013825398"/>
               <site name="l14" pos="0.062004826 -0.01668013 0.014081972"/>
@@ -271,8 +270,7 @@
               <body name="toe_l" pos="0.11963 0.012783 -0.01619">
                 <!-- <inertial pos="0.017277 -0.00821652 -0.00133839" quat="-0.186453 0.72691 -0.0994773 0.653408" mass="0.00196768" diaginertia="2.29553e-07 2.27545e-07 2.30729e-08"/> -->
                 <joint name="mtp_angle_l" pos="0 0 0" axis="0.375959 -0.926408 0.02056" range="-1 1"/>
-                <geom name="toe_l" type="mesh" rgba="1 1 1 1" mesh="toe_l" density="2718.18"
-                      condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+                <geom name="toe_l" type="mesh" rgba="1 1 1 1" mesh="toe_l" density="2718.18"/>
               </body>
             </body>
           </body>

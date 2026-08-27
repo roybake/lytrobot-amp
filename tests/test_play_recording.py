@@ -3,12 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.play import (
+    RealTimePacer,
+    SimulationFrameScheduler,
     best_checkpoint_quality_warning,
     checkpoint_recording_path,
     infer_stage,
     make_env_cfg,
     resolve_step_limit,
+    validate_recurrent_sensor_architecture,
 )
 
 
@@ -289,6 +294,102 @@ def test_viewer_defaults_to_unlimited_repetition() -> None:
     assert resolve_step_limit(None, viewer=True) == 0
     assert resolve_step_limit(None, viewer=False) == 1000
     assert resolve_step_limit(250, viewer=True) == 250
+
+
+def test_playback_uses_checkpoint_100hz_control_timing() -> None:
+    args = SimpleNamespace(
+        model_xml="robot.xml",
+        motion_file="motion.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=False,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/stage1/run/model.pt",
+        stage="stage1",
+    )
+    checkpoint = {"env_config": {"timestep": 0.005, "decimation": 2}}
+
+    cfg = make_env_cfg(args, checkpoint, "stage1")
+
+    assert cfg.timestep * cfg.decimation == pytest.approx(0.01)
+
+
+def test_playback_rejects_old_50hz_checkpoint() -> None:
+    args = SimpleNamespace(
+        model_xml="robot.xml",
+        motion_file="motion.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=False,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/stage1/run/model.pt",
+        stage="stage1",
+    )
+
+    with pytest.raises(ValueError, match="100 Hz"):
+        make_env_cfg(
+            args,
+            {"env_config": {"timestep": 0.005, "decimation": 4}},
+            "stage1",
+        )
+
+
+def test_playback_rejects_removed_recurrent_moe_checkpoint() -> None:
+    with pytest.raises(ValueError, match="removed residual-MoE"):
+        validate_recurrent_sensor_architecture(
+            {
+                "sensor_policy_architecture": {
+                    "name": "proprioceptive_gru_context_residual_moe",
+                    "recurrent": True,
+                }
+            }
+        )
+
+
+def test_recording_frame_scheduler_preserves_one_second_duration_at_100hz() -> None:
+    scheduler = SimulationFrameScheduler(30.0)
+
+    frame_count = sum(scheduler.frames_due((step + 1) * 0.01) for step in range(100))
+
+    assert frame_count == 30
+    assert scheduler.frames_emitted / scheduler.fps == pytest.approx(1.0)
+
+
+def test_realtime_pacer_never_catches_up_with_accelerated_steps() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def clock() -> float:
+        return now[0]
+
+    def sleeper(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    pacer = RealTimePacer(clock=clock, sleeper=sleeper)
+    now[0] += 0.002
+    assert pacer.wait(0.01) == pytest.approx(0.008)
+    now[0] += 0.020
+    assert pacer.wait(0.01) == 0.0
+    now[0] += 0.002
+    assert pacer.wait(0.01) == pytest.approx(0.008)
+    assert sleeps == pytest.approx([0.008, 0.008])
 
 
 def test_playback_randomizes_every_episode_when_seed_is_omitted() -> None:

@@ -24,6 +24,10 @@ from sensor_training.train_multimotion import default_train_args as sensor_multi
 
 
 ROOT = Path(__file__).resolve().parents[1]
+NO_STAIRS_REFERENCES = (
+    ROOT / "robot" / "reference_data" / "multimotion" / "walk_omniretarget.npz",
+    ROOT / "robot" / "reference_data" / "multimotion" / "rough_walk_omniretarget.npz",
+)
 
 
 class TwoStageTrainingTaskTests(unittest.TestCase):
@@ -56,10 +60,17 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             self.assertTrue(parsed.terrain_course_random_assignment)
             self.assertEqual(parsed.rough_terrain_height, 0.05)
             self.assertEqual(parsed.slope_angle_deg, 6.0)
-            self.assertEqual(parsed.episode_steps, 1800)
+            self.assertEqual(parsed.decimation, 2)
+            self.assertEqual(parsed.episode_steps, 3600)
             self.assertEqual(parsed.motion_names, ["walk", "rough_walk"])
+            self.assertEqual(
+                [Path(path).parent.name for path in parsed.motion_files],
+                ["multimotion", "multimotion"],
+            )
+            self.assertEqual(parsed.motion_loop, ["true", "false"])
             self.assertFalse(parsed.skill_conditioning)
             self.assertEqual(parsed.reference_ctrl_blend, 0.0)
+            self.assertFalse(parsed.serial_reference_state_init)
 
     def test_task_launchers_use_the_requested_log_trees(self) -> None:
         expected_roots = {
@@ -119,6 +130,26 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
                     ROOT / "logs" / "multimotion" / "no_stairs",
                 )
                 self.assertIn("--no-wandb", sys.argv)
+
+    def test_stair_free_stage_overrides_canonical_ordinary_reference_defaults(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["launcher.py", *no_stairs_args(), "--no-wandb"],
+        ), patch("scripts.train_stage1.runpy.run_path"):
+            run_stage1()
+            effective_argv = list(sys.argv)
+
+        with patch.object(sys, "argv", ["train.py", *effective_argv[1:]]):
+            parsed = train.parse_args()
+        self.assertEqual(
+            [Path(path) for path in parsed.motion_files],
+            list(NO_STAIRS_REFERENCES),
+        )
+        self.assertEqual(parsed.motion_loop, ["true", "false"])
+        self.assertTrue(parsed.serial_reference_state_init)
+        self.assertEqual(parsed.motion_reset_prob, 0.5)
+        self.assertAlmostEqual(parsed.target_velocity, 0.862295, places=5)
 
     def test_task_defaults_do_not_enable_domain_randomization(self) -> None:
         for args in (no_stairs_args(), stairs_args(), sensor_multimotion_args()):

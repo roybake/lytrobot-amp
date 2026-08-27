@@ -839,11 +839,14 @@ class SquatCpuAmpEnv(SquatRewardMixin, LytRobotAmpEnv):
 class SquatSensorHistoryEnv(SensorHistoryEnv):
     """Sensor history plus the feedback-corrected squat phase clock."""
 
+    actor_history_enabled = True
     phase_dim = 2
 
     @property
     def sensor_history_obs_dim(self) -> int:
-        return int(super().obs_dim)
+        return int(
+            self.sensor_frame_dim * self.sensor_observation_cfg.frame_count
+        )
 
     @property
     def policy_frame_dim(self) -> int:
@@ -879,6 +882,7 @@ class SquatSensorHistoryEnv(SensorHistoryEnv):
         metadata = super().observation_metadata
         metadata.update(
             {
+                "frame_order": "oldest_to_current",
                 "command_fields": (),
                 "command_dim": 0,
                 "actor_obs_dim": self.obs_dim,

@@ -63,6 +63,11 @@ def _normalized_terrain_context(
 class SensorHistoryEnv:
     """Wrap an existing environment while leaving its dynamics and rewards intact."""
 
+    # The recurrent locomotion actor has always consumed only the newest sensor
+    # frame; its GRU owns the causal history. Keep a stacked actor history only
+    # for task wrappers (currently squat) that explicitly expose it.
+    actor_history_enabled = False
+
     def __init__(
         self,
         base_env: LytRobotAmpEnv | LytRobotWarpAmpEnv,
@@ -100,6 +105,10 @@ class SensorHistoryEnv:
 
     @property
     def obs_dim(self) -> int:
+        return int(self.sensor_frame_dim)
+
+    @property
+    def sensor_history_obs_dim(self) -> int:
         return int(self.sensor_frame_dim * self.sensor_observation_cfg.frame_count)
 
     @property
@@ -125,7 +134,7 @@ class SensorHistoryEnv:
     def observation_metadata(self) -> dict[str, Any]:
         return {
             "config": asdict(self.sensor_observation_cfg),
-            "frame_order": "oldest_to_current",
+            "frame_order": "current_only",
             "imu_sensor_names": self.imu_layout.names,
             "imu_dim_per_frame": self.imu_layout.dim,
             "tendon_length_dim_per_frame": self.base_env.position_action_dim,
@@ -135,6 +144,8 @@ class SensorHistoryEnv:
             "command_dim": 0,
             "strict_sensor_only": True,
             "actor_obs_dim": self.obs_dim,
+            "sensor_history_obs_dim": self.sensor_history_obs_dim,
+            "actor_uses_stacked_history": bool(self.actor_history_enabled),
             "amp_frame_dim": self.base_motion.feature_dim,
             "amp_obs_dim": self.amp_obs_dim,
             "privileged_training_context": self.privileged_context_metadata,
@@ -157,13 +168,39 @@ class SensorHistoryEnv:
             )
 
     def _allocate_histories(self) -> None:
-        shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.sensor_frame_dim)
         amp_shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.base_motion.feature_dim)
         if self.is_torch_env:
-            self._actor_history = torch.zeros(shape, dtype=torch.float32, device=self.base_env.device)
+            if self.actor_history_enabled:
+                actor_shape = (
+                    self.num_envs,
+                    self.sensor_observation_cfg.frame_count,
+                    self.sensor_frame_dim,
+                )
+                self._actor_history = torch.zeros(
+                    actor_shape,
+                    dtype=torch.float32,
+                    device=self.base_env.device,
+                )
+            else:
+                self._actor_frame = torch.zeros(
+                    (self.num_envs, self.sensor_frame_dim),
+                    dtype=torch.float32,
+                    device=self.base_env.device,
+                )
             self._amp_history = torch.zeros(amp_shape, dtype=torch.float32, device=self.base_env.device)
         else:
-            self._actor_history = np.zeros(shape, dtype=np.float32)
+            if self.actor_history_enabled:
+                actor_shape = (
+                    self.num_envs,
+                    self.sensor_observation_cfg.frame_count,
+                    self.sensor_frame_dim,
+                )
+                self._actor_history = np.zeros(actor_shape, dtype=np.float32)
+            else:
+                self._actor_frame = np.zeros(
+                    (self.num_envs, self.sensor_frame_dim),
+                    dtype=np.float32,
+                )
             self._amp_history = np.zeros(amp_shape, dtype=np.float32)
 
     def _build_privileged_context_tables(self) -> None:
@@ -320,16 +357,26 @@ class SensorHistoryEnv:
                 dtype=torch.long,
                 device=self.base_env.device,
             )
-            self._actor_history[ids] = actor_frame[ids, None, :].expand(-1, self.sensor_observation_cfg.frame_count, -1)
+            if self.actor_history_enabled:
+                self._actor_history[ids] = actor_frame[ids, None, :].expand(
+                    -1,
+                    self.sensor_observation_cfg.frame_count,
+                    -1,
+                )
+            else:
+                self._actor_frame[ids] = actor_frame[ids]
             self._amp_history[ids] = amp_frame[ids, None, :].expand(-1, self.sensor_observation_cfg.frame_count, -1)
             return
 
         ids = np.asarray(env_ids, dtype=np.int64)
-        self._actor_history[ids] = np.repeat(
-            actor_frame[ids, None, :],
-            self.sensor_observation_cfg.frame_count,
-            axis=1,
-        )
+        if self.actor_history_enabled:
+            self._actor_history[ids] = np.repeat(
+                actor_frame[ids, None, :],
+                self.sensor_observation_cfg.frame_count,
+                axis=1,
+            )
+        else:
+            self._actor_frame[ids] = actor_frame[ids]
         self._amp_history[ids] = np.repeat(
             amp_frame[ids, None, :],
             self.sensor_observation_cfg.frame_count,
@@ -340,16 +387,25 @@ class SensorHistoryEnv:
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
-            self._actor_history = torch.roll(self._actor_history, shifts=-1, dims=1)
+            if self.actor_history_enabled:
+                self._actor_history = torch.roll(self._actor_history, shifts=-1, dims=1)
+                self._actor_history[:, -1] = actor_frame
+            else:
+                self._actor_frame = actor_frame
             self._amp_history = torch.roll(self._amp_history, shifts=-1, dims=1)
         else:
-            self._actor_history = np.roll(self._actor_history, shift=-1, axis=1)
+            if self.actor_history_enabled:
+                self._actor_history = np.roll(self._actor_history, shift=-1, axis=1)
+                self._actor_history[:, -1] = actor_frame
+            else:
+                self._actor_frame = actor_frame
             self._amp_history = np.roll(self._amp_history, shift=-1, axis=1)
-        self._actor_history[:, -1] = actor_frame
         self._amp_history[:, -1] = amp_frame
 
     def observe(self) -> np.ndarray | torch.Tensor:
-        return self._actor_history.reshape(self.num_envs, self.obs_dim)
+        if self.actor_history_enabled:
+            return self._actor_history[:, -1]
+        return self._actor_frame
 
     def amp_observe(self) -> np.ndarray | torch.Tensor:
         return self._amp_history.reshape(self.num_envs, self.amp_obs_dim)

@@ -30,7 +30,7 @@
   asymmetric critic，避免传统两阶段蒸馏的分布偏移。
 
 本项目选择 DreamWaQ/CTS 风格的单阶段方案，而不直接移植大型 Transformer 或完整两阶段
-DAgger：当前策略已有因果 GRU、soft residual-MoE、AMP 参考数据和大规模 Warp rollout，
+DAgger：当前策略已有因果 GRU、单一 Actor MLP、AMP 参考数据和大规模 Warp rollout，
 加入训练期上下文监督即可复用现有路径，显著小于另建教师/学生 rollout 的工程和显存成本。
 
 ## 实现结构
@@ -39,9 +39,8 @@ DAgger：当前策略已有因果 GRU、soft residual-MoE、AMP 参考数据和�
 IMU(42) + 肌腱长度(14)
           │ 每步 56 维，部署唯一输入
           ▼
-       GRU(128) ───────────► base actor + soft residual-MoE ─► 14 维动作
-          │                                      │
-          │                                      └─ gate 时序平滑/负载均衡
+       GRU(128) ───────────► single actor MLP ───► 14 维动作
+          │
           ├─► context estimator（仅训练损失，部署不需要目标）
           └─► asymmetric critic + 训练期特权上下文
 ```
@@ -58,8 +57,7 @@ IMU(42) + 肌腱长度(14)
 
 传感器多地形入口把 `reference_ctrl_blend` 固定为 0。执行器目标以实测肌腱长度为基准，
 策略输出 14 维目标修正量；模拟器按当前位置选择的参考动作只用于奖励和 AMP 教师分布，
-不再通过控制基准泄漏给部署策略。动作 rate 惩罚、soft gate 变化损失和 residual L2 共同
-约束过渡抖动。
+不再通过控制基准泄漏给部署策略。动作 rate 惩罚约束过渡抖动。
 
 ## 训练顺序
 
@@ -76,7 +74,7 @@ critic 与旧 recurrent checkpoint 形状不同，必须新开运行，不能直
 训练时至少监控：
 
 - `privileged_context_loss`：应下降且保持有限；
-- `gate_change_loss`、`task_action_rate`：不应在地形边界形成持续尖峰；
+- `task_action_rate`：不应在地形边界形成持续尖峰；
 - `task_course_stage_completion` 和 `episode_success_rate`：确认不仅学会站立；
 - `task_invalid_state`：应持续为 0；
 - `termination_fraction` 与各地形单独成功率。

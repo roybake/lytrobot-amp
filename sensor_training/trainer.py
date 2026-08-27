@@ -13,6 +13,7 @@ from torch.nn import functional as F
 
 from lytrobot_amp.ppo_amp import PPOAMPTrainer
 from lytrobot_amp.networks import AmpDiscriminator
+from lytrobot_amp.training_defaults import CONTROL_FREQUENCY_HZ, require_100hz_control
 
 from .networks import RecurrentSensorActorExport, SensorActorCritic
 from .ppo_config import SensorPPOAMPConfig
@@ -67,20 +68,40 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             max_action_std=cfg.max_action_std,
             sensor_frame_dim=policy_frame_dim,
             recurrent_hidden_dim=cfg.recurrent_hidden_dim,
-            num_experts=cfg.num_experts,
-            gate_hidden_dims=cfg.gate_hidden_dims,
-            expert_hidden_dims=cfg.expert_hidden_dims,
-            residual_scale=cfg.residual_scale,
             privileged_context_dim=env.privileged_context_dim,
         ).to(self.device)
         self.discriminator = AmpDiscriminator(
             input_dim=env.amp_obs_dim,
             hidden_dims=cfg.discriminator_hidden_dims,
         ).to(self.device)
-        self.optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=cfg.learning_rate)
-        self.discriminator_optimizer = torch.optim.Adam(
-            self.discriminator.parameters(), lr=cfg.discriminator_learning_rate
+        fused_optimizer = bool(cfg.fused_optimizer and self.device.type == "cuda")
+        self.optimizer = torch.optim.Adam(
+            self.actor_critic.parameters(),
+            lr=cfg.learning_rate,
+            fused=fused_optimizer,
         )
+        self.discriminator_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(),
+            lr=cfg.discriminator_learning_rate,
+            fused=fused_optimizer,
+        )
+        self._compiled_policy_update = bool(
+            cfg.compile_policy and self.device.type == "cuda"
+        )
+        self._evaluate_policy_sequence = self.actor_critic.evaluate_sequence
+        if self._compiled_policy_update:
+            self._evaluate_policy_sequence = torch.compile(
+                self.actor_critic.evaluate_sequence,
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=False,
+            )
+            print(
+                "[INFO] recurrent BPTT torch.compile enabled; the first policy "
+                "update performs a one-time CUDA compilation."
+            )
+        if fused_optimizer:
+            print("[INFO] fused CUDA Adam enabled for policy and AMP updates.")
 
         self.obs = env.reset()
         self.recurrent_state = self.actor_critic.initial_state(env.num_envs)
@@ -150,8 +171,6 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     value,
                     _median_value,
                     next_recurrent_state,
-                    _gate_weights,
-                    _residual,
                 ) = self.actor_critic.recurrent_action_and_value(
                     obs_tensor,
                     self.recurrent_state,
@@ -411,9 +430,6 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "bpo_target_ratio",
             "bpo_policy_weight",
             "bpo_median_advantage_abs",
-            "gate_change_loss",
-            "expert_load_balance_loss",
-            "residual_l2_loss",
             "privileged_context_loss",
         )
         if env_batch_size == 0:
@@ -443,16 +459,19 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             epoch_update_count = 0
             env_indices = torch.randperm(env_batch_size, device=self.device)
             for mb in torch.tensor_split(env_indices, minibatches):
+                if self._compiled_policy_update:
+                    # reduce-overhead mode reuses CUDA-graph output storage.
+                    # Mark every optimizer update as a new step so outputs from
+                    # the previous minibatch may be safely recycled.
+                    torch.compiler.cudagraph_mark_step_begin()
                 (
                     new_log_prob,
                     entropy,
                     new_value,
                     median_value,
                     _next_hidden,
-                    gate_weights,
-                    residual,
                     context_prediction,
-                ) = self.actor_critic.evaluate_sequence(
+                ) = self._evaluate_policy_sequence(
                     obs[:, mb],
                     initial_hidden[mb],
                     episode_starts[:, mb],
@@ -511,20 +530,6 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 ).mean()
                 entropy_loss = entropy.mean()
 
-                if gate_weights.shape[0] > 1:
-                    valid_transition = 1.0 - episode_starts[1:, mb]
-                    gate_delta = (gate_weights[1:] - gate_weights[:-1]).square().mean(dim=-1)
-                    gate_change_loss = (
-                        (gate_delta * valid_transition).sum()
-                        / valid_transition.sum().clamp_min(1.0)
-                    )
-                else:
-                    gate_change_loss = gate_weights.new_zeros(())
-                mean_expert_load = gate_weights.mean(dim=(0, 1))
-                expert_load_balance_loss = (
-                    self.cfg.num_experts * mean_expert_load.square().sum() - 1.0
-                )
-                residual_l2_loss = residual.square().mean()
                 privileged_context_loss = F.smooth_l1_loss(
                     context_prediction,
                     privileged_contexts[:, mb],
@@ -535,9 +540,6 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     + self.cfg.value_coef * value_loss
                     + self.cfg.median_value_coef * median_value_loss
                     - self.cfg.entropy_coef * entropy_loss
-                    + self.cfg.gate_change_coef * gate_change_loss
-                    + self.cfg.expert_load_balance_coef * expert_load_balance_loss
-                    + self.cfg.residual_l2_coef * residual_l2_loss
                     + self.cfg.privileged_context_loss_coef
                     * privileged_context_loss
                 )
@@ -573,9 +575,6 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                         target_ratio.mean(),
                         policy_weight.mean(),
                         median_advantage.abs().mean(),
-                        gate_change_loss,
-                        expert_load_balance_loss,
-                        residual_l2_loss,
                         privileged_context_loss,
                     )
                 ).detach()
@@ -619,9 +618,27 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         architecture = checkpoint.get("sensor_policy_architecture")
         if not isinstance(architecture, dict) or not bool(architecture.get("recurrent", False)):
             raise ValueError(
-                "Checkpoint uses the legacy feed-forward sensor policy; recurrent MoE "
+                "Checkpoint uses the legacy feed-forward sensor policy; recurrent GRU/MLP "
                 "training must start in a new run instead of resuming that checkpoint."
             )
+        if architecture.get("name") != "proprioceptive_gru_context_mlp":
+            raise ValueError(
+                "Checkpoint uses the removed residual-MoE policy architecture; "
+                "start a new single-GRU/MLP run instead of resuming it."
+            )
+        saved_env_cfg = checkpoint.get("env_config", {})
+        if not isinstance(saved_env_cfg, dict):
+            raise ValueError("Checkpoint has no valid env_config timing metadata.")
+        require_100hz_control(
+            float(saved_env_cfg.get("timestep", 0.0)),
+            int(saved_env_cfg.get("decimation", 0)),
+            source="checkpoint",
+        )
+        require_100hz_control(
+            float(self.env.cfg.timestep),
+            int(self.env.cfg.decimation),
+            source="current training",
+        )
         saved_context_dim = int(architecture.get("privileged_context_dim", 0))
         if saved_context_dim != self.env.privileged_context_dim:
             raise ValueError(
@@ -662,7 +679,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "training_task": str(getattr(self.env.cfg, "training_task", "")),
             "sensor_observation": self.env.observation_metadata,
             "sensor_policy_architecture": {
-                "name": "proprioceptive_gru_context_residual_moe",
+                "name": "proprioceptive_gru_context_mlp",
                 "recurrent": True,
                 # Legacy key retained for playback/evaluation loaders.  For
                 # squat it includes the current sin/cos phase appended after
@@ -676,10 +693,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 ),
                 "physical_sensor_frame_dim": self.env.sensor_frame_dim,
                 "recurrent_hidden_dim": self.cfg.recurrent_hidden_dim,
-                "num_experts": self.cfg.num_experts,
-                "gate_hidden_dims": list(self.cfg.gate_hidden_dims),
-                "expert_hidden_dims": list(self.cfg.expert_hidden_dims),
-                "residual_scale": self.cfg.residual_scale,
+                "control_frequency_hz": CONTROL_FREQUENCY_HZ,
+                "control_period_s": float(self.env.dt),
                 "privileged_context_dim": self.env.privileged_context_dim,
                 "privileged_context_fields": list(
                     self.env.privileged_context_metadata["fields"]
@@ -729,7 +744,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
 
         model = onnx.load(path)
         metadata = {
-            "format_version": 2,
+            "format_version": 3,
             "iteration": checkpoint["iteration"],
             "global_step": checkpoint["global_step"],
             "obs_dim": checkpoint["obs_dim"],

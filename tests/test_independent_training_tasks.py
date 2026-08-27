@@ -34,6 +34,7 @@ from sensor_training.envs import SensorHistoryCpuAmpEnv
 
 ROOT = Path(__file__).resolve().parents[1]
 MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
+NO_STAIRS_MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 
 
 def _option_values(args: list[str], option: str) -> list[str]:
@@ -50,9 +51,11 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert _option_values(args, "--training-task") == ["multimotion_no_stairs"]
     assert _option_values(args, "--motion-names") == ["walk", "rough_walk"]
     assert [Path(value) for value in _option_values(args, "--motion-files")] == [
-        MOTION_DIR / "walk_omniretarget.npz",
-        MOTION_DIR / "rough_walk_omniretarget.npz",
+        NO_STAIRS_MOTION_DIR / "walk_omniretarget.npz",
+        NO_STAIRS_MOTION_DIR / "rough_walk_omniretarget.npz",
     ]
+    assert _option_values(args, "--motion-weights") == ["0.50", "0.50"]
+    assert _option_values(args, "--motion-loop") == ["true", "false"]
     assert set(_option_values(args, "--terrain-types")) == {
         "flat",
         "rough",
@@ -65,20 +68,20 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert float(_option_values(args, "--terrain-course-random-start-prob")[0]) == (
         NO_STAIRS_RANDOM_START_PROBABILITY
     )
-    assert NO_STAIRS_RANDOM_START_PROBABILITY <= 0.25
+    assert NO_STAIRS_RANDOM_START_PROBABILITY >= 0.80
     assert float(
         _option_values(args, "--terrain-course-random-start-warmup-iterations")[0]
     ) == NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS
-    assert NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS >= 18000
+    assert NO_STAIRS_RANDOM_START_WARMUP_ITERATIONS <= 5000
     assert float(
         _option_values(args, "--terrain-course-random-start-ramp-iterations")[0]
     ) == NO_STAIRS_RANDOM_START_RAMP_ITERATIONS
     assert "--terrain-course-phase-sync" in args
     assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
     assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
-    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 3.0
-    assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 2.0
-    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 2.5
+    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 2.0
+    assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 1.0
+    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.5
     assert float(_option_values(args, "--stance-foot-reward-coef")[0]) == 1.0
     assert float(_option_values(args, "--contact-reward-coef")[0]) == 0.70
     assert float(_option_values(args, "--symmetry-reward-coef")[0]) == 0.50
@@ -86,23 +89,25 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert not any(value.startswith("--stair-") for value in args)
     assert "--no-skill-conditioning" in args
     assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
-    assert "--use-reference-velocity" not in args
+    assert "--use-reference-velocity" in args
+    assert "--serial-reference-state-init" in args
+    assert _option_values(args, "--motion-reset-prob") == ["0.50"]
+    assert _option_values(args, "--stand-start-prob") == ["0.0"]
+    assert _option_values(args, "--startup-action-ramp-steps") == ["0"]
 
-    with patch.object(sys, "argv", ["train.py"]):
-        ordinary = vars(train.parse_args())
     with patch.object(sys, "argv", ["train.py", *args]):
         stair_free = vars(train.parse_args())
-    # PPO/AMP rollout and optimizer parameters still come directly from the
-    # ordinary walking parser/stage wrappers.
-    for key in (
-        "num_envs",
-        "num_steps",
-        "epochs",
-        "minibatches",
-        "amp_minibatch_size",
-        "amp_disc_updates",
-    ):
-        assert stair_free[key] == ordinary[key]
+    # Match the stable 08-06 multi-motion sampling regime instead of the
+    # under-sampled 08-25 run (4 PPO minibatches, 1024 AMP samples, one
+    # discriminator update).
+    assert stair_free["num_envs"] == 4096
+    assert stair_free["num_steps"] == 24
+    assert stair_free["epochs"] == 4
+    assert stair_free["minibatches"] == 8
+    assert stair_free["amp_minibatch_size"] == 4096
+    assert stair_free["amp_disc_updates"] == 2
+    assert stair_free["warp_nconmax"] == 128
+    assert stair_free["warp_njmax"] == 512
 
     # The original all-terrain entry point remains a separate four-clip task.
     original = original_multimotion_args()
@@ -250,8 +255,8 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
             model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
             training_task="multimotion_no_stairs",
             motion_files=(
-                str(MOTION_DIR / "walk_omniretarget.npz"),
-                str(MOTION_DIR / "rough_walk_omniretarget.npz"),
+                str(NO_STAIRS_MOTION_DIR / "walk_omniretarget.npz"),
+                str(NO_STAIRS_MOTION_DIR / "rough_walk_omniretarget.npz"),
             ),
             motion_names=("walk", "rough_walk"),
             motion_weights=(0.5, 0.5),
@@ -259,6 +264,7 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
             skill_conditioning=False,
             terrain_types=("flat", "rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
+            serial_reference_state_init=True,
             terrain_course_variants=6,
             num_envs=1,
             stand_start_prob=0.0,
@@ -272,11 +278,12 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
         observation = env.reset()
         assert env.action_dim == 14
         assert env.sensor_frame_dim == 42 + 14
-        assert observation.shape == (1, 336)
+        assert observation.shape == (1, 56)
         assert env.observation_metadata["actor_input_fields"] == ("imu", "tendon_length")
         assert env.observation_metadata["command_dim"] == 0
         assert env.stair_cfg.enabled is False
         assert env.more_terrain_cfg.serial_course is True
+        assert env.base_env.motion_count == 2
     finally:
         env.close()
 
@@ -317,13 +324,13 @@ def test_stair_task_keeps_terrain_reward_outside_sensor_actor() -> None:
     try:
         observation = env.reset()
         assert env.action_dim == 14
-        assert observation.shape == (1, 336)
+        assert observation.shape == (1, 56)
         assert env.observation_metadata["actor_input_fields"] == ("imu", "tendon_length")
         assert env.observation_metadata["command_dim"] == 0
         observation, reward, done, info = env.step(
             np.zeros((1, env.action_dim), dtype=np.float32)
         )
-        assert observation.shape == (1, 336)
+        assert observation.shape == (1, 56)
         assert np.isfinite(reward).all()
         assert np.isfinite(done).all()
         for key in (
@@ -337,7 +344,7 @@ def test_stair_task_keeps_terrain_reward_outside_sensor_actor() -> None:
         env.close()
 
 
-def test_serial_stair_stage_terminates_when_pelvis_sinks_into_steps() -> None:
+def test_serial_stair_stage_terminates_on_deep_geometry_penetration() -> None:
     env = LytRobotAmpEnv(
         LytRobotEnvCfg(
             model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
@@ -390,7 +397,10 @@ def test_serial_stair_stage_terminates_when_pelvis_sinks_into_steps() -> None:
 
         np.testing.assert_array_equal(done, [1.0])
         np.testing.assert_array_equal(info["termination"], [1.0])
-        np.testing.assert_array_equal(info["stair_terrain_penetration"], [1.0])
-        assert info["stair_root_clearance_value"][0] < env.cfg.stair_min_root_clearance
+        np.testing.assert_array_equal(info["terrain_penetration"], [1.0])
+        assert (
+            info["terrain_penetration_depth"][0]
+            > env.cfg.terrain_penetration_tolerance
+        )
     finally:
         env.close()

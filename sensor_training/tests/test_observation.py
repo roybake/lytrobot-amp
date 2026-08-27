@@ -122,7 +122,7 @@ class SensorObservationTests(unittest.TestCase):
         self.assertTrue(np.all(features[0::2] < 100.0))
         self.assertTrue(np.all(features[1::2] >= 100.0))
 
-    def test_actor_observation_contains_only_imu_and_tendon_history(self) -> None:
+    def test_actor_observation_contains_only_current_imu_and_tendon_frame(self) -> None:
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
                 model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
@@ -142,8 +142,9 @@ class SensorObservationTests(unittest.TestCase):
         try:
             observation = env.reset()
             self.assertEqual(env.sensor_frame_dim, 56)
-            self.assertEqual(env.obs_dim, 336)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertEqual(env.obs_dim, 56)
+            self.assertEqual(env.sensor_history_obs_dim, 336)
+            self.assertEqual(observation.shape, (1, 56))
             self.assertEqual(
                 env.observation_metadata["actor_input_fields"],
                 ("imu", "tendon_length"),
@@ -151,6 +152,9 @@ class SensorObservationTests(unittest.TestCase):
             self.assertEqual(env.observation_metadata["command_fields"], ())
             self.assertEqual(env.observation_metadata["command_dim"], 0)
             self.assertTrue(env.observation_metadata["strict_sensor_only"])
+            self.assertFalse(
+                env.observation_metadata["actor_uses_stacked_history"]
+            )
             self.assertFalse(
                 env.observation_metadata["privileged_training_context"][
                     "actor_input"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import fields
 import json
 import re
@@ -27,6 +28,10 @@ import numpy as np
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.networks import ActorCritic
 from lytrobot_amp.terrain import course_end_x, course_segments, load_multi_robot_model
+from lytrobot_amp.training_defaults import (
+    CONTROL_FREQUENCY_HZ,
+    require_100hz_control,
+)
 
 
 class OnnxPolicy:
@@ -81,6 +86,48 @@ class OnnxPolicy:
         if self.recurrent:
             self.recurrent_state = outputs[1]
         return outputs[0]
+
+
+class RealTimePacer:
+    """Keep policy playback at wall-clock speed without catch-up acceleration."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.perf_counter,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.clock = clock
+        self.sleeper = sleeper
+        self.deadline = float(clock())
+
+    def wait(self, control_period: float) -> float:
+        self.deadline += float(control_period)
+        now = float(self.clock())
+        delay = self.deadline - now
+        if delay > 0.0:
+            self.sleeper(delay)
+            return delay
+        # Rendering/inference overrun must make playback slower, never trigger
+        # a faster-than-real-time burst intended to catch up with an old clock.
+        self.deadline = now
+        return 0.0
+
+
+class SimulationFrameScheduler:
+    """Map simulation time to encoded frames without changing video speed."""
+
+    def __init__(self, fps: float) -> None:
+        if float(fps) <= 0.0:
+            raise ValueError("recording fps must be positive.")
+        self.fps = float(fps)
+        self.frames_emitted = 0
+
+    def frames_due(self, simulation_time: float) -> int:
+        target_frames = int(np.floor(max(float(simulation_time), 0.0) * self.fps + 1.0e-9))
+        due = max(target_frames - self.frames_emitted, 0)
+        self.frames_emitted += due
+        return due
 
 
 def load_onnx_metadata(path: str | Path) -> dict:
@@ -334,7 +381,25 @@ def make_env_cfg(
         # Playback randomness is a runtime contract, not checkpoint state.
         # This also keeps old deterministic checkpoints random by default.
         cfg.randomize_episode_seed = True
+    require_100hz_control(
+        float(cfg.timestep),
+        int(cfg.decimation),
+        source="playback checkpoint",
+    )
     return cfg
+
+
+def validate_recurrent_sensor_architecture(checkpoint: dict) -> None:
+    """Reject recurrent checkpoints produced by the removed MoE actor."""
+
+    architecture = checkpoint.get("sensor_policy_architecture", {})
+    if not isinstance(architecture, dict) or not bool(architecture.get("recurrent", False)):
+        return
+    if architecture.get("name") != "proprioceptive_gru_context_mlp":
+        raise ValueError(
+            "This recurrent checkpoint uses the removed residual-MoE architecture. "
+            "Train and play a new single-GRU/MLP 100 Hz checkpoint."
+        )
 
 
 def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -> str:
@@ -612,6 +677,7 @@ def main() -> None:
         print(f"[WARN] {quality_warning}")
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
     stage = infer_stage(args.checkpoint, checkpoint, args.stage)
+    validate_recurrent_sensor_architecture(checkpoint)
 
     env_cfg = make_env_cfg(args, checkpoint, stage)
     if env_cfg.serial_terrain_course and not (
@@ -646,10 +712,6 @@ def main() -> None:
                 max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
                 sensor_frame_dim=int(sensor_architecture["sensor_frame_dim"]),
                 recurrent_hidden_dim=int(sensor_architecture["recurrent_hidden_dim"]),
-                num_experts=int(sensor_architecture["num_experts"]),
-                gate_hidden_dims=tuple(sensor_architecture["gate_hidden_dims"]),
-                expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),
-                residual_scale=float(sensor_architecture["residual_scale"]),
                 privileged_context_dim=int(
                     sensor_architecture.get("privileged_context_dim", 0)
                 ),
@@ -676,7 +738,8 @@ def main() -> None:
     print(
         f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
         f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode} "
-        f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course}"
+        f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course} "
+        f"control_frequency={CONTROL_FREQUENCY_HZ:g}Hz realtime=True"
     )
     if env.cfg.serial_terrain_course:
         for index, order in enumerate(env.more_terrain_cfg.normalized_course_orders):
@@ -699,6 +762,7 @@ def main() -> None:
     episode_start = np.ones(env.num_envs, dtype=np.float32)
     viewer = None
     recorder = None
+    recorder_frame_scheduler = None
     display_model = env.model
     display_data = env.datas[0]
     if env.num_envs > 1 and args.viewer:
@@ -726,10 +790,10 @@ def main() -> None:
             crf=args.record_crf,
             camera_mode=args.camera_mode,
         )
+        recorder_frame_scheduler = SimulationFrameScheduler(record_fps)
         print(f"[RECORD] saving {record_path}")
         configure_tracking_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
         viewer.sync()
-        recorder.write_frame(getattr(viewer, "cam", None))
 
     rewards: list[float] = []
     forward_velocities: list[float] = []
@@ -745,6 +809,8 @@ def main() -> None:
     max_forward_displacement = np.zeros(env.num_envs, dtype=np.float32)
     furthest_course_stage = np.zeros(env.num_envs, dtype=np.int32)
     furthest_course_stage_progress = np.zeros(env.num_envs, dtype=np.float32)
+    simulation_time = 0.0
+    real_time_pacer = RealTimePacer()
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
@@ -775,6 +841,7 @@ def main() -> None:
                 else:
                     action = policy.act_inference(obs_tensor).cpu().numpy()
             obs, reward, done, _info = env.step(action)
+            simulation_time += env.dt
             episode_start = np.asarray(done, dtype=np.float32)
             completed = episode_start > 0.5
             completed_episodes += int(np.count_nonzero(completed))
@@ -847,9 +914,14 @@ def main() -> None:
                     sync_multi_robot_state(display_model, display_data, env)
                 update_follow_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
                 viewer.sync()
-                if recorder is not None:
-                    recorder.write_frame(getattr(viewer, "cam", None))
-                time.sleep(env.dt)
+                if recorder is not None and recorder_frame_scheduler is not None:
+                    frames_due = recorder_frame_scheduler.frames_due(simulation_time)
+                    if frames_due > 0:
+                        recorder.write_frame(
+                            getattr(viewer, "cam", None),
+                            repeat=frames_due,
+                        )
+            real_time_pacer.wait(env.dt)
     finally:
         if recorder is not None:
             recorder.close()

@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.train_multimotion_no_stairs import default_stair_free_course_args
+from scripts.train_multimotion_no_stairs import (
+    default_ordinary_stair_free_course_args,
+)
 
 
 def _has_arg(name: str) -> bool:
@@ -36,7 +38,7 @@ def _take_option(name: str) -> str | None:
 
 if __name__ == "__main__":
     user_args = sys.argv[1:]
-    sys.argv[1:] = [*default_stair_free_course_args(), *user_args]
+    sys.argv[1:] = [*default_ordinary_stair_free_course_args(), *user_args]
 
     stage1_checkpoint = _take_option("--stage1-checkpoint") or _take_option("--stage1-model")
     if stage1_checkpoint is not None:

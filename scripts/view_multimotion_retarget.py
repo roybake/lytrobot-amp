@@ -469,12 +469,32 @@ def create_contact_sheet(
     )
 
 
+def _reference_forward_speed(motion: MotionReference) -> float:
+    """Return the displayed root-X speed in native reference time."""
+
+    qpos = np.asarray(motion.reference_qpos, dtype=np.float64)
+    frequency = float(motion.frequency)
+    if len(qpos) < 2 or frequency <= 0.0:
+        return 0.0
+    loop = bool(getattr(motion, "source_loop", False))
+    duration = (len(qpos) - (0 if loop else 1)) / frequency
+    distance = float(qpos[-1, 0] - qpos[0, 0])
+    if loop:
+        distance += float(np.median(np.diff(qpos[:, 0])))
+    return distance / max(duration, 1.0e-9)
+
+
 def main() -> None:
     args = parse_args()
     if not args.record and not args.viewer:
         raise ValueError("Enable at least one of --record or --viewer.")
     if args.fps <= 0.0 or args.speed <= 0.0:
         raise ValueError("--fps and --speed must be positive.")
+    if not math.isclose(args.speed, 1.0, rel_tol=0.0, abs_tol=1.0e-9):
+        raise ValueError(
+            "MuJoCo playback and recordings require --speed 1.0 so displayed "
+            "world velocity matches the reference's physical robot velocity."
+        )
     if args.walk_cycles < 1:
         raise ValueError("--walk-cycles must be at least one.")
 
@@ -523,7 +543,8 @@ def main() -> None:
             for segment in segments:
                 print(
                     f"[{segment.spec.title}] {segment.motion.frame_count} source frames, "
-                    f"{segment.motion.frequency:g} Hz"
+                    f"{segment.motion.frequency:g} Hz, native_world_speed="
+                    f"{_reference_forward_speed(segment.motion):.4f} m/s"
                 )
                 wall_start = time.perf_counter()
                 for local_frame in range(segment.total_frames):

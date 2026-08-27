@@ -61,8 +61,8 @@ if __name__ == "__main__":
         "--dr-curriculum-initial-scale": "0.0",
         "--dr-curriculum-update-interval": "250",
         "--dr-curriculum-step": "0.025",
-        "--push-interval-min-steps": "75",
-        "--push-interval-max-steps": "200",
+        "--push-interval-min-steps": "150",
+        "--push-interval-max-steps": "400",
         # Robustness randomizes dynamics and disturbances, not the deployment
         # contract that squat control starts from stable standing.
         "--stand-start-prob": "1.0",

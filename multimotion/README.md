@@ -92,10 +92,10 @@ uv run python scripts/view_multimotion_retarget.py --viewer
 uv run python scripts/view_multimotion_retarget.py \
   --clips stair_up stair_down --viewer --no-record
 
-# 生成脚跟 -> 脚掌 -> 脚趾慢放测试
+# 导出原生速度的脚跟 -> 脚掌 -> 脚趾接触测试
 MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
-  --speed 0.5 \
-  --output recording/reference/multimotion_foot_contact_slow.mp4
+  --speed 1.0 \
+  --output recording/reference/multimotion_foot_contact.mp4
 ```
 
 ## 当前多动作训练地形

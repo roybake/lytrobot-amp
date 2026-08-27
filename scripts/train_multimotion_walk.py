@@ -36,7 +36,7 @@ def default_train_args() -> list[str]:
         ["1.0", "0.0", "0.0", "0.0"],
     )
     _replace_option_values(args, "--specific-cot-penalty-coef", ["0.0"])
-    _replace_option_values(args, "--episode-steps", ["1000"])
+    _replace_option_values(args, "--episode-steps", ["2000"])
     _replace_option_values(args, "--log-group", ["multimotion_walk_warmup"])
     _replace_option_values(
         args,

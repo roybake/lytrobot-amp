@@ -71,7 +71,9 @@ def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None
         base_env=SimpleNamespace(position_action_dim=14),
         base_motion=SimpleNamespace(feature_dim=45),
         sensor_frame_dim=56,
-        obs_dim=336,
+        obs_dim=56,
+        sensor_history_obs_dim=336,
+        actor_history_enabled=False,
         amp_obs_dim=270,
         privileged_context_metadata={"actor_input": False, "training_only": True},
     )
@@ -83,7 +85,9 @@ def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None
     assert metadata["command_dim"] == 0
     assert metadata["strict_sensor_only"] is True
     assert metadata["actor_frame_dim"] == 42 + 14
-    assert metadata["actor_obs_dim"] == (42 + 14) * 6
+    assert metadata["actor_obs_dim"] == 42 + 14
+    assert metadata["sensor_history_obs_dim"] == (42 + 14) * 6
+    assert metadata["actor_uses_stacked_history"] is False
     assert metadata["privileged_training_context"]["actor_input"] is False
 
 

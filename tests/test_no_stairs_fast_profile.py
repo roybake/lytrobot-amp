@@ -5,13 +5,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lytrobot_amp.training_defaults import NO_STAIRS_FAST_TARGET_SPEED_MPS
+from lytrobot_amp.training_defaults import (
+    NO_STAIRS_FAST_TARGET_SPEED_MPS,
+    TRAINING_TARGET_SPEED_MPS,
+)
 from multimotion.retargeting.analyze_gait import analyze_reference
 from scripts.train_multimotion_no_stairs import default_train_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FAST_DIR = ROOT / "robot" / "reference_data" / "no_stairs_fast"
+MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 
 
 def _values(args: list[str], option: str) -> list[str]:
@@ -22,18 +26,25 @@ def _values(args: list[str], option: str) -> list[str]:
     return args[start:end]
 
 
-def test_no_stairs_fast_entrypoint_is_isolated_and_sensor_only() -> None:
+def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> None:
     args = default_train_args()
     assert [Path(value) for value in _values(args, "--motion-files")] == [
-        FAST_DIR / "walk_omniretarget.npz",
-        FAST_DIR / "rough_walk_omniretarget.npz",
+        MOTION_DIR / "walk_omniretarget.npz",
+        MOTION_DIR / "rough_walk_omniretarget.npz",
     ]
     assert np.isclose(
-        float(_values(args, "--target-velocity")[0]), NO_STAIRS_FAST_TARGET_SPEED_MPS
+        float(_values(args, "--target-velocity")[0]), TRAINING_TARGET_SPEED_MPS
     )
     assert _values(args, "--terrain-types") == ["flat", "rough", "slope_up", "slope_down"]
     assert not any(arg.startswith("--stair-") for arg in args)
     assert "--no-skill-conditioning" in args
+    assert "--serial-reference-state-init" in args
+    assert _values(args, "--motion-loop") == ["true", "false"]
+    assert _values(args, "--motion-reset-prob") == ["0.50"]
+    assert "--use-reference-velocity" in args
+    assert _values(args, "--terrain-course-random-start-prob") == ["0.8"]
+    assert _values(args, "--warp-nconmax") == ["128"]
+    assert _values(args, "--warp-njmax") == ["512"]
 
 
 @pytest.mark.skipif(

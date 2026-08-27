@@ -73,7 +73,7 @@ def default_train_args() -> list[str]:
     tag_index = args.index("--wandb-tags") + 1
     args[tag_index] = (
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
-        "asymmetric-critic,residual-moe,sensor-only,"
+        "asymmetric-critic,single-actor-mlp,sensor-only,"
         "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
         "sim2real"
     )

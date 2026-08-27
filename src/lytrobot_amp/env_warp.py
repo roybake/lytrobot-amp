@@ -22,6 +22,7 @@ from .motion import (
 )
 from .terrain import (
     MoreTerrainCfg,
+    STRICT_RESET_CLEARANCE,
     StairTerrainCfg,
     course_end_x,
     course_motion_sequence,
@@ -238,12 +239,13 @@ class LytRobotWarpAmpEnv:
             self.more_terrain_cfg,
         )
         self.model.opt.timestep = float(cfg.timestep)
-        self.model.opt.iterations = max(1, int(cfg.solver_iterations))
+        self.model.opt.iterations = max(20, int(cfg.solver_iterations))
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
-        # MuJoCo Warp rejects non-zero contact margins with CCD enabled. The LYT
-        # MJCF defaults geom margin to 0.001, so disable CCD for this backend.
+        # MuJoCo-Warp cannot combine MULTICCD with a non-zero predictive
+        # margin.  Keep native convex collision enabled, preserve the 5 mm
+        # anti-tunnelling margin, and disable only the incompatible multi-point
+        # mode.  The old implementation disabled native collision as well.
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD.value
-        self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD.value
         self.base_body_mass_np = np.asarray(self.model.body_mass, dtype=np.float32).copy()
         self.base_body_inertia_np = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
         self.base_geom_friction_np = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
@@ -702,6 +704,14 @@ class LytRobotWarpAmpEnv:
         cpu_data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, cpu_data)
 
+        # Older checkpoints stored 32/128, which is below the contact demand
+        # of a convex foot/body against a heightfield.  Never allow playback
+        # or resumed training to silently truncate collision constraints.
+        nconmax = max(128, int(self.cfg.warp_nconmax))
+        njmax = max(512, int(self.cfg.warp_njmax))
+        self.cfg.warp_nconmax = nconmax
+        self.cfg.warp_njmax = njmax
+
         wp.init()
         self.wp_device = wp.get_device(f"cuda:{self.device.index or 0}")
         with wp.ScopedDevice(self.wp_device):
@@ -710,8 +720,8 @@ class LytRobotWarpAmpEnv:
                 self.model,
                 cpu_data,
                 nworld=self.num_envs,
-                nconmax=max(1, int(self.cfg.warp_nconmax)),
-                njmax=max(1, int(self.cfg.warp_njmax)),
+                nconmax=nconmax,
+                njmax=njmax,
             )
             mjwarp.forward(self.wp_model, self.wp_data)
 
@@ -730,9 +740,19 @@ class LytRobotWarpAmpEnv:
         self.wp_body_subtreemass = wp.to_torch(self.wp_model.body_subtreemass)
         self.wp_geom_friction = wp.to_torch(self.wp_model.geom_friction)
         self.wp_gravity = wp.to_torch(self.wp_model.opt.gravity)
-        self.contact_geom = wp.to_torch(self.wp_data.contact.geom).long()
-        self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid).long()
-        self.contact_dim = wp.to_torch(self.wp_data.contact.dim).long()
+        # Keep the original int32 zero-copy views.  Calling ``.long()`` here
+        # allocates a one-time copy, after which contact IDs/world IDs/dims no
+        # longer follow the live Warp buffers.
+        self.contact_geom = wp.to_torch(self.wp_data.contact.geom)
+        self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid)
+        self.contact_dim = wp.to_torch(self.wp_data.contact.dim)
+        self.contact_dist = wp.to_torch(self.wp_data.contact.dist)
+        self.contact_count = wp.to_torch(self.wp_data.nacon)
+        self.contact_slot_ids = torch.arange(
+            self.contact_geom.shape[0],
+            dtype=self.contact_worldid.dtype,
+            device=self.device,
+        )
         self._warp_reset_mask = torch.zeros(
             self.num_envs,
             dtype=torch.bool,
@@ -1328,8 +1348,20 @@ class LytRobotWarpAmpEnv:
         g1 = self.contact_geom[:, 0]
         g2 = self.contact_geom[:, 1]
         world = self.contact_worldid
-        valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
-        safe_world = torch.clamp(world, 0, self.num_envs - 1)
+        # Contact storage is fixed-capacity and slots beyond nacon retain old
+        # values.  Never treat that stale tail as current contact data.
+        active_slot = self.contact_slot_ids < torch.clamp(
+            self.contact_count[0],
+            min=0,
+            max=self.contact_slot_ids.numel(),
+        )
+        valid = (
+            active_slot
+            & (self.contact_dim > 0)
+            & (world >= 0)
+            & (world < self.num_envs)
+        )
+        safe_world = torch.clamp(world, 0, self.num_envs - 1).to(torch.long)
 
         g1_terrain = torch.isin(g1, self.terrain_geom_ids)
         g2_terrain = torch.isin(g2, self.terrain_geom_ids)
@@ -1349,6 +1381,64 @@ class LytRobotWarpAmpEnv:
 
     def _foot_contacts(self) -> torch.Tensor:
         return self._side_contacts_from_geom(self._foot_geom_contacts())
+
+    def _terrain_penetration_depths(self) -> torch.Tensor:
+        """Return maximum robot/terrain overlap for every Warp world."""
+
+        g1 = self.contact_geom[:, 0]
+        g2 = self.contact_geom[:, 1]
+        world = self.contact_worldid
+        active_slot = self.contact_slot_ids < torch.clamp(
+            self.contact_count[0],
+            min=0,
+            max=self.contact_slot_ids.numel(),
+        )
+        valid_world = active_slot & (world >= 0) & (world < self.num_envs)
+        robot_terrain = torch.logical_xor(
+            torch.isin(g1, self.terrain_geom_ids),
+            torch.isin(g2, self.terrain_geom_ids),
+        )
+        valid = (self.contact_dim > 0) & valid_world & robot_terrain
+        safe_world = torch.clamp(world, 0, self.num_envs - 1).to(torch.long)
+        source = torch.where(
+            valid,
+            torch.clamp(
+                -torch.nan_to_num(
+                    self.contact_dist,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ),
+                min=0.0,
+            ),
+            torch.zeros_like(self.contact_dist),
+        )
+        result = torch.zeros(
+            self.num_envs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        result.scatter_reduce_(
+            0,
+            safe_world,
+            source,
+            reduce="amax",
+            include_self=True,
+        )
+        return result
+
+    def _resolve_terrain_reset_penetration(self, ids: torch.Tensor) -> None:
+        """Project selected reset worlds above the exact collision surface."""
+
+        for _ in range(4):
+            penetration = self._terrain_penetration_depths()[ids]
+            correction = torch.where(
+                penetration > 0.0,
+                penetration + float(STRICT_RESET_CLEARANCE),
+                torch.zeros_like(penetration),
+            )
+            self.qpos[ids, 2] += correction
+            self._warp_forward()
 
     def reset(self, env_ids: np.ndarray | list[int] | torch.Tensor | None = None) -> torch.Tensor:
         if env_ids is None:
@@ -1382,12 +1472,20 @@ class LytRobotWarpAmpEnv:
             states = self.motion.sample_states(
                 len(ids_np), self.rng, motion_ids=sampled_motion_ids
             )
-            for row, motion_id in enumerate(sampled_motion_ids):
-                states.qpos[row] = self.motion.motions[int(motion_id)].reference_qpos[0]
-                # Match the CPU serial-course reset: enter every route at rest
-                # instead of applying a reference seam velocity as an impulse.
-                states.qvel[row] = 0.0
-                states.indices[row] = 0
+            if self.cfg.serial_reference_state_init:
+                for row, motion_id in enumerate(sampled_motion_ids):
+                    # Retain the sampled gait pose/velocity/phase while
+                    # rebasing local clip travel to the course-stage entrance.
+                    motion = self.motion.motions[int(motion_id)]
+                    states.qpos[row, :2] = motion.reference_qpos[0, :2]
+            else:
+                for row, motion_id in enumerate(sampled_motion_ids):
+                    states.qpos[row] = self.motion.motions[
+                        int(motion_id)
+                    ].reference_qpos[0]
+                    # Match the legacy CPU reset for tasks that do not opt in.
+                    states.qvel[row] = 0.0
+                    states.indices[row] = 0
         elif isinstance(self.motion, MotionLibrary):
             sampled_motion_ids = self.motion.sample_motion_ids(len(ids_np), self.rng)
             states = self.motion.sample_states(len(ids_np), self.rng, motion_ids=sampled_motion_ids)
@@ -1399,15 +1497,13 @@ class LytRobotWarpAmpEnv:
         use_stand_start = self.rng.random(len(ids_np)) < float(
             np.clip(self.cfg.stand_start_prob, 0.0, 1.0)
         )
-        use_motion_reset = (
-            ~use_stand_start
-            if serial_course
-            else ~use_stand_start
-            & (
-                self.rng.random(len(ids_np))
-                < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+        if serial_course and not self.cfg.serial_reference_state_init:
+            use_motion_reset = ~use_stand_start
+        else:
+            sample_motion_state = self.rng.random(len(ids_np)) < float(
+                np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)
             )
-        )
+            use_motion_reset = ~use_stand_start & sample_motion_state
         # Mass, inertia, friction, and gravity live on the single shared Warp
         # model.  They are opt-in because one draw would otherwise change all
         # worlds at once and destroy the within-batch dynamics distribution.
@@ -1483,6 +1579,7 @@ class LytRobotWarpAmpEnv:
         self.ctrl[ids] = 0.0
         with wp.ScopedDevice(self.wp_device):
             self._warp_forward()
+            self._resolve_terrain_reset_penetration(ids)
 
         self.episode_step[ids] = 0
         self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
@@ -2180,6 +2277,15 @@ class LytRobotWarpAmpEnv:
             | (root_height > max_root_height)
             | (up_z < self.cfg.min_upright_z)
         )
+        terrain_penetration_depth = self._terrain_penetration_depths()
+        terrain_penetration = terrain_penetration_depth > max(
+            float(self.cfg.terrain_penetration_tolerance), 0.0
+        )
+        reward = reward - (
+            max(float(self.cfg.terrain_penetration_penalty_coef), 0.0)
+            * terrain_penetration_depth
+        )
+        fallen = fallen | terrain_penetration
         if self.cfg.reward_mode == "stairs":
             stair_active = self.stair_motion_mask[self.motion_ids]
             stair_surface = self._stair_surface_height(self.qpos[:, 0:1])[:, 0]
@@ -2195,6 +2301,8 @@ class LytRobotWarpAmpEnv:
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": targets["root_height"],
+            "terrain_penetration_depth": terrain_penetration_depth,
+            "terrain_penetration": terrain_penetration.to(torch.float32),
             "stair_root_clearance_value": torch.where(
                 stair_active, stair_root_clearance, torch.zeros_like(root_height)
             ),

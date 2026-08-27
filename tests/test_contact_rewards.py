@@ -9,6 +9,7 @@ import torch
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.motion import CONTACT_GEOM_NAMES, resolve_contact_geom_ids
+from lytrobot_amp.terrain import STRICT_CONTACT_MARGIN
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -163,7 +164,7 @@ class ContactRewardTests(unittest.TestCase):
         self.assertLess(foot_symmetry, 0.20)
         self.assertLess(symmetry, 0.30)
 
-    def test_foot_mesh_geoms_provide_contact_collision(self) -> None:
+    def test_every_robot_geom_collides_only_with_static_terrain(self) -> None:
         model = mujoco.MjModel.from_xml_path(str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
         contact_ids = resolve_contact_geom_ids(model)
         self.assertEqual(len(contact_ids), 4)
@@ -176,8 +177,14 @@ class ContactRewardTests(unittest.TestCase):
         )
         for geom_id in range(model.ngeom):
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
-            collision_enabled = bool(model.geom_contype[geom_id] or model.geom_conaffinity[geom_id])
-            self.assertEqual(collision_enabled, name == "floor" or name in CONTACT_GEOM_NAMES)
+            if model.geom_bodyid[geom_id] == 0:
+                self.assertEqual(model.geom_contype[geom_id], 1)
+                self.assertEqual(model.geom_conaffinity[geom_id], 0)
+            else:
+                self.assertEqual(model.geom_contype[geom_id], 0)
+                self.assertEqual(model.geom_conaffinity[geom_id], 1)
+            self.assertEqual(model.geom_condim[geom_id], 3)
+            self.assertAlmostEqual(model.geom_margin[geom_id], STRICT_CONTACT_MARGIN)
             if name in CONTACT_GEOM_NAMES:
                 self.assertEqual(model.geom_type[geom_id], mujoco.mjtGeom.mjGEOM_MESH)
                 mesh_id = int(model.geom_dataid[geom_id])
@@ -186,6 +193,37 @@ class ContactRewardTests(unittest.TestCase):
                     mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, mesh_id),
                     name,
                 )
+
+    def test_fallen_body_is_supported_without_entering_floor(self) -> None:
+        model = mujoco.MjModel.from_xml_path(
+            str(REPO_ROOT / "robot" / "MJCFmodelposition.xml")
+        )
+        model.opt.iterations = 20
+        data = mujoco.MjData(model)
+        data.qpos[:] = model.qpos0
+        data.qpos[2] = 1.2
+        data.qpos[3:7] = [np.cos(np.pi / 4.0), 0.0, np.sin(np.pi / 4.0), 0.0]
+        mujoco.mj_forward(model, data)
+
+        min_distance = float("inf")
+        contacted_nonfoot_body = False
+        for _ in range(600):
+            mujoco.mj_step(model, data)
+            for contact in data.contact[: data.ncon]:
+                min_distance = min(min_distance, float(contact.dist))
+                for geom_id in (int(contact.geom1), int(contact.geom2)):
+                    if (
+                        model.geom_bodyid[geom_id] != 0
+                        and mujoco.mj_id2name(
+                            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
+                        )
+                        not in CONTACT_GEOM_NAMES
+                    ):
+                        contacted_nonfoot_body = True
+
+        self.assertTrue(contacted_nonfoot_body)
+        self.assertGreaterEqual(min_distance, -1.0e-5)
+        self.assertGreater(data.qpos[2], 0.05)
 
 
 if __name__ == "__main__":

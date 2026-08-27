@@ -3,6 +3,36 @@
 from __future__ import annotations
 
 
+# Deployment control contract. MuJoCo integrates at 200 Hz, while the policy
+# is evaluated every two physics steps. Training, evaluation and recording all
+# consume this same 100 Hz policy clock.
+SIMULATION_TIMESTEP_S = 0.005
+CONTROL_FREQUENCY_HZ = 100.0
+CONTROL_PERIOD_S = 1.0 / CONTROL_FREQUENCY_HZ
+CONTROL_DECIMATION = 2
+
+
+def control_frequency_hz(timestep: float, decimation: int) -> float:
+    """Return policy frequency for a MuJoCo timestep/decimation pair."""
+
+    period = float(timestep) * int(decimation)
+    if period <= 0.0:
+        raise ValueError("timestep and decimation must define a positive control period.")
+    return 1.0 / period
+
+
+def require_100hz_control(timestep: float, decimation: int, *, source: str) -> None:
+    """Fail closed when a training or playback config is not the deployment clock."""
+
+    frequency = control_frequency_hz(timestep, decimation)
+    if abs(frequency - CONTROL_FREQUENCY_HZ) > 1.0e-6:
+        raise ValueError(
+            f"{source} control frequency is {frequency:g} Hz; this project requires "
+            f"exactly {CONTROL_FREQUENCY_HZ:g} Hz "
+            f"(timestep={SIMULATION_TIMESTEP_S:g}, decimation={CONTROL_DECIMATION})."
+        )
+
+
 # Preserve the native timing of CMU subject 69 trial 01 after scaling and
 # retargeting it to the LYT model.
 ORIGINAL_RETARGETED_WALK_SPEED_MPS = 0.8622949262039437

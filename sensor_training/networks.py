@@ -30,7 +30,7 @@ def build_mlp(
 
 
 class SensorActorCritic(nn.Module):
-    """GRU actor-critic with a base MLP and softly weighted residual experts.
+    """Single GRU/MLP actor with an asymmetric recurrent critic.
 
     The environment keeps its existing stacked sensor observation for AMP and
     checkpoint metadata.  The recurrent policy consumes only the newest frame;
@@ -52,10 +52,6 @@ class SensorActorCritic(nn.Module):
         *,
         sensor_frame_dim: int | None = None,
         recurrent_hidden_dim: int = 128,
-        num_experts: int = 4,
-        gate_hidden_dims: tuple[int, ...] = (128, 64),
-        expert_hidden_dims: tuple[int, ...] = (128, 64),
-        residual_scale: float = 0.35,
         privileged_context_dim: int = 0,
     ) -> None:
         super().__init__()
@@ -63,17 +59,11 @@ class SensorActorCritic(nn.Module):
         self.action_dim = int(action_dim)
         self.sensor_frame_dim = int(sensor_frame_dim or obs_dim)
         self.recurrent_hidden_dim = int(recurrent_hidden_dim)
-        self.num_experts = int(num_experts)
-        self.residual_scale = float(residual_scale)
         self.privileged_context_dim = int(privileged_context_dim)
         if not 0 < self.sensor_frame_dim <= self.obs_dim:
             raise ValueError("sensor_frame_dim must be in [1, obs_dim].")
         if self.recurrent_hidden_dim < 1:
             raise ValueError("recurrent_hidden_dim must be positive.")
-        if self.num_experts < 1:
-            raise ValueError("num_experts must be positive.")
-        if self.residual_scale < 0.0:
-            raise ValueError("residual_scale must be non-negative.")
         if self.privileged_context_dim < 0:
             raise ValueError("privileged_context_dim must be non-negative.")
 
@@ -83,20 +73,6 @@ class SensorActorCritic(nn.Module):
             self.recurrent_hidden_dim,
             actor_hidden_dims,
             self.action_dim,
-        )
-        self.gate = build_mlp(
-            self.recurrent_hidden_dim,
-            gate_hidden_dims,
-            self.num_experts,
-        )
-        self.experts = nn.ModuleList(
-            build_mlp(
-                self.recurrent_hidden_dim,
-                expert_hidden_dims,
-                self.action_dim,
-                output_activation=nn.Tanh(),
-            )
-            for _ in range(self.num_experts)
         )
         critic_input_dim = self.recurrent_hidden_dim + self.privileged_context_dim
         self.critic = build_mlp(critic_input_dim, critic_hidden_dims, 1)
@@ -159,34 +135,25 @@ class SensorActorCritic(nn.Module):
         current_frame = obs[:, -self.sensor_frame_dim :]
         return self.recurrent(current_frame, hidden_state)
 
-    def _actor_outputs(
-        self,
-        hidden_state: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        base_logits = self.actor(hidden_state)
-        gate_weights = torch.softmax(self.gate(hidden_state), dim=-1)
-        expert_actions = torch.stack(
-            tuple(expert(hidden_state) for expert in self.experts),
-            dim=1,
-        )
-        residual = torch.sum(gate_weights.unsqueeze(-1) * expert_actions, dim=1)
-        mean = torch.tanh(base_logits + self.residual_scale * residual)
-        return mean, gate_weights, residual
+    def _actor_mean(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Map one recurrent state through the single deployment actor."""
+
+        return torch.tanh(self.actor(hidden_state))
 
     def _distribution_from_hidden(
         self,
         hidden_state: torch.Tensor,
-    ) -> tuple[Normal, torch.Tensor, torch.Tensor]:
-        mean, gate_weights, residual = self._actor_outputs(hidden_state)
+    ) -> Normal:
+        mean = self._actor_mean(hidden_state)
         std = torch.exp(self._clamped_log_std()).expand_as(mean)
-        return Normal(mean, std), gate_weights, residual
+        return Normal(mean, std)
 
     def _distribution(self, obs: torch.Tensor) -> Normal:
         """Stateless compatibility distribution for one-shot callers."""
 
         hidden = self.initial_state(obs.shape[0], device=obs.device, dtype=obs.dtype)
         next_hidden = self._next_hidden(obs, hidden, None)
-        return self._distribution_from_hidden(next_hidden)[0]
+        return self._distribution_from_hidden(next_hidden)
 
     def _critic_features(
         self,
@@ -240,11 +207,9 @@ class SensorActorCritic(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
     ]:
         next_hidden = self._next_hidden(obs, hidden_state, episode_start)
-        dist, gate_weights, residual = self._distribution_from_hidden(next_hidden)
+        dist = self._distribution_from_hidden(next_hidden)
         if action is None:
             # Keep raw Gaussian samples for an unbiased likelihood ratio.  The
             # actuator environment performs the physical command clipping.
@@ -261,8 +226,6 @@ class SensorActorCritic(nn.Module):
             value,
             median_value,
             next_hidden,
-            gate_weights,
-            residual,
         )
 
     def evaluate_sequence(
@@ -279,8 +242,6 @@ class SensorActorCritic(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
     ]:
         """Evaluate a time-major rollout with truncated BPTT."""
 
@@ -291,8 +252,6 @@ class SensorActorCritic(nn.Module):
         entropies: list[torch.Tensor] = []
         values: list[torch.Tensor] = []
         median_values: list[torch.Tensor] = []
-        gate_weights: list[torch.Tensor] = []
-        residuals: list[torch.Tensor] = []
         context_predictions: list[torch.Tensor] = []
         for step in range(obs.shape[0]):
             (
@@ -302,8 +261,6 @@ class SensorActorCritic(nn.Module):
                 value,
                 median_value,
                 hidden,
-                weights,
-                residual,
             ) = self.recurrent_action_and_value(
                 obs[step],
                 hidden,
@@ -319,8 +276,6 @@ class SensorActorCritic(nn.Module):
             entropies.append(entropy)
             values.append(value)
             median_values.append(median_value)
-            gate_weights.append(weights)
-            residuals.append(residual)
             context_predictions.append(self.predict_context(hidden))
         return (
             torch.stack(log_probs),
@@ -328,8 +283,6 @@ class SensorActorCritic(nn.Module):
             torch.stack(values),
             torch.stack(median_values),
             hidden,
-            torch.stack(gate_weights),
-            torch.stack(residuals),
             torch.stack(context_predictions),
         )
 
@@ -365,7 +318,7 @@ class SensorActorCritic(nn.Module):
         episode_start: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         next_hidden = self._next_hidden(obs, hidden_state, episode_start)
-        mean, _gate_weights, _residual = self._actor_outputs(next_hidden)
+        mean = self._actor_mean(next_hidden)
         return torch.clamp(mean, -1.0, 1.0), next_hidden
 
 
@@ -393,5 +346,5 @@ class RecurrentSensorActorExport(nn.Module):
             observation[:, -self.policy.sensor_frame_dim :],
             recurrent_state,
         )
-        action, _weights, _residual = self.policy._actor_outputs(next_hidden)
+        action = self.policy._actor_mean(next_hidden)
         return torch.clamp(action, -1.0, 1.0), next_hidden

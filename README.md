@@ -14,7 +14,8 @@
 42 维 IMU 和 14 维实际肌腱长度，共 56 维；不接收关节状态、根部真值、目标速度、
 技能标签或地形参数。蹲起是唯一例外：在相同的 336 维传感器历史后附加当前控制器的
 `sin/cos` 相位，因此为 338 维。该相位由肌腱长度估计的蹲起深度和 IMU 姿态反馈校正，
-不是仿真真值。训练环境维护 6 帧传感器历史，策略由 128 维 GRU 隐状态形成因果记忆。
+不是仿真真值。行走 Actor 只传输当前 56 维帧，由 128 维 GRU 隐状态形成因果记忆；
+6 帧历史仅为 AMP 判别器保留，不再作为冗余 Actor 输入搬运。
 AMP、任务奖励和 asymmetric critic 可以使用训练期仿真真值，但这些值不会进入 actor
 或导出的 ONNX。普通行走策略日志写入 `logs/sensor_policy/`，全地形和无阶梯串联课程日志
 统一写入 `logs/multimotion/`，独立阶梯训练写入 `logs/stairs/`；旧完整状态 checkpoint、
@@ -171,6 +172,23 @@ uv run python sensor_training/play.py \
 也会使用新的随机 seed 生成路线。训练经过入口预热后逐步加入随机后续阶段 reset，避免
 后段地形样本饥饿；测试和完整路线成功率仍强制从入口连续走到出口。
 
+当前配置以“先稳定走完全程”为目标，使用已验证的
+`multimotion/walk_omniretarget.npz` 与 `multimotion/rough_walk_omniretarget.npz`，目标速度约
+`0.8623 m/s`，不再强制单一 1.39 m/s 快走参考。Stage 1 reset 中 50% 使用随机步态
+姿态、速度和相位学习步态延续，另外 50% 保持回放一致的“路线入口、phase 0、静止”
+起点；后续地形随机 reset 从 5000 轮开始开放，到 15000 轮达到 80%，使粗糙地面和坡面
+获得足够训练样本。参考状态的局部 X/Y 位移会重定位到路段入口，不会虚增路线进度。
+Actor 和 ONNX 输入仍严格只有 IMU 与肌肉长度，参考动作、相位、目标速度和地形标签均
+不进入网络或执行器基准。
+
+机器人所有实体几何现在都只与静态地形碰撞，机器人内部不产生自碰撞；地面、平台、
+坡面和高度场统一使用硬接触参数。Warp 每个 world 的接触/约束容量提高到 `128/512`，
+原生凸体碰撞保持开启，随机 reset 会按实际碰撞面上抬直至零嵌入。训练对每毫米地形
+嵌入施加惩罚，深度超过 1 cm 立即终止；支撑脚切向速度另有独立滑移惩罚。
+
+`08-25-11:38:09` 运行使用了失效的串联 reset（配置的 `motion_reset_prob=0.5` 实际被
+强制覆盖成 phase 0 + 零速度），不能通过继续增加旧训练轮数修复，应从头启动新 run。
+
 Stage 1 训练：
 
 ```bash
@@ -181,7 +199,7 @@ Stage 1 有界面测试：
 
 ```bash
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/no_stairs/stage1/08-18-08:42:56/model_final.onnx\
+  --checkpoint logs/multimotion/no_stairs/stage1/08-27-10:25:51/model_best.onnx\
   --stage stage1 \
   --device cuda \
   --viewer \
@@ -419,9 +437,9 @@ iteration 写本地日志，W&B 默认每 10 轮上报一次。第一阶段强�
 需要复现时必须同时传 `--seed N --no-episode-random-seed`。完整命令统一放在本文开头
 “所有任务的两阶段训练与测试命令”。
 
-训练默认启用 Warp CUDA Graph，求解器使用 `iterations=10`、`ls_iterations=20`，每个 world 预留 32 个 contact 和 64 个 constraint。可分别用 `--no-warp-cuda-graph`、`--solver-iterations`、`--solver-ls-iterations`、`--warp-nconmax`、`--warp-njmax` 做回退或容量调试。默认不主动 sleep；与桌面共用 GPU 时可显式增加 `--iteration-sleep-ms 10`。
+训练默认启用 Warp CUDA Graph，物理积分周期为 `0.005 s`、策略 `decimation=2`，因此训练、测试和部署 ONNX 均为 `100 Hz` 控制。入口拒绝其他控制频率以及旧 50 Hz checkpoint，防止训练/测试动力学错配。求解器使用 `iterations=20`、`ls_iterations=20`，每个 world 预留 128 个 contact 和 512 个 constraint。运行时也会把旧 checkpoint 中更小的碰撞容量提升到该下限，避免无台阶串联地形上的全身接触被静默截断。可分别用 `--no-warp-cuda-graph`、`--solver-iterations`、`--solver-ls-iterations`、`--warp-nconmax`、`--warp-njmax` 做容量调试。默认不主动 sleep；与桌面共用 GPU 时可显式增加 `--iteration-sleep-ms 10`。
 
-机器人 STL 只用于显示和惯量，碰撞仅保留双脚掌和脚趾的 4 个简化 box。旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期训练主内存增长问题；当前版本默认关闭周期性 Python GC，但仍保留 32GB RSS 安全停止保护，必要时可通过 `--memory-cleanup-interval` 恢复定期回收。
+机器人全身 STL 凸碰撞体均与静态地形建立碰撞约束，脚掌和脚趾的 4 个具名网格同时用于接触奖励；碰撞掩码禁止机器人内部自碰撞。旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期训练主内存增长问题；当前版本默认关闭周期性 Python GC，但仍保留 32GB RSS 安全停止保护，必要时可通过 `--memory-cleanup-interval` 恢复定期回收。
 
 `--stage1-checkpoint` 用来指定第一阶段权重 `model_final.pt`，并把第二阶段的 iteration 与 `global_step` 从 0 重新计数。蹲起 Stage2 还会重置优化器，并根据成功率、下蹲深度和异常终止率自适应调整域随机化强度；不要把旧 Stage2 checkpoint 传给这个参数。也可以使用等价别名 `--stage1-model`。如果需要恢复第二阶段自身的中断训练，使用底层参数 `--resume-checkpoint logs/sensor_policy/stage2/<run>/model_final.pt`，此时会保留第二阶段已有的训练进度、域随机化强度和优化器状态。旧版训练产生的编号 checkpoint 仍可加载，但新训练不会再生成。
 
@@ -480,7 +498,7 @@ run 和 iteration，例如：
 logs/sensor_policy/stage1/recordings/06-06-21-19-41-2049.mp4
 ```
 
-默认录制为 1080p、30fps、H.264、`yuv420p`、`faststart` MP4，兼容 PPT 和微信播放。MuJoCo 窗口和录屏镜头都会始终跟随机器人 `pelvis` 移动。重复测试同一个权重时会自动追加 `-2`、`-3`，避免覆盖已有视频。
+默认录制为 1080p、30fps、H.264、`yuv420p`、`faststart` MP4，兼容 PPT 和微信播放。播放循环固定使用 100 Hz 实时墙钟节拍，录屏按照仿真时间重采样为 30fps，因此 1 秒视频严格对应 1 秒仿真，不存在倍速或逐控制步写帧造成的慢放。MuJoCo 窗口和录屏镜头都会始终跟随机器人 `pelvis` 移动。重复测试同一个权重时会自动追加 `-2`、`-3`，避免覆盖已有视频。
 
 所有 checkpoint 播放入口统一采用持续重复测试语义：只要 viewer 没有关闭就一直运行。
 循环动作直接继续下一个周期；非循环动作、完整多地形路线或单次蹲起完成后，从稳定的

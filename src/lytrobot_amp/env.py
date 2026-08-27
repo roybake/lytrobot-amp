@@ -17,8 +17,10 @@ from .motion import (
     load_motion_library,
     resolve_contact_geom_ids,
 )
+from .training_defaults import CONTROL_DECIMATION, SIMULATION_TIMESTEP_S
 from .terrain import (
     MoreTerrainCfg,
+    STRICT_RESET_CLEARANCE,
     StairTerrainCfg,
     course_end_x,
     course_motion_sequence,
@@ -235,6 +237,12 @@ class LytRobotEnvCfg:
     terrain_course_run_out: float = 3.10
     terrain_course_base_height: float = 0.30
     terrain_course_random_assignment: bool = True
+    # Training-only AMP state initialization for serial courses.  When
+    # enabled, ``motion_reset_prob`` samples a physically moving reference
+    # pose/velocity/phase while keeping the robot at the selected stage's
+    # spatial entrance.  Deployment playback sets motion_reset_prob=0 and
+    # therefore still starts from rest at phase zero.
+    serial_reference_state_init: bool = False
     terrain_course_completion_reward: float = 25.0
     terrain_course_stage_reward: float = 0.0
     terrain_course_stage_tolerance: float = 0.35
@@ -247,15 +255,17 @@ class LytRobotEnvCfg:
     num_envs: int = 4096
     seed: int = 42
     randomize_episode_seed: bool = False
-    decimation: int = 4
-    timestep: float = 0.005
-    solver_iterations: int = 10
+    decimation: int = CONTROL_DECIMATION
+    timestep: float = SIMULATION_TIMESTEP_S
+    solver_iterations: int = 20
     solver_ls_iterations: int = 20
-    warp_nconmax: int = 32
-    warp_njmax: int = 128
+    warp_nconmax: int = 128
+    warp_njmax: int = 512
     warp_cuda_graph: bool = True
-    episode_steps: int = 1000
-    episode_timeout_jitter_steps: int = 240
+    terrain_penetration_tolerance: float = 0.01
+    terrain_penetration_penalty_coef: float = 0.0
+    episode_steps: int = 2000
+    episode_timeout_jitter_steps: int = 480
     target_velocity: float = 1.0
     reward_mode: str = "default"
     forward_velocity_tracking_sigma: float = 0.25
@@ -264,8 +274,8 @@ class LytRobotEnvCfg:
     forward_velocity_deficit_penalty_coef: float = 0.0
     forward_velocity_excess_penalty_coef: float = 0.0
     min_forward_progress_speed: float = 0.0
-    forward_progress_grace_steps: int = 50
-    forward_progress_window_steps: int = 50
+    forward_progress_grace_steps: int = 100
+    forward_progress_window_steps: int = 100
     forward_progress_termination_penalty: float = 2.0
     fall_penalty: float = 2.0
     terminate_incomplete_motion_end: bool = False
@@ -309,12 +319,12 @@ class LytRobotEnvCfg:
     symmetry_foot_weight: float = 0.60
     symmetry_contact_weight: float = 0.25
     symmetry_action_weight: float = 0.15
-    startup_action_ramp_steps: int = 20
+    startup_action_ramp_steps: int = 40
     stand_start_prob: float = 0.5
-    stand_start_phase_delay_steps: int = 25
-    stand_start_transition_min_steps: int = 80
-    stand_start_transition_max_steps: int = 160
-    stand_start_push_delay_steps: int = 100
+    stand_start_phase_delay_steps: int = 50
+    stand_start_transition_min_steps: int = 160
+    stand_start_transition_max_steps: int = 320
+    stand_start_push_delay_steps: int = 200
     # Used only by squat_training's phase-clock supervisor.  Other tasks do
     # not read these fields and therefore retain their original phase logic.
     squat_phase_feedback: bool = False
@@ -324,7 +334,7 @@ class LytRobotEnvCfg:
     squat_stand_depth_threshold: float = 0.15
     squat_upright_threshold: float = 0.75
     squat_phase_stall_threshold: float = 0.25
-    squat_phase_max_stall_steps: int = 40
+    squat_phase_max_stall_steps: int = 80
     squat_phase_stall_penalty: float = 0.25
     squat_phase_slowdown_penalty_coef: float = 2.0
     squat_cycle_completion_bonus: float = 5.0
@@ -348,10 +358,10 @@ class LytRobotEnvCfg:
     gravity_max: float = 9.85
     push_force_min: float = 0.0
     push_force_max: float = 80.0
-    push_interval_min_steps: int = 25
-    push_interval_max_steps: int = 100
-    push_duration_min_steps: int = 2
-    push_duration_max_steps: int = 8
+    push_interval_min_steps: int = 50
+    push_interval_max_steps: int = 200
+    push_duration_min_steps: int = 4
+    push_duration_max_steps: int = 16
     obs_noise_std: float = 0.02
     action_noise_std: float = 0.01
     action_delay_min_ms: float = 2.0
@@ -424,7 +434,10 @@ class LytRobotAmpEnv:
             self.more_terrain_cfg,
         )
         self.model.opt.timestep = float(cfg.timestep)
-        self.model.opt.iterations = max(1, int(cfg.solver_iterations))
+        # Collision contacts are safety constraints for this robot.  Keep a
+        # hard minimum even when replaying an older checkpoint that stored the
+        # former 10-iteration setting.
+        self.model.opt.iterations = max(20, int(cfg.solver_iterations))
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
         self.position_actuator_ids = np.arange(self.model.nu, dtype=np.int32)
         self.position_action_dim = int(len(self.position_actuator_ids))
@@ -1158,6 +1171,28 @@ class LytRobotAmpEnv:
     def _foot_contacts(self, data: mujoco.MjData) -> np.ndarray:
         return self._side_contacts_from_geom(self._foot_geom_contacts(data))
 
+    def _terrain_penetration_depth(self, data: mujoco.MjData) -> float:
+        penetration = 0.0
+        for contact_id in range(data.ncon):
+            contact = data.contact[contact_id]
+            geom1_terrain = int(contact.geom1) in self.terrain_geom_ids
+            geom2_terrain = int(contact.geom2) in self.terrain_geom_ids
+            if geom1_terrain == geom2_terrain:
+                continue
+            penetration = max(penetration, -float(contact.dist))
+        return penetration
+
+    def _resolve_terrain_reset_penetration(self, data: mujoco.MjData) -> None:
+        """Lift a reset state until no robot geom starts inside terrain."""
+
+        for _ in range(4):
+            mujoco.mj_forward(self.model, data)
+            penetration = self._terrain_penetration_depth(data)
+            if penetration <= 0.0:
+                return
+            data.qpos[2] += penetration + STRICT_RESET_CLEARANCE
+        mujoco.mj_forward(self.model, data)
+
     def reset(self, env_ids: np.ndarray | list[int] | None = None) -> np.ndarray:
         if env_ids is None:
             ids = np.arange(self.num_envs, dtype=np.int32)
@@ -1189,13 +1224,24 @@ class LytRobotAmpEnv:
             states = self.motion.sample_states(
                 len(ids), self.rng, motion_ids=sampled_motion_ids
             )
-            for row, motion_id in enumerate(sampled_motion_ids):
-                states.qpos[row] = self.motion.motions[int(motion_id)].reference_qpos[0]
-                # A serial course always starts at its entrance.  Starting at
-                # rest avoids turning a corrupt reference seam into an impulse
-                # and lets the policy learn the acceleration into its route.
-                states.qvel[row] = 0.0
-                states.indices[row] = 0
+            if self.cfg.serial_reference_state_init:
+                for row, motion_id in enumerate(sampled_motion_ids):
+                    # MotionReference root X/Y is local clip travel.  Preserve
+                    # the sampled gait pose, velocity and phase, but let the
+                    # terrain spawn offset place it at the physical stage
+                    # entrance.  This keeps full-route success honest instead
+                    # of moving a reset several metres down the course.
+                    motion = self.motion.motions[int(motion_id)]
+                    states.qpos[row, :2] = motion.reference_qpos[0, :2]
+            else:
+                for row, motion_id in enumerate(sampled_motion_ids):
+                    states.qpos[row] = self.motion.motions[
+                        int(motion_id)
+                    ].reference_qpos[0]
+                    # Tasks that do not explicitly opt into serial reference
+                    # initialization retain the legacy phase-zero rest reset.
+                    states.qvel[row] = 0.0
+                    states.indices[row] = 0
         elif isinstance(self.motion, MotionLibrary):
             sampled_motion_ids = self.motion.sample_motion_ids(len(ids), self.rng)
             states = self.motion.sample_states(len(ids), self.rng, motion_ids=sampled_motion_ids)
@@ -1211,15 +1257,13 @@ class LytRobotAmpEnv:
         use_stand_start = self.rng.random(len(ids)) < float(
             np.clip(self.cfg.stand_start_prob, 0.0, 1.0)
         )
-        use_motion_reset = (
-            ~use_stand_start
-            if serial_course
-            else ~use_stand_start
-            & (
-                self.rng.random(len(ids))
-                < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
+        if serial_course and not self.cfg.serial_reference_state_init:
+            use_motion_reset = ~use_stand_start
+        else:
+            sample_motion_state = self.rng.random(len(ids)) < float(
+                np.clip(self.cfg.motion_reset_prob, 0.0, 1.0)
             )
-        )
+            use_motion_reset = ~use_stand_start & sample_motion_state
         self._sample_domain_randomization(ids)
         self.stand_start[ids] = use_stand_start
         self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids))
@@ -1284,7 +1328,7 @@ class LytRobotAmpEnv:
 
             data.qpos[:] = qpos
             data.qvel[:] = qvel
-            mujoco.mj_forward(self.model, data)
+            self._resolve_terrain_reset_penetration(data)
             if isinstance(self.motion, MotionLibrary):
                 reference_ctrl = self.motion.targets_at_phase(
                     np.asarray([phase], dtype=np.float32),
@@ -2011,6 +2055,15 @@ class LytRobotAmpEnv:
             or root_height > max_root_height
             or up_z < self.cfg.min_upright_z
         )
+        terrain_penetration_depth = self._terrain_penetration_depth(data)
+        terrain_penetration = terrain_penetration_depth > max(
+            float(self.cfg.terrain_penetration_tolerance), 0.0
+        )
+        reward -= (
+            max(float(self.cfg.terrain_penetration_penalty_coef), 0.0)
+            * terrain_penetration_depth
+        )
+        fallen = fallen or terrain_penetration
         stair_root_clearance = 0.0
         stair_terrain_penetration = False
         if self.cfg.reward_mode == "stairs" and self.stair_motion_mask[
@@ -2029,6 +2082,8 @@ class LytRobotAmpEnv:
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": ref_root_height,
+            "terrain_penetration_depth": terrain_penetration_depth,
+            "terrain_penetration": float(terrain_penetration),
             "stair_root_clearance_value": stair_root_clearance,
             "stair_terrain_penetration": float(stair_terrain_penetration),
             "root_vel": root_vel,

@@ -82,7 +82,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             ["rough", "slope_up", "slope_down", "stairs"],
         )
 
-    def test_real_multimotion_env_exposes_only_336_sensor_values(self) -> None:
+    def test_real_multimotion_env_exposes_only_current_56_sensor_values(self) -> None:
         motion_dir = REPO_ROOT / "robot" / "reference_data" / "multimotion"
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
@@ -121,8 +121,9 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         )
         try:
             observation = env.reset()
-            self.assertEqual(env.obs_dim, 336)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertEqual(env.obs_dim, 56)
+            self.assertEqual(env.sensor_history_obs_dim, 336)
+            self.assertEqual(observation.shape, (1, 56))
             self.assertTrue(np.isfinite(observation).all())
             privileged_context = env.privileged_observe()
             self.assertEqual(
@@ -191,7 +192,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             self.assertEqual(tuple(recurrent_state.shape), (1, 128))
             self.assertFalse(torch.equal(recurrent_state, torch.zeros_like(recurrent_state)))
             observation, reward, done, _info = env.step(action)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertEqual(observation.shape, (1, 56))
             self.assertTrue(np.isfinite(observation).all())
             self.assertTrue(np.isfinite(reward).all())
             self.assertTrue(np.isfinite(done).all())

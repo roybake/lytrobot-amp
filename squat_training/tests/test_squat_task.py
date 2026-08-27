@@ -169,7 +169,7 @@ class SquatTaskTests(unittest.TestCase):
             )
             self.assertEqual(
                 env.observation_metadata["phase_feedback"]["max_stall_steps"],
-                40,
+                80,
             )
             self.assertEqual(
                 env.observation_metadata["success_definition"],

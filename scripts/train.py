@@ -32,6 +32,11 @@ import torch
 
 from lytrobot_amp import __version__
 from lytrobot_amp.env import LytRobotEnvCfg
+from lytrobot_amp.training_defaults import (
+    CONTROL_DECIMATION,
+    CONTROL_FREQUENCY_HZ,
+    require_100hz_control,
+)
 from sensor_training.ppo_config import SensorPPOAMPConfig as PPOAMPConfig
 from sensor_training.trainer import SensorHistoryPPOAMPTrainer as PPOAMPTrainer
 
@@ -244,6 +249,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--serial-reference-state-init",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow motion_reset_prob to initialize a serial-course training "
+            "episode from a moving reference gait state at the stage entrance."
+        ),
+    )
     parser.add_argument("--log-root", default=str(REPO_ROOT / "logs" / "sensor_policy"))
     parser.add_argument(
         "--log-group",
@@ -289,14 +303,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=24)
-    parser.add_argument("--episode-steps", type=int, default=1000)
-    parser.add_argument("--episode-timeout-jitter-steps", type=int, default=240)
-    parser.add_argument("--decimation", type=int, default=4)
-    parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument("--episode-steps", type=int, default=2000)
+    parser.add_argument("--episode-timeout-jitter-steps", type=int, default=480)
+    parser.add_argument(
+        "--decimation",
+        type=int,
+        default=CONTROL_DECIMATION,
+        help="Fixed at 2 with the 0.005 s physics timestep for 100 Hz control.",
+    )
+    parser.add_argument("--solver-iterations", type=int, default=20)
     parser.add_argument("--solver-ls-iterations", type=int, default=20)
-    parser.add_argument("--warp-nconmax", type=int, default=32)
-    parser.add_argument("--warp-njmax", type=int, default=128)
+    parser.add_argument("--warp-nconmax", type=int, default=128)
+    parser.add_argument("--warp-njmax", type=int, default=512)
+    parser.add_argument("--terrain-penetration-tolerance", type=float, default=0.01)
+    parser.add_argument("--terrain-penetration-penalty-coef", type=float, default=0.0)
     parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compile-policy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compile recurrent BPTT on CUDA for long training runs. The first "
+            "policy update has a one-time compilation cost; one-iteration smoke "
+            "runs disable it automatically."
+        ),
+    )
+    parser.add_argument(
+        "--fused-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use numerically equivalent fused CUDA Adam updates.",
+    )
     parser.add_argument("--target-velocity", type=float, default=1.0)
     parser.add_argument(
         "--reward-mode",
@@ -318,8 +355,8 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Terminate policies whose net world-X speed stays below this threshold; 0 disables.",
     )
-    parser.add_argument("--forward-progress-grace-steps", type=int, default=50)
-    parser.add_argument("--forward-progress-window-steps", type=int, default=50)
+    parser.add_argument("--forward-progress-grace-steps", type=int, default=100)
+    parser.add_argument("--forward-progress-window-steps", type=int, default=100)
     parser.add_argument("--forward-progress-termination-penalty", type=float, default=2.0)
     parser.add_argument("--fall-penalty", type=float, default=2.0)
     parser.add_argument(
@@ -391,12 +428,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symmetry-foot-weight", type=float, default=0.60)
     parser.add_argument("--symmetry-contact-weight", type=float, default=0.25)
     parser.add_argument("--symmetry-action-weight", type=float, default=0.15)
-    parser.add_argument("--startup-action-ramp-steps", type=int, default=20)
+    parser.add_argument("--startup-action-ramp-steps", type=int, default=40)
     parser.add_argument("--stand-start-prob", type=float, default=0.5)
-    parser.add_argument("--stand-start-phase-delay-steps", type=int, default=25)
-    parser.add_argument("--stand-start-transition-min-steps", type=int, default=80)
-    parser.add_argument("--stand-start-transition-max-steps", type=int, default=160)
-    parser.add_argument("--stand-start-push-delay-steps", type=int, default=100)
+    parser.add_argument("--stand-start-phase-delay-steps", type=int, default=50)
+    parser.add_argument("--stand-start-transition-min-steps", type=int, default=160)
+    parser.add_argument("--stand-start-transition-max-steps", type=int, default=320)
+    parser.add_argument("--stand-start-push-delay-steps", type=int, default=200)
     parser.add_argument(
         "--squat-phase-feedback",
         action=argparse.BooleanOptionalAction,
@@ -412,7 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--squat-stand-depth-threshold", type=float, default=0.15)
     parser.add_argument("--squat-upright-threshold", type=float, default=0.75)
     parser.add_argument("--squat-phase-stall-threshold", type=float, default=0.25)
-    parser.add_argument("--squat-phase-max-stall-steps", type=int, default=40)
+    parser.add_argument("--squat-phase-max-stall-steps", type=int, default=80)
     parser.add_argument("--squat-phase-stall-penalty", type=float, default=0.25)
     parser.add_argument(
         "--squat-phase-slowdown-penalty-coef", type=float, default=2.0
@@ -483,10 +520,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity-max", type=float, default=9.85)
     parser.add_argument("--push-force-min", type=float, default=0.0)
     parser.add_argument("--push-force-max", type=float, default=80.0)
-    parser.add_argument("--push-interval-min-steps", type=int, default=25)
-    parser.add_argument("--push-interval-max-steps", type=int, default=100)
-    parser.add_argument("--push-duration-min-steps", type=int, default=2)
-    parser.add_argument("--push-duration-max-steps", type=int, default=8)
+    parser.add_argument("--push-interval-min-steps", type=int, default=50)
+    parser.add_argument("--push-interval-max-steps", type=int, default=200)
+    parser.add_argument("--push-duration-min-steps", type=int, default=4)
+    parser.add_argument("--push-duration-max-steps", type=int, default=16)
     parser.add_argument("--obs-noise-std", type=float, default=0.02)
     parser.add_argument("--action-noise-std", type=float, default=0.01)
     parser.add_argument("--action-delay-min-ms", type=float, default=2.0)
@@ -814,9 +851,6 @@ def _setup_wandb_metrics() -> None:
         "bpo_target_ratio",
         "bpo_policy_weight",
         "bpo_median_advantage_abs",
-        "gate_change_loss",
-        "expert_load_balance_loss",
-        "residual_l2_loss",
         "privileged_context_loss",
         "policy_updates_skipped_nonfinite",
         "policy_samples_dropped_nonfinite",
@@ -1333,6 +1367,11 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
+    require_100hz_control(
+        LytRobotEnvCfg.timestep,
+        args.decimation,
+        source="training",
+    )
     if args.seed is None:
         args.seed = secrets.randbits(32)
     if args.skill_conditioning:
@@ -1384,6 +1423,10 @@ def main() -> None:
         )
     if args.min_forward_progress_speed < 0.0:
         raise ValueError("--min-forward-progress-speed must be non-negative.")
+    if args.terrain_penetration_tolerance < 0.0:
+        raise ValueError("--terrain-penetration-tolerance must be non-negative.")
+    if args.terrain_penetration_penalty_coef < 0.0:
+        raise ValueError("--terrain-penetration-penalty-coef must be non-negative.")
     if args.serial_terrain_course and args.min_forward_progress_speed <= 0.0:
         raise ValueError(
             "Serial-course training requires --min-forward-progress-speed above zero "
@@ -1513,7 +1556,7 @@ def main() -> None:
     print(f"[INFO] log_dir={log_dir}")
     print(
         f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
-        f"seed={args.seed}, control=position, "
+        f"seed={args.seed}, control=position@{CONTROL_FREQUENCY_HZ:g}Hz, "
         f"domain_randomization={args.domain_randomization}, "
         f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
     )
@@ -1555,6 +1598,7 @@ def main() -> None:
         terrain_course_run_out=args.terrain_course_run_out,
         terrain_course_base_height=args.terrain_course_base_height,
         terrain_course_random_assignment=bool(args.terrain_course_random_assignment),
+        serial_reference_state_init=bool(args.serial_reference_state_init),
         terrain_course_completion_reward=args.terrain_course_completion_reward,
         terrain_course_stage_reward=args.terrain_course_stage_reward,
         terrain_course_stage_tolerance=args.terrain_course_stage_tolerance,
@@ -1571,6 +1615,8 @@ def main() -> None:
         solver_ls_iterations=args.solver_ls_iterations,
         warp_nconmax=args.warp_nconmax,
         warp_njmax=args.warp_njmax,
+        terrain_penetration_tolerance=args.terrain_penetration_tolerance,
+        terrain_penetration_penalty_coef=args.terrain_penetration_penalty_coef,
         warp_cuda_graph=args.warp_cuda_graph,
         target_velocity=args.target_velocity,
         reward_mode=args.reward_mode,
@@ -1718,6 +1764,8 @@ def main() -> None:
         min_action_std=args.min_action_std,
         max_action_std=args.max_action_std,
         episode_metric_window=args.episode_metric_window,
+        compile_policy=bool(args.compile_policy and args.max_iterations != 1),
+        fused_optimizer=bool(args.fused_optimizer),
     )
     save_config(log_dir, args, env_cfg, ppo_cfg)
 

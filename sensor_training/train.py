@@ -30,7 +30,7 @@ def main() -> None:
         sys.argv.extend(
             [
                 "--wandb-tags",
-                "lytrobot,bpo,amp,imu,tendon,recurrent,gru,residual-moe",
+                "lytrobot,bpo,amp,imu,tendon,recurrent,gru,single-actor-mlp",
             ]
         )
 

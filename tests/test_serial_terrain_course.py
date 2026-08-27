@@ -170,7 +170,7 @@ def test_serial_stair_reward_surface_matches_compiled_collision_surface() -> Non
     ]
     assert stair_geom_ids
     assert np.all(model.geom_contype[stair_geom_ids] == 1)
-    assert np.all(model.geom_conaffinity[stair_geom_ids] == 1)
+    assert np.all(model.geom_conaffinity[stair_geom_ids] == 0)
 
 
 def test_course_curriculum_starts_preserve_full_route_population() -> None:
@@ -519,7 +519,7 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
 
         for env_id, data in enumerate(env.datas):
             data.qpos[0] = env.course_stage_end_x[env.course_variant_ids[env_id], 0]
-            mujoco.mj_forward(env.model, data)
+            env._resolve_terrain_reset_penetration(data)
         previous_reference_ctrl = env.last_reference_ctrl.copy()
         env.motion_phase[:] = env.motion.frame_counts[env.motion_ids] - 1.1
         _, _, done, info = env.step(
@@ -637,11 +637,14 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
             atol=1.0e-7,
         )
         # The natural pose is placed on the selected course lane/datum.
-        np.testing.assert_allclose(
-            [data.qpos[2] for data in env.datas],
-            env.motion.model_qpos0[2] + env.more_terrain_cfg.course_base_height,
-            atol=1.0e-7,
+        nominal_height = (
+            env.motion.model_qpos0[2] + env.more_terrain_cfg.course_base_height
         )
+        root_heights = np.asarray([data.qpos[2] for data in env.datas])
+        assert np.all(root_heights >= nominal_height)
+        assert np.all(root_heights <= nominal_height + 0.01)
+        for data in env.datas:
+            assert all(float(contact.dist) >= 0.0 for contact in data.contact[: data.ncon])
 
         # A finite rough-terrain clip may not run to its final frame while the
         # robot is still at the stage entrance. This is the regression that
@@ -675,5 +678,105 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
         unchanged, limited, _ = env._sync_serial_course_phase(requested, frame_counts)
         np.testing.assert_allclose(unchanged, requested)
         assert not np.any(limited)
+    finally:
+        env.close()
+
+
+def test_opt_in_serial_reference_state_init_honors_motion_reset_probability() -> None:
+    """AMP gait states train continuation without moving resets down-course."""
+
+    names = ("walk", "rough_walk")
+    paths = tuple(
+        str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
+    )
+    env = LytRobotAmpEnv(
+        LytRobotEnvCfg(
+            motion_files=paths,
+            motion_names=names,
+            motion_loop=(True, True),
+            terrain_types=("flat", "rough", "slope_up", "slope_down"),
+            serial_terrain_course=True,
+            serial_reference_state_init=True,
+            terrain_course_variants=1,
+            terrain_course_random_assignment=False,
+            terrain_course_random_start_prob=0.0,
+            num_envs=32,
+            stand_start_prob=0.0,
+            motion_reset_prob=1.0,
+            reset_noise_scale=0.0,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        env.reset()
+        assert np.any(env.motion_phase > 0.0)
+        assert np.all(
+            np.asarray([data.qvel[0] for data in env.datas]) > 0.0
+        )
+        # Sampled clip travel is rebased; every full-route episode still
+        # begins at the physical run-in spawn rather than several metres into
+        # the route.
+        np.testing.assert_allclose(
+            [data.qpos[0] for data in env.datas],
+            0.30,
+            atol=1.0e-6,
+        )
+
+        # Playback sets motion_reset_prob=0.  The exact same environment flag
+        # must then return phase-zero, zero-velocity deployment starts.
+        env.cfg.motion_reset_prob = 0.0
+        env.reset()
+        np.testing.assert_array_equal(
+            env.motion_phase,
+            np.zeros(env.num_envs, dtype=np.float32),
+        )
+        np.testing.assert_allclose(
+            [data.qvel for data in env.datas],
+            np.zeros((env.num_envs, env.model.nv)),
+            atol=1.0e-7,
+        )
+    finally:
+        env.close()
+
+
+def test_random_stage_resets_have_zero_robot_terrain_overlap() -> None:
+    """Rough and downhill curriculum starts must not spawn inside geometry."""
+
+    names = ("walk", "rough_walk")
+    paths = tuple(
+        str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
+    )
+    env = LytRobotAmpEnv(
+        LytRobotEnvCfg(
+            motion_files=paths,
+            motion_names=names,
+            motion_loop=(True, False),
+            terrain_types=("flat", "rough", "slope_up", "slope_down"),
+            serial_terrain_course=True,
+            serial_reference_state_init=True,
+            terrain_course_variants=1,
+            terrain_course_random_assignment=False,
+            terrain_course_random_start_prob=1.0,
+            num_envs=64,
+            stand_start_prob=0.0,
+            motion_reset_prob=1.0,
+            reset_noise_scale=0.0,
+            episode_timeout_jitter_steps=0,
+        )
+    )
+    try:
+        env.reset()
+        scenarios = {
+            env.course_stage_scenario_names[int(env.course_variant_ids[index])][
+                int(env.course_stage_ids[index])
+            ]
+            for index in range(env.num_envs)
+        }
+        assert {"rough", "slope_up", "slope_down"}.issubset(scenarios)
+        np.testing.assert_allclose(
+            [env._terrain_penetration_depth(data) for data in env.datas],
+            0.0,
+            atol=1.0e-9,
+        )
     finally:
         env.close()

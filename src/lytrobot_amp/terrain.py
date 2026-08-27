@@ -48,6 +48,10 @@ COURSE_TERRAIN_LENGTHS = {
 MORE_XML_TERRAIN_RGBA = (0.5, 0.5, 0.5, 1.0)
 MORE_MATTE_TERRAIN_MATERIAL = "more_matte_terrain"
 MORE_TERRAIN_CHECKER_TEXTURE = "more_terrain_checker"
+STRICT_CONTACT_MARGIN = 0.005
+STRICT_CONTACT_SOLREF = (0.005, 1.0)
+STRICT_CONTACT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2.0)
+STRICT_RESET_CLEARANCE = 0.001
 
 
 @dataclass(frozen=True)
@@ -699,7 +703,11 @@ def _add_box(
     geom.friction = (1.0, 0.005, 0.0001)
     geom.group = 2
     geom.contype = 1
-    geom.conaffinity = 1
+    geom.conaffinity = 0
+    geom.condim = 3
+    geom.margin = STRICT_CONTACT_MARGIN
+    geom.solref = STRICT_CONTACT_SOLREF
+    geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def _add_ramp(
@@ -721,7 +729,11 @@ def _add_ramp(
     geom.friction = (1.0, 0.005, 0.0001)
     geom.group = 2
     geom.contype = 1
-    geom.conaffinity = 1
+    geom.conaffinity = 0
+    geom.condim = 3
+    geom.margin = STRICT_CONTACT_MARGIN
+    geom.solref = STRICT_CONTACT_SOLREF
+    geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def _attach_terrain(
@@ -829,7 +841,11 @@ def _attach_terrain(
                 geom.friction = (1.0, 0.005, 0.0001)
                 geom.group = 2
                 geom.contype = 1
-                geom.conaffinity = 1
+                geom.conaffinity = 0
+                geom.condim = 3
+                geom.margin = STRICT_CONTACT_MARGIN
+                geom.solref = STRICT_CONTACT_SOLREF
+                geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def load_model(
@@ -984,11 +1000,20 @@ def terrain_spawn_offset(
                         "slope_down": 0.0,
                     }[segment.kind]
                     stage_x.append(segment.start_x + local_x)
-                    stage_z.append(
-                        0.0
-                        if segment.kind in {"gap", "pit"}
-                        else more.course_base_height
-                    )
+                    if segment.kind in {"gap", "pit"}:
+                        spawn_z = 0.0
+                    elif segment.kind == "slope_down":
+                        # A downhill segment starts at the crest shared with
+                        # the preceding uphill ramp.  Spawning at the common
+                        # course datum embedded the whole robot about 0.19 m
+                        # inside this ramp.
+                        spawn_z = more.course_base_height + (
+                            segment.length
+                            * np.tan(np.deg2rad(float(more.slope_angle_deg)))
+                        )
+                    else:
+                        spawn_z = more.course_base_height
+                    stage_z.append(spawn_z)
             last_x = course_segments(more, int(course_variant))[-1].end_x
             stage_x.append(last_x + 0.30)
             stage_z.append(more.course_base_height)
@@ -1024,8 +1049,13 @@ def terrain_spawn_offset(
                 [x, lane_y, more.course_base_height], dtype=np.float32
             )
         if kind in {"slope_up", "slope_down"}:
+            spawn_z = more.course_base_height
+            if kind == "slope_down":
+                spawn_z += segment.length * np.tan(
+                    np.deg2rad(float(more.slope_angle_deg))
+                )
             return np.asarray(
-                [segment.start_x, lane_y, more.course_base_height],
+                [segment.start_x, lane_y, spawn_z],
                 dtype=np.float32,
             )
 
