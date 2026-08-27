@@ -639,6 +639,27 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             int(self.env.cfg.decimation),
             source="current training",
         )
+        saved_collision_profile = str(
+            saved_env_cfg.get("robot_collision_profile", "full_body")
+        )
+        current_collision_profile = str(
+            getattr(self.env.cfg, "robot_collision_profile", "full_body")
+        )
+        if saved_collision_profile != current_collision_profile:
+            if not bool(
+                getattr(self.env.cfg, "allow_collision_profile_migration", False)
+            ):
+                raise ValueError(
+                    "Checkpoint collision profile does not match current training: "
+                    f"saved={saved_collision_profile!r}, "
+                    f"current={current_collision_profile!r}. Use the saved profile "
+                    "for exact continuation, or explicitly pass "
+                    "--allow-collision-profile-migration in a new log directory."
+                )
+            print(
+                "[WARN] explicitly migrating checkpoint collision profile: "
+                f"{saved_collision_profile} -> {current_collision_profile}"
+            )
         saved_context_dim = int(architecture.get("privileged_context_dim", 0))
         if saved_context_dim != self.env.privileged_context_dim:
             raise ValueError(

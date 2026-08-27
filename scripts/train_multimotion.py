@@ -73,12 +73,13 @@ def default_train_args() -> list[str]:
         str(AMP_DISCRIMINATOR_UPDATES),
         "--episode-metric-window",
         str(PARALLEL_ENVS),
-        # Reserve every convex mesh/heightfield contact and its friction rows;
-        # silently truncating these buffers can let a foot tunnel into terrain.
+        # Four full foot/toe meshes retain detailed terrain collision.  The
+        # original 32/128 buffers leave headroom without sizing every solver
+        # kernel for non-colliding body meshes.
         "--warp-nconmax",
-        "128",
+        "32",
         "--warp-njmax",
-        "512",
+        "128",
         "--use-reference-velocity",
         "--target-velocity",
         f"{TRAINING_TARGET_SPEED_MPS:g}",

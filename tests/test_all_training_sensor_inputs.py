@@ -4,9 +4,13 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from scripts import train
 from scripts.train_multimotion import default_train_args as multimotion_args
 from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
+from scripts.train_multimotion_walk import default_train_args as walk_only_args
+from scripts.train_no_stairs_old import default_train_args as old_no_stairs_args
 from scripts.train_stairs import default_train_args as stairs_args
 from sensor_training.config import SensorObservationConfig
 from sensor_training.envs import SensorHistoryEnv, SensorHistoryWarpAmpEnv
@@ -34,6 +38,14 @@ def test_generic_training_engine_always_builds_sensor_actor() -> None:
     assert args.seed is None
     assert args.episode_random_seed is True
     assert args.log_root.endswith("logs/sensor_policy")
+    # Every task launcher ultimately uses this parser. These are the shared
+    # fast-physics defaults unless a user explicitly requests legacy physics.
+    assert args.robot_collision_profile == "feet"
+    assert args.solver_iterations == 10
+    assert args.solver_ls_iterations == 20
+    assert args.warp_nconmax == 32
+    assert args.warp_njmax == 128
+    assert args.warp_cuda_graph is True
     assert {"imu", "tendon", "recurrent", "sensor-only"}.issubset(
         set(args.wandb_tags.split(","))
     )
@@ -60,6 +72,26 @@ def test_every_multimotion_task_disables_commands_and_reference_control() -> Non
         assert "--skill-conditioning" not in args
         if "--reference-ctrl-blend" in args:
             assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
+
+
+def test_every_training_task_resolves_to_shared_fast_physics_defaults() -> None:
+    task_defaults = (
+        [],
+        multimotion_args(),
+        no_stairs_args(),
+        walk_only_args(),
+        old_no_stairs_args(),
+        stairs_args(),
+    )
+    for defaults in task_defaults:
+        with patch.object(sys, "argv", ["train.py", *defaults]):
+            args = train.parse_args()
+        assert args.robot_collision_profile == "feet"
+        assert args.solver_iterations == 10
+        assert args.solver_ls_iterations == 20
+        assert args.warp_nconmax == 32
+        assert args.warp_njmax == 128
+        assert args.warp_cuda_graph is True
 
 
 def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None:
@@ -119,3 +151,46 @@ def test_locomotion_training_fails_closed_on_non_sensor_actor_input() -> None:
         assert "exactly IMU and tendon length" in str(exc)
     else:  # pragma: no cover - failure branch for a regressed guard.
         raise AssertionError("Terrain state unexpectedly reached the locomotion Actor.")
+
+
+def test_sensor_step_reuses_current_frames_when_refilling_reset_history() -> None:
+    env = SensorHistoryEnv.__new__(SensorHistoryEnv)
+    env.is_torch_env = True
+    env.actor_history_enabled = False
+    env.num_envs = 3
+    env.sensor_observation_cfg = SimpleNamespace(frame_count=2)
+    env._actor_frame = torch.zeros((3, 2), dtype=torch.float32)
+    env._amp_history = torch.tensor(
+        [
+            [[1.0], [2.0]],
+            [[3.0], [4.0]],
+            [[5.0], [6.0]],
+        ]
+    )
+    calls = {"sensor": 0, "amp": 0}
+    actor_frame = torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]])
+    amp_frame = torch.tensor([[12.0], [22.0], [32.0]])
+
+    def normalized_sensor_frame() -> torch.Tensor:
+        calls["sensor"] += 1
+        return actor_frame
+
+    def current_amp_frame() -> torch.Tensor:
+        calls["amp"] += 1
+        return amp_frame
+
+    done = torch.tensor([0.0, 1.0, 0.0])
+    env._normalized_sensor_frame = normalized_sensor_frame
+    env._current_amp_frame = current_amp_frame
+    env.base_env = SimpleNamespace(
+        step=lambda _action: (None, torch.zeros(3), done, {})
+    )
+
+    observation, _reward, returned_done, _info = env.step(torch.zeros((3, 1)))
+
+    assert calls == {"sensor": 1, "amp": 1}
+    torch.testing.assert_close(observation, actor_frame)
+    torch.testing.assert_close(returned_done, done)
+    torch.testing.assert_close(env._amp_history[0, :, 0], torch.tensor([2.0, 12.0]))
+    torch.testing.assert_close(env._amp_history[1, :, 0], torch.tensor([22.0, 22.0]))
+    torch.testing.assert_close(env._amp_history[2, :, 0], torch.tensor([6.0, 32.0]))

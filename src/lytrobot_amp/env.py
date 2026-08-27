@@ -37,6 +37,32 @@ from .terrain import (
     validate_terrain_types,
 )
 
+ROBOT_COLLISION_PROFILES = ("full_body", "feet")
+
+
+def configure_robot_collision_profile(
+    model: mujoco.MjModel,
+    profile: str,
+) -> str:
+    """Select terrain colliders without replacing the detailed foot meshes."""
+
+    normalized = str(profile).strip().lower()
+    if normalized not in ROBOT_COLLISION_PROFILES:
+        raise ValueError(
+            f"robot_collision_profile must be one of {ROBOT_COLLISION_PROFILES}, "
+            f"got {profile!r}."
+        )
+    foot_names = set(CONTACT_GEOM_NAMES)
+    for geom_id in range(model.ngeom):
+        if model.geom_bodyid[geom_id] == 0:
+            continue
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        model.geom_contype[geom_id] = 0
+        model.geom_conaffinity[geom_id] = int(
+            normalized == "full_body" or name in foot_names
+        )
+    return normalized
+
 
 def _canonical_quat(quat: np.ndarray) -> np.ndarray:
     quat = np.asarray(quat, dtype=np.float32).copy()
@@ -257,6 +283,11 @@ class LytRobotEnvCfg:
     randomize_episode_seed: bool = False
     decimation: int = CONTROL_DECIMATION
     timestep: float = SIMULATION_TIMESTEP_S
+    # Full-body is the backward-compatible interpretation for old checkpoints
+    # that predate an explicit collision-profile field. New launchers pass the
+    # faster feet profile and its smaller solver settings explicitly.
+    robot_collision_profile: str = "full_body"
+    allow_collision_profile_migration: bool = False
     solver_iterations: int = 20
     solver_ls_iterations: int = 20
     warp_nconmax: int = 128
@@ -433,11 +464,16 @@ class LytRobotAmpEnv:
             self.stair_cfg,
             self.more_terrain_cfg,
         )
+        self.cfg.robot_collision_profile = configure_robot_collision_profile(
+            self.model, self.cfg.robot_collision_profile
+        )
         self.model.opt.timestep = float(cfg.timestep)
-        # Collision contacts are safety constraints for this robot.  Keep a
-        # hard minimum even when replaying an older checkpoint that stored the
-        # former 10-iteration setting.
-        self.model.opt.iterations = max(20, int(cfg.solver_iterations))
+        minimum_iterations = (
+            20 if self.cfg.robot_collision_profile == "full_body" else 1
+        )
+        self.model.opt.iterations = max(
+            minimum_iterations, int(cfg.solver_iterations)
+        )
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
         self.position_actuator_ids = np.arange(self.model.nu, dtype=np.int32)
         self.position_action_dim = int(len(self.position_actuator_ids))

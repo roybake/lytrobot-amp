@@ -180,9 +180,9 @@ def default_train_args() -> list[str]:
         "1.0",
         "--foot-slip-penalty-coef",
         "2.0",
-        # During exploration tolerate only shallow solver compliance, penalize
-        # every millimetre, and terminate before overlap becomes visible as a
-        # body passing through the terrain.
+        # During exploration tolerate only shallow foot/terrain solver
+        # compliance, penalize every millimetre, and terminate before overlap
+        # becomes visible.
         "--terrain-penetration-tolerance",
         "0.01",
         "--terrain-penetration-penalty-coef",
@@ -221,9 +221,9 @@ def default_train_args() -> list[str]:
         "--episode-metric-window",
         "4096",
         "--warp-nconmax",
-        "128",
+        "32",
         "--warp-njmax",
-        "512",
+        "128",
         "--log-root",
         str(REPO_ROOT / "logs" / "multimotion" / "no_stairs"),
         "--wandb-tags",

@@ -12,6 +12,7 @@ import torch
 from .env import (
     LytRobotEnvCfg,
     _stair_root_height_transform,
+    configure_robot_collision_profile,
     scaled_randomization_range,
 )
 from .motion import (
@@ -238,8 +239,16 @@ class LytRobotWarpAmpEnv:
             self.stair_cfg,
             self.more_terrain_cfg,
         )
+        self.cfg.robot_collision_profile = configure_robot_collision_profile(
+            self.model, self.cfg.robot_collision_profile
+        )
         self.model.opt.timestep = float(cfg.timestep)
-        self.model.opt.iterations = max(20, int(cfg.solver_iterations))
+        minimum_iterations = (
+            20 if self.cfg.robot_collision_profile == "full_body" else 1
+        )
+        self.model.opt.iterations = max(
+            minimum_iterations, int(cfg.solver_iterations)
+        )
         self.model.opt.ls_iterations = max(1, int(cfg.solver_ls_iterations))
         # MuJoCo-Warp cannot combine MULTICCD with a non-zero predictive
         # margin.  Keep native convex collision enabled, preserve the 5 mm
@@ -397,7 +406,18 @@ class LytRobotWarpAmpEnv:
         self.terrain_geom_ids = torch.as_tensor(
             terrain_ids_np, dtype=torch.long, device=self.device
         )
-        self.contact_geom_id_values = tuple(int(geom_id) for geom_id in contact_geom_ids_np)
+        geom_is_terrain = torch.zeros(
+            self.model.ngeom, dtype=torch.bool, device=self.device
+        )
+        geom_is_terrain[self.terrain_geom_ids] = True
+        self.geom_is_terrain = geom_is_terrain
+        geom_foot_index = torch.full(
+            (self.model.ngeom,), -1, dtype=torch.long, device=self.device
+        )
+        geom_foot_index[self.contact_geom_ids] = torch.arange(
+            len(contact_geom_ids_np), dtype=torch.long, device=self.device
+        )
+        self.geom_foot_index = geom_foot_index
         self.right_contact_geom_ids = self.contact_geom_ids[:2]
         self.left_contact_geom_ids = self.contact_geom_ids[2:]
         self._build_stand_reference()
@@ -467,6 +487,11 @@ class LytRobotWarpAmpEnv:
             (self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device
         )
         self.last_foot_world_pos = torch.zeros_like(self.last_foot_pos)
+        self.last_foot_geom_contact = torch.zeros(
+            (self.num_envs, len(CONTACT_GEOM_NAMES)),
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.foot_stride_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.foot_x_min = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.foot_x_max = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -704,11 +729,14 @@ class LytRobotWarpAmpEnv:
         cpu_data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, cpu_data)
 
-        # Older checkpoints stored 32/128, which is below the contact demand
-        # of a convex foot/body against a heightfield.  Never allow playback
-        # or resumed training to silently truncate collision constraints.
-        nconmax = max(128, int(self.cfg.warp_nconmax))
-        njmax = max(512, int(self.cfg.warp_njmax))
+        # The feet profile admits only four full foot/toe meshes against static
+        # terrain. The legacy full-body profile retains its larger buffers.
+        if self.cfg.robot_collision_profile == "full_body":
+            min_nconmax, min_njmax = 128, 512
+        else:
+            min_nconmax, min_njmax = 32, 128
+        nconmax = max(min_nconmax, int(self.cfg.warp_nconmax))
+        njmax = max(min_njmax, int(self.cfg.warp_njmax))
         self.cfg.warp_nconmax = nconmax
         self.cfg.warp_njmax = njmax
 
@@ -1339,12 +1367,9 @@ class LytRobotWarpAmpEnv:
             dim=1,
         )
 
-    def _foot_geom_contacts(self) -> torch.Tensor:
-        contact = torch.zeros(
-            (self.num_envs, len(CONTACT_GEOM_NAMES)),
-            dtype=torch.float32,
-            device=self.device,
-        )
+    def _terrain_contact_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Aggregate detailed foot contact and maximum terrain penetration once."""
+
         g1 = self.contact_geom[:, 0]
         g2 = self.contact_geom[:, 1]
         world = self.contact_worldid
@@ -1355,53 +1380,47 @@ class LytRobotWarpAmpEnv:
             min=0,
             max=self.contact_slot_ids.numel(),
         )
+        valid_geom = (
+            (g1 >= 0)
+            & (g1 < self.model.ngeom)
+            & (g2 >= 0)
+            & (g2 < self.model.ngeom)
+        )
         valid = (
             active_slot
             & (self.contact_dim > 0)
             & (world >= 0)
             & (world < self.num_envs)
+            & valid_geom
         )
         safe_world = torch.clamp(world, 0, self.num_envs - 1).to(torch.long)
+        safe_g1 = torch.clamp(g1, 0, self.model.ngeom - 1).to(torch.long)
+        safe_g2 = torch.clamp(g2, 0, self.model.ngeom - 1).to(torch.long)
+        g1_terrain = valid_geom & self.geom_is_terrain[safe_g1]
+        g2_terrain = valid_geom & self.geom_is_terrain[safe_g2]
+        robot_terrain = torch.logical_xor(g1_terrain, g2_terrain)
+        valid_terrain = valid & robot_terrain
+        robot_geom = torch.where(g1_terrain, safe_g2, safe_g1)
+        foot_index = self.geom_foot_index[robot_geom]
+        valid_foot = valid_terrain & (foot_index >= 0)
 
-        g1_terrain = torch.isin(g1, self.terrain_geom_ids)
-        g2_terrain = torch.isin(g2, self.terrain_geom_ids)
-        for contact_index, geom in enumerate(self.contact_geom_id_values):
-            matched = valid & (
-                (g1_terrain & (g2 == geom))
-                | (g2_terrain & (g1 == geom))
-            )
-            contact[:, contact_index].scatter_reduce_(
-                0,
-                safe_world,
-                matched.to(torch.float32),
-                reduce="amax",
-                include_self=True,
-            )
-        return contact
-
-    def _foot_contacts(self) -> torch.Tensor:
-        return self._side_contacts_from_geom(self._foot_geom_contacts())
-
-    def _terrain_penetration_depths(self) -> torch.Tensor:
-        """Return maximum robot/terrain overlap for every Warp world."""
-
-        g1 = self.contact_geom[:, 0]
-        g2 = self.contact_geom[:, 1]
-        world = self.contact_worldid
-        active_slot = self.contact_slot_ids < torch.clamp(
-            self.contact_count[0],
-            min=0,
-            max=self.contact_slot_ids.numel(),
+        safe_foot_index = torch.clamp(foot_index, 0, len(CONTACT_GEOM_NAMES) - 1)
+        flat_foot_slot = safe_world * len(CONTACT_GEOM_NAMES) + safe_foot_index
+        foot_contact = torch.zeros(
+            self.num_envs * len(CONTACT_GEOM_NAMES),
+            dtype=torch.float32,
+            device=self.device,
         )
-        valid_world = active_slot & (world >= 0) & (world < self.num_envs)
-        robot_terrain = torch.logical_xor(
-            torch.isin(g1, self.terrain_geom_ids),
-            torch.isin(g2, self.terrain_geom_ids),
+        foot_contact.scatter_reduce_(
+            0,
+            flat_foot_slot,
+            valid_foot.to(torch.float32),
+            reduce="amax",
+            include_self=True,
         )
-        valid = (self.contact_dim > 0) & valid_world & robot_terrain
-        safe_world = torch.clamp(world, 0, self.num_envs - 1).to(torch.long)
-        source = torch.where(
-            valid,
+
+        penetration_source = torch.where(
+            valid_terrain,
             torch.clamp(
                 -torch.nan_to_num(
                     self.contact_dist,
@@ -1413,27 +1432,46 @@ class LytRobotWarpAmpEnv:
             ),
             torch.zeros_like(self.contact_dist),
         )
-        result = torch.zeros(
+        penetration = torch.zeros(
             self.num_envs,
             dtype=torch.float32,
             device=self.device,
         )
-        result.scatter_reduce_(
+        penetration.scatter_reduce_(
             0,
             safe_world,
-            source,
+            penetration_source,
             reduce="amax",
             include_self=True,
         )
-        return result
+        return foot_contact.view(self.num_envs, len(CONTACT_GEOM_NAMES)), penetration
+
+    def _foot_geom_contacts(self) -> torch.Tensor:
+        return self._terrain_contact_state()[0]
+
+    def _foot_contacts(self) -> torch.Tensor:
+        return self._side_contacts_from_geom(self.last_foot_geom_contact)
+
+    def _terrain_penetration_depths(self) -> torch.Tensor:
+        """Return maximum robot/terrain overlap for every Warp world."""
+
+        return self._terrain_contact_state()[1]
 
     def _resolve_terrain_reset_penetration(self, ids: torch.Tensor) -> None:
         """Project selected reset worlds above the exact collision surface."""
 
         for _ in range(4):
             penetration = self._terrain_penetration_depths()[ids]
+            needs_correction = penetration > 0.0
+            # ``mjwarp.forward`` advances every world, not only ``ids``. Most
+            # spawn offsets already clear the surface, so repeating it four
+            # times unconditionally turns a small partial reset into four
+            # extra full-batch forwards. Keep the same four-correction safety
+            # limit, but stop as soon as the selected feet are clear.
+            if not bool(torch.any(needs_correction).item()):
+                break
             correction = torch.where(
-                penetration > 0.0,
+                needs_correction,
                 penetration + float(STRICT_RESET_CLEARANCE),
                 torch.zeros_like(penetration),
             )
@@ -1601,6 +1639,7 @@ class LytRobotWarpAmpEnv:
         foot_pos = self._foot_positions_local()[ids]
         self.last_foot_pos[ids] = foot_pos
         self.last_foot_world_pos[ids] = self._foot_positions_world()[ids]
+        self.last_foot_geom_contact[ids] = self._terrain_contact_state()[0][ids]
         side_x = torch.stack(
             (
                 torch.mean(foot_pos[:, 0:2, 0], dim=1),
@@ -1901,7 +1940,7 @@ class LytRobotWarpAmpEnv:
         foot_vel = (foot_pos - self.last_foot_pos) / max(self.dt, 1.0e-6)
         foot_world_pos = self._foot_positions_world()
         foot_world_vel = (foot_world_pos - self.last_foot_world_pos) / max(self.dt, 1.0e-6)
-        foot_geom_contact = self._foot_geom_contacts()
+        foot_geom_contact, terrain_penetration_depth = self._terrain_contact_state()
         foot_contact = self._side_contacts_from_geom(foot_geom_contact)
         rewards, dones, time_outs, components = self._compute_reward_done(
             commanded_action,
@@ -1918,6 +1957,7 @@ class LytRobotWarpAmpEnv:
             foot_world_vel,
             foot_geom_contact,
             foot_contact,
+            terrain_penetration_depth,
         )
         invalid_step = mechanical_energy_invalid | (
             components["invalid_state"] > 0.5
@@ -2031,6 +2071,7 @@ class LytRobotWarpAmpEnv:
         self.last_action[:] = commanded_action
         self.last_foot_pos[:] = foot_pos
         self.last_foot_world_pos[:] = foot_world_pos
+        self.last_foot_geom_contact[:] = foot_geom_contact
 
         reported_course_stage = self.course_stage_ids.clone()
         reported_course_start_stage = self.course_start_stage_ids.clone()
@@ -2063,6 +2104,7 @@ class LytRobotWarpAmpEnv:
         foot_world_vel: torch.Tensor,
         foot_geom_contact: torch.Tensor,
         foot_contact: torch.Tensor,
+        terrain_penetration_depth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         root_height = self.qpos[:, 2]
         up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
@@ -2277,7 +2319,6 @@ class LytRobotWarpAmpEnv:
             | (root_height > max_root_height)
             | (up_z < self.cfg.min_upright_z)
         )
-        terrain_penetration_depth = self._terrain_penetration_depths()
         terrain_penetration = terrain_penetration_depth > max(
             float(self.cfg.terrain_penetration_tolerance), 0.0
         )

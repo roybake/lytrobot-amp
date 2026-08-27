@@ -162,8 +162,9 @@ uv run python sensor_training/play.py \
   --steps 0
 ```
 
-`sensor_training/train_multimotion_stage1.py` 和
-`sensor_training/train_multimotion_stage2.py` 是该任务的兼容别名，使用相同日志目录。
+`sensor_training/train_multimotion_stage2.py` 是全地形 Stage 2 的兼容别名。全地形
+Stage 1 请使用上面的 `scripts/train_multimotion_stage1.py`；传感器目录下同名 Stage 1
+入口已改为下节的无阶梯任务。
 
 ### 4. 无阶梯随机串联行走
 
@@ -193,6 +194,8 @@ Stage 1 训练：
 
 ```bash
 uv run python scripts/train_multimotion_no_stairs_stage1.py
+# 等价的传感器目录入口：
+uv run python sensor_training/train_multimotion_stage1.py
 ```
 
 Stage 1 有界面测试：
@@ -437,9 +440,9 @@ iteration 写本地日志，W&B 默认每 10 轮上报一次。第一阶段强�
 需要复现时必须同时传 `--seed N --no-episode-random-seed`。完整命令统一放在本文开头
 “所有任务的两阶段训练与测试命令”。
 
-训练默认启用 Warp CUDA Graph，物理积分周期为 `0.005 s`、策略 `decimation=2`，因此训练、测试和部署 ONNX 均为 `100 Hz` 控制。入口拒绝其他控制频率以及旧 50 Hz checkpoint，防止训练/测试动力学错配。求解器使用 `iterations=20`、`ls_iterations=20`，每个 world 预留 128 个 contact 和 512 个 constraint。运行时也会把旧 checkpoint 中更小的碰撞容量提升到该下限，避免无台阶串联地形上的全身接触被静默截断。可分别用 `--no-warp-cuda-graph`、`--solver-iterations`、`--solver-ls-iterations`、`--warp-nconmax`、`--warp-njmax` 做容量调试。默认不主动 sleep；与桌面共用 GPU 时可显式增加 `--iteration-sleep-ms 10`。
+训练默认启用 Warp CUDA Graph，物理积分周期为 `0.005 s`、策略 `decimation=2`，因此训练、测试和部署 ONNX 均为 `100 Hz` 控制。入口拒绝其他控制频率以及旧 50 Hz checkpoint，防止训练/测试动力学错配。所有普通、传感器、多动作、无阶梯和楼梯训练入口共享同一套快速物理默认值。新训练默认采用 `--robot-collision-profile feet`：脚掌和脚趾继续使用四个完整 STL 网格、三维摩擦接触、`5 mm` 预测 margin 和原有硬接触参数，其余身体网格不进入地形碰撞 broadphase，跌倒仍由根高度和姿态终止；求解器使用 `iterations=10`、`ls_iterations=20`，每个 world 预留 32 个 contact 和 128 个 constraint。重置只在仍有地形穿透时追加全批 Warp forward，传感器历史也复用当步已计算的 IMU、肌腱和 AMP 帧。旧 checkpoint 缺少碰撞模式字段时按 `full_body` 解释，并自动保留至少 `20` 次求解迭代和 `128/512` 容量，以维持原动力学回放。精确续训可显式传 `--robot-collision-profile full_body`；要从旧权重迁移到快速足部模式，需传 `--allow-collision-profile-migration` 且不能指定旧 `--log-dir`，以免把两种动力学写进同一日志。可分别用 `--solver-iterations`、`--solver-ls-iterations`、`--warp-nconmax`、`--warp-njmax` 显式增加精度/容量，也可用 `--no-warp-cuda-graph` 关闭 CUDA Graph 调试。默认不主动 sleep；与桌面共用 GPU 时可显式增加 `--iteration-sleep-ms 10`。
 
-机器人全身 STL 凸碰撞体均与静态地形建立碰撞约束，脚掌和脚趾的 4 个具名网格同时用于接触奖励；碰撞掩码禁止机器人内部自碰撞。旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期训练主内存增长问题；当前版本默认关闭周期性 Python GC，但仍保留 32GB RSS 安全停止保护，必要时可通过 `--memory-cleanup-interval` 恢复定期回收。
+`full_body` 模式下全身 STL 凸碰撞体均与静态地形建立约束；默认快速 `feet` 模式仅让脚掌和脚趾的 4 个具名完整网格参与地形碰撞及接触奖励。两种模式都禁止机器人内部自碰撞。旧版 MuJoCo-Warp 3.8.0.2/Warp 1.12.0 存在长期训练主内存增长问题；当前版本默认关闭周期性 Python GC，但仍保留 32GB RSS 安全停止保护，必要时可通过 `--memory-cleanup-interval` 恢复定期回收。
 
 `--stage1-checkpoint` 用来指定第一阶段权重 `model_final.pt`，并把第二阶段的 iteration 与 `global_step` 从 0 重新计数。蹲起 Stage2 还会重置优化器，并根据成功率、下蹲深度和异常终止率自适应调整域随机化强度；不要把旧 Stage2 checkpoint 传给这个参数。也可以使用等价别名 `--stage1-model`。如果需要恢复第二阶段自身的中断训练，使用底层参数 `--resume-checkpoint logs/sensor_policy/stage2/<run>/model_final.pt`，此时会保留第二阶段已有的训练进度、域随机化强度和优化器状态。旧版训练产生的编号 checkpoint 仍可加载，但新训练不会再生成。
 

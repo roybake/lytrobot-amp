@@ -76,7 +76,9 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
         expected_roots = {
             "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion",
             "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
-            "sensor_training/train_multimotion_stage1.py": ROOT / "logs" / "multimotion",
+            "sensor_training/train_multimotion_stage1.py": (
+                ROOT / "logs" / "multimotion" / "no_stairs"
+            ),
             "sensor_training/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
             "scripts/train_stairs_stage1.py": ROOT / "logs" / "stairs",
             "scripts/train_stairs_stage2.py": ROOT / "logs" / "stairs",
@@ -87,6 +89,44 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             ) as mocked_run:
                 runpy.run_path(str(ROOT / launcher), run_name="__main__")
                 self.assertEqual(mocked_run.call_args.kwargs["log_root"], expected_root)
+
+    def test_sensor_multimotion_stage1_removes_stair_terrain_and_motions(self) -> None:
+        with patch("scripts.two_stage_task.run_task_stage") as mocked_run:
+            runpy.run_path(
+                str(ROOT / "sensor_training" / "train_multimotion_stage1.py"),
+                run_name="__main__",
+            )
+
+        call = mocked_run.call_args
+        stage_args = build_task_stage_args(
+            call.kwargs["task_defaults"],
+            stage=call.kwargs["stage"],
+            log_root=call.kwargs["log_root"],
+        )
+        with patch.object(
+            sys,
+            "argv",
+            ["train.py", *sensor_multimotion_args(), *stage_args],
+        ):
+            parsed = train.parse_args()
+
+        self.assertEqual(parsed.training_task, "multimotion_no_stairs")
+        self.assertEqual(
+            parsed.terrain_types,
+            ["flat", "rough", "slope_up", "slope_down"],
+        )
+        self.assertNotIn("stairs", parsed.terrain_types)
+        self.assertEqual(parsed.motion_names, ["walk", "rough_walk"])
+        self.assertEqual(parsed.motion_weights, [0.5, 0.5])
+        self.assertEqual(parsed.motion_loop, ["true", "false"])
+        self.assertEqual(
+            [Path(path) for path in parsed.motion_files],
+            list(NO_STAIRS_REFERENCES),
+        )
+        self.assertEqual(
+            Path(parsed.log_root),
+            ROOT / "logs" / "multimotion" / "no_stairs",
+        )
 
     def test_stair_stage2_defaults_to_hardest_assessment_geometry(self) -> None:
         with patch("scripts.two_stage_task.run_task_stage") as mocked_run:

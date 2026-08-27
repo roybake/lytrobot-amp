@@ -138,8 +138,8 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(rollout_batch, 98_304)
         self.assertEqual(rollout_batch % PPO_MINIBATCHES, 0)
         self.assertEqual(rollout_batch // PPO_MINIBATCHES, 12_288)
-        self.assertEqual(integer("--warp-nconmax"), 128)
-        self.assertEqual(integer("--warp-njmax"), 512)
+        self.assertEqual(integer("--warp-nconmax"), 32)
+        self.assertEqual(integer("--warp-njmax"), 128)
 
     def test_multimotion_defaults_cover_training_terrain_without_energy_penalty(self) -> None:
         args = default_train_args()

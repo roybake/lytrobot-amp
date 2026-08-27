@@ -311,10 +311,27 @@ def parse_args() -> argparse.Namespace:
         default=CONTROL_DECIMATION,
         help="Fixed at 2 with the 0.005 s physics timestep for 100 Hz control.",
     )
-    parser.add_argument("--solver-iterations", type=int, default=20)
+    parser.add_argument("--solver-iterations", type=int, default=10)
     parser.add_argument("--solver-ls-iterations", type=int, default=20)
-    parser.add_argument("--warp-nconmax", type=int, default=128)
-    parser.add_argument("--warp-njmax", type=int, default=512)
+    parser.add_argument("--warp-nconmax", type=int, default=32)
+    parser.add_argument("--warp-njmax", type=int, default=128)
+    parser.add_argument(
+        "--robot-collision-profile",
+        choices=("feet", "full_body"),
+        default="feet",
+        help=(
+            "feet keeps complete foot/toe mesh collision and removes other body "
+            "meshes from terrain broadphase; full_body reproduces legacy physics."
+        ),
+    )
+    parser.add_argument(
+        "--allow-collision-profile-migration",
+        action="store_true",
+        help=(
+            "Explicitly allow resuming weights trained with a different robot "
+            "collision profile. Omit --log-dir so the migrated run gets a new directory."
+        ),
+    )
     parser.add_argument("--terrain-penetration-tolerance", type=float, default=0.01)
     parser.add_argument("--terrain-penetration-penalty-coef", type=float, default=0.0)
     parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
@@ -1515,6 +1532,16 @@ def main() -> None:
     # Fail before creating a log directory, starting W&B, or initializing the
     # simulator. Every save trigger atomically overwrites the same latest model.
     args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint)
+    if args.allow_collision_profile_migration:
+        if args.resume_checkpoint is None:
+            raise ValueError(
+                "--allow-collision-profile-migration requires --resume-checkpoint."
+            )
+        if args.log_dir is not None:
+            raise ValueError(
+                "Collision-profile migration must use a new log directory; "
+                "omit --log-dir."
+            )
     if args.stage == "stage2" and args.resume_checkpoint is None:
         raise ValueError(
             "Stage 2 requires a Stage 1 checkpoint or an interrupted Stage 2 "
@@ -1557,6 +1584,7 @@ def main() -> None:
     print(
         f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
         f"seed={args.seed}, control=position@{CONTROL_FREQUENCY_HZ:g}Hz, "
+        f"collision_profile={args.robot_collision_profile}, "
         f"domain_randomization={args.domain_randomization}, "
         f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
     )
@@ -1611,6 +1639,10 @@ def main() -> None:
         decimation=args.decimation,
         episode_steps=args.episode_steps,
         episode_timeout_jitter_steps=args.episode_timeout_jitter_steps,
+        robot_collision_profile=args.robot_collision_profile,
+        allow_collision_profile_migration=bool(
+            args.allow_collision_profile_migration
+        ),
         solver_iterations=args.solver_iterations,
         solver_ls_iterations=args.solver_ls_iterations,
         warp_nconmax=args.warp_nconmax,

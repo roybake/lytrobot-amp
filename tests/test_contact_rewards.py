@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
 import torch
 
-from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
+from lytrobot_amp.env import (
+    LytRobotAmpEnv,
+    LytRobotEnvCfg,
+    configure_robot_collision_profile,
+)
 from lytrobot_amp.motion import CONTACT_GEOM_NAMES, resolve_contact_geom_ids
 from lytrobot_amp.terrain import STRICT_CONTACT_MARGIN
 
@@ -112,6 +117,70 @@ class ContactRewardTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(actual[0]), expected, places=6)
 
+    def test_warp_contact_aggregation_ignores_stale_capacity_tail(self) -> None:
+        from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+
+        warp_env = LytRobotWarpAmpEnv.__new__(LytRobotWarpAmpEnv)
+        warp_env.num_envs = 2
+        warp_env.device = torch.device("cpu")
+        warp_env.model = SimpleNamespace(ngeom=7)
+        warp_env.contact_geom = torch.tensor(
+            [[0, 2], [3, 1], [1, 5], [6, 1], [0, 4], [0, 0]],
+            dtype=torch.int32,
+        )
+        warp_env.contact_worldid = torch.tensor(
+            [0, 0, 1, 1, 1, -1], dtype=torch.int32
+        )
+        warp_env.contact_dim = torch.tensor([3, 3, 3, 3, 3, 0], dtype=torch.int32)
+        warp_env.contact_dist = torch.tensor(
+            [-0.002, -0.001, -0.003, -0.004, -0.5, 0.0],
+            dtype=torch.float32,
+        )
+        warp_env.contact_count = torch.tensor([4], dtype=torch.int32)
+        warp_env.contact_slot_ids = torch.arange(6, dtype=torch.int32)
+        warp_env.geom_is_terrain = torch.tensor(
+            [True, True, False, False, False, False, False]
+        )
+        warp_env.geom_foot_index = torch.tensor(
+            [-1, -1, 0, 1, 2, 3, -1], dtype=torch.long
+        )
+
+        contacts, penetration = warp_env._terrain_contact_state()
+
+        torch.testing.assert_close(
+            contacts,
+            torch.tensor([[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+        )
+        torch.testing.assert_close(penetration, torch.tensor([0.002, 0.004]))
+
+    def test_warp_reset_penetration_stops_forwarding_once_clear(self) -> None:
+        from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+
+        warp_env = LytRobotWarpAmpEnv.__new__(LytRobotWarpAmpEnv)
+        warp_env.qpos = torch.zeros((2, 7), dtype=torch.float32)
+        penetrations = iter(
+            (
+                torch.tensor([0.0, 0.02]),
+                torch.tensor([0.0, 0.0]),
+            )
+        )
+        forward_calls = 0
+
+        def penetration_depths() -> torch.Tensor:
+            return next(penetrations)
+
+        def warp_forward() -> None:
+            nonlocal forward_calls
+            forward_calls += 1
+
+        warp_env._terrain_penetration_depths = penetration_depths
+        warp_env._warp_forward = warp_forward
+        warp_env._resolve_terrain_reset_penetration(torch.tensor([1]))
+
+        self.assertEqual(forward_calls, 1)
+        self.assertGreater(float(warp_env.qpos[1, 2]), 0.02)
+        self.assertEqual(float(warp_env.qpos[0, 2]), 0.0)
+
     def test_local_velocity_tracking_ignores_stance_geometries(self) -> None:
         foot_vel = np.zeros((4, 3), dtype=np.float32)
         ref_foot_vel = np.zeros((4, 3), dtype=np.float32)
@@ -164,8 +233,9 @@ class ContactRewardTests(unittest.TestCase):
         self.assertLess(foot_symmetry, 0.20)
         self.assertLess(symmetry, 0.30)
 
-    def test_every_robot_geom_collides_only_with_static_terrain(self) -> None:
+    def test_only_full_foot_meshes_collide_with_static_terrain(self) -> None:
         model = mujoco.MjModel.from_xml_path(str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
+        configure_robot_collision_profile(model, "feet")
         contact_ids = resolve_contact_geom_ids(model)
         self.assertEqual(len(contact_ids), 4)
         self.assertEqual(
@@ -182,7 +252,10 @@ class ContactRewardTests(unittest.TestCase):
                 self.assertEqual(model.geom_conaffinity[geom_id], 0)
             else:
                 self.assertEqual(model.geom_contype[geom_id], 0)
-                self.assertEqual(model.geom_conaffinity[geom_id], 1)
+                self.assertEqual(
+                    model.geom_conaffinity[geom_id],
+                    1 if name in CONTACT_GEOM_NAMES else 0,
+                )
             self.assertEqual(model.geom_condim[geom_id], 3)
             self.assertAlmostEqual(model.geom_margin[geom_id], STRICT_CONTACT_MARGIN)
             if name in CONTACT_GEOM_NAMES:
@@ -194,36 +267,37 @@ class ContactRewardTests(unittest.TestCase):
                     name,
                 )
 
-    def test_fallen_body_is_supported_without_entering_floor(self) -> None:
+    def test_standing_pose_contacts_all_four_full_foot_meshes_with_capacity_headroom(self) -> None:
         model = mujoco.MjModel.from_xml_path(
             str(REPO_ROOT / "robot" / "MJCFmodelposition.xml")
         )
-        model.opt.iterations = 20
+        configure_robot_collision_profile(model, "feet")
+        model.opt.iterations = 10
         data = mujoco.MjData(model)
         data.qpos[:] = model.qpos0
-        data.qpos[2] = 1.2
-        data.qpos[3:7] = [np.cos(np.pi / 4.0), 0.0, np.sin(np.pi / 4.0), 0.0]
         mujoco.mj_forward(model, data)
 
-        min_distance = float("inf")
-        contacted_nonfoot_body = False
-        for _ in range(600):
-            mujoco.mj_step(model, data)
-            for contact in data.contact[: data.ncon]:
-                min_distance = min(min_distance, float(contact.dist))
-                for geom_id in (int(contact.geom1), int(contact.geom2)):
-                    if (
-                        model.geom_bodyid[geom_id] != 0
-                        and mujoco.mj_id2name(
-                            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id
-                        )
-                        not in CONTACT_GEOM_NAMES
-                    ):
-                        contacted_nonfoot_body = True
+        contacted_robot_geoms = {
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            for contact in data.contact[: data.ncon]
+            for geom_id in (int(contact.geom1), int(contact.geom2))
+            if model.geom_bodyid[geom_id] != 0
+        }
+        self.assertEqual(contacted_robot_geoms, set(CONTACT_GEOM_NAMES))
+        self.assertLess(data.ncon, 32)
+        self.assertLess(data.nefc, 128)
 
-        self.assertTrue(contacted_nonfoot_body)
-        self.assertGreaterEqual(min_distance, -1.0e-5)
-        self.assertGreater(data.qpos[2], 0.05)
+    def test_full_body_profile_remains_available_for_old_checkpoints(self) -> None:
+        model = mujoco.MjModel.from_xml_path(
+            str(REPO_ROOT / "robot" / "MJCFmodelposition.xml")
+        )
+        configure_robot_collision_profile(model, "full_body")
+
+        robot_geom_ids = np.flatnonzero(model.geom_bodyid != 0)
+        np.testing.assert_array_equal(
+            model.geom_conaffinity[robot_geom_ids],
+            np.ones(len(robot_geom_ids), dtype=model.geom_conaffinity.dtype),
+        )
 
 
 if __name__ == "__main__":

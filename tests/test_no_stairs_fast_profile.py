@@ -43,8 +43,8 @@ def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> Non
     assert _values(args, "--motion-reset-prob") == ["0.50"]
     assert "--use-reference-velocity" in args
     assert _values(args, "--terrain-course-random-start-prob") == ["0.8"]
-    assert _values(args, "--warp-nconmax") == ["128"]
-    assert _values(args, "--warp-njmax") == ["512"]
+    assert _values(args, "--warp-nconmax") == ["32"]
+    assert _values(args, "--warp-njmax") == ["128"]
 
 
 @pytest.mark.skipif(

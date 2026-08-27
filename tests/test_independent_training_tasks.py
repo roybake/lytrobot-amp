@@ -106,8 +106,8 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert stair_free["minibatches"] == 8
     assert stair_free["amp_minibatch_size"] == 4096
     assert stair_free["amp_disc_updates"] == 2
-    assert stair_free["warp_nconmax"] == 128
-    assert stair_free["warp_njmax"] == 512
+    assert stair_free["warp_nconmax"] == 32
+    assert stair_free["warp_njmax"] == 128
 
     # The original all-terrain entry point remains a separate four-clip task.
     original = original_multimotion_args()

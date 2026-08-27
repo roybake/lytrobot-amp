@@ -348,9 +348,20 @@ class SensorHistoryEnv:
     def _current_amp_frame(self) -> np.ndarray | torch.Tensor:
         return self.base_env.amp_observe()
 
-    def _fill_history(self, env_ids: np.ndarray | torch.Tensor) -> None:
-        actor_frame = self._normalized_sensor_frame()
-        amp_frame = self._current_amp_frame()
+    def _fill_history(
+        self,
+        env_ids: np.ndarray | torch.Tensor,
+        *,
+        actor_frame: np.ndarray | torch.Tensor | None = None,
+        amp_frame: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        # ``step`` has already assembled both full-batch frames before it knows
+        # which histories need refilling. Reusing them avoids recomputing all
+        # sensor and AMP features for every world after each partial reset.
+        actor_frame = (
+            self._normalized_sensor_frame() if actor_frame is None else actor_frame
+        )
+        amp_frame = self._current_amp_frame() if amp_frame is None else amp_frame
         if self.is_torch_env:
             ids = env_ids if torch.is_tensor(env_ids) else torch.as_tensor(
                 env_ids,
@@ -383,7 +394,9 @@ class SensorHistoryEnv:
             axis=1,
         )
 
-    def _append_history(self) -> None:
+    def _append_history(
+        self,
+    ) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
@@ -401,6 +414,7 @@ class SensorHistoryEnv:
                 self._actor_frame = actor_frame
             self._amp_history = np.roll(self._amp_history, shift=-1, axis=1)
         self._amp_history[:, -1] = amp_frame
+        return actor_frame, amp_frame
 
     def observe(self) -> np.ndarray | torch.Tensor:
         if self.actor_history_enabled:
@@ -430,15 +444,23 @@ class SensorHistoryEnv:
 
     def step(self, action: np.ndarray | torch.Tensor):
         _base_obs, reward, done, info = self.base_env.step(action)
-        self._append_history()
+        actor_frame, amp_frame = self._append_history()
         if self.is_torch_env:
             # Boolean indexing stays on device and avoids a second CUDA sync
             # after the base environment has already handled resets.
-            self._fill_history(done > 0.0)
+            self._fill_history(
+                done > 0.0,
+                actor_frame=actor_frame,
+                amp_frame=amp_frame,
+            )
         else:
             done_ids = np.nonzero(np.asarray(done) > 0.0)[0].astype(np.int64)
             if len(done_ids) > 0:
-                self._fill_history(done_ids)
+                self._fill_history(
+                    done_ids,
+                    actor_frame=actor_frame,
+                    amp_frame=amp_frame,
+                )
         return self.observe(), reward, done, info
 
     def close(self) -> None:
