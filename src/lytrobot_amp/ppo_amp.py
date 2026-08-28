@@ -55,6 +55,8 @@ class PPOAMPConfig:
     amp_label_smoothing: float = 0.20
     amp_obs_noise_std: float = 0.05
     amp_mirror_ref_prob: float = 0.50
+    teacher_checkpoint: str | None = None
+    distillation_coef: float = 0.0
     actor_hidden_dims: tuple[int, ...] = (256, 128)
     critic_hidden_dims: tuple[int, ...] = (256, 128)
     discriminator_hidden_dims: tuple[int, ...] = (256, 128)
@@ -62,6 +64,11 @@ class PPOAMPConfig:
     min_action_std: float = 0.05
     max_action_std: float = 0.60
     episode_metric_window: int = 4096
+    # These flags are consumed by the sensor trainer.  Keep them on the base
+    # config too because the shared CLI builds one config for both legacy
+    # reference-conditioned and sensor-only tasks.
+    compile_policy: bool = True
+    fused_optimizer: bool = True
 
 
 class PPOAMPTrainer:

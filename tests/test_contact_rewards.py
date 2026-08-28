@@ -287,13 +287,19 @@ class ContactRewardTests(unittest.TestCase):
         self.assertLess(data.ncon, 32)
         self.assertLess(data.nefc, 128)
 
-    def test_full_body_profile_remains_available_for_old_checkpoints(self) -> None:
+    def test_full_body_collision_is_model_default_and_restores_every_robot_geom(self) -> None:
         model = mujoco.MjModel.from_xml_path(
             str(REPO_ROOT / "robot" / "MJCFmodelposition.xml")
         )
-        configure_robot_collision_profile(model, "full_body")
-
         robot_geom_ids = np.flatnonzero(model.geom_bodyid != 0)
+        np.testing.assert_array_equal(
+            model.geom_conaffinity[robot_geom_ids],
+            np.ones(len(robot_geom_ids), dtype=model.geom_conaffinity.dtype),
+        )
+
+        configure_robot_collision_profile(model, "feet")
+        self.assertEqual(int(model.geom_conaffinity[robot_geom_ids].sum()), 4)
+        configure_robot_collision_profile(model, "full_body")
         np.testing.assert_array_equal(
             model.geom_conaffinity[robot_geom_ids],
             np.ones(len(robot_geom_ids), dtype=model.geom_conaffinity.dtype),

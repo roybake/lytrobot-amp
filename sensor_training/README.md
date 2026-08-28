@@ -106,7 +106,7 @@ uv run python sensor_training/train_stage1.py \
 
 默认 checkpoint 写入 `logs/sensor_policy/`，不会与原训练日志混在一起。新训练只能
 恢复同时带有相同 `sensor_observation` 和 `sensor_policy_architecture` 元数据的
-100 Hz single-GRU/MLP checkpoint；旧 residual-MoE、旧50 Hz recurrent、旧336/337维前馈传感器模型、
+100 Hz single-GRU/MLP checkpoint；旧50 Hz recurrent、旧336/337维前馈传感器模型、
 完整状态策略和历史力位联控模型均不兼容，必须使用新的运行目录从头训练。
 
 导出的 ONNX 使用显式状态接口：输入为 `observation`、`recurrent_state` 和

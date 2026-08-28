@@ -271,6 +271,7 @@ class LytRobotWarpAmpEnv:
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
+            force_library=bool(cfg.serial_terrain_course and cfg.serial_course_single_motion),
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -535,6 +536,18 @@ class LytRobotWarpAmpEnv:
             return np.empty((0, 0), dtype=np.int64)
         if not isinstance(self.motion, MotionLibrary):
             raise ValueError("serial terrain course requires a multi-motion library.")
+        if self.cfg.serial_course_single_motion:
+            if len(motion_names) != 1:
+                raise ValueError(
+                    "--serial-course-single-motion requires exactly one motion clip."
+                )
+            stage_count = len(course_motion_sequence(
+                self.more_terrain_cfg.normalized_course_orders[0]
+            ))
+            return np.zeros(
+                (len(self.more_terrain_cfg.normalized_course_orders), stage_count),
+                dtype=np.int64,
+            )
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
@@ -2303,15 +2316,73 @@ class LytRobotWarpAmpEnv:
                 - self.cfg.missed_contact_penalty_coef * missed_contact
             )
 
+        if self.cfg.amp_task_only:
+            # Do not mix reference tracking into the task reward: the AMP
+            # discriminator is the sole consumer of the retargeted motion.
+            previous_contact = self._side_contacts_from_geom(self.last_foot_geom_contact)
+            touchdown = (foot_contact > 0.5) & (previous_contact <= 0.5)
+            alternating_step = (
+                (touchdown[:, 0] & (previous_contact[:, 1] > 0.5))
+                | (touchdown[:, 1] & (previous_contact[:, 0] > 0.5))
+            ).to(torch.float32)
+            terrain_height = (
+                float(self.more_terrain_cfg.course_base_height)
+                if self.more_terrain_cfg.serial_course
+                else 0.0
+            )
+            physical_height = torch.exp(
+                -(
+                    (root_height - (self.nominal_root_height + terrain_height)).square()
+                )
+                / (0.16**2)
+            )
+            upright = torch.clamp(
+                (up_z - float(self.cfg.min_upright_z))
+                / max(1.0 - float(self.cfg.min_upright_z), 1.0e-6),
+                0.0,
+                1.0,
+            )
+            stable_velocity = forward_velocity_track * upright * physical_height
+            forward_only_progress = torch.clamp(forward_progress, 0.0, 1.0)
+            support = torch.any(foot_contact > 0.5, dim=1).to(torch.float32)
+            reward = (
+                0.05
+                + 1.20 * upright
+                + 0.80 * physical_height
+                + self.cfg.forward_velocity_reward_coef * stable_velocity
+                + self.cfg.forward_progress_reward_coef * forward_only_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + self.cfg.contact_reward_coef * support
+                + self.cfg.alternating_step_reward_coef * alternating_step
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+            )
+
         bad_state = ~(
             torch.isfinite(self.qpos).all(dim=1)
             & torch.isfinite(self.qvel).all(dim=1)
             & torch.isfinite(self.ctrl).all(dim=1)
         )
-        min_root_height = targets["root_height"] + (
+        physical_root_height = torch.full_like(
+            root_height,
+            self.nominal_root_height
+            + (
+                float(self.more_terrain_cfg.course_base_height)
+                if self.more_terrain_cfg.serial_course
+                else 0.0
+            ),
+        )
+        height_reference = (
+            physical_root_height if self.cfg.amp_task_only else targets["root_height"]
+        )
+        min_root_height = height_reference + (
             float(self.cfg.fall_height) - self.nominal_root_height
         )
-        max_root_height = targets["root_height"] + (
+        max_root_height = height_reference + (
             float(self.cfg.max_height) - self.nominal_root_height
         )
         fallen = (
@@ -2391,6 +2462,11 @@ class LytRobotWarpAmpEnv:
             "action_rate": action_rate,
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
+            "alternating_step": (
+                alternating_step
+                if self.cfg.amp_task_only
+                else torch.zeros_like(root_height)
+            ),
         }
         reward, bad_state, components = _sanitize_reward_outputs(
             reward,

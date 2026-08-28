@@ -148,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         help="Disabled for all sensor-only actors; skill labels are training-only.",
     )
     parser.add_argument(
+        "--legacy-reference-conditioned-actor",
+        action="store_true",
+        help="Enable only for an isolated frozen privileged Teacher task.",
+    )
+    parser.add_argument(
+        "--sensor-wrapper-base-skill-conditioning",
+        action="store_true",
+        help="Keep skill labels in the hidden simulator Teacher view; never expose them to the sensor Actor.",
+    )
+    parser.add_argument(
         "--use-reference-velocity",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -187,6 +197,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Place every enabled terrain in a randomized serial course in front of each robot.",
+    )
+    parser.add_argument(
+        "--serial-course-single-motion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse one looping AMP reference for every serial-course stage; "
+            "requires exactly one --motion-files clip."
+        ),
     )
     parser.add_argument("--terrain-course-variants", type=int, default=8)
     parser.add_argument("--terrain-course-lane-spacing", type=float, default=3.0)
@@ -311,17 +330,17 @@ def parse_args() -> argparse.Namespace:
         default=CONTROL_DECIMATION,
         help="Fixed at 2 with the 0.005 s physics timestep for 100 Hz control.",
     )
-    parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument("--solver-iterations", type=int, default=20)
     parser.add_argument("--solver-ls-iterations", type=int, default=20)
-    parser.add_argument("--warp-nconmax", type=int, default=32)
-    parser.add_argument("--warp-njmax", type=int, default=128)
+    parser.add_argument("--warp-nconmax", type=int, default=128)
+    parser.add_argument("--warp-njmax", type=int, default=512)
     parser.add_argument(
         "--robot-collision-profile",
         choices=("feet", "full_body"),
-        default="feet",
+        default="full_body",
         help=(
-            "feet keeps complete foot/toe mesh collision and removes other body "
-            "meshes from terrain broadphase; full_body reproduces legacy physics."
+            "full_body keeps every robot mesh colliding with static terrain; "
+            "feet is an explicit reduced-collision diagnostic profile."
         ),
     )
     parser.add_argument(
@@ -359,6 +378,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reward composition to use. The stairs profile adds vertical-motion, "
             "tread-support, and terrain-relative swing-clearance objectives."
+        ),
+    )
+    parser.add_argument(
+        "--amp-task-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep retargeted reference comparisons exclusively in AMP; task "
+            "rewards use only physical stability, foot alternation and velocity."
         ),
     )
     parser.add_argument("--forward-velocity-tracking-sigma", type=float, default=0.25)
@@ -426,6 +454,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-foot-pos-coef", type=float, default=0.0)
     parser.add_argument("--step-gap-coef", type=float, default=0.0)
     parser.add_argument("--swing-advance-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--alternating-step-reward-coef",
+        type=float,
+        default=0.0,
+        help="Reward physical left/right alternating touchdown events in AMP task-only mode.",
+    )
     parser.add_argument("--stair-vertical-velocity-sigma", type=float, default=0.25)
     parser.add_argument("--stair-vertical-velocity-reward-coef", type=float, default=1.0)
     parser.add_argument("--stair-swing-clearance", type=float, default=0.08)
@@ -570,6 +604,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-obs-noise-std", type=float, default=0.05)
     parser.add_argument("--amp-mirror-ref-prob", type=float, default=0.50)
     parser.add_argument("--amp-reward-coef", type=float, default=1.20)
+    parser.add_argument(
+        "--teacher-checkpoint",
+        default=None,
+        help="Frozen privileged Teacher checkpoint used only for sensor-policy distillation.",
+    )
+    parser.add_argument(
+        "--distillation-coef",
+        type=float,
+        default=0.0,
+        help="Smooth-L1 action-mean distillation weight for --teacher-checkpoint.",
+    )
     parser.add_argument("--task-reward-lerp", type=float, default=0.50)
     parser.add_argument("--min-action-std", type=float, default=0.05)
     parser.add_argument("--max-action-std", type=float, default=0.60)
@@ -1391,11 +1436,23 @@ def main() -> None:
     )
     if args.seed is None:
         args.seed = secrets.randbits(32)
-    if args.skill_conditioning:
+    if args.skill_conditioning and not (
+        args.legacy_reference_conditioned_actor
+        or args.sensor_wrapper_base_skill_conditioning
+    ):
         raise ValueError(
             "All training actors are sensor-only; --skill-conditioning is not allowed."
         )
-    if abs(float(args.reference_ctrl_blend)) > 1.0e-12:
+    if args.amp_task_only and not args.amp:
+        raise ValueError("--amp-task-only requires AMP to remain enabled.")
+    if args.distillation_coef < 0.0:
+        raise ValueError("--distillation-coef must be non-negative.")
+    if args.teacher_checkpoint is None and args.distillation_coef > 0.0:
+        raise ValueError("--distillation-coef requires --teacher-checkpoint.")
+    if (
+        abs(float(args.reference_ctrl_blend)) > 1.0e-12
+        and not args.legacy_reference_conditioned_actor
+    ):
         raise ValueError(
             "All training actors require --reference-ctrl-blend 0 so reference "
             "targets cannot enter the deployed control path."
@@ -1454,6 +1511,20 @@ def main() -> None:
             "Serial-course training requires --terminate-incomplete-motion-end "
             "so a policy cannot freeze on a finished reference frame."
         )
+    if args.serial_course_single_motion and not args.serial_terrain_course:
+        raise ValueError("--serial-course-single-motion requires --serial-terrain-course.")
+    if args.serial_course_single_motion and (
+        args.motion_files is None or len(args.motion_files) != 1
+    ):
+        raise ValueError(
+            "--serial-course-single-motion requires exactly one --motion-files clip."
+        )
+    if args.serial_course_single_motion and args.motion_loop != ["true"]:
+        raise ValueError(
+            "--serial-course-single-motion requires its one motion to use --motion-loop true."
+        )
+    if args.alternating_step_reward_coef < 0.0:
+        raise ValueError("--alternating-step-reward-coef must be non-negative.")
     if not 0.0 <= args.terrain_course_random_start_prob <= 1.0:
         raise ValueError("--terrain-course-random-start-prob must be in [0, 1].")
     if args.terrain_course_random_start_warmup_iterations < 0:
@@ -1620,6 +1691,7 @@ def main() -> None:
         slope_angle_deg=args.slope_angle_deg,
         gap_terrain_width=args.gap_terrain_width,
         serial_terrain_course=bool(args.serial_terrain_course),
+        serial_course_single_motion=bool(args.serial_course_single_motion),
         terrain_course_variants=args.terrain_course_variants,
         terrain_course_lane_spacing=args.terrain_course_lane_spacing,
         terrain_course_run_in=args.terrain_course_run_in,
@@ -1652,6 +1724,7 @@ def main() -> None:
         warp_cuda_graph=args.warp_cuda_graph,
         target_velocity=args.target_velocity,
         reward_mode=args.reward_mode,
+        amp_task_only=bool(args.amp_task_only),
         forward_velocity_tracking_sigma=args.forward_velocity_tracking_sigma,
         forward_velocity_reward_coef=args.forward_velocity_reward_coef,
         forward_progress_reward_coef=args.forward_progress_reward_coef,
@@ -1689,6 +1762,7 @@ def main() -> None:
         side_foot_pos_coef=args.side_foot_pos_coef,
         step_gap_coef=args.step_gap_coef,
         swing_advance_coef=args.swing_advance_coef,
+        alternating_step_reward_coef=args.alternating_step_reward_coef,
         stair_vertical_velocity_sigma=args.stair_vertical_velocity_sigma,
         stair_vertical_velocity_reward_coef=args.stair_vertical_velocity_reward_coef,
         stair_swing_clearance=args.stair_swing_clearance,
@@ -1793,6 +1867,8 @@ def main() -> None:
         amp_label_smoothing=args.amp_label_smoothing,
         amp_obs_noise_std=args.amp_obs_noise_std,
         amp_mirror_ref_prob=args.amp_mirror_ref_prob,
+        teacher_checkpoint=args.teacher_checkpoint,
+        distillation_coef=args.distillation_coef,
         min_action_std=args.min_action_std,
         max_action_std=args.max_action_std,
         episode_metric_window=args.episode_metric_window,

@@ -73,13 +73,12 @@ def default_train_args() -> list[str]:
         str(AMP_DISCRIMINATOR_UPDATES),
         "--episode-metric-window",
         str(PARALLEL_ENVS),
-        # Four full foot/toe meshes retain detailed terrain collision.  The
-        # original 32/128 buffers leave headroom without sizing every solver
-        # kernel for non-colliding body meshes.
+        # Full-body terrain collision needs enough room for simultaneous body,
+        # foot, and toe contacts after a fall or on complex terrain.
         "--warp-nconmax",
-        "32",
-        "--warp-njmax",
         "128",
+        "--warp-njmax",
+        "512",
         "--use-reference-velocity",
         "--target-velocity",
         f"{TRAINING_TARGET_SPEED_MPS:g}",

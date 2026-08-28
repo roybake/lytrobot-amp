@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 import sys
 
+from lytrobot_amp.ppo_amp import PPOAMPConfig
 from scripts import train
 from scripts.train_no_stairs_old import default_train_args
 
@@ -43,3 +44,10 @@ def test_no_stairs_old_preserves_the_reference_conditioned_task_without_stairs()
     assert parsed.training_task == "no_stairs_old"
     assert parsed.skill_conditioning is True
     assert parsed.use_reference_velocity is True
+
+
+def test_legacy_actor_config_accepts_shared_cli_acceleration_options() -> None:
+    cfg = PPOAMPConfig(compile_policy=False, fused_optimizer=False)
+
+    assert cfg.compile_policy is False
+    assert cfg.fused_optimizer is False

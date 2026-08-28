@@ -38,13 +38,13 @@ def test_generic_training_engine_always_builds_sensor_actor() -> None:
     assert args.seed is None
     assert args.episode_random_seed is True
     assert args.log_root.endswith("logs/sensor_policy")
-    # Every task launcher ultimately uses this parser. These are the shared
-    # fast-physics defaults unless a user explicitly requests legacy physics.
-    assert args.robot_collision_profile == "feet"
-    assert args.solver_iterations == 10
+    # Every task launcher ultimately uses this parser. Full-body collision and
+    # its solver capacity are shared defaults for every training task.
+    assert args.robot_collision_profile == "full_body"
+    assert args.solver_iterations == 20
     assert args.solver_ls_iterations == 20
-    assert args.warp_nconmax == 32
-    assert args.warp_njmax == 128
+    assert args.warp_nconmax == 128
+    assert args.warp_njmax == 512
     assert args.warp_cuda_graph is True
     assert {"imu", "tendon", "recurrent", "sensor-only"}.issubset(
         set(args.wandb_tags.split(","))
@@ -74,7 +74,7 @@ def test_every_multimotion_task_disables_commands_and_reference_control() -> Non
             assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
 
 
-def test_every_training_task_resolves_to_shared_fast_physics_defaults() -> None:
+def test_every_training_task_resolves_to_full_body_collision_defaults() -> None:
     task_defaults = (
         [],
         multimotion_args(),
@@ -86,11 +86,11 @@ def test_every_training_task_resolves_to_shared_fast_physics_defaults() -> None:
     for defaults in task_defaults:
         with patch.object(sys, "argv", ["train.py", *defaults]):
             args = train.parse_args()
-        assert args.robot_collision_profile == "feet"
-        assert args.solver_iterations == 10
+        assert args.robot_collision_profile == "full_body"
+        assert args.solver_iterations == 20
         assert args.solver_ls_iterations == 20
-        assert args.warp_nconmax == 32
-        assert args.warp_njmax == 128
+        assert args.warp_nconmax == 128
+        assert args.warp_njmax == 512
         assert args.warp_cuda_graph is True
 
 

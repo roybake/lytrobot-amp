@@ -12,7 +12,7 @@ import torch
 from torch.nn import functional as F
 
 from lytrobot_amp.ppo_amp import PPOAMPTrainer
-from lytrobot_amp.networks import AmpDiscriminator
+from lytrobot_amp.networks import ActorCritic, AmpDiscriminator
 from lytrobot_amp.training_defaults import CONTROL_FREQUENCY_HZ, require_100hz_control
 
 from .networks import RecurrentSensorActorExport, SensorActorCritic
@@ -74,6 +74,35 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             input_dim=env.amp_obs_dim,
             hidden_dims=cfg.discriminator_hidden_dims,
         ).to(self.device)
+        self.teacher_actor_critic: ActorCritic | None = None
+        teacher_path = cfg.teacher_checkpoint
+        if teacher_path is not None:
+            checkpoint = torch.load(Path(teacher_path), map_location=self.device)
+            saved_obs_dim = int(checkpoint.get("obs_dim", -1))
+            if saved_obs_dim != int(env.base_env.obs_dim):
+                raise ValueError(
+                    "Teacher observation dimension does not match the student base environment: "
+                    f"teacher={saved_obs_dim}, base={env.base_env.obs_dim}."
+                )
+            if int(checkpoint.get("action_dim", -1)) != int(env.action_dim):
+                raise ValueError("Teacher action dimension does not match the student.")
+            saved_cfg = checkpoint.get("ppo_amp_config", {})
+            if not isinstance(saved_cfg, dict):
+                raise ValueError("Teacher checkpoint has no valid PPO-AMP configuration.")
+            teacher = ActorCritic(
+                obs_dim=saved_obs_dim,
+                action_dim=env.action_dim,
+                actor_hidden_dims=tuple(saved_cfg.get("actor_hidden_dims", (256, 128))),
+                critic_hidden_dims=tuple(saved_cfg.get("critic_hidden_dims", (256, 128))),
+                init_std=float(saved_cfg.get("init_std", 0.35)),
+                min_action_std=float(saved_cfg.get("min_action_std", 0.05)),
+                max_action_std=float(saved_cfg.get("max_action_std", 0.60)),
+            ).to(self.device)
+            teacher.load_state_dict(checkpoint["actor_critic"], strict=True)
+            teacher.eval()
+            for parameter in teacher.parameters():
+                parameter.requires_grad_(False)
+            self.teacher_actor_critic = teacher
         fused_optimizer = bool(cfg.fused_optimizer and self.device.type == "cuda")
         self.optimizer = torch.optim.Adam(
             self.actor_critic.parameters(),
@@ -144,6 +173,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             (num_steps, num_envs, self.env.amp_obs_dim),
             device=self.device,
         )
+        teacher_actions = torch.empty_like(actions) if self.teacher_actor_critic else None
         privileged_contexts = torch.empty(
             (num_steps, num_envs, self.env.privileged_context_dim),
             device=self.device,
@@ -182,6 +212,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     if self.cfg.amp_enabled
                     else torch.zeros(num_envs, device=self.device)
                 )
+                if teacher_actions is not None:
+                    teacher_obs = self._as_device_tensor(self.env.base_env.observe())
+                    teacher_actions[step] = self.teacher_actor_critic.act_inference(teacher_obs)
 
             env_action = action if getattr(self.env, "is_torch_env", False) else action.cpu().numpy()
             next_obs, task_reward_value, done_value, info = self.env.step(env_action)
@@ -363,6 +396,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "episode_starts": episode_starts,
             "initial_recurrent_state": initial_recurrent_state,
             "amp_features": amp_features,
+            "teacher_actions": teacher_actions,
             "privileged_contexts": privileged_contexts,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
@@ -385,6 +419,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = rollout["episode_starts"]
         initial_hidden = rollout["initial_recurrent_state"]
         privileged_contexts = rollout["privileged_contexts"]
+        teacher_actions = rollout.get("teacher_actions")
         assert all(torch.is_tensor(value) for value in (
             obs,
             actions,
@@ -416,6 +451,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = episode_starts[:, finite_envs]
         initial_hidden = initial_hidden[finite_envs]
         privileged_contexts = privileged_contexts[:, finite_envs]
+        if torch.is_tensor(teacher_actions):
+            teacher_actions = teacher_actions[:, finite_envs]
 
         env_batch_size = obs.shape[1]
         minibatches = max(1, min(self.cfg.num_minibatches, env_batch_size))
@@ -431,6 +468,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "bpo_policy_weight",
             "bpo_median_advantage_abs",
             "privileged_context_loss",
+            "distillation_loss",
         )
         if env_batch_size == 0:
             metrics = {key: 0.0 for key in metric_names}
@@ -534,6 +572,18 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     context_prediction,
                     privileged_contexts[:, mb],
                 )
+                hidden = initial_hidden[mb]
+                student_means: list[torch.Tensor] = []
+                for step in range(obs.shape[0]):
+                    hidden = self.actor_critic._next_hidden(
+                        obs[step, mb], hidden, episode_starts[step, mb]
+                    )
+                    student_means.append(self.actor_critic._actor_mean(hidden))
+                distillation_loss = (
+                    F.smooth_l1_loss(torch.stack(student_means), teacher_actions[:, mb])
+                    if torch.is_tensor(teacher_actions)
+                    else torch.zeros((), dtype=obs.dtype, device=self.device)
+                )
 
                 loss = (
                     policy_loss
@@ -542,6 +592,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     - self.cfg.entropy_coef * entropy_loss
                     + self.cfg.privileged_context_loss_coef
                     * privileged_context_loss
+                    + self.cfg.distillation_coef * distillation_loss
                 )
                 stepped = self._optimizer_step_if_finite(
                     loss,
@@ -576,6 +627,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                         policy_weight.mean(),
                         median_advantage.abs().mean(),
                         privileged_context_loss,
+                        distillation_loss,
                     )
                 ).detach()
                 update_count += 1
@@ -623,8 +675,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             )
         if architecture.get("name") != "proprioceptive_gru_context_mlp":
             raise ValueError(
-                "Checkpoint uses the removed residual-MoE policy architecture; "
-                "start a new single-GRU/MLP run instead of resuming it."
+                "Checkpoint recurrent policy architecture is incompatible with "
+                "the current single-GRU/MLP policy; start a new run instead of "
+                "resuming it."
             )
         saved_env_cfg = checkpoint.get("env_config", {})
         if not isinstance(saved_env_cfg, dict):
@@ -698,6 +751,11 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         checkpoint = super()._checkpoint_payload(iteration)
         checkpoint.update({
             "training_task": str(getattr(self.env.cfg, "training_task", "")),
+            "distillation": {
+                "teacher_checkpoint": self.cfg.teacher_checkpoint,
+                "teacher_frozen": self.teacher_actor_critic is not None,
+                "coefficient": float(self.cfg.distillation_coef),
+            },
             "sensor_observation": self.env.observation_metadata,
             "sensor_policy_architecture": {
                 "name": "proprioceptive_gru_context_mlp",

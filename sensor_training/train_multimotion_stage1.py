@@ -16,6 +16,6 @@ if __name__ == "__main__":
     run_task_stage(
         ROOT / "sensor_training" / "train_multimotion.py",
         stage="stage1",
-        log_root=ROOT / "logs" / "multimotion" / "no_stairs",
+        log_root=ROOT / "logs" / "multimotion" / "no_stairs_amp_single",
         task_defaults=default_train_args(),
     )

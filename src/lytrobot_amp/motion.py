@@ -774,9 +774,10 @@ def load_motion_library(
     motion_weights: Sequence[float] | None = None,
     motion_names: Sequence[str] | None = None,
     motion_loop: Sequence[bool] | None = None,
+    force_library: bool = False,
 ) -> MotionReference | MotionLibrary:
     files = tuple(motion_files)
-    if len(files) == 1:
+    if len(files) == 1 and not force_library:
         return MotionReference(files[0], model, actuator_ids=actuator_ids)
     return MotionLibrary(
         files,

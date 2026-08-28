@@ -257,6 +257,10 @@ class LytRobotEnvCfg:
     slope_angle_deg: float = 6.0
     gap_terrain_width: float = 0.20
     serial_terrain_course: bool = False
+    # Reuse one looping walk clip as the AMP expert for every serial-course
+    # stage.  This is explicit because ordinary courses still require a
+    # terrain-aligned multi-motion library.
+    serial_course_single_motion: bool = False
     terrain_course_variants: int = 8
     terrain_course_lane_spacing: float = 3.0
     terrain_course_run_in: float = 2.90
@@ -283,9 +287,8 @@ class LytRobotEnvCfg:
     randomize_episode_seed: bool = False
     decimation: int = CONTROL_DECIMATION
     timestep: float = SIMULATION_TIMESTEP_S
-    # Full-body is the backward-compatible interpretation for old checkpoints
-    # that predate an explicit collision-profile field. New launchers pass the
-    # faster feet profile and its smaller solver settings explicitly.
+    # Full-body is both the training default and the backward-compatible
+    # interpretation for checkpoints that predate this explicit field.
     robot_collision_profile: str = "full_body"
     allow_collision_profile_migration: bool = False
     solver_iterations: int = 20
@@ -299,6 +302,10 @@ class LytRobotEnvCfg:
     episode_timeout_jitter_steps: int = 480
     target_velocity: float = 1.0
     reward_mode: str = "default"
+    # Keep retargeted data exclusively inside the AMP discriminator.  The task
+    # reward then contains only physical walking objectives, never reference
+    # pose/contact/control matching.
+    amp_task_only: bool = False
     forward_velocity_tracking_sigma: float = 0.25
     forward_velocity_reward_coef: float = 0.0
     forward_progress_reward_coef: float = 0.0
@@ -336,6 +343,7 @@ class LytRobotEnvCfg:
     side_foot_pos_coef: float = 0.0
     step_gap_coef: float = 0.0
     swing_advance_coef: float = 0.0
+    alternating_step_reward_coef: float = 0.0
     stair_vertical_velocity_sigma: float = 0.25
     stair_vertical_velocity_reward_coef: float = 1.0
     stair_swing_clearance: float = 0.08
@@ -487,6 +495,7 @@ class LytRobotAmpEnv:
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
+            force_library=bool(cfg.serial_terrain_course and cfg.serial_course_single_motion),
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -631,6 +640,7 @@ class LytRobotAmpEnv:
         self.motion_transition_steps_left = np.zeros(self.num_envs, dtype=np.int32)
         self.last_foot_pos = np.zeros((self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
         self.last_foot_world_pos = np.zeros_like(self.last_foot_pos)
+        self.last_foot_contact = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_stride_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_x_min = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_x_max = np.zeros((self.num_envs, 2), dtype=np.float32)
@@ -673,6 +683,18 @@ class LytRobotAmpEnv:
             return np.empty((0, 0), dtype=np.int32)
         if not isinstance(self.motion, MotionLibrary):
             raise ValueError("serial terrain course requires a multi-motion library.")
+        if self.cfg.serial_course_single_motion:
+            if len(motion_names) != 1:
+                raise ValueError(
+                    "--serial-course-single-motion requires exactly one motion clip."
+                )
+            stage_count = len(course_motion_sequence(
+                self.more_terrain_cfg.normalized_course_orders[0]
+            ))
+            return np.zeros(
+                (len(self.more_terrain_cfg.normalized_course_orders), stage_count),
+                dtype=np.int32,
+            )
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
@@ -1390,6 +1412,7 @@ class LytRobotAmpEnv:
             foot_pos = self._foot_positions_local(data)
             self.last_foot_pos[int(env_id)] = foot_pos
             self.last_foot_world_pos[int(env_id)] = self._foot_positions_world(data)
+            self.last_foot_contact[int(env_id)] = self._foot_contacts(data)
             side_x = np.asarray(
                 [
                     np.mean(foot_pos[0:2, 0]),
@@ -1797,6 +1820,7 @@ class LytRobotAmpEnv:
             self.last_action[env_id] = commanded_action
             self.last_foot_pos[env_id] = foot_pos
             self.last_foot_world_pos[env_id] = foot_world_pos
+            self.last_foot_contact[env_id] = foot_contact
             for key, value in reward_parts.items():
                 components.setdefault(key, []).append(float(value))
             if self.more_terrain_cfg.serial_course:
@@ -2075,15 +2099,72 @@ class LytRobotAmpEnv:
                 - self.cfg.missed_contact_penalty_coef * missed_contact
             )
 
+        if self.cfg.amp_task_only:
+            # The retargeted sequence must shape this policy only through AMP.
+            # Touchdown is rewarded when it alternates from the foot that was
+            # supporting the previous step; this uses simulator contacts only.
+            previous_contact = self.last_foot_contact[env_id]
+            touchdown = (foot_contact > 0.5) & (previous_contact <= 0.5)
+            alternating_step = float(
+                (touchdown[0] and previous_contact[1] > 0.5)
+                or (touchdown[1] and previous_contact[0] > 0.5)
+            )
+            terrain_height = (
+                float(self.more_terrain_cfg.course_base_height)
+                if self.more_terrain_cfg.serial_course
+                else 0.0
+            )
+            physical_height = float(
+                np.exp(
+                    -((root_height - (self.nominal_root_height + terrain_height)) ** 2)
+                    / (0.16**2)
+                )
+            )
+            upright = float(
+                np.clip(
+                    (up_z - float(self.cfg.min_upright_z))
+                    / max(1.0 - float(self.cfg.min_upright_z), 1.0e-6),
+                    0.0,
+                    1.0,
+                )
+            )
+            stable_velocity = forward_velocity_track * upright * physical_height
+            forward_only_progress = float(np.clip(forward_progress, 0.0, 1.0))
+            support = float(np.any(foot_contact > 0.5))
+            reward = (
+                0.05
+                + 1.20 * upright
+                + 0.80 * physical_height
+                + self.cfg.forward_velocity_reward_coef * stable_velocity
+                + self.cfg.forward_progress_reward_coef * forward_only_progress
+                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
+                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
+                + self.cfg.contact_reward_coef * support
+                + self.cfg.alternating_step_reward_coef * alternating_step
+                - self.cfg.foot_slip_penalty_coef * foot_slip
+                - self.cfg.ctrl_penalty_coef * ctrl_penalty
+                - self.cfg.action_rate_penalty_coef * action_rate
+                - self.cfg.distal_action_penalty_coef * distal_action
+                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
+            )
+
         bad_state = not (
             np.isfinite(data.qpos).all()
             and np.isfinite(data.qvel).all()
             and np.isfinite(data.ctrl).all()
         )
-        min_root_height = ref_root_height + (
+        physical_root_height = self.nominal_root_height + (
+            float(self.more_terrain_cfg.course_base_height)
+            if self.more_terrain_cfg.serial_course
+            else 0.0
+        )
+        height_reference = (
+            physical_root_height if self.cfg.amp_task_only else ref_root_height
+        )
+        min_root_height = height_reference + (
             float(self.cfg.fall_height) - self.nominal_root_height
         )
-        max_root_height = ref_root_height + (
+        max_root_height = height_reference + (
             float(self.cfg.max_height) - self.nominal_root_height
         )
         fallen = (
@@ -2165,6 +2246,9 @@ class LytRobotAmpEnv:
             "action_rate": action_rate,
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
+            "alternating_step": (
+                alternating_step if self.cfg.amp_task_only else 0.0
+            ),
         }
         reward, bad_state, components = _sanitize_reward_outputs(
             reward,

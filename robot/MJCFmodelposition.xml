@@ -23,8 +23,8 @@
   <default>
     <joint limited="true" damping="0.1" armature="0.01" stiffness="1.5"></joint>
     <!-- Every robot geom collides with static terrain, but robot geoms do not
-         collide with one another.  Training can explicitly select the faster
-         foot-only profile after loading this backward-compatible model. -->
+         collide with one another.  A predictive margin plus a hard contact
+         impedance prevents visible tunnelling during fast impacts. -->
     <geom rgba="0.8 0.6 .4 1" margin="0.005" condim="3" group="0"
           contype="0" conaffinity="1" friction="1 .1 .1"
           solref="0.005 1" solimp="0.95 0.99 0.001"></geom>

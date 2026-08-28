@@ -65,8 +65,6 @@ class SensorPolicyDistributionTests(unittest.TestCase):
         self.assertTrue(cfg.adaptive_lr)
         self.assertEqual(cfg.max_learning_rate, 3.0e-4)
         self.assertEqual(cfg.recurrent_hidden_dim, 128)
-        self.assertFalse(hasattr(cfg, "num_experts"))
-        self.assertFalse(hasattr(cfg, "gate_change_coef"))
         self.assertGreater(cfg.privileged_context_loss_coef, 0.0)
 
 

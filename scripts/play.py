@@ -390,15 +390,15 @@ def make_env_cfg(
 
 
 def validate_recurrent_sensor_architecture(checkpoint: dict) -> None:
-    """Reject recurrent checkpoints produced by the removed MoE actor."""
+    """Require the current recurrent sensor-policy checkpoint contract."""
 
     architecture = checkpoint.get("sensor_policy_architecture", {})
     if not isinstance(architecture, dict) or not bool(architecture.get("recurrent", False)):
         return
     if architecture.get("name") != "proprioceptive_gru_context_mlp":
         raise ValueError(
-            "This recurrent checkpoint uses the removed residual-MoE architecture. "
-            "Train and play a new single-GRU/MLP 100 Hz checkpoint."
+            "This recurrent checkpoint is incompatible with the current "
+            "single-GRU/MLP 100 Hz policy. Train and play a new checkpoint."
         )
 
 

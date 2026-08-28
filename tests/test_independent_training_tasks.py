@@ -34,7 +34,7 @@ from sensor_training.envs import SensorHistoryCpuAmpEnv
 
 ROOT = Path(__file__).resolve().parents[1]
 MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
-NO_STAIRS_MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
+NO_STAIRS_MOTION_DIR = ROOT / "robot" / "reference_data" / "no_stairs_fast"
 
 
 def _option_values(args: list[str], option: str) -> list[str]:
@@ -48,14 +48,15 @@ def _option_values(args: list[str], option: str) -> list[str]:
 def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None:
     args = no_stairs_args()
 
-    assert _option_values(args, "--training-task") == ["multimotion_no_stairs"]
-    assert _option_values(args, "--motion-names") == ["walk", "rough_walk"]
+    assert _option_values(args, "--training-task") == ["multimotion_no_stairs_amp_single"]
+    assert _option_values(args, "--motion-names") == ["walk"]
     assert [Path(value) for value in _option_values(args, "--motion-files")] == [
         NO_STAIRS_MOTION_DIR / "walk_omniretarget.npz",
-        NO_STAIRS_MOTION_DIR / "rough_walk_omniretarget.npz",
     ]
-    assert _option_values(args, "--motion-weights") == ["0.50", "0.50"]
-    assert _option_values(args, "--motion-loop") == ["true", "false"]
+    assert _option_values(args, "--motion-weights") == ["1.0"]
+    assert _option_values(args, "--motion-loop") == ["true"]
+    assert "--serial-course-single-motion" in args
+    assert "--amp-task-only" in args
     assert set(_option_values(args, "--terrain-types")) == {
         "flat",
         "rough",
@@ -79,21 +80,20 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert "--terrain-course-phase-sync" in args
     assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
     assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
-    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 2.0
+    assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 3.0
     assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 1.0
-    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.5
-    assert float(_option_values(args, "--stance-foot-reward-coef")[0]) == 1.0
-    assert float(_option_values(args, "--contact-reward-coef")[0]) == 0.70
-    assert float(_option_values(args, "--symmetry-reward-coef")[0]) == 0.50
+    assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.0
+    assert float(_option_values(args, "--forward-velocity-excess-penalty-coef")[0]) == 0.0
+    assert float(_option_values(args, "--contact-reward-coef")[0]) == 0.35
+    assert float(_option_values(args, "--alternating-step-reward-coef")[0]) == 1.50
     assert "--reward-mode" not in args
     assert not any(value.startswith("--stair-") for value in args)
     assert "--no-skill-conditioning" in args
     assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
-    assert "--use-reference-velocity" in args
     assert "--serial-reference-state-init" in args
     assert _option_values(args, "--motion-reset-prob") == ["0.50"]
-    assert _option_values(args, "--stand-start-prob") == ["0.0"]
-    assert _option_values(args, "--startup-action-ramp-steps") == ["0"]
+    assert _option_values(args, "--stand-start-prob") == ["0.25"]
+    assert _option_values(args, "--startup-action-ramp-steps") == ["40"]
 
     with patch.object(sys, "argv", ["train.py", *args]):
         stair_free = vars(train.parse_args())
@@ -106,8 +106,8 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert stair_free["minibatches"] == 8
     assert stair_free["amp_minibatch_size"] == 4096
     assert stair_free["amp_disc_updates"] == 2
-    assert stair_free["warp_nconmax"] == 32
-    assert stair_free["warp_njmax"] == 128
+    assert stair_free["warp_nconmax"] == 128
+    assert stair_free["warp_njmax"] == 512
 
     # The original all-terrain entry point remains a separate four-clip task.
     original = original_multimotion_args()
@@ -253,17 +253,18 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
     env = SensorHistoryCpuAmpEnv(
         LytRobotEnvCfg(
             model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
-            training_task="multimotion_no_stairs",
+            training_task="multimotion_no_stairs_amp_single",
             motion_files=(
                 str(NO_STAIRS_MOTION_DIR / "walk_omniretarget.npz"),
-                str(NO_STAIRS_MOTION_DIR / "rough_walk_omniretarget.npz"),
             ),
-            motion_names=("walk", "rough_walk"),
-            motion_weights=(0.5, 0.5),
-            motion_loop=(True, False),
+            motion_names=("walk",),
+            motion_weights=(1.0,),
+            motion_loop=(True,),
             skill_conditioning=False,
             terrain_types=("flat", "rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
+            serial_course_single_motion=True,
+            amp_task_only=True,
             serial_reference_state_init=True,
             terrain_course_variants=6,
             num_envs=1,
@@ -283,7 +284,7 @@ def test_stair_free_task_actor_observation_is_strictly_sensor_only() -> None:
         assert env.observation_metadata["command_dim"] == 0
         assert env.stair_cfg.enabled is False
         assert env.more_terrain_cfg.serial_course is True
-        assert env.base_env.motion_count == 2
+        assert env.base_env.motion_count == 1
     finally:
         env.close()
 

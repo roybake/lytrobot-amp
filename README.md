@@ -21,6 +21,122 @@ AMP、任务奖励和 asymmetric critic 可以使用训练期仿真真值，但�
 统一写入 `logs/multimotion/`，独立阶梯训练写入 `logs/stairs/`；旧完整状态 checkpoint、
 旧 336 维无相位蹲起 checkpoint 与当前 338 维策略不兼容。
 
+## 命令速查
+
+所有训练命令都显式进入项目根目录；每个 run 仅保留最新的
+`model_final.pt/.onnx` 与最佳的 `model_best.pt/.onnx`。`model_final` 用于续训，
+`model_best` 用于播放/部署；`model_best.json` 仅记录最佳模型的选择指标。
+
+### 训练与权重位置
+
+普通行走：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py --stage1-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt
+```
+
+权重：`logs/sensor_policy/stage1/<run>/`、`logs/sensor_policy/stage2/<run>/`。
+
+蹲起：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python squat_training/train_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python squat_training/train_stage2.py --stage1-checkpoint logs/squat_sensor_policy/stage1/<run>/model_final.pt
+```
+
+权重：`logs/squat_sensor_policy/stage1/<run>/`、`logs/squat_sensor_policy/stage2/<run>/`。
+
+全地形多动作（含楼梯）：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage2.py --stage1-checkpoint logs/multimotion/stage1/<run>/model_final.pt
+```
+
+权重：`logs/multimotion/stage1/<run>/`、`logs/multimotion/stage2/<run>/`。
+
+无阶梯、单个 OmniRetarget 数据、纯 AMP 传感器策略：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_stage2.py --stage1-checkpoint logs/multimotion/no_stairs_amp_single/stage1/<run>/model_final.pt
+```
+
+权重：`logs/multimotion/no_stairs_amp_single/stage1/<run>/`、`logs/multimotion/no_stairs_amp_single/stage2/<run>/`。
+
+无阶梯 privileged Teacher（08-06 当前安全近似）：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_amp_teacher.py
+```
+
+权重：`logs/multimotion/multimotion_no_stairs_amp_teacher/<run>/`。
+
+无阶梯 IMU+肌腱 Student（冻结 Teacher 后蒸馏）：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_amp_student.py --teacher-checkpoint logs/multimotion/multimotion_no_stairs_amp_teacher/<run>/model_best.pt
+```
+
+权重：`logs/multimotion/multimotion_no_stairs_amp_student/<run>/`。
+
+独立上下楼梯：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stairs_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stairs_stage2.py --stage1-checkpoint logs/stairs/stage1/<run>/model_final.pt
+```
+
+权重：`logs/stairs/stage1/<run>/`、`logs/stairs/stage2/<run>/`。
+
+多动作网络布局的平地预训练：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_walk_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_walk_stage2.py --stage1-checkpoint logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt
+```
+
+权重：`logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/`、`logs/sensor_policy/multimotion_walk_warmup/stage2/<run>/`。
+
+旧无阶梯参考条件基线（仅用于对照）：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_no_stairs_old.py
+```
+
+权重：`logs/sensor_policy/stage1/<run>/`；不要与 Teacher/Student 或纯 AMP 无阶梯任务混用。
+
+### 测试、录屏与完整测试集
+
+传感器行走、多动作、无阶梯、楼梯和 Student：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python sensor_training/play.py --checkpoint logs/<task>/<stage>/<run>/model_best.onnx --stage <stage> --viewer --steps 0 --record-fps 30
+```
+
+蹲起：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python squat_training/play.py --checkpoint logs/squat_sensor_policy/<stage>/<run>/model_best.onnx --stage <stage> --viewer --steps 0 --record-fps 30
+```
+
+Teacher 和旧参考条件基线：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/play.py --checkpoint logs/multimotion/multimotion_no_stairs_amp_teacher/<run>/model_best.pt --stage stage1 --device cuda --viewer --steps 0 --record-fps 30
+```
+
+录屏位于对应 checkpoint 的 `recordings/` 目录。播放固定按 100 Hz 仿真节拍等待；录屏按
+仿真时间重采样 30 fps，所以播放与 MP4 均为真实仿真速度（1 秒视频 = 1 秒仿真）。
+
+```bash
+cd /home/yeah/code/LYTrobot_amp && .venv/bin/python -m pytest -q
+cd /home/yeah/code/LYTrobot_amp && .venv/bin/python -m pytest -q tests/test_play_recording.py
+```
+
+`sensor_training/train*.py` 是对应 `scripts/` 传感器任务的兼容入口；除排查兼容性外，使用上面的正式入口。
+
 ## 所有任务的两阶段训练与测试命令
 
 所有正式任务遵守同一约束：Stage 1 强制关闭域随机化；Stage 2 必须加载同任务的
@@ -53,7 +169,7 @@ cd /home/yeah/code/LYTrobot_amp
 Stage 1 训练：
 
 ```bash
-uv run python scripts/train_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage1.py
 ```
 
 Stage 1 有界面测试：
@@ -70,7 +186,7 @@ uv run python sensor_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python scripts/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt
 ```
 
@@ -93,7 +209,7 @@ uv run python sensor_training/play.py \
 Stage 1 训练：
 
 ```bash
-uv run python squat_training/train_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python squat_training/train_stage1.py
 ```
 
 Stage 1 有界面测试：
@@ -110,7 +226,7 @@ uv run python squat_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python squat_training/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python squat_training/train_stage2.py \
   --stage1-checkpoint logs/squat_sensor_policy/stage1/<run>/model_final.pt
 ```
 
@@ -130,7 +246,7 @@ uv run python squat_training/play.py \
 Stage 1 训练：
 
 ```bash
-uv run python scripts/train_multimotion_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage1.py
 ```
 
 Stage 1 有界面测试（默认同屏 3 台机器人和随机路线）：
@@ -147,7 +263,7 @@ uv run python sensor_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python scripts/train_multimotion_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage2.py \
   --stage1-checkpoint logs/multimotion/stage1/<run>/model_final.pt
 ```
 
@@ -193,9 +309,9 @@ Actor 和 ONNX 输入仍严格只有 IMU 与肌肉长度，参考动作、相位
 Stage 1 训练：
 
 ```bash
-uv run python scripts/train_multimotion_no_stairs_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_stage1.py
 # 等价的传感器目录入口：
-uv run python sensor_training/train_multimotion_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python sensor_training/train_multimotion_stage1.py
 ```
 
 Stage 1 有界面测试：
@@ -212,7 +328,7 @@ uv run python sensor_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python scripts/train_multimotion_no_stairs_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_no_stairs_stage2.py \
   --stage1-checkpoint \
     logs/multimotion/no_stairs/stage1/<run>/model_best.pt
 ```
@@ -243,7 +359,7 @@ Stage 1 前 `15000` 轮只从路线入口训练稳定步态，再用 `7500` 轮�
 Stage 1 训练：
 
 ```bash
-uv run python scripts/train_stairs_stage1.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stairs_stage1.py \
   --stair-step-height 0.13
 ```
 
@@ -261,7 +377,7 @@ uv run python sensor_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python scripts/train_stairs_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stairs_stage2.py \
   --stage1-checkpoint logs/stairs/stage1/<run>/model_best.pt \
   --stair-step-height 0.13
 ```
@@ -282,7 +398,7 @@ uv run python sensor_training/play.py \
 Stage 1 训练：
 
 ```bash
-uv run python scripts/train_multimotion_walk_stage1.py
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_walk_stage1.py
 ```
 
 Stage 1 有界面测试：
@@ -301,7 +417,7 @@ uv run python sensor_training/play.py \
 Stage 2 训练：
 
 ```bash
-uv run python scripts/train_multimotion_walk_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_walk_stage2.py \
   --stage1-checkpoint \
     logs/sensor_policy/multimotion_walk_warmup/stage1/<run>/model_final.pt
 ```
@@ -333,15 +449,15 @@ seed 每次启动、每次 reset 都不同；如需复现，在对应的有界�
 ## 直线全地形多动作训练
 
 当前训练策略按要求暂不训练转身，只使用 walk、rough、pit、gap、stair_up、
-stair_down 六种参考动作，连续通过 MoRE 风格不平路、沟坑、间隙、坡道和楼梯。
+stair_down 六种参考动作，连续通过不平路、沟坑、间隙、坡道和楼梯。
 左/右转参考文件仍保留给后续独立转身课程使用，不再拼入直线地形路线：
 
 ```bash
 cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_multimotion_stage1.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage1.py \
   --num-envs 4096 --max-iterations 30000
 
-uv run python scripts/train_multimotion_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_multimotion_stage2.py \
   --stage1-checkpoint \
     logs/multimotion/stage1/<run>/model_best.pt \
   --num-envs 4096 --max-iterations 7500
@@ -449,7 +565,7 @@ iteration 写本地日志，W&B 默认每 10 轮上报一次。第一阶段强�
 第二阶段默认随机化包括：负重质量、各 body 质量、肌腱长度比例、地面摩擦系数、重力加速度 `9.75~9.85m/s^2`、随机方向/大小推力、观测噪声、动作噪声、`2~5ms` action delay。范围均可用命令行覆盖，例如：
 
 ```bash
-uv run python scripts/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/<stage1_run>/model_final.pt \
   --payload-mass-min 0.0 \
   --payload-mass-max 3.0 \
@@ -472,7 +588,7 @@ uv run python scripts/train_stage2.py \
 为了让策略具备物理样机可用的“静止起步”能力，训练环境默认会把一部分 episode 设为双脚静止站立起步：先保持站立相位，再用 80~160 个 policy step 平滑接入周期步态，起步前 100 step 不施加随机推力。相关参数可以覆盖：
 
 ```bash
-uv run python scripts/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/<stage1_run>/model_final.pt \
   --stand-start-prob 0.5 \
   --stand-start-phase-delay-steps 25 \
@@ -521,7 +637,7 @@ wandb login
 常用参数：
 
 ```bash
-uv run python scripts/train_stage1.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage1.py \
   --num-envs 1024 \
   --target-velocity 1.0 \
   --motion-reset-prob 0.5 \
@@ -568,7 +684,7 @@ uv run python scripts/train_stage1.py \
 
 ```bash
 cd /home/yeah/code/LYTrobot_amp
-uv run python scripts/train_stage1.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage1.py \
   --resume-checkpoint logs/06-06-21:19:41/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-07-stabilize-ankle-stage1 \
@@ -583,7 +699,7 @@ uv run python scripts/train_stage1.py \
 第二阶段鲁棒性训练从第一阶段最好的 checkpoint 继续，并启用领域随机化：
 
 ```bash
-uv run python scripts/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/06-07-stabilize-ankle-stage1/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-07-stabilize-ankle-stage2 \
@@ -600,7 +716,7 @@ uv run python scripts/train_stage2.py \
 针对当前支撑脚前后蹭动，先从与第二阶段兼容的 14 维 position stage1 策略低学习率续训约 4000 iteration：
 
 ```bash
-uv run python scripts/train_stage1.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage1.py \
   --resume-checkpoint logs/sensor_policy/stage1/06-18-10:01:10/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-30-no-slip-stage1 \
@@ -613,7 +729,7 @@ uv run python scripts/train_stage1.py \
 选择 `task_stance_foot_speed`、`task_missed_contact` 已下降且步态未退化的 checkpoint，再进入第二阶段；不要直接用旧 stage2 权重消除已经形成的腾空蹭步：
 
 ```bash
-uv run python scripts/train_stage2.py \
+cd /home/yeah/code/LYTrobot_amp && uv run python scripts/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/06-30-no-slip-stage1/model_final.pt \
   --resume-reset-optimizer \
   --run-name 06-30-no-slip-stage2 \
@@ -664,6 +780,23 @@ uv run python sensor_training/play.py \
   --stage stage2 --viewer --steps 0
 ```
 
-这条命令也会自动生成
-`logs/sensor_policy/stage2/recordings/<run>-<iteration>.mp4`。其他动作同样保存到各自
-checkpoint 所在任务的 `stage1/recordings/` 或 `stage2/recordings/`。
+当前 `08-27-15:38:23` Stage 1 ONNX 模型的有界面测试命令：
+
+```bash
+uv run python sensor_training/play.py \
+  --checkpoint logs/sensor_policy/stage1/08-27-15:38:23/model_final.onnx\
+  --stage stage1 \
+  --viewer \
+  --steps 0
+```
+
+该 ONNX 内嵌 56 维传感器输入、128 维 GRU 状态和环境配置，播放入口会自动维护并在
+episode 重置时清零循环状态。模型元数据启用了平地、不平路面、上坡和下坡组成的无阶梯
+串联路线，因此上面的命令会按训练配置测试完整路线。`--steps 0` 表示持续播放，关闭
+MuJoCo 窗口即可结束；带 `--viewer` 时会自动录制视频。ONNX 推理固定使用 CPU
+Execution Provider，无需指定 `--device cuda`。
+
+录像会根据 checkpoint 路径保存到对应阶段的 `recordings/` 目录；例如当前模型写入
+`logs/sensor_policy/stage1/recordings/08-27-15-38-23-<iteration>.mp4`，同名录像会自动
+追加序号而不会覆盖。其他动作同样保存到各自 checkpoint 所在任务的
+`stage1/recordings/` 或 `stage2/recordings/`。

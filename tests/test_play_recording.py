@@ -350,12 +350,12 @@ def test_playback_rejects_old_50hz_checkpoint() -> None:
         )
 
 
-def test_playback_rejects_removed_recurrent_moe_checkpoint() -> None:
-    with pytest.raises(ValueError, match="removed residual-MoE"):
+def test_playback_rejects_incompatible_recurrent_checkpoint() -> None:
+    with pytest.raises(ValueError, match="incompatible"):
         validate_recurrent_sensor_architecture(
             {
                 "sensor_policy_architecture": {
-                    "name": "proprioceptive_gru_context_residual_moe",
+                    "name": "legacy_recurrent_sensor_policy",
                     "recurrent": True,
                 }
             }
