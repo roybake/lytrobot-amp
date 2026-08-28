@@ -161,9 +161,34 @@ class SensorObservationTests(unittest.TestCase):
                 ]
             )
             self.assertNotEqual(env.privileged_context_dim, 0)
+            self.assertGreater(env.privileged_context_dim, env.base_env.obs_dim)
             self.assertEqual(
                 env.privileged_observe().shape,
                 (1, env.privileged_context_dim),
+            )
+            self.assertEqual(env.estimator_context_dim, 11)
+            self.assertEqual(
+                env.estimator_observe().shape,
+                (1, env.estimator_context_dim),
+            )
+            privileged_metadata = env.privileged_context_metadata
+            self.assertEqual(privileged_metadata["version"], 2)
+            self.assertEqual(
+                set(privileged_metadata["groups"]),
+                {
+                    "clean_simulator_reference_observation",
+                    "actuator_control",
+                    "actuator_force",
+                    "actuator_velocity",
+                    "detailed_foot_contact",
+                    "terrain",
+                    "motion_identity",
+                    "task_and_course",
+                    "body_mass_randomization",
+                    "tendon_length_randomization",
+                    "randomization_and_external_force",
+                    "task_specific",
+                },
             )
             observation_before_command_change = observation.copy()
             env.base_env.cfg.target_velocity = 3.0

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Train the original reference-conditioned AMP policy without stairs.
-
-This is intentionally separate from :mod:`train_multimotion_no_stairs`, which
-trains the newer sensor-history actor.  It preserves the 08-06 multi-motion
-policy/AMP implementation and its reference-conditioned actor input, while
-removing only the stair clips and stair terrain from that run.
-"""
+"""Train the former 08-06 no-stairs setup with the unified sensor Actor."""
 
 from __future__ import annotations
 
@@ -33,7 +27,7 @@ def default_train_args() -> list[str]:
 
     return [
         "--training-task",
-        "no_stairs_old",
+        "no_stairs_old_sensor_privileged_v2",
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
@@ -46,7 +40,7 @@ def default_train_args() -> list[str]:
         "--motion-loop",
         "true",
         "false",
-        "--skill-conditioning",
+        "--no-skill-conditioning",
         "--use-reference-velocity",
         "--terrain-types",
         "rough",
@@ -113,7 +107,7 @@ def default_train_args() -> list[str]:
         "--distal-action-scale",
         "1.0",
         "--reference-ctrl-blend",
-        "1.0",
+        "0.0",
         "--motion-reset-prob",
         "1.0",
         "--motion-transition-blend-steps",
@@ -175,28 +169,18 @@ def default_train_args() -> list[str]:
         "--max-action-std",
         "0.6",
         "--log-group",
-        "no_stairs_old",
+        "no_stairs_old_sensor_privileged_v2",
         "--wandb-tags",
-        "lytrobot,bpo,amp,multimotion,no-stairs-old,serial-course,random-order,rough,slope-up,slope-down",
+        "lytrobot,bpo,amp,multimotion,no-stairs-old,sensor-only,asymmetric-critic,"
+        "privileged-v2,serial-course,random-order,rough,slope-up,slope-down",
     ]
 
 
 def main() -> None:
-    """Run ``scripts.train`` with the pre-sensor actor and PPO-AMP classes."""
-
-    import scripts.train as runner
-    from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
-    from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
-
-    # ``scripts.train`` is the shared CLI/logging loop.  Its normal bindings
-    # deliberately select the sensor-only environment; replace those bindings
-    # before entering the loop so this task keeps the original 131-D actor.
-    runner.LytRobotWarpAmpEnv = LytRobotWarpAmpEnv
-    runner.PPOAMPConfig = PPOAMPConfig
-    runner.PPOAMPTrainer = PPOAMPTrainer
-    runner.validate_locomotion_actor_input_contract = lambda _env: None
     sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
-    runner.main()
+    from sensor_training.train import main as train_main
+
+    train_main()
 
 
 if __name__ == "__main__":

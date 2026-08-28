@@ -715,6 +715,12 @@ def main() -> None:
                 privileged_context_dim=int(
                     sensor_architecture.get("privileged_context_dim", 0)
                 ),
+                estimator_context_dim=int(
+                    sensor_architecture.get(
+                        "estimator_context_dim",
+                        sensor_architecture.get("privileged_context_dim", 0),
+                    )
+                ),
             ).to(args.device)
             recurrent_state = policy.initial_state(env.num_envs)
         else:

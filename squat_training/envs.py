@@ -837,27 +837,22 @@ class SquatCpuAmpEnv(SquatRewardMixin, LytRobotAmpEnv):
 
 
 class SquatSensorHistoryEnv(SensorHistoryEnv):
-    """Sensor history plus the feedback-corrected squat phase clock."""
+    """Squat task with a strictly IMU+tendon Actor and privileged phase Critic."""
 
-    actor_history_enabled = True
-    phase_dim = 2
+    actor_history_enabled = False
 
     @property
-    def sensor_history_obs_dim(self) -> int:
-        return int(
-            self.sensor_frame_dim * self.sensor_observation_cfg.frame_count
+    def _task_privileged_fields(self) -> tuple[str, ...]:
+        return (
+            "squat_sin_phase",
+            "squat_cos_phase",
+            "squat_phase_feedback_scale",
+            "squat_sensor_depth",
+            "squat_phase_stalled",
+            "squat_phase_stall_progress",
+            "squat_cycle_stage",
+            "squat_cycle_count",
         )
-
-    @property
-    def policy_frame_dim(self) -> int:
-        # The GRU consumes the newest 56-D sensor frame followed by the two
-        # current controller phase values.  Older sensor frames remain in the
-        # public observation for checkpoint compatibility and diagnostics.
-        return int(self.sensor_frame_dim + self.phase_dim)
-
-    @property
-    def obs_dim(self) -> int:
-        return int(self.sensor_history_obs_dim + self.phase_dim)
 
     def _phase_features(self) -> np.ndarray | torch.Tensor:
         frame_count = max(int(self.base_motion.frame_count), 1)
@@ -867,42 +862,58 @@ class SquatSensorHistoryEnv(SensorHistoryEnv):
         angle = 2.0 * np.pi * self.base_env.motion_phase / float(frame_count)
         return np.stack((np.sin(angle), np.cos(angle)), axis=1).astype(np.float32)
 
-    def observe(self) -> np.ndarray | torch.Tensor:
-        sensor_history = self._actor_history.reshape(
-            self.num_envs,
-            self.sensor_history_obs_dim,
-        )
+    def _task_privileged_observe(self) -> np.ndarray | torch.Tensor:
         phase = self._phase_features()
+        env = self.base_env
+        stall_normalizer = max(int(env.cfg.squat_phase_max_stall_steps), 1)
         if self.is_torch_env:
-            return torch.cat((sensor_history, phase), dim=1)
-        return np.concatenate((sensor_history, phase), axis=1).astype(np.float32)
+            return torch.cat(
+                (
+                    phase,
+                    env.squat_phase_feedback_scale[:, None],
+                    env.squat_depth_sensor_progress[:, None],
+                    env.squat_phase_stalled.to(torch.float32)[:, None],
+                    (
+                        env.squat_phase_stall_steps.to(torch.float32)
+                        / float(stall_normalizer)
+                    )[:, None],
+                    (env.squat_cycle_stage.to(torch.float32) / 2.0)[:, None],
+                    torch.clamp(env.squat_cycle_count.to(torch.float32), 0.0, 4.0)[:, None]
+                    / 4.0,
+                ),
+                dim=1,
+            )
+        return np.concatenate(
+            (
+                phase,
+                env.squat_phase_feedback_scale[:, None],
+                env.squat_depth_sensor_progress[:, None],
+                env.squat_phase_stalled.astype(np.float32)[:, None],
+                (
+                    env.squat_phase_stall_steps.astype(np.float32)
+                    / float(stall_normalizer)
+                )[:, None],
+                (env.squat_cycle_stage.astype(np.float32) / 2.0)[:, None],
+                (np.clip(env.squat_cycle_count, 0, 4).astype(np.float32) / 4.0)[:, None],
+            ),
+            axis=1,
+        ).astype(np.float32)
 
     @property
     def observation_metadata(self) -> dict[str, Any]:
         metadata = super().observation_metadata
         metadata.update(
             {
-                "frame_order": "oldest_to_current",
+                "frame_order": "current_only",
                 "command_fields": (),
                 "command_dim": 0,
                 "actor_obs_dim": self.obs_dim,
                 "sensor_history_obs_dim": self.sensor_history_obs_dim,
-                "phase_dim": self.phase_dim,
-                "phase_fields": ("sin_phase", "cos_phase"),
-                "actor_frame_dim": self.policy_frame_dim,
-                "actor_input_fields": (
-                    "imu",
-                    "tendon_length",
-                    "feedback_corrected_phase",
-                ),
+                "actor_frame_dim": self.sensor_frame_dim,
+                "actor_input_fields": ("imu", "tendon_length"),
                 "task": "squat",
-                "policy_inputs": (
-                    "imu",
-                    "tendon_length",
-                    "sin_phase",
-                    "cos_phase",
-                ),
-                "phase_source": "controller_clock_feedback_corrected",
+                "policy_inputs": ("imu", "tendon_length"),
+                "phase_source": "training_only_asymmetric_critic",
                 "phase_feedback_inputs": (
                     "tendon_length",
                     "imu_gravity_direction",
@@ -958,7 +969,7 @@ class SquatSensorHistoryEnv(SensorHistoryEnv):
                     else "survived_episode_with_complete_stand_squat_stand_cycle"
                 ),
                 "posture_sensor_inputs": ("imu", "tendon_length"),
-                "strict_sensor_only": False,
+                "strict_sensor_only": True,
             }
         )
         return metadata

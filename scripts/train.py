@@ -84,16 +84,11 @@ def best_model_path(log_dir: str | Path) -> Path:
 
 
 def validate_locomotion_actor_input_contract(env) -> None:
-    """Fail closed if a locomotion Actor receives anything but IMU/tendon data."""
-
-    training_task = str(getattr(env.cfg, "training_task", "")).strip().lower()
-    # Squat has its own explicit feedback-corrected phase input contract.  All
-    # walking, multimotion and terrain tasks must remain strictly sensor-only.
-    if training_task == "squat":
-        return
+    """Fail closed unless Actor and asymmetric-Critic inputs are isolated."""
 
     metadata = env.observation_metadata
     privileged = metadata.get("privileged_training_context", {})
+    estimator = metadata.get("estimator_training_target", {})
     expected_fields = ("imu", "tendon_length")
     sensor_dim = int(metadata.get("imu_dim_per_frame", -1)) + int(
         metadata.get("tendon_length_dim_per_frame", -1)
@@ -108,12 +103,20 @@ def validate_locomotion_actor_input_contract(env) -> None:
         and int(metadata.get("actor_frame_dim", -1)) == sensor_dim
         and int(getattr(env, "sensor_frame_dim", -1)) == sensor_dim
         and int(getattr(env, "policy_frame_dim", sensor_dim)) == sensor_dim
+        and int(privileged.get("version", -1)) >= 2
+        and int(privileged.get("dim", 0)) == int(env.privileged_context_dim)
+        and int(env.privileged_context_dim) > 0
+        and isinstance(estimator, dict)
+        and estimator.get("actor_input") is False
+        and int(estimator.get("dim", 0)) == int(env.estimator_context_dim)
+        and int(env.estimator_context_dim) > 0
     )
     if not valid:
         raise ValueError(
-            "Locomotion Actor inputs must be exactly IMU and tendon length; "
+            "Every training Actor input must be exactly IMU and tendon length; "
             "commands, terrain/course state, reference motion and privileged "
-            "training context are forbidden."
+            "training context are forbidden, and the Critic must use the "
+            "versioned training-only privileged context."
         )
 
 
@@ -150,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--legacy-reference-conditioned-actor",
         action="store_true",
-        help="Enable only for an isolated frozen privileged Teacher task.",
+        help="Removed: all trainable actors must use only IMU and tendon length.",
     )
     parser.add_argument(
         "--sensor-wrapper-base-skill-conditioning",
@@ -1436,10 +1439,13 @@ def main() -> None:
     )
     if args.seed is None:
         args.seed = secrets.randbits(32)
-    if args.skill_conditioning and not (
-        args.legacy_reference_conditioned_actor
-        or args.sensor_wrapper_base_skill_conditioning
-    ):
+    if args.legacy_reference_conditioned_actor:
+        raise ValueError(
+            "--legacy-reference-conditioned-actor is no longer a valid training "
+            "mode; every Actor must remain sensor-only and use only IMU and "
+            "tendon length."
+        )
+    if args.skill_conditioning and not args.sensor_wrapper_base_skill_conditioning:
         raise ValueError(
             "All training actors are sensor-only; --skill-conditioning is not allowed."
         )
@@ -1449,10 +1455,7 @@ def main() -> None:
         raise ValueError("--distillation-coef must be non-negative.")
     if args.teacher_checkpoint is None and args.distillation_coef > 0.0:
         raise ValueError("--distillation-coef requires --teacher-checkpoint.")
-    if (
-        abs(float(args.reference_ctrl_blend)) > 1.0e-12
-        and not args.legacy_reference_conditioned_actor
-    ):
+    if abs(float(args.reference_ctrl_blend)) > 1.0e-12:
         raise ValueError(
             "All training actors require --reference-ctrl-blend 0 so reference "
             "targets cannot enter the deployed control path."

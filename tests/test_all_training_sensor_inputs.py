@@ -10,6 +10,9 @@ from scripts import train
 from scripts.train_multimotion import default_train_args as multimotion_args
 from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
 from scripts.train_multimotion_walk import default_train_args as walk_only_args
+from scripts.train_multimotion_no_stairs_amp_teacher import (
+    default_train_args as sensor_teacher_args,
+)
 from scripts.train_no_stairs_old import default_train_args as old_no_stairs_args
 from scripts.train_stairs import default_train_args as stairs_args
 from sensor_training.config import SensorObservationConfig
@@ -55,6 +58,7 @@ def test_generic_training_rejects_actor_commands_and_reference_leakage() -> None
     invalid_argv = (
         ["train.py", "--skill-conditioning"],
         ["train.py", "--reference-ctrl-blend", "0.1"],
+        ["train.py", "--legacy-reference-conditioned-actor"],
     )
     for argv in invalid_argv:
         with patch.object(sys, "argv", argv):
@@ -67,9 +71,16 @@ def test_generic_training_rejects_actor_commands_and_reference_leakage() -> None
 
 
 def test_every_multimotion_task_disables_commands_and_reference_control() -> None:
-    for args in (multimotion_args(), no_stairs_args(), stairs_args()):
+    for args in (
+        multimotion_args(),
+        no_stairs_args(),
+        stairs_args(),
+        old_no_stairs_args(),
+        sensor_teacher_args(),
+    ):
         assert "--no-skill-conditioning" in args
         assert "--skill-conditioning" not in args
+        assert "--legacy-reference-conditioned-actor" not in args
         if "--reference-ctrl-blend" in args:
             assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
 
@@ -81,6 +92,7 @@ def test_every_training_task_resolves_to_full_body_collision_defaults() -> None:
         no_stairs_args(),
         walk_only_args(),
         old_no_stairs_args(),
+        sensor_teacher_args(),
         stairs_args(),
     )
     for defaults in task_defaults:
@@ -107,7 +119,16 @@ def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None
         sensor_history_obs_dim=336,
         actor_history_enabled=False,
         amp_obs_dim=270,
-        privileged_context_metadata={"actor_input": False, "training_only": True},
+        privileged_context_metadata={
+            "version": 2,
+            "actor_input": False,
+            "training_only": True,
+        },
+        estimator_context_metadata={
+            "dim": 11,
+            "actor_input": False,
+            "training_target_only": True,
+        },
     )
     metadata_getter = SensorHistoryEnv.observation_metadata.fget
     assert metadata_getter is not None
@@ -132,12 +153,22 @@ def test_locomotion_training_fails_closed_on_non_sensor_actor_input() -> None:
         "command_fields": (),
         "command_dim": 0,
         "strict_sensor_only": True,
-        "privileged_training_context": {"actor_input": False},
+        "privileged_training_context": {
+            "version": 2,
+            "dim": 229,
+            "actor_input": False,
+        },
+        "estimator_training_target": {
+            "dim": 11,
+            "actor_input": False,
+        },
     }
     env = SimpleNamespace(
         cfg=SimpleNamespace(training_task="walk"),
         observation_metadata=metadata,
         sensor_frame_dim=56,
+        privileged_context_dim=229,
+        estimator_context_dim=11,
     )
     train.validate_locomotion_actor_input_contract(env)
 

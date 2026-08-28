@@ -30,6 +30,7 @@ def default_train_args() -> list[str]:
     _replace(args, "--training-task", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--log-group", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--reference-ctrl-blend", ["0.0"])
+    args[args.index("--no-skill-conditioning")] = "--skill-conditioning"
     args.extend(
         [
             # The simulator retains labels solely to reconstruct the frozen

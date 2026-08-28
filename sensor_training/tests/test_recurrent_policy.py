@@ -22,9 +22,15 @@ class _DummySensorEnv:
     action_dim = 2
     amp_obs_dim = 4
     privileged_context_dim = 5
+    estimator_context_dim = 3
     is_torch_env = True
     privileged_context_metadata = {
-        "fields": tuple(f"context_{index}" for index in range(5))
+        "version": 2,
+        "fields": tuple(f"context_{index}" for index in range(5)),
+        "groups": {},
+    }
+    estimator_context_metadata = {
+        "fields": tuple(f"estimator_{index}" for index in range(3))
     }
     observation_metadata = {
         "strict_sensor_only": True,
@@ -48,6 +54,12 @@ class _DummySensorEnv:
     def privileged_observe(self):
         return torch.full(
             (self.num_envs, self.privileged_context_dim),
+            0.1 * float(self.step_count),
+        )
+
+    def estimator_observe(self):
+        return torch.full(
+            (self.num_envs, self.estimator_context_dim),
             0.1 * float(self.step_count),
         )
 
@@ -189,6 +201,11 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             critic_hidden_dims=(8,),
         )
         trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
+        self.assertEqual(trainer.actor_critic.critic[0].in_features, 8 + 5)
+        self.assertEqual(
+            trainer.actor_critic.context_estimator[-2].out_features,
+            env.estimator_context_dim,
+        )
 
         rollout = trainer.collect_rollout()
 
@@ -205,6 +222,10 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
         self.assertEqual(
             tuple(rollout["privileged_contexts"].shape),
             (3, 2, env.privileged_context_dim),
+        )
+        self.assertEqual(
+            tuple(rollout["estimator_contexts"].shape),
+            (3, 2, env.estimator_context_dim),
         )
 
     def test_privileged_context_trains_estimator_and_critic_but_not_actor_input(self) -> None:

@@ -1,6 +1,6 @@
 # IMU + 肌腱长度独立训练
 
-动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。通用 `scripts/train.py` 也已直接绑定本目录的传感器环境和 recurrent trainer。行走、多动作和楼梯入口遵守本页的严格传感器输入约束；蹲起入口复用同一网络，但按任务要求额外附加反馈校正的二维 `sin/cos` 相位。
+动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。通用 `scripts/train.py` 也已直接绑定本目录的传感器环境和 recurrent trainer。行走、多动作、楼梯、蹲起、Teacher 和旧超参数复现入口全部遵守本页的严格传感器输入约束。
 
 sensor stage1 默认与 `scripts/train_stage1.py` 使用相同的奖励系数和训练模式；stage2 入口会显式追加鲁棒训练和速度奖励相关参数。环境收到动作时仍统一裁剪到 `[-1, 1]`。
 
@@ -24,10 +24,13 @@ AMP 判别器仍维护6帧历史；episode 重置时全部填充为当前 AMP �
 GRU 隐状态，避免跨 episode 泄漏状态。
 
 策略保持14维肌腱位置目标修正量：单一 Actor MLP 直接把 GRU 隐状态映射为动作，并经过
-`tanh` 限幅。网络中不再包含专家分支、门控或专家混合。Critic 和
-BPO median critic 使用 GRU 隐状态和仅训练期可见的11维特权上下文。GRU 同时预测根部
-线速度、左右脚接触和连续地形参数，Smooth-L1 辅助损失促使隐状态从 IMU/肌腱历史形成
-隐式地形估计。特权上下文不进入 Actor 或 ONNX。训练按环境序列做截断 BPTT。
+`tanh` 限幅。网络中不再包含专家分支、门控或专家混合。Critic 和 BPO median critic
+使用 GRU 隐状态以及 v2 富特权上下文：无噪声完整仿真/参考观测、执行器控制/力/速度、
+详细足底接触、连续地形参数、motion/课程状态、质量与肌腱随机化、摩擦/重力/延迟和外力。
+上下文维度会随动作库大小和任务特有状态变化，字段及切片写入 checkpoint 元数据。
+GRU 的独立 11 维 estimator head 只预测可由本体历史推断的根部线速度、左右脚接触和连续
+地形参数，避免让 Actor 表征拟合不可观测的 motion ID 或随机质量。特权上下文和 estimator
+目标都不进入 Actor 或 ONNX。训练按环境序列做截断 BPTT。
 
 传感器多地形入口固定 `--reference-ctrl-blend 0`，执行器基准来自实测肌腱长度，
 模拟器选择的动作参考只用于训练奖励和 AMP，不进入部署控制链。地形过渡完全由 GRU
@@ -106,7 +109,7 @@ uv run python sensor_training/train_stage1.py \
 
 默认 checkpoint 写入 `logs/sensor_policy/`，不会与原训练日志混在一起。新训练只能
 恢复同时带有相同 `sensor_observation` 和 `sensor_policy_architecture` 元数据的
-100 Hz single-GRU/MLP checkpoint；旧50 Hz recurrent、旧336/337维前馈传感器模型、
+100 Hz single-GRU/MLP checkpoint；旧 11 维 Critic 上下文、旧50 Hz recurrent、旧336/337维前馈传感器模型、
 完整状态策略和历史力位联控模型均不兼容，必须使用新的运行目录从头训练。
 
 导出的 ONNX 使用显式状态接口：输入为 `observation`、`recurrent_state` 和

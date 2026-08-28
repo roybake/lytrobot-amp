@@ -32,11 +32,12 @@ def squat_training_defaults() -> dict[str, str]:
             / "reference_data"
             / "squat_cmu_22_14_omniretarget.npz"
         ),
-        "--log-root": str(REPO_ROOT / "logs" / "squat_sensor_policy"),
-        "--training-task": "squat",
+        "--log-root": str(REPO_ROOT / "logs" / "squat_sensor_privileged_v2"),
+        "--training-task": "squat_sensor_privileged_v2",
         "--wandb-project": "lytrobot-squat-amp",
         "--wandb-tags": (
-            "lytrobot,bpo,amp,squat,half-depth,imu,tendon,history6,omniretarget"
+            "lytrobot,bpo,amp,squat,half-depth,imu,tendon,sensor-only,"
+            "asymmetric-critic,privileged-v2,omniretarget"
         ),
         "--target-velocity": "0.0",
         "--forward-velocity-reward-coef": "0.0",
@@ -73,8 +74,7 @@ def squat_training_defaults() -> dict[str, str]:
 def main() -> None:
     if _has_arg("--skill-conditioning"):
         raise ValueError(
-            "Squat actor inputs are limited to IMU, tendon length, and the "
-            "feedback-corrected controller phase."
+            "Squat Actor inputs are limited to IMU and tendon length."
         )
     for name, value in squat_training_defaults().items():
         if not _has_arg(name):

@@ -53,6 +53,7 @@ class SensorActorCritic(nn.Module):
         sensor_frame_dim: int | None = None,
         recurrent_hidden_dim: int = 128,
         privileged_context_dim: int = 0,
+        estimator_context_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -60,12 +61,19 @@ class SensorActorCritic(nn.Module):
         self.sensor_frame_dim = int(sensor_frame_dim or obs_dim)
         self.recurrent_hidden_dim = int(recurrent_hidden_dim)
         self.privileged_context_dim = int(privileged_context_dim)
+        self.estimator_context_dim = int(
+            self.privileged_context_dim
+            if estimator_context_dim is None
+            else estimator_context_dim
+        )
         if not 0 < self.sensor_frame_dim <= self.obs_dim:
             raise ValueError("sensor_frame_dim must be in [1, obs_dim].")
         if self.recurrent_hidden_dim < 1:
             raise ValueError("recurrent_hidden_dim must be positive.")
         if self.privileged_context_dim < 0:
             raise ValueError("privileged_context_dim must be non-negative.")
+        if self.estimator_context_dim < 0:
+            raise ValueError("estimator_context_dim must be non-negative.")
 
         self.recurrent = nn.GRUCell(self.sensor_frame_dim, self.recurrent_hidden_dim)
         # Keep the public ``actor`` name for checkpoint/export compatibility.
@@ -81,10 +89,10 @@ class SensorActorCritic(nn.Module):
             build_mlp(
                 self.recurrent_hidden_dim,
                 (64,),
-                self.privileged_context_dim,
+                self.estimator_context_dim,
                 output_activation=nn.Tanh(),
             )
-            if self.privileged_context_dim > 0
+            if self.estimator_context_dim > 0
             else None
         )
         self.min_action_std = float(max(min_action_std, 1.0e-4))

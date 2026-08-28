@@ -69,6 +69,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             sensor_frame_dim=policy_frame_dim,
             recurrent_hidden_dim=cfg.recurrent_hidden_dim,
             privileged_context_dim=env.privileged_context_dim,
+            estimator_context_dim=env.estimator_context_dim,
         ).to(self.device)
         self.discriminator = AmpDiscriminator(
             input_dim=env.amp_obs_dim,
@@ -178,6 +179,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             (num_steps, num_envs, self.env.privileged_context_dim),
             device=self.device,
         )
+        estimator_contexts = torch.empty(
+            (num_steps, num_envs, self.env.estimator_context_dim),
+            device=self.device,
+        )
         completed_reward_values = torch.zeros_like(rewards)
         completed_length_values = torch.zeros_like(rewards)
         episode_progress_sum = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -191,6 +196,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             amp_tensor = self._as_device_tensor(self.env.amp_observe())
             privileged_context = self._as_device_tensor(
                 self.env.privileged_observe()
+            )
+            estimator_context = self._as_device_tensor(
+                self.env.estimator_observe()
             )
             current_episode_starts = self.episode_starts
             with torch.no_grad():
@@ -311,6 +319,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             episode_starts[step] = current_episode_starts
             amp_features[step] = amp_tensor
             privileged_contexts[step] = privileged_context
+            estimator_contexts[step] = estimator_context
             self.obs = next_obs
             self.recurrent_state = next_recurrent_state.detach()
             self.episode_starts = done.detach()
@@ -398,6 +407,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "amp_features": amp_features,
             "teacher_actions": teacher_actions,
             "privileged_contexts": privileged_contexts,
+            "estimator_contexts": estimator_contexts,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
             "episode_progress": float(component_values[-1]),
@@ -419,6 +429,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = rollout["episode_starts"]
         initial_hidden = rollout["initial_recurrent_state"]
         privileged_contexts = rollout["privileged_contexts"]
+        estimator_contexts = rollout["estimator_contexts"]
         teacher_actions = rollout.get("teacher_actions")
         assert all(torch.is_tensor(value) for value in (
             obs,
@@ -429,6 +440,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             episode_starts,
             initial_hidden,
             privileged_contexts,
+            estimator_contexts,
         ))
 
         finite_envs = (
@@ -439,6 +451,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             & torch.isfinite(old_values).all(dim=0)
             & torch.isfinite(initial_hidden).all(dim=1)
             & torch.isfinite(privileged_contexts).all(dim=(0, 2))
+            & torch.isfinite(estimator_contexts).all(dim=(0, 2))
         )
         dropped_sample_count = int(
             ((~finite_envs).sum() * obs.shape[0]).detach().cpu()
@@ -451,6 +464,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = episode_starts[:, finite_envs]
         initial_hidden = initial_hidden[finite_envs]
         privileged_contexts = privileged_contexts[:, finite_envs]
+        estimator_contexts = estimator_contexts[:, finite_envs]
         if torch.is_tensor(teacher_actions):
             teacher_actions = teacher_actions[:, finite_envs]
 
@@ -570,7 +584,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
 
                 privileged_context_loss = F.smooth_l1_loss(
                     context_prediction,
-                    privileged_contexts[:, mb],
+                    estimator_contexts[:, mb],
                 )
                 hidden = initial_hidden[mb]
                 student_means: list[torch.Tensor] = []
@@ -716,9 +730,26 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         saved_context_dim = int(architecture.get("privileged_context_dim", 0))
         if saved_context_dim != self.env.privileged_context_dim:
             raise ValueError(
-                "Checkpoint has no compatible implicit-terrain estimator: "
+                "Checkpoint has no compatible asymmetric-Critic context: "
                 f"saved privileged_context_dim={saved_context_dim}, "
                 f"current={self.env.privileged_context_dim}. Start a new run."
+            )
+        saved_context_version = int(architecture.get("privileged_context_version", 0))
+        current_context_version = int(
+            self.env.privileged_context_metadata.get("version", 0)
+        )
+        if saved_context_version != current_context_version:
+            raise ValueError(
+                "Checkpoint privileged-context version does not match current "
+                f"training: saved={saved_context_version}, "
+                f"current={current_context_version}. Start a new run."
+            )
+        saved_estimator_dim = int(architecture.get("estimator_context_dim", 0))
+        if saved_estimator_dim != self.env.estimator_context_dim:
+            raise ValueError(
+                "Checkpoint estimator target dimension does not match current "
+                f"training: saved={saved_estimator_dim}, "
+                f"current={self.env.estimator_context_dim}. Start a new run."
             )
         saved_metadata = checkpoint.get("sensor_observation")
         if saved_metadata is None:
@@ -760,9 +791,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "sensor_policy_architecture": {
                 "name": "proprioceptive_gru_context_mlp",
                 "recurrent": True,
-                # Legacy key retained for playback/evaluation loaders.  For
-                # squat it includes the current sin/cos phase appended after
-                # the newest physical sensor frame.
+                # Legacy key retained for playback/evaluation loaders. Every
+                # task now uses the same physical IMU+tendon frame contract.
                 "sensor_frame_dim": int(
                     getattr(
                         self.env,
@@ -775,11 +805,21 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "control_frequency_hz": CONTROL_FREQUENCY_HZ,
                 "control_period_s": float(self.env.dt),
                 "privileged_context_dim": self.env.privileged_context_dim,
+                "privileged_context_version": int(
+                    self.env.privileged_context_metadata["version"]
+                ),
                 "privileged_context_fields": list(
                     self.env.privileged_context_metadata["fields"]
                 ),
+                "privileged_context_groups": self.env.privileged_context_metadata[
+                    "groups"
+                ],
                 "privileged_context_actor_input": False,
                 "asymmetric_critic": True,
+                "estimator_context_dim": self.env.estimator_context_dim,
+                "estimator_context_fields": list(
+                    self.env.estimator_context_metadata["fields"]
+                ),
                 "recurrent_state_reset": "episode_start",
             },
         })

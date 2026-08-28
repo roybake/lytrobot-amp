@@ -45,14 +45,24 @@ IMU(42) + 肌腱长度(14)
           └─► asymmetric critic + 训练期特权上下文
 ```
 
-训练上下文共 11 维，全部归一化到 `[-1, 1]`：
+Critic 的 v2 训练期特权上下文包含：
+
+1. 无噪声完整仿真状态与参考跟踪状态；
+2. 执行器控制、力、速度和四个足底几何体接触；
+3. 连续地形参数、motion one-hot、目标速度、参考/episode/课程进度；
+4. 质量、肌腱尺度、摩擦、重力、动作延迟和外力等域随机化真值；
+5. 蹲起等任务的专用训练状态。
+
+具体维度随动作库和任务变化，字段名及各组切片保存在 checkpoint 元数据中。Critic 直接
+读取这些真值以降低 value 方差。独立的 GRU estimator 目标仍保持 11 维、全部归一化到
+`[-1, 1]`：
 
 1. 三轴根部线速度；
 2. 左右脚接触状态；
 3. 连续地形参数：坡度、不平度、有符号台阶高度、踏面深度、沟宽和坑深。
 
-上下文目标不会拼入 Actor 观测。GRU 的 context head 使用 Smooth-L1 损失恢复这些量；critic
-可直接读取训练真值以降低 value 方差。导出的 ONNX 仍只有 `observation`、
+这 11 维 estimator 目标也不会拼入 Actor 观测。GRU 的 context head 使用 Smooth-L1
+损失恢复它们，不预测不可观测的 motion ID 或域随机化真值。导出的 ONNX 仍只有 `observation`、
 `recurrent_state` 和 `episode_start` 三个输入。
 
 传感器多地形入口把 `reference_ctrl_blend` 固定为 0。执行器目标以实测肌腱长度为基准，

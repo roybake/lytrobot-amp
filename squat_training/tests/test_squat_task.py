@@ -113,7 +113,7 @@ class SquatTaskTests(unittest.TestCase):
             self.assertGreater(float(qpos[0, 2] - qpos[120, 2]), 0.12)
             self.assertGreater(float(qpos[-1, 2] - qpos[120, 2]), 0.12)
 
-    def test_actor_receives_sensor_history_and_feedback_corrected_phase(self) -> None:
+    def test_actor_receives_only_current_imu_and_tendon_frame(self) -> None:
         env = SquatSensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
                 model_xml=str(MODEL),
@@ -133,22 +133,20 @@ class SquatTaskTests(unittest.TestCase):
             self.assertEqual(env.imu_layout.dim, 42)
             self.assertEqual(env.base_env.position_action_dim, 14)
             self.assertEqual(env.sensor_frame_dim, 56)
-            self.assertEqual(env.policy_frame_dim, 58)
             self.assertEqual(env.sensor_history_obs_dim, 336)
-            self.assertEqual(env.obs_dim, 338)
+            self.assertEqual(env.obs_dim, 56)
             self.assertEqual(env.amp_obs_dim, 270)
-            self.assertEqual(observation.shape, (1, 338))
-            np.testing.assert_allclose(observation[0, -2:], [0.0, 1.0], atol=1.0e-6)
+            self.assertEqual(observation.shape, (1, 56))
             self.assertEqual(env.observation_metadata["command_dim"], 0)
             self.assertEqual(env.observation_metadata["command_fields"], ())
             self.assertEqual(
                 env.observation_metadata["policy_inputs"],
-                ("imu", "tendon_length", "sin_phase", "cos_phase"),
+                ("imu", "tendon_length"),
             )
             self.assertEqual(env.observation_metadata["posture_sensor_inputs"], ("imu", "tendon_length"))
             self.assertEqual(
                 env.observation_metadata["phase_source"],
-                "controller_clock_feedback_corrected",
+                "training_only_asymmetric_critic",
             )
             self.assertEqual(
                 env.observation_metadata["phase_feedback_inputs"],
@@ -180,7 +178,14 @@ class SquatTaskTests(unittest.TestCase):
                     "terminate_on_cycle_completion"
                 ]
             )
-            self.assertFalse(env.observation_metadata["strict_sensor_only"])
+            self.assertTrue(env.observation_metadata["strict_sensor_only"])
+            self.assertFalse(
+                env.observation_metadata["privileged_training_context"]["actor_input"]
+            )
+            self.assertEqual(
+                env.privileged_observe().shape,
+                (1, env.privileged_context_dim),
+            )
         finally:
             env.close()
 

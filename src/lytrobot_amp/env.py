@@ -1453,7 +1453,7 @@ class LytRobotAmpEnv:
             low, high = self.model.jnt_range[joint_id]
             qpos[adr] = np.clip(qpos[adr], low, high)
 
-    def observe(self) -> np.ndarray:
+    def observe(self, *, add_noise: bool = True) -> np.ndarray:
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         reference_targets = self._targets_at_current_phase()
         stand_start_progress = self._stand_start_progress()
@@ -1501,7 +1501,7 @@ class LytRobotAmpEnv:
                 parts.append(skill)
             obs[env_id] = np.concatenate(parts)
         obs = np.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0)
-        if self.domain_randomization and self.cfg.obs_noise_std > 0.0:
+        if add_noise and self.domain_randomization and self.cfg.obs_noise_std > 0.0:
             obs += self.rng.normal(
                 0.0,
                 self.domain_randomization_scale * float(self.cfg.obs_noise_std),

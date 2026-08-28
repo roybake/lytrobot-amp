@@ -1681,7 +1681,12 @@ class LytRobotWarpAmpEnv:
             values = self.rng.integers(low, high, size=batch_size, dtype=np.int64)
         return torch.as_tensor(values, dtype=torch.long, device=self.device)
 
-    def observe(self, targets: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+    def observe(
+        self,
+        targets: dict[str, torch.Tensor] | None = None,
+        *,
+        add_noise: bool = True,
+    ) -> torch.Tensor:
         targets = self._targets_at_current_phase() if targets is None else targets
         quat = _canonical_quat(self.qpos[:, 3:7])
         up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
@@ -1726,7 +1731,7 @@ class LytRobotWarpAmpEnv:
             )
         obs = torch.cat(parts, dim=1)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0)
-        if self.domain_randomization and self.cfg.obs_noise_std > 0.0:
+        if add_noise and self.domain_randomization and self.cfg.obs_noise_std > 0.0:
             noise_std = self.domain_randomization_scale * float(self.cfg.obs_noise_std)
             obs = obs + noise_std * torch.randn_like(obs)
         return torch.clamp(obs, -20.0, 20.0)

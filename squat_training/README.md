@@ -44,7 +44,7 @@ uv run python squat_training/retargeting/build_training_reference.py \
 
 ## 策略输入与训练
 
-Actor 不接收关节角、关节速度、速度指令或仿真根部真值。每帧姿态反馈只有 7 个三轴加速度计、7 个三轴陀螺仪和 14 个肌腱长度，共 `42 + 14 = 56` 维；当前帧加前 5 帧历史组成 `56 × 6 = 336` 维。其后附加控制器当前相位的 `sin/cos` 两维，总观测为 `338` 维；GRU 每步读取最新 56 维传感器和当前 2 维相位，共 58 维。AMP 判别器继续使用训练期特权运动特征。
+Actor 不接收关节角、关节速度、速度指令、控制相位或仿真根部真值。每个控制步只输入 7 个三轴加速度计、7 个三轴陀螺仪和 14 个肌腱长度，共 `42 + 14 = 56` 维；GRU 用隐状态保存因果历史。`56 × 6 = 336` 维历史只供 AMP 判别器构造时序特征，不进入 Actor。Critic 额外使用训练期完整仿真/参考状态、执行器动力学、接触、域随机化参数以及蹲起相位/阶段状态，这些特权量不会导出到 ONNX。
 
 相位不是盲目固定时钟。训练环境以 14 个实际肌腱长度在“站立→最低点”的参考肌腱方向上投影，得到物理下蹲深度，并用骨盆 IMU 重力方向检查躯干直立性：
 
@@ -63,10 +63,9 @@ Actor 不接收关节角、关节速度、速度指令或仿真根部真值。�
 连续扣除减速代价；到回合上限仍未完成周期会作为异常终止处理，而不是可 bootstrap
 的正常 timeout。
 
-策略观测、奖励参考和执行目标共用这一反馈校正后的相位。实机控制器必须采用相同的肌腱长度归一化和 IMU 姿态估计，并在稳定站立启动时同时复位相位与 GRU 状态。训练日志额外记录 `task_phase_feedback_scale`、`task_phase_feedback_frozen` 和 `task_sensor_depth_progress`。
-checkpoint 和 ONNX 元数据中的 `sensor_observation.phase_feedback` 会保存控制周期、参考频率、站立肌腱长度、归一化半宽、深度投影方向、参考深度曲线和全部门控阈值，实机端应直接读取这些值，避免手工复制参数造成训练/部署不一致。
+训练奖励、参考目标和特权 Critic 共用这一反馈校正后的相位，但 Actor 不读取相位。实机部署只需按训练时相同方式归一化 IMU/肌腱长度，并在稳定站立启动时复位 GRU 状态。训练日志额外记录 `task_phase_feedback_scale`、`task_phase_feedback_frozen` 和 `task_sensor_depth_progress`；checkpoint 元数据仍保存相位反馈配置，供训练复现和诊断使用，不属于部署输入契约。
 
-默认入口会启用 `--squat-phase-feedback`。阈值可用 `--squat-phase-lag-tolerance`、`--squat-phase-min-scale`、`--squat-bottom-depth-threshold`、`--squat-stand-depth-threshold`、`--squat-upright-threshold`、`--squat-phase-stall-threshold`、`--squat-phase-max-stall-steps`、`--squat-phase-stall-penalty` 和 `--squat-phase-slowdown-penalty-coef` 调整。由于观测从 336 维变为 338 维，旧无相位 checkpoint 不能恢复，必须从 Stage 1 重新训练。
+默认入口会启用 `--squat-phase-feedback`。阈值可用 `--squat-phase-lag-tolerance`、`--squat-phase-min-scale`、`--squat-bottom-depth-threshold`、`--squat-stand-depth-threshold`、`--squat-upright-threshold`、`--squat-phase-stall-threshold`、`--squat-phase-max-stall-steps`、`--squat-phase-stall-penalty` 和 `--squat-phase-slowdown-penalty-coef` 调整。Actor 已从旧 338 维相位条件策略改为严格 56 维传感器策略，Critic 特权上下文也已升级为 v2；旧 checkpoint 不能恢复，必须从 Stage 1 重新训练。
 
 蹲起环境使用独立奖励 profile，不复用行走任务的摆动脚和交替步态奖励。任务奖励由参考姿态/骨盆高度/运动速度跟踪、双脚固定与持续接触、左右同步性和动作平滑性组成。默认完整周期奖励为 5 分，跌倒或失败终止额外扣除 50 分；训练从稳定站立开始，躯干直立终止阈值提高到 `0.65`，保证生存优先于蹲起次数。训练日志中的 `task_squat_track` 和 `task_support_track` 分别表示蹲起轨迹跟踪质量与双支撑质量。
 
@@ -84,7 +83,7 @@ KL 硬停止 `0.015`、BPO ratio 范围 `0.10`，每轮只更新 2 个 epoch。�
 
 ```bash
 uv run python squat_training/train_stage2.py \
-  --stage1-checkpoint logs/squat_sensor_policy/stage1/<run-name>/model_final.pt
+  --stage1-checkpoint logs/squat_sensor_privileged_v2/stage1/<run-name>/model_final.pt
 ```
 
 Stage2 默认重置优化器并使用 `1e-4` 学习率。域随机化每 250 轮评估一次：成功率和下蹲深度达标且异常终止率足够低时强度增加 `0.025`，性能明显下降时回退，不再按训练轮数强行增加。外力最终范围仍为 0–80 N，但间隔放宽为 75–200 个控制步；所有默认回合都从稳定站立状态开始，随机化动力学和扰动而不随机化部署初态。
@@ -125,8 +124,8 @@ uv run python squat_training/play.py \
 uv run python squat_training/play_reference.py
 ```
 
-所有训练日志写入 `logs/squat_sensor_policy/`，录像按 checkpoint 阶段写入
-`logs/squat_sensor_policy/stage1/recordings/` 或
-`logs/squat_sensor_policy/stage2/recordings/`。
+所有训练日志写入 `logs/squat_sensor_privileged_v2/`，录像按 checkpoint 阶段写入
+`logs/squat_sensor_privileged_v2/stage1/recordings/` 或
+`logs/squat_sensor_privileged_v2/stage2/recordings/`。
 W&B 的 `episode` 分组中会记录 `episode/total_reward`（已完成回合的平均累计总回报）
 和 `episode/length`（已完成回合的平均长度），两条曲线统一使用 `global_step` 作为横轴。

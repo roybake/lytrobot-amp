@@ -149,8 +149,12 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 env.base_env.course_stage_scenario_names[0]
             ):
                 env.base_env.course_stage_ids[0] = stage
+                terrain_group = env.privileged_context_metadata["groups"]["terrain"]
                 np.testing.assert_allclose(
-                    env.privileged_observe()[0, 5:],
+                    env.privileged_observe()[
+                        0,
+                        terrain_group["start"] : terrain_group["stop"],
+                    ],
                     _normalized_terrain_context(scenario, env.base_env.cfg),
                 )
             env.base_env.course_stage_ids[0] = 0
@@ -168,6 +172,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 env.action_dim,
                 sensor_frame_dim=env.sensor_frame_dim,
                 privileged_context_dim=env.privileged_context_dim,
+                estimator_context_dim=env.estimator_context_dim,
             )
             self.assertEqual(policy.recurrent.input_size, env.sensor_frame_dim)
             self.assertEqual(policy.recurrent.hidden_size, 128)
@@ -179,7 +184,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             self.assertEqual(policy.actor[0].in_features, 128)
             self.assertEqual(
                 policy.context_estimator[-2].out_features,
-                env.privileged_context_dim,
+                env.estimator_context_dim,
             )
             with torch.no_grad():
                 recurrent_state = policy.initial_state(1)
