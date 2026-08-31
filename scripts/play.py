@@ -179,7 +179,14 @@ def best_checkpoint_quality_warning(path: str | Path) -> str | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play/evaluate a LYT BPO-AMP checkpoint.")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
+    parser.add_argument(
+        "--model-xml",
+        default=None,
+        help=(
+            "Optional playback-model override. By default, use the XML saved "
+            "with the checkpoint so its scene and terrain appearance match training."
+        ),
+    )
     parser.add_argument(
         "--terrain-types",
         nargs="+",
@@ -303,7 +310,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-width", type=int, default=1920)
     parser.add_argument("--record-height", type=int, default=1080)
     parser.add_argument("--record-crf", type=int, default=12)
-    parser.add_argument("--record-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--record-fps",
+        type=float,
+        default=0.0,
+        help=(
+            "Encoded video frame rate. The default 0 follows the simulation "
+            "control frequency, preserving one recorded frame per control step."
+        ),
+    )
     parser.add_argument(
         "--record-preset",
         default="veryfast",
@@ -336,8 +351,14 @@ def make_env_cfg(
         if args.target_velocity is None
         else float(args.target_velocity)
     )
+    saved_model_xml = (
+        str(checkpoint_env_cfg.get("model_xml"))
+        if isinstance(checkpoint_env_cfg, dict)
+        and checkpoint_env_cfg.get("model_xml")
+        else str(REPO_ROOT / "robot" / "MJCFmodelposition.xml")
+    )
     cfg = LytRobotEnvCfg(
-        model_xml=args.model_xml,
+        model_xml=args.model_xml or saved_model_xml,
         motion_file=args.motion_file,
         num_envs=1,
         target_velocity=target_velocity,
@@ -360,13 +381,26 @@ def make_env_cfg(
     cfg.model_xml = str(
         LEGACY_0806_MODEL_XML
         if getattr(args, "legacy_0806_compat", False)
-        else args.model_xml
+        else (args.model_xml or saved_model_xml)
     )
     cfg.motion_file = args.motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
     if robot_count is None:
-        robot_count = 3 if resolved_stage == "multimotion" else 1
+        # Keep the 0809 no-stairs layout one robot per unique course.  The
+        # up/down slope pair is a fixed height-preserving block, so this course
+        # has exactly two non-duplicate routes.
+        if (
+            isinstance(checkpoint_env_cfg, dict)
+            and str(checkpoint_env_cfg.get("training_task", ""))
+            in {
+                "multimotion_no_stairs_amp_teacher",
+                "multimotion_no_stairs_amp_student",
+            }
+        ):
+            robot_count = max(1, int(cfg.terrain_course_variants))
+        else:
+            robot_count = 3 if resolved_stage == "multimotion" else 1
     if robot_count < 1:
         raise ValueError("--num-robots must be positive.")
     cfg.num_envs = int(robot_count)
@@ -391,7 +425,6 @@ def make_env_cfg(
     # value stayed True because only the enabling branch assigned this field.
     cfg.serial_terrain_course = use_serial_course
     if use_serial_course:
-        cfg.terrain_course_variants = max(int(robot_count), 1)
         cfg.terrain_course_random_assignment = False
         # Playback is a strict full-route evaluation, never a curriculum reset.
         cfg.terrain_course_random_start_prob = 0.0
@@ -450,7 +483,11 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
     env_cfg = checkpoint.get("env_config", {})
     if not training_task and isinstance(env_cfg, dict):
         training_task = str(env_cfg.get("training_task", "")).strip()
-    if training_task == "multimotion":
+    if training_task in {
+        "multimotion",
+        "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_student",
+    }:
         return "multimotion"
     if training_task in {
         "multimotion_no_stairs",
@@ -501,7 +538,16 @@ def checkpoint_recording_path(
         "stage2" if "stage2" in path_parts else "stage1" if "stage1" in path_parts else stage
     )
     checkpoint_stage_dir = checkpoint_path.parent.parent
-    if record_dir is None and checkpoint_stage_dir.name in {"stage1", "stage2"}:
+    training_task = str(checkpoint.get("training_task", "")).strip()
+    checkpoint_env_cfg = checkpoint.get("env_config", {})
+    if not training_task and isinstance(checkpoint_env_cfg, dict):
+        training_task = str(checkpoint_env_cfg.get("training_task", "")).strip()
+    if record_dir is None and training_task in {
+        "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_student",
+    }:
+        output_dir = checkpoint_stage_dir.resolve() / "recording"
+    elif record_dir is None and checkpoint_stage_dir.name in {"stage1", "stage2"}:
         output_dir = checkpoint_stage_dir.resolve() / "recordings"
     elif record_dir is None:
         output_dir = checkpoint_stage_dir.resolve() / recording_stage / "recordings"
@@ -869,7 +915,10 @@ def main() -> None:
                 camera_mode=args.camera_mode,
             )
             recorder_frame_scheduler = SimulationFrameScheduler(record_fps)
-            print(f"[RECORD] saving {record_path}")
+            print(
+                f"[RECORD] saving {record_path} at {record_fps:g}fps "
+                f"(simulation dt={env.dt:g}s, speed=1x)"
+            )
         viewer = mujoco_viewer.launch_passive(display_model, display_data)
         configure_tracking_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
         viewer.sync()
