@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 
-# Deployment control contract. MuJoCo integrates at 200 Hz, while the policy
-# is evaluated every two physics steps. Training, evaluation and recording all
-# consume this same 100 Hz policy clock.
+# Deployment control contract. MuJoCo integrates at 200 Hz, while newly trained
+# policies are evaluated every two physics steps at 100 Hz. Playback may still
+# load old checkpoints at their saved control frequency for visual inspection.
 SIMULATION_TIMESTEP_S = 0.005
 CONTROL_FREQUENCY_HZ = 100.0
 CONTROL_PERIOD_S = 1.0 / CONTROL_FREQUENCY_HZ
@@ -22,7 +22,7 @@ def control_frequency_hz(timestep: float, decimation: int) -> float:
 
 
 def require_100hz_control(timestep: float, decimation: int, *, source: str) -> None:
-    """Fail closed when a training or playback config is not the deployment clock."""
+    """Fail closed when a training config is not the deployment clock."""
 
     frequency = control_frequency_hz(timestep, decimation)
     if abs(frequency - CONTROL_FREQUENCY_HZ) > 1.0e-6:

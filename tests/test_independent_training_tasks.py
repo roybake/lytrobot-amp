@@ -79,7 +79,6 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     ) == NO_STAIRS_RANDOM_START_RAMP_ITERATIONS
     assert "--terrain-course-phase-sync" in args
     assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
-    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
     assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 3.0
     assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 1.0
     assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.0
@@ -109,17 +108,17 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert stair_free["warp_nconmax"] == 128
     assert stair_free["warp_njmax"] == 512
 
-    # The original all-terrain entry point remains a separate four-clip task.
+    # The standard multimotion entry point is now the 08-09 stair-free,
+    # terrain-aligned two-clip task.
     original = original_multimotion_args()
-    assert _option_values(original, "--training-task") == ["multimotion"]
-    assert _option_values(original, "--motion-names") == [
-        "walk",
-        "rough_walk",
-        "stair_up",
-        "stair_down",
+    assert _option_values(original, "--training-task") == ["multimotion_0809_no_stairs"]
+    assert _option_values(original, "--motion-names") == ["walk", "rough_walk"]
+    assert _option_values(original, "--motion-weights") == ["0.50", "0.50"]
+    assert "stairs" not in _option_values(original, "--terrain-types")
+    assert _option_values(original, "--log-group") == ["multimotion_0809_no_stairs"]
+    assert _option_values(original, "--model-xml") == [
+        str(ROOT / "robot" / "MJCFmodelposition_0806.xml")
     ]
-    assert "stairs" in _option_values(original, "--terrain-types")
-    assert _option_values(original, "--log-group") == ["multimotion"]
     assert "--no-skill-conditioning" in original
     assert "--skill-conditioning" not in original
 
@@ -150,7 +149,6 @@ def test_dedicated_stair_task_uses_one_continuous_route_and_reward() -> None:
     ) == STAIRS_RANDOM_START_RAMP_ITERATIONS
     assert "--terrain-course-phase-sync" in args
     assert float(_option_values(args, "--foot-slip-penalty-coef")[0]) > 0.0
-    assert _option_values(args, "--specific-cot-penalty-coef") == ["0.0"]
     assert float(_option_values(args, "--forward-velocity-reward-coef")[0]) == 1.5
     assert float(_option_values(args, "--forward-progress-reward-coef")[0]) == 0.75
     assert float(_option_values(args, "--forward-velocity-deficit-penalty-coef")[0]) == 1.0

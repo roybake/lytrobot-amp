@@ -14,8 +14,6 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
 
 from scripts.train_multimotion import default_train_args as base_multimotion_args
 from lytrobot_amp.training_defaults import (
-    MULTIMOTION_STAIR_STEP_DEPTH_M,
-    MULTIMOTION_STAIR_STEP_HEIGHT_M,
     ROUGH_TERRAIN_HEIGHT_M,
     SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
@@ -46,16 +44,6 @@ def default_train_args() -> list[str]:
     )
     _replace_option_values(
         args,
-        "--stair-step-height",
-        [f"{MULTIMOTION_STAIR_STEP_HEIGHT_M:.2f}"],
-    )
-    _replace_option_values(
-        args,
-        "--stair-step-depth",
-        [f"{MULTIMOTION_STAIR_STEP_DEPTH_M:.2f}"],
-    )
-    _replace_option_values(
-        args,
         "--target-velocity",
         [f"{TRAINING_TARGET_SPEED_MPS:.6f}"],
     )
@@ -64,7 +52,6 @@ def default_train_args() -> list[str]:
         "--slope-angle-deg",
         [f"{SLOPE_ANGLE_DEG:.1f}"],
     )
-    _replace_option_values(args, "--specific-cot-penalty-coef", ["0.0"])
     # The deployed control path must not receive the simulator-selected motion
     # reference.  With zero blend, actions remain 14 tendon target corrections
     # around measured tendon lengths and terrain adaptation comes from the GRU.
@@ -74,7 +61,7 @@ def default_train_args() -> list[str]:
     args[tag_index] = (
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
         "asymmetric-critic,single-actor-mlp,sensor-only,"
-        "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
+        "0809-scene,no-stairs,more,serial-course,random-order,rough,slope-up,slope-down,"
         "sim2real"
     )
     # SensorHistoryEnv never exposes the skill one-hot, and persisting this as

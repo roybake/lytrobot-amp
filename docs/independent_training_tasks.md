@@ -24,8 +24,7 @@ uv run python scripts/train_multimotion_no_stairs_stage2.py \
 ```
 
 Stage 1 和 Stage 2 的领域随机化、恢复优化器及训练轮数规则与普通行走入口一致。
-当前课程不把机械能或 CoT 计入奖励，`specific_cot_penalty_coef=0`；功率、机械能和 CoT
-指标仍正常记录，仅用于离线分析。奖励优先推动持续前进，同时保留足滑惩罚。
+当前课程不把机械能计入奖励；功率和机械能指标仍正常记录，仅用于离线分析。奖励优先推动持续前进，同时保留足滑惩罚。
 训练前 18000 轮全部从入口开始，先学会持续前进；随后用 8000 轮把随机后续阶段
 reset 概率缓慢提高到 25%，为后段地形补充直接样本，同时至少保留 75% 的完整路线
 episode，避免后段 reset 淹没入口行走并导致遗忘。完整路线成功率仍只统计入口起步的
@@ -53,7 +52,7 @@ uv run python scripts/train_stairs_stage2.py \
 
 Stage 1 强制关闭域随机化，默认使用较易的 `0.13 m` 级高和 `0.32 m` 踏深；
 Stage 2 强制开启自适应域随机化，并默认切换到更困难的 `0.20 m` 级高和 `0.22 m` 踏深。
-两个阶段均设置 `specific_cot_penalty_coef=0`，能耗指标只记录、不参与奖励优化。
+两个阶段均不将能耗指标计入奖励优化。
 命令行显式给出的楼梯尺寸仍可覆盖默认值。输出分别写入
 `logs/stairs/stage1/<timestamp>/` 和
 `logs/stairs/stage2/<timestamp>/`。`--reward-mode stairs` 使用独立的

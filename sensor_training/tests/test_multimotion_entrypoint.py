@@ -70,7 +70,6 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
         self.assertEqual(value("--stair-step-height"), MULTIMOTION_STAIR_STEP_HEIGHT_M)
         self.assertEqual(value("--stair-step-depth"), MULTIMOTION_STAIR_STEP_DEPTH_M)
-        self.assertNotIn("--specific-cot-limit", args)
         terrain_start = args.index("--terrain-types") + 1
         terrain_end = next(
             index

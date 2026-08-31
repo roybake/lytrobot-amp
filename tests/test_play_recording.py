@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+import sys
 
 import pytest
 
@@ -12,6 +14,7 @@ from scripts.play import (
     checkpoint_recording_path,
     infer_stage,
     make_env_cfg,
+    parse_args,
     resolve_step_limit,
     validate_recurrent_sensor_architecture,
 )
@@ -164,6 +167,31 @@ def test_best_checkpoint_recording_uses_selected_iteration(tmp_path: Path) -> No
     )
 
     assert output.name == "run-12500.mp4"
+
+
+def test_viewer_recording_is_enabled_by_default() -> None:
+    with patch.object(
+        sys,
+        "argv",
+        ["play.py", "--checkpoint", "model.onnx", "--viewer", "--steps", "0"],
+    ):
+        args = parse_args()
+
+    assert args.viewer is True
+    assert args.steps == 0
+    assert args.record is True
+    assert args.record_preset == "veryfast"
+
+
+def test_viewer_recording_can_be_disabled_for_display_only_realtime() -> None:
+    with patch.object(
+        sys,
+        "argv",
+        ["play.py", "--checkpoint", "model.onnx", "--viewer", "--no-record"],
+    ):
+        args = parse_args()
+
+    assert args.record is False
 
 
 def test_play_can_disable_checkpoint_serial_course() -> None:
@@ -322,7 +350,7 @@ def test_playback_uses_checkpoint_100hz_control_timing() -> None:
     assert cfg.timestep * cfg.decimation == pytest.approx(0.01)
 
 
-def test_playback_rejects_old_50hz_checkpoint() -> None:
+def test_playback_accepts_old_50hz_checkpoint_for_visualization() -> None:
     args = SimpleNamespace(
         model_xml="robot.xml",
         motion_file="motion.npz",
@@ -342,12 +370,13 @@ def test_playback_rejects_old_50hz_checkpoint() -> None:
         stage="stage1",
     )
 
-    with pytest.raises(ValueError, match="100 Hz"):
-        make_env_cfg(
-            args,
-            {"env_config": {"timestep": 0.005, "decimation": 4}},
-            "stage1",
-        )
+    cfg = make_env_cfg(
+        args,
+        {"env_config": {"timestep": 0.005, "decimation": 4}},
+        "stage1",
+    )
+
+    assert cfg.timestep * cfg.decimation == pytest.approx(0.02)
 
 
 def test_playback_rejects_incompatible_recurrent_checkpoint() -> None:

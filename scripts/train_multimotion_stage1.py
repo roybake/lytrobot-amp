@@ -14,5 +14,5 @@ if __name__ == "__main__":
     run_task_stage(
         ROOT / "scripts" / "train_multimotion.py",
         stage="stage1",
-        log_root=ROOT / "logs" / "multimotion",
+        log_root=ROOT / "logs" / "multimotion_0809_no_stairs",
     )

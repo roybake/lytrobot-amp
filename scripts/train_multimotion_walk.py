@@ -27,15 +27,14 @@ def _replace_option_values(
 
 
 def default_train_args() -> list[str]:
-    """Keep the four straight-terrain skills in the layout but sample only walk."""
+    """Keep the stair-free terrain-aligned layout but sample only walk."""
 
     args = multimotion_train_args()
     _replace_option_values(
         args,
         "--motion-weights",
-        ["1.0", "0.0", "0.0", "0.0"],
+        ["1.0", "0.0"],
     )
-    _replace_option_values(args, "--specific-cot-penalty-coef", ["0.0"])
     _replace_option_values(args, "--episode-steps", ["2000"])
     _replace_option_values(args, "--log-group", ["multimotion_walk_warmup"])
     _replace_option_values(

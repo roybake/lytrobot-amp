@@ -104,6 +104,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             for parameter in teacher.parameters():
                 parameter.requires_grad_(False)
             self.teacher_actor_critic = teacher
+        if cfg.distill_teacher_control_target:
+            if self.teacher_actor_critic is None:
+                raise ValueError(
+                    "Teacher control-target distillation requires a frozen Teacher."
+                )
+            if abs(float(env.base_env.cfg.reference_ctrl_blend)) > 1.0e-12:
+                raise ValueError(
+                    "Teacher control-target distillation requires the Student "
+                    "environment to use reference_ctrl_blend=0."
+                )
         fused_optimizer = bool(cfg.fused_optimizer and self.device.type == "cuda")
         self.optimizer = torch.optim.Adam(
             self.actor_critic.parameters(),
@@ -130,6 +140,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "[INFO] recurrent BPTT torch.compile enabled; the first policy "
                 "update performs a one-time CUDA compilation."
             )
+
         if fused_optimizer:
             print("[INFO] fused CUDA Adam enabled for policy and AMP updates.")
 
@@ -148,6 +159,38 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.completed_episode_lengths: deque[int] = deque(maxlen=window)
         self.completed_episode_successes: deque[float] = deque(maxlen=window)
         self.loaded_domain_randomization_scale: float | None = None
+
+    def _student_space_teacher_target(
+        self, teacher_action: torch.Tensor
+    ) -> torch.Tensor:
+        """Map the Teacher's reference residual to the Student control space.
+
+        The 08-06 Teacher adds its action around the retargeted tendon target,
+        while the deployable Student adds its action around measured tendon
+        lengths.  Distilling the raw Teacher residual therefore teaches a
+        different command.  Convert the Teacher's intended actuator target
+        into the equivalent Student action before applying the imitation loss.
+        """
+
+        if not self.cfg.distill_teacher_control_target:
+            return teacher_action
+        base_env = self.env.base_env
+        control_scale = (
+            base_env.ctrl_half_range
+            * base_env.action_scale
+            * float(base_env.cfg.action_residual_scale)
+        ).clamp_min(1.0e-6)
+        teacher_ctrl = torch.clamp(
+            base_env.last_reference_ctrl + teacher_action * control_scale,
+            min=base_env.ctrl_low,
+            max=base_env.ctrl_high,
+        )
+        current_ctrl = base_env._current_tendon_ctrl()
+        return torch.clamp(
+            (teacher_ctrl - current_ctrl) / control_scale,
+            -1.0,
+            1.0,
+        )
 
     def reset_training_env(self) -> None:
         super().reset_training_env()
@@ -222,7 +265,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 )
                 if teacher_actions is not None:
                     teacher_obs = self._as_device_tensor(self.env.base_env.observe())
-                    teacher_actions[step] = self.teacher_actor_critic.act_inference(teacher_obs)
+                    teacher_action = self.teacher_actor_critic.act_inference(teacher_obs)
+                    teacher_actions[step] = self._student_space_teacher_target(
+                        teacher_action
+                    )
 
             env_action = action if getattr(self.env, "is_torch_env", False) else action.cpu().numpy()
             next_obs, task_reward_value, done_value, info = self.env.step(env_action)

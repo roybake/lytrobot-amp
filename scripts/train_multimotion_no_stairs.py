@@ -9,6 +9,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 ORDINARY_REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
+SERIAL_TERRAIN_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
 AMP_REFERENCE = (
     REPO_ROOT / "robot" / "reference_data" / "no_stairs_fast" / "walk_omniretarget.npz"
 )
@@ -45,6 +46,8 @@ def _stair_free_course_args(
     serial_reference_state_init: bool,
 ) -> list[str]:
     args = [
+        "--model-xml",
+        str(SERIAL_TERRAIN_MODEL_XML),
         "--motion-files",
         *(str(path) for path in motion_files),
         "--motion-names",
@@ -97,7 +100,7 @@ def _stair_free_course_args(
         "--terrain-course-stage-reward",
         "5.0",
         "--terrain-course-run-out",
-        "3.10",
+        "0.30",
         "--rough-terrain-height",
         f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
@@ -159,6 +162,8 @@ def default_stair_free_course_args() -> list[str]:
     """
 
     return [
+        "--model-xml",
+        str(SERIAL_TERRAIN_MODEL_XML),
         "--motion-files",
         str(AMP_REFERENCE),
         "--motion-names",
@@ -219,7 +224,7 @@ def default_stair_free_course_args() -> list[str]:
         "--terrain-course-stage-reward",
         "5.0",
         "--terrain-course-run-out",
-        "3.10",
+        "0.30",
         "--rough-terrain-height",
         f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
@@ -260,14 +265,18 @@ def default_train_args() -> list[str]:
         "0.35",
         "--alternating-step-reward-coef",
         "1.50",
-        "--specific-cot-penalty-coef",
-        "0.0",
-        # The reference trajectory affects learning only through AMP.  Keep a
-        # small physical task component for course completion and robustness.
+        # Pure AMP: the retargeted reference is the ONLY reward source.  The
+        # 08-28 15:20 run mixed a 25% physical task component into the reward;
+        # the policy then maximised upright/velocity shaping with a stiff
+        # shuffle gait (AMP reward pinned at 0.27, agent prob 0.234, episode
+        # length 242 steps, zero course success).  With task-reward-lerp 0.0
+        # every reward bit must come from the discriminator, and the style
+        # coefficient is raised so the per-step reward magnitude matches the
+        # previous mix (reward_scale 0.25 * 3.0 * amp ~ 0.19 at amp 0.27).
         "--amp-reward-coef",
-        "2.0",
+        "3.0",
         "--task-reward-lerp",
-        "0.25",
+        "0.0",
         "--min-action-std",
         "0.05",
         # Match the stable 08-06 multi-motion optimizer/AMP sampling regime.
@@ -293,7 +302,7 @@ def default_train_args() -> list[str]:
         str(REPO_ROOT / "logs" / "multimotion" / "no_stairs_amp_single"),
         "--wandb-tags",
         (
-            "lytrobot,bpo,amp,amp-task-only,single-omniretarget,walk,no-stairs,"
+            "lytrobot,bpo,amp,amp-task-only,pure-amp,single-omniretarget,walk,no-stairs,"
             "serial-course,random-order,flat,rough,slope-up,slope-down,"
             "alternating-feet,velocity-tracking,imu,tendon,recurrent,gru,sensor-only"
         ),

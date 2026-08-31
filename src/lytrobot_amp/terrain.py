@@ -109,6 +109,9 @@ class MoreTerrainCfg:
     course_run_out: float = 3.10
     course_base_height: float = 0.30
     course_completion_tolerance: float = 1.0
+    # Reproduce the terrain model compiled for logs/multimotion/08-06-10:56:09:
+    # no appended flat suffix stage and the original MuJoCo contact parameters.
+    legacy_0806_model: bool = False
 
     flat_lane_y: float = 3.0
     rough_lane_y: float = 6.0
@@ -237,7 +240,9 @@ def course_end_x(cfg: MoreTerrainCfg, variant: int) -> float:
     return float(last_x + cfg.course_run_out)
 
 
-def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
+def course_motion_sequence(
+    order: Sequence[str], *, legacy_0806_model: bool = False
+) -> tuple[str, ...]:
     """Expand a terrain order into the multi-action reference sequence."""
 
     result = list(COURSE_PREFIX_MOTIONS)
@@ -258,7 +263,8 @@ def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
             result.append("pit_walk")
         else:
             raise ValueError(f"Unknown course terrain kind: {kind!r}.")
-    result.extend(COURSE_SUFFIX_MOTIONS)
+    if not legacy_0806_model:
+        result.extend(COURSE_SUFFIX_MOTIONS)
     return tuple(result)
 
 
@@ -282,11 +288,14 @@ def course_stage_end_positions(
             result.extend((float(segment.center_x), float(segment.end_x)))
         else:
             result.append(float(segment.end_x))
-    result.append(course_end_x(cfg, variant))
+    if not cfg.legacy_0806_model:
+        result.append(course_end_x(cfg, variant))
     return tuple(result)
 
 
-def course_stage_scenarios(order: Sequence[str]) -> tuple[str, ...]:
+def course_stage_scenarios(
+    order: Sequence[str], *, legacy_0806_model: bool = False
+) -> tuple[str, ...]:
     """Return assessment scenario labels aligned with course motion stages."""
 
     result = ["flat"] * len(COURSE_PREFIX_MOTIONS)
@@ -295,7 +304,8 @@ def course_stage_scenarios(order: Sequence[str]) -> tuple[str, ...]:
             result.extend(("stair_up", "stair_down"))
         else:
             result.append(str(kind))
-    result.extend(("flat",) * len(COURSE_SUFFIX_MOTIONS))
+    if not legacy_0806_model:
+        result.extend(("flat",) * len(COURSE_SUFFIX_MOTIONS))
     return tuple(result)
 
 
@@ -692,6 +702,7 @@ def _add_box(
     half_size: np.ndarray,
     rgba: tuple[float, float, float, float],
     material: str,
+    legacy_0806_model: bool = False,
 ) -> None:
     geom = spec.worldbody.add_geom()
     geom.name = name
@@ -703,11 +714,12 @@ def _add_box(
     geom.friction = (1.0, 0.005, 0.0001)
     geom.group = 2
     geom.contype = 1
-    geom.conaffinity = 0
-    geom.condim = 3
-    geom.margin = STRICT_CONTACT_MARGIN
-    geom.solref = STRICT_CONTACT_SOLREF
-    geom.solimp = STRICT_CONTACT_SOLIMP
+    geom.conaffinity = 1 if legacy_0806_model else 0
+    if not legacy_0806_model:
+        geom.condim = 3
+        geom.margin = STRICT_CONTACT_MARGIN
+        geom.solref = STRICT_CONTACT_SOLREF
+        geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def _add_ramp(
@@ -717,6 +729,7 @@ def _add_ramp(
     half_size: np.ndarray,
     quat: np.ndarray,
     material: str,
+    legacy_0806_model: bool = False,
 ) -> None:
     geom = spec.worldbody.add_geom()
     geom.name = name
@@ -729,11 +742,12 @@ def _add_ramp(
     geom.friction = (1.0, 0.005, 0.0001)
     geom.group = 2
     geom.contype = 1
-    geom.conaffinity = 0
-    geom.condim = 3
-    geom.margin = STRICT_CONTACT_MARGIN
-    geom.solref = STRICT_CONTACT_SOLREF
-    geom.solimp = STRICT_CONTACT_SOLIMP
+    geom.conaffinity = 1 if legacy_0806_model else 0
+    if not legacy_0806_model:
+        geom.condim = 3
+        geom.margin = STRICT_CONTACT_MARGIN
+        geom.solref = STRICT_CONTACT_SOLREF
+        geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def _attach_terrain(
@@ -759,6 +773,7 @@ def _attach_terrain(
                 half_size,
                 MORE_XML_TERRAIN_RGBA,
                 terrain_material,
+                bool(more is not None and more.legacy_0806_model),
             )
 
     if more_enabled:
@@ -776,11 +791,20 @@ def _attach_terrain(
                 half_size,
                 MORE_XML_TERRAIN_RGBA,
                 terrain_material,
+                more.legacy_0806_model,
             )
 
         if serial_course and ({"slope_up", "slope_down"} & set(more.terrain_types)):
             for name, center, half_size, quat in serial_course_ramps(more):
-                _add_ramp(spec, name, center, half_size, quat, terrain_material)
+                _add_ramp(
+                    spec,
+                    name,
+                    center,
+                    half_size,
+                    quat,
+                    terrain_material,
+                    more.legacy_0806_model,
+                )
 
         if "rough" in more.terrain_types:
             asset_dir = (
@@ -841,11 +865,12 @@ def _attach_terrain(
                 geom.friction = (1.0, 0.005, 0.0001)
                 geom.group = 2
                 geom.contype = 1
-                geom.conaffinity = 0
-                geom.condim = 3
-                geom.margin = STRICT_CONTACT_MARGIN
-                geom.solref = STRICT_CONTACT_SOLREF
-                geom.solimp = STRICT_CONTACT_SOLIMP
+                geom.conaffinity = 1 if more.legacy_0806_model else 0
+                if not more.legacy_0806_model:
+                    geom.condim = 3
+                    geom.margin = STRICT_CONTACT_MARGIN
+                    geom.solref = STRICT_CONTACT_SOLREF
+                    geom.solimp = STRICT_CONTACT_SOLIMP
 
 
 def load_model(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the former 08-06 no-stairs setup with the unified sensor Actor."""
+"""Train the former 08-06 setup after removing stair clips and terrain."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
 
 
 REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
+SERIAL_TERRAIN_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
 
 
 def default_train_args() -> list[str]:
@@ -27,7 +28,9 @@ def default_train_args() -> list[str]:
 
     return [
         "--training-task",
-        "no_stairs_old_sensor_privileged_v2",
+        "no_stairs_old_0806_teacher",
+        "--model-xml",
+        str(SERIAL_TERRAIN_MODEL_XML),
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
@@ -40,15 +43,25 @@ def default_train_args() -> list[str]:
         "--motion-loop",
         "true",
         "false",
-        "--no-skill-conditioning",
+        "--skill-conditioning",
+        "--seed",
+        "42",
+        "--decimation",
+        "2",
         "--use-reference-velocity",
         "--terrain-types",
         "rough",
         "slope_up",
         "slope_down",
         "--serial-terrain-course",
+        "--terrain-course-run-in",
+        "2.90",
+        "--terrain-course-run-out",
+        "0.30",
+        "--terrain-course-base-height",
+        "0.30",
         "--terrain-course-variants",
-        "8",
+        "6",
         "--terrain-course-random-start-prob",
         "0.80",
         "--terrain-course-random-start-warmup-iterations",
@@ -70,9 +83,9 @@ def default_train_args() -> list[str]:
         "--episode-metric-window",
         "4096",
         "--warp-nconmax",
-        "128",
+        "32",
         "--warp-njmax",
-        "512",
+        "128",
         "--target-velocity",
         "0.862295",
         "--forward-velocity-tracking-sigma",
@@ -96,10 +109,6 @@ def default_train_args() -> list[str]:
         "--fall-penalty",
         "10.0",
         "--terminate-incomplete-motion-end",
-        "--specific-cot-limit",
-        "0.8",
-        "--specific-cot-penalty-coef",
-        "2.0",
         "--reset-noise-scale",
         "0.01",
         "--action-residual-scale",
@@ -107,7 +116,7 @@ def default_train_args() -> list[str]:
         "--distal-action-scale",
         "1.0",
         "--reference-ctrl-blend",
-        "0.0",
+        "1.0",
         "--motion-reset-prob",
         "1.0",
         "--motion-transition-blend-steps",
@@ -144,8 +153,30 @@ def default_train_args() -> list[str]:
         "0",
         "--stand-start-prob",
         "0.0",
+        "--stand-start-phase-delay-steps",
+        "25",
+        "--stand-start-transition-min-steps",
+        "80",
+        "--stand-start-transition-max-steps",
+        "160",
+        "--stand-start-push-delay-steps",
+        "100",
         "--episode-steps",
         "1800",
+        "--episode-timeout-jitter-steps",
+        "240",
+        "--solver-iterations",
+        "10",
+        "--terrain-course-stage-reward",
+        "5.0",
+        "--push-interval-min-steps",
+        "25",
+        "--push-interval-max-steps",
+        "100",
+        "--push-duration-min-steps",
+        "2",
+        "--push-duration-max-steps",
+        "8",
         "--ctrl-penalty-coef",
         "0.04",
         "--action-rate-penalty-coef",
@@ -169,18 +200,28 @@ def default_train_args() -> list[str]:
         "--max-action-std",
         "0.6",
         "--log-group",
-        "no_stairs_old_sensor_privileged_v2",
+        "no_stairs_old_0806_teacher",
         "--wandb-tags",
-        "lytrobot,bpo,amp,multimotion,no-stairs-old,sensor-only,asymmetric-critic,"
-        "privileged-v2,serial-course,random-order,rough,slope-up,slope-down",
+        "lytrobot,bpo,amp,multimotion,no-stairs-old,0806,privileged,"
+        "reference-conditioned,serial-course,random-order,rough,slope-up,slope-down",
     ]
 
 
 def main() -> None:
-    sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
-    from sensor_training.train import main as train_main
+    import scripts.train as runner
+    from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+    from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
 
-    train_main()
+    runner.LytRobotWarpAmpEnv = LytRobotWarpAmpEnv
+    runner.PPOAMPConfig = PPOAMPConfig
+    runner.PPOAMPTrainer = PPOAMPTrainer
+    sys.argv = [
+        str(HERE / "train.py"),
+        *default_train_args(),
+        "--legacy-reference-conditioned-actor",
+        *sys.argv[1:],
+    ]
+    runner.main()
 
 
 if __name__ == "__main__":

@@ -153,7 +153,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--legacy-reference-conditioned-actor",
         action="store_true",
-        help="Removed: all trainable actors must use only IMU and tendon length.",
+        help=(
+            "Use the legacy reference-conditioned Actor. This is only for "
+            "frozen Teacher training; deployable/student Actors must remain "
+            "sensor-only."
+        ),
     )
     parser.add_argument(
         "--sensor-wrapper-base-skill-conditioning",
@@ -270,6 +274,14 @@ def parse_args() -> argparse.Namespace:
         "--terrain-course-random-assignment",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--legacy-0806-terrain-model",
+        action="store_true",
+        help=(
+            "Reproduce the 08-06 serial-course stage layout and MuJoCo terrain "
+            "contact parameters. Reserved for the explicit 08-06 Teacher task."
+        ),
     )
     parser.add_argument(
         "--serial-reference-state-init",
@@ -413,9 +425,6 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Terminate a non-looping serial-course stage that ends before its spatial boundary.",
     )
-    parser.add_argument("--specific-cot-limit", type=float, default=0.8)
-    parser.add_argument("--specific-cot-penalty-coef", type=float, default=0.0)
-    parser.add_argument("--cot-min-forward-speed", type=float, default=0.10)
     parser.add_argument("--reset-noise-scale", type=float, default=0.01)
     parser.add_argument("--motion-reset-prob", type=float, default=0.5)
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
@@ -580,7 +589,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--push-duration-max-steps", type=int, default=16)
     parser.add_argument("--obs-noise-std", type=float, default=0.02)
     parser.add_argument("--action-noise-std", type=float, default=0.01)
-    parser.add_argument("--action-delay-min-ms", type=float, default=2.0)
+    parser.add_argument("--action-delay-min-ms", type=float, default=0.02)
     parser.add_argument("--action-delay-max-ms", type=float, default=5.0)
 
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
@@ -617,6 +626,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Smooth-L1 action-mean distillation weight for --teacher-checkpoint.",
+    )
+    parser.add_argument(
+        "--distill-teacher-control-target",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Convert a reference-based Teacher residual into the equivalent "
+            "sensor-only Student action before computing distillation loss."
+        ),
     )
     parser.add_argument("--task-reward-lerp", type=float, default=0.50)
     parser.add_argument("--min-action-std", type=float, default=0.05)
@@ -1439,13 +1457,34 @@ def main() -> None:
     )
     if args.seed is None:
         args.seed = secrets.randbits(32)
-    if args.legacy_reference_conditioned_actor:
+    if args.legacy_reference_conditioned_actor and args.training_task not in {
+        "multimotion_no_stairs_amp_teacher",
+        "no_stairs_old_0806_teacher",
+    }:
         raise ValueError(
-            "--legacy-reference-conditioned-actor is no longer a valid training "
-            "mode; every Actor must remain sensor-only and use only IMU and "
-            "tendon length."
+            "--legacy-reference-conditioned-actor is reserved for explicit "
+            "no-stairs Teacher tasks."
         )
-    if args.skill_conditioning and not args.sensor_wrapper_base_skill_conditioning:
+    if args.legacy_0806_terrain_model and args.training_task not in {
+        "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_student",
+    }:
+        raise ValueError(
+            "--legacy-0806-terrain-model is reserved for the 08-06 Teacher/Student tasks."
+        )
+    if (
+        args.serial_terrain_course
+        and str(args.training_task).startswith("multimotion")
+        and ("stairs" in set(args.terrain_types or ()) or args.stair_terrain)
+    ):
+        raise ValueError(
+            "Multimotion serial courses use the 08-09 stair-free terrain profile; "
+            "remove stairs or use the dedicated stairs task."
+        )
+    if args.skill_conditioning and not (
+        args.sensor_wrapper_base_skill_conditioning
+        or args.legacy_reference_conditioned_actor
+    ):
         raise ValueError(
             "All training actors are sensor-only; --skill-conditioning is not allowed."
         )
@@ -1455,7 +1494,14 @@ def main() -> None:
         raise ValueError("--distillation-coef must be non-negative.")
     if args.teacher_checkpoint is None and args.distillation_coef > 0.0:
         raise ValueError("--distillation-coef requires --teacher-checkpoint.")
-    if abs(float(args.reference_ctrl_blend)) > 1.0e-12:
+    if args.distill_teacher_control_target and args.teacher_checkpoint is None:
+        raise ValueError(
+            "--distill-teacher-control-target requires --teacher-checkpoint."
+        )
+    if (
+        not args.legacy_reference_conditioned_actor
+        and abs(float(args.reference_ctrl_blend)) > 1.0e-12
+    ):
         raise ValueError(
             "All training actors require --reference-ctrl-blend 0 so reference "
             "targets cannot enter the deployed control path."
@@ -1708,6 +1754,7 @@ def main() -> None:
         terrain_course_random_start_prob=initial_course_random_start_prob,
         terrain_course_phase_sync=bool(args.terrain_course_phase_sync),
         terrain_course_phase_lookahead=args.terrain_course_phase_lookahead,
+        legacy_0806_terrain_model=bool(args.legacy_0806_terrain_model),
         num_envs=args.num_envs,
         seed=args.seed,
         randomize_episode_seed=bool(args.episode_random_seed),
@@ -1739,9 +1786,6 @@ def main() -> None:
         forward_progress_termination_penalty=args.forward_progress_termination_penalty,
         fall_penalty=args.fall_penalty,
         terminate_incomplete_motion_end=bool(args.terminate_incomplete_motion_end),
-        specific_cot_limit=args.specific_cot_limit,
-        specific_cot_penalty_coef=args.specific_cot_penalty_coef,
-        cot_min_forward_speed=args.cot_min_forward_speed,
         reset_noise_scale=args.reset_noise_scale,
         motion_reset_prob=args.motion_reset_prob,
         action_residual_scale=args.action_residual_scale,
@@ -1872,6 +1916,7 @@ def main() -> None:
         amp_mirror_ref_prob=args.amp_mirror_ref_prob,
         teacher_checkpoint=args.teacher_checkpoint,
         distillation_coef=args.distillation_coef,
+        distill_teacher_control_target=bool(args.distill_teacher_control_target),
         min_action_std=args.min_action_std,
         max_action_std=args.max_action_std,
         episode_metric_window=args.episode_metric_window,
@@ -1885,11 +1930,12 @@ def main() -> None:
     assert sim_backend == "warp"
     assert LytRobotWarpAmpEnv is not None
     env = LytRobotWarpAmpEnv(env_cfg, device=device)
-    try:
-        validate_locomotion_actor_input_contract(env)
-    except Exception:
-        env.close()
-        raise
+    if not args.legacy_reference_conditioned_actor:
+        try:
+            validate_locomotion_actor_input_contract(env)
+        except Exception:
+            env.close()
+            raise
     trainer = PPOAMPTrainer(env, ppo_cfg, device=device, log_dir=log_dir)
 
     # Optional: useful for debugging gradients, but expensive during long GPU/Warp runs.

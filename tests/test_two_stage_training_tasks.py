@@ -77,12 +77,12 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
 
     def test_task_launchers_use_the_requested_log_trees(self) -> None:
         expected_roots = {
-            "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion",
-            "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
+            "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion_0809_no_stairs",
+            "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion_0809_no_stairs",
             "sensor_training/train_multimotion_stage1.py": (
                 ROOT / "logs" / "multimotion" / "no_stairs_amp_single"
             ),
-            "sensor_training/train_multimotion_stage2.py": ROOT / "logs" / "multimotion",
+            "sensor_training/train_multimotion_stage2.py": ROOT / "logs" / "multimotion_0809_no_stairs",
             "scripts/train_stairs_stage1.py": ROOT / "logs" / "stairs",
             "scripts/train_stairs_stage2.py": ROOT / "logs" / "stairs",
         }
@@ -276,7 +276,7 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
 
     def test_effective_parser_contract_for_every_new_two_stage_task(self) -> None:
         tasks = (
-            ("multimotion", multimotion_args()),
+            ("multimotion_0809_no_stairs", multimotion_args()),
             ("stairs_up_down", stairs_args()),
         )
         for task_name, task_args in tasks:

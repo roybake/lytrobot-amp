@@ -109,22 +109,6 @@ def _stability_gated_locomotion_terms(
     return stability, gated_track, gated_progress
 
 
-def _bounded_specific_cot_excess(
-    specific_cot: torch.Tensor,
-    limit: float,
-) -> torch.Tensor:
-    """Return a bounded relative CoT violation in ``[0, 1]``."""
-
-    safe_limit = max(float(limit), 1.0e-6)
-    finite = torch.nan_to_num(specific_cot, nan=1.0e6, posinf=1.0e6, neginf=0.0)
-    excess = torch.clamp_min(finite - safe_limit, 0.0)
-    return torch.clamp(
-        excess / torch.clamp_min(finite, safe_limit),
-        0.0,
-        1.0,
-    )
-
-
 def _forward_progress_guard(
     position_x: torch.Tensor,
     episode_step: torch.Tensor,
@@ -230,6 +214,7 @@ class LytRobotWarpAmpEnv:
             rough_height=cfg.rough_terrain_height,
             slope_angle_deg=cfg.slope_angle_deg,
             gap_width=cfg.gap_terrain_width,
+            legacy_0806_model=bool(cfg.legacy_0806_terrain_model),
         )
         self.complex_terrain_enabled = bool(
             self.stair_cfg.enabled or self.more_terrain_cfg.enabled
@@ -348,7 +333,10 @@ class LytRobotWarpAmpEnv:
             else ()
         )
         self.course_stage_scenario_names = tuple(
-            course_stage_scenarios(order)
+            course_stage_scenarios(
+                order,
+                legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+            )
             for order in self.more_terrain_cfg.normalized_course_orders
         )
         self.course_stage_end_x_np = self._build_course_stage_end_x()
@@ -541,9 +529,12 @@ class LytRobotWarpAmpEnv:
                 raise ValueError(
                     "--serial-course-single-motion requires exactly one motion clip."
                 )
-            stage_count = len(course_motion_sequence(
-                self.more_terrain_cfg.normalized_course_orders[0]
-            ))
+            stage_count = len(
+                course_motion_sequence(
+                    self.more_terrain_cfg.normalized_course_orders[0],
+                    legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+                )
+            )
             return np.zeros(
                 (len(self.more_terrain_cfg.normalized_course_orders), stage_count),
                 dtype=np.int64,
@@ -551,7 +542,10 @@ class LytRobotWarpAmpEnv:
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
-            names = course_motion_sequence(order)
+            names = course_motion_sequence(
+                order,
+                legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+            )
             missing = [name for name in names if name not in name_to_id]
             if missing:
                 raise ValueError(
@@ -984,7 +978,12 @@ class LytRobotWarpAmpEnv:
         max_delay = scale * max(0.0, float(self.cfg.action_delay_max_ms)) / 1000.0
         max_delay = max(min_delay, max_delay)
         delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids_np))
-        delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int64)
+        # Round to the nearest physics tick instead of ceiling: the configured
+        # 0.02-5 ms range spans sub-tick delays, and ceiling would quantise
+        # every positive delay to a full 5 ms tick (losing the near-zero end).
+        delay_ticks = np.floor(
+            delay_seconds / max(float(self.cfg.timestep), 1.0e-9) + 0.5
+        ).astype(np.int64)
         self.action_delay_ticks[ids] = torch.as_tensor(
             np.clip(delay_ticks, 0, self.max_action_delay_ticks),
             dtype=torch.long,
@@ -2004,37 +2003,10 @@ class LytRobotWarpAmpEnv:
             mechanical_energy,
         )
         actuator_power = mechanical_energy / max(self.dt, 1.0e-6)
-        forward_distance = torch.nan_to_num(
-            torch.clamp(self.qpos[:, 0] - start_x, min=0.0),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        cot_distance = torch.clamp(
-            forward_distance,
-            min=max(float(self.cfg.cot_min_forward_speed) * self.dt, 1.0e-6),
-        )
-        specific_cot = torch.nan_to_num(
-            mechanical_energy / (max(self.robot_mass, 1.0e-6) * cot_distance),
-            nan=1.0e6,
-            posinf=1.0e6,
-            neginf=1.0e6,
-        )
-        cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
-        specific_cot_excess = _bounded_specific_cot_excess(
-            specific_cot,
-            cot_limit,
-        )
-        if self.cfg.specific_cot_penalty_coef != 0.0:
-            rewards = rewards - (
-                float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
-            )
         components.update(
             {
                 "actuator_power": actuator_power,
                 "mechanical_energy": mechanical_energy,
-                "specific_cot": specific_cot,
-                "specific_cot_excess": specific_cot_excess,
                 "course_phase_sync_limited": course_phase_sync_limited.to(
                     torch.float32
                 ),

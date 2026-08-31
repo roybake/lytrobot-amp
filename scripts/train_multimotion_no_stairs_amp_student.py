@@ -12,7 +12,9 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from scripts.train_no_stairs_old import default_train_args as baseline_args
+from scripts.train_multimotion_no_stairs_amp_teacher import (
+    default_train_args as teacher_args,
+)
 
 
 def _replace(args: list[str], option: str, values: list[str]) -> None:
@@ -24,26 +26,33 @@ def _replace(args: list[str], option: str, values: list[str]) -> None:
 
 
 def default_train_args() -> list[str]:
-    """Keep the 08-06 no-stairs course while hiding all Teacher inputs."""
+    """Match the 100 Hz Teacher environment while hiding Teacher inputs."""
 
-    args = baseline_args()
+    args = teacher_args()
     _replace(args, "--training-task", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--log-group", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--reference-ctrl-blend", ["0.0"])
-    args[args.index("--no-skill-conditioning")] = "--skill-conditioning"
+    _replace(
+        args,
+        "--wandb-tags",
+        [
+            "lytrobot,bpo,amp,multimotion,no-stairs,amp-student,0806,100hz,"
+            "teacher-distillation,imu,tendon,recurrent,gru,sensor-only,"
+            "rough,slope-up,slope-down"
+        ],
+    )
+    args.remove("--legacy-reference-conditioned-actor")
     args.extend(
         [
             # The simulator retains labels solely to reconstruct the frozen
-            # Teacher's 08-06 observation. SensorHistoryEnv never exposes
-            # them to the Student actor.
+            # Teacher's four-motion 08-06 observation. SensorHistoryEnv never
+            # exposes them to the Student actor.
             "--sensor-wrapper-base-skill-conditioning",
             "--distillation-coef",
             "1.0",
-            "--log-root",
-            str(ROOT / "logs" / "multimotion"),
-            "--wandb-tags",
-            "lytrobot,bpo,amp,no-stairs,amp-student,teacher-distillation,"
-            "imu,tendon,recurrent,gru,sensor-only,rough,slope-up,slope-down",
+            # The Teacher action is a residual around the retargeted control;
+            # convert it to the Student's measured-tendon control space.
+            "--distill-teacher-control-target",
         ]
     )
     return args

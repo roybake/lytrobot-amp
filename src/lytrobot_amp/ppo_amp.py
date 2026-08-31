@@ -57,6 +57,7 @@ class PPOAMPConfig:
     amp_mirror_ref_prob: float = 0.50
     teacher_checkpoint: str | None = None
     distillation_coef: float = 0.0
+    distill_teacher_control_target: bool = False
     actor_hidden_dims: tuple[int, ...] = (256, 128)
     critic_hidden_dims: tuple[int, ...] = (256, 128)
     discriminator_hidden_dims: tuple[int, ...] = (256, 128)

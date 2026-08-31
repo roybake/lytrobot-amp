@@ -13,7 +13,9 @@ from scripts.train_multimotion_walk import default_train_args as walk_only_args
 from scripts.train_multimotion_no_stairs_amp_teacher import (
     default_train_args as sensor_teacher_args,
 )
-from scripts.train_no_stairs_old import default_train_args as old_no_stairs_args
+from scripts.train_multimotion_no_stairs_amp_student import (
+    default_train_args as sensor_student_args,
+)
 from scripts.train_stairs import default_train_args as stairs_args
 from sensor_training.config import SensorObservationConfig
 from sensor_training.envs import SensorHistoryEnv, SensorHistoryWarpAmpEnv
@@ -65,9 +67,26 @@ def test_generic_training_rejects_actor_commands_and_reference_leakage() -> None
             try:
                 train.main()
             except ValueError as exc:
-                assert "sensor-only" in str(exc) or "reference-ctrl-blend 0" in str(exc)
+                assert (
+                    "sensor-only" in str(exc)
+                    or "reference-ctrl-blend 0" in str(exc)
+                    or "reserved for explicit no-stairs Teacher tasks" in str(exc)
+                )
             else:  # pragma: no cover - failure branch for a regressed guard.
                 raise AssertionError(f"Training unexpectedly accepted {argv[1:]}")
+
+
+def test_legacy_teacher_is_the_only_reference_conditioned_training_exception() -> None:
+    args = sensor_teacher_args()
+
+    assert "--legacy-reference-conditioned-actor" in args
+    assert "--skill-conditioning" in args
+    assert _option_values(args, "--reference-ctrl-blend") == ["1.0"]
+    assert _option_values(args, "--decimation") == ["2"]
+    assert _option_values(args, "--solver-iterations") == ["10"]
+    assert _option_values(args, "--warp-nconmax") == ["32"]
+    assert _option_values(args, "--warp-njmax") == ["128"]
+    assert "stairs" not in _option_values(args, "--terrain-types")
 
 
 def test_every_multimotion_task_disables_commands_and_reference_control() -> None:
@@ -75,8 +94,6 @@ def test_every_multimotion_task_disables_commands_and_reference_control() -> Non
         multimotion_args(),
         no_stairs_args(),
         stairs_args(),
-        old_no_stairs_args(),
-        sensor_teacher_args(),
     ):
         assert "--no-skill-conditioning" in args
         assert "--skill-conditioning" not in args
@@ -85,14 +102,26 @@ def test_every_multimotion_task_disables_commands_and_reference_control() -> Non
             assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
 
 
+def test_student_distillation_keeps_teacher_labels_out_of_actor_inputs() -> None:
+    args = sensor_student_args()
+
+    assert "--legacy-reference-conditioned-actor" not in args
+    assert "--skill-conditioning" in args
+    assert "--sensor-wrapper-base-skill-conditioning" in args
+    assert _option_values(args, "--reference-ctrl-blend") == ["0.0"]
+    assert _option_values(args, "--distillation-coef") == ["1.0"]
+    assert _option_values(args, "--decimation") == ["2"]
+    assert _option_values(args, "--warp-nconmax") == ["32"]
+    assert _option_values(args, "--warp-njmax") == ["128"]
+    assert "stairs" not in _option_values(args, "--terrain-types")
+
+
 def test_every_training_task_resolves_to_full_body_collision_defaults() -> None:
     task_defaults = (
         [],
         multimotion_args(),
         no_stairs_args(),
         walk_only_args(),
-        old_no_stairs_args(),
-        sensor_teacher_args(),
         stairs_args(),
     )
     for defaults in task_defaults:
@@ -104,6 +133,22 @@ def test_every_training_task_resolves_to_full_body_collision_defaults() -> None:
         assert args.warp_nconmax == 128
         assert args.warp_njmax == 512
         assert args.warp_cuda_graph is True
+
+
+def test_all_training_task_launchers_use_100hz_control() -> None:
+    task_defaults = (
+        [],
+        multimotion_args(),
+        no_stairs_args(),
+        walk_only_args(),
+        stairs_args(),
+        sensor_teacher_args(),
+        sensor_student_args(),
+    )
+    for defaults in task_defaults:
+        with patch.object(sys, "argv", ["train.py", *defaults]):
+            args = train.parse_args()
+        assert args.decimation == 2
 
 
 def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None:

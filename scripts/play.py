@@ -7,11 +7,13 @@ import argparse
 from collections.abc import Callable
 from dataclasses import fields
 import json
+import queue
 import re
 import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +22,8 @@ SRC_ROOT = REPO_ROOT / "src"
 for path in (REPO_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+LEGACY_0806_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
 
 import torch
 import mujoco
@@ -30,7 +34,7 @@ from lytrobot_amp.networks import ActorCritic
 from lytrobot_amp.terrain import course_end_x, course_segments, load_multi_robot_model
 from lytrobot_amp.training_defaults import (
     CONTROL_FREQUENCY_HZ,
-    require_100hz_control,
+    control_frequency_hz,
 )
 
 
@@ -176,6 +180,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play/evaluate a LYT BPO-AMP checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
+    parser.add_argument(
+        "--terrain-types",
+        nargs="+",
+        choices=("flat", "gap", "pit", "rough", "slope_up", "slope_down", "stairs"),
+        default=None,
+        help="Override the checkpoint terrain set for playback.",
+    )
+    parser.add_argument(
+        "--legacy-0806-compat",
+        action="store_true",
+        help=(
+            "Replay the 08-06 multimotion checkpoint with its frozen robot XML, "
+            "0.30 m course run-out, and original terrain contact model."
+        ),
+    )
     parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
     parser.add_argument(
         "--steps",
@@ -272,10 +291,24 @@ def parse_args() -> argparse.Namespace:
             "checkpoint under logs/<task>/<stage>/recordings/."
         ),
     )
+    parser.add_argument(
+        "--record",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save an MP4 while the viewer runs. Enabled by default; use "
+            "--no-record for viewer-only realtime playback."
+        ),
+    )
     parser.add_argument("--record-width", type=int, default=1920)
     parser.add_argument("--record-height", type=int, default=1080)
     parser.add_argument("--record-crf", type=int, default=12)
     parser.add_argument("--record-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--record-preset",
+        default="veryfast",
+        help="ffmpeg x264 preset for viewer recording; default favors realtime playback.",
+    )
     return parser.parse_args()
 
 
@@ -316,7 +349,19 @@ def make_env_cfg(
         for key, value in checkpoint_env_cfg.items():
             if key in valid_fields and key not in {"model_xml", "motion_file", "num_envs", "seed", "target_velocity"}:
                 setattr(cfg, key, value)
-    cfg.model_xml = args.model_xml
+    if getattr(args, "legacy_0806_compat", False):
+        cfg.terrain_course_run_out = 0.30
+        cfg.legacy_0806_terrain_model = True
+        cfg.robot_collision_profile = "feet"
+    terrain_types = getattr(args, "terrain_types", None)
+    if terrain_types is not None:
+        cfg.terrain_types = tuple(terrain_types)
+        cfg.stair_terrain = False
+    cfg.model_xml = str(
+        LEGACY_0806_MODEL_XML
+        if getattr(args, "legacy_0806_compat", False)
+        else args.model_xml
+    )
     cfg.motion_file = args.motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
@@ -381,11 +426,6 @@ def make_env_cfg(
         # Playback randomness is a runtime contract, not checkpoint state.
         # This also keeps old deterministic checkpoints random by default.
         cfg.randomize_episode_seed = True
-    require_100hz_control(
-        float(cfg.timestep),
-        int(cfg.decimation),
-        source="playback checkpoint",
-    )
     return cfg
 
 
@@ -412,7 +452,11 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
         training_task = str(env_cfg.get("training_task", "")).strip()
     if training_task == "multimotion":
         return "multimotion"
-    if training_task in {"multimotion_no_stairs", "stairs_up_down"}:
+    if training_task in {
+        "multimotion_no_stairs",
+        "multimotion_0809_no_stairs",
+        "stairs_up_down",
+    }:
         if "stage2" in parts or (
             isinstance(env_cfg, dict) and bool(env_cfg.get("domain_randomization", False))
         ):
@@ -575,6 +619,7 @@ class MujocoVideoRecorder:
         height: int,
         fps: float,
         crf: int,
+        preset: str,
         camera_mode: str,
     ) -> None:
         ffmpeg = shutil.which("ffmpeg")
@@ -614,7 +659,7 @@ class MujocoVideoRecorder:
             "-c:v",
             "libx264",
             "-preset",
-            "slow",
+            str(preset),
             "-crf",
             str(int(crf)),
             "-profile:v",
@@ -630,9 +675,31 @@ class MujocoVideoRecorder:
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
         self.fps = fps_value
         self.frame_count = 0
+        self._frame_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+        self._writer_error: BaseException | None = None
+        self._writer_thread = threading.Thread(
+            target=self._write_frames,
+            name="mujoco-video-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+    def _write_frames(self) -> None:
+        try:
+            while True:
+                frame_bytes = self._frame_queue.get()
+                if frame_bytes is None:
+                    break
+                if self.process.stdin is not None:
+                    self.process.stdin.write(frame_bytes)
+        except BaseException as exc:
+            self._writer_error = exc
+        finally:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
 
     def write_frame(self, camera: mujoco.MjvCamera | None = None, repeat: int = 1) -> None:
-        if self.process.stdin is None:
+        if self.process.stdin is None or self._writer_error is not None:
             return
         if camera is None:
             camera = self.camera
@@ -641,16 +708,18 @@ class MujocoVideoRecorder:
         frame = self.renderer.render()
         frame_bytes = frame.tobytes()
         for _ in range(max(1, int(repeat))):
-            self.process.stdin.write(frame_bytes)
+            self._frame_queue.put(frame_bytes)
             self.frame_count += 1
 
     def close(self) -> None:
         try:
-            if self.process.stdin is not None:
-                self.process.stdin.close()
+            self._frame_queue.put(None)
+            self._writer_thread.join()
             return_code = self.process.wait()
         finally:
             self.renderer.close()
+        if self._writer_error is not None:
+            raise RuntimeError(f"ffmpeg failed while writing {self.output_path}") from self._writer_error
         if return_code != 0:
             raise RuntimeError(f"ffmpeg failed while writing {self.output_path}")
 
@@ -745,7 +814,9 @@ def main() -> None:
         f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
         f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode} "
         f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course} "
-        f"control_frequency={CONTROL_FREQUENCY_HZ:g}Hz realtime=True"
+        f"control_frequency={control_frequency_hz(env.cfg.timestep, env.cfg.decimation):g}Hz "
+        f"training_control_frequency={CONTROL_FREQUENCY_HZ:g}Hz "
+        f"realtime=True record={bool(args.record)}"
     )
     if env.cfg.serial_terrain_course:
         for index, order in enumerate(env.more_terrain_cfg.normalized_course_orders):
@@ -783,21 +854,23 @@ def main() -> None:
     if args.viewer:
         from mujoco import viewer as mujoco_viewer
 
+        if args.record:
+            record_path = checkpoint_recording_path(args.checkpoint, checkpoint, args.record_dir, stage)
+            record_fps = args.record_fps if args.record_fps > 0.0 else 1.0 / max(env.dt, 1.0e-6)
+            recorder = MujocoVideoRecorder(
+                display_model,
+                display_data,
+                record_path,
+                width=args.record_width,
+                height=args.record_height,
+                fps=record_fps,
+                crf=args.record_crf,
+                preset=args.record_preset,
+                camera_mode=args.camera_mode,
+            )
+            recorder_frame_scheduler = SimulationFrameScheduler(record_fps)
+            print(f"[RECORD] saving {record_path}")
         viewer = mujoco_viewer.launch_passive(display_model, display_data)
-        record_path = checkpoint_recording_path(args.checkpoint, checkpoint, args.record_dir, stage)
-        record_fps = args.record_fps if args.record_fps > 0.0 else 1.0 / max(env.dt, 1.0e-6)
-        recorder = MujocoVideoRecorder(
-            display_model,
-            display_data,
-            record_path,
-            width=args.record_width,
-            height=args.record_height,
-            fps=record_fps,
-            crf=args.record_crf,
-            camera_mode=args.camera_mode,
-        )
-        recorder_frame_scheduler = SimulationFrameScheduler(record_fps)
-        print(f"[RECORD] saving {record_path}")
         configure_tracking_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
         viewer.sync()
 
@@ -929,11 +1002,11 @@ def main() -> None:
                         )
             real_time_pacer.wait(env.dt)
     finally:
+        if viewer is not None:
+            viewer.close()
         if recorder is not None:
             recorder.close()
             print(f"[RECORD] saved {recorder.output_path} frames={recorder.frame_count}")
-        if viewer is not None:
-            viewer.close()
         env.close()
 
     mean_reward = sum(rewards) / max(len(rewards), 1)

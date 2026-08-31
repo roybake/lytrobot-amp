@@ -144,29 +144,6 @@ def _stability_gated_locomotion_terms(
     return stability, gated_track, gated_progress
 
 
-def _bounded_specific_cot_excess(
-    specific_cot: float | np.ndarray,
-    limit: float,
-) -> float | np.ndarray:
-    """Return a bounded relative CoT violation in ``[0, 1]``.
-
-    Normalizing the raw excess by a small configured limit makes nearly every
-    early-training transition hit the same large penalty.  A negative per-step
-    reward then teaches the policy to end the episode as quickly as possible.
-    Normalizing by the measured CoT preserves zero penalty at or below the
-    limit and caps the configured penalty coefficient's actual contribution.
-    """
-
-    values = np.asarray(specific_cot, dtype=np.float32)
-    safe_limit = max(float(limit), 1.0e-6)
-    finite = np.nan_to_num(values, nan=1.0e6, posinf=1.0e6, neginf=0.0)
-    excess = np.maximum(finite - safe_limit, 0.0)
-    bounded = np.clip(excess / np.maximum(finite, safe_limit), 0.0, 1.0)
-    if np.ndim(specific_cot) == 0:
-        return float(bounded)
-    return bounded
-
-
 def _forward_progress_guard(
     position_x: np.ndarray,
     episode_step: np.ndarray,
@@ -282,6 +259,7 @@ class LytRobotEnvCfg:
     # policy is still short of the physical stage boundary.
     terrain_course_phase_sync: bool = False
     terrain_course_phase_lookahead: float = 0.10
+    legacy_0806_terrain_model: bool = False
     num_envs: int = 4096
     seed: int = 42
     randomize_episode_seed: bool = False
@@ -317,9 +295,6 @@ class LytRobotEnvCfg:
     forward_progress_termination_penalty: float = 2.0
     fall_penalty: float = 2.0
     terminate_incomplete_motion_end: bool = False
-    specific_cot_limit: float = 0.8
-    specific_cot_penalty_coef: float = 0.0
-    cot_min_forward_speed: float = 0.10
     reset_noise_scale: float = 0.01
     motion_reset_prob: float = 0.5
     action_residual_scale: float = 0.5
@@ -403,7 +378,7 @@ class LytRobotEnvCfg:
     push_duration_max_steps: int = 16
     obs_noise_std: float = 0.02
     action_noise_std: float = 0.01
-    action_delay_min_ms: float = 2.0
+    action_delay_min_ms: float = 0.02
     action_delay_max_ms: float = 5.0
 
 
@@ -463,6 +438,7 @@ class LytRobotAmpEnv:
             rough_height=cfg.rough_terrain_height,
             slope_angle_deg=cfg.slope_angle_deg,
             gap_width=cfg.gap_terrain_width,
+            legacy_0806_model=bool(cfg.legacy_0806_terrain_model),
         )
         self.complex_terrain_enabled = bool(
             self.stair_cfg.enabled or self.more_terrain_cfg.enabled
@@ -568,7 +544,10 @@ class LytRobotAmpEnv:
             else ()
         )
         self.course_stage_scenario_names = tuple(
-            course_stage_scenarios(order)
+            course_stage_scenarios(
+                order,
+                legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+            )
             for order in self.more_terrain_cfg.normalized_course_orders
         )
         self.course_stage_end_x = self._build_course_stage_end_x()
@@ -688,9 +667,12 @@ class LytRobotAmpEnv:
                 raise ValueError(
                     "--serial-course-single-motion requires exactly one motion clip."
                 )
-            stage_count = len(course_motion_sequence(
-                self.more_terrain_cfg.normalized_course_orders[0]
-            ))
+            stage_count = len(
+                course_motion_sequence(
+                    self.more_terrain_cfg.normalized_course_orders[0],
+                    legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+                )
+            )
             return np.zeros(
                 (len(self.more_terrain_cfg.normalized_course_orders), stage_count),
                 dtype=np.int32,
@@ -698,7 +680,10 @@ class LytRobotAmpEnv:
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
-            names = course_motion_sequence(order)
+            names = course_motion_sequence(
+                order,
+                legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+            )
             missing = [name for name in names if name not in name_to_id]
             if missing:
                 raise ValueError(
@@ -1046,7 +1031,12 @@ class LytRobotAmpEnv:
         max_delay = scale * max(0.0, float(self.cfg.action_delay_max_ms)) / 1000.0
         max_delay = max(min_delay, max_delay)
         delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids))
-        delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int32)
+        # Round to the nearest physics tick instead of ceiling: the configured
+        # 0.02-5 ms range spans sub-tick delays, and ceiling would quantise
+        # every positive delay to a full 5 ms tick (losing the near-zero end).
+        delay_ticks = np.floor(
+            delay_seconds / max(float(self.cfg.timestep), 1.0e-9) + 0.5
+        ).astype(np.int32)
         self.action_delay_ticks[ids] = np.clip(delay_ticks, 0, self.max_action_delay_ticks)
         self.action_delay_history[ids] = 0.0
         self.action_delay_cursor[ids] = 0
@@ -1540,8 +1530,6 @@ class LytRobotAmpEnv:
             "forward_velocity_excess": [],
             "actuator_power": [],
             "mechanical_energy": [],
-            "specific_cot": [],
-            "specific_cot_excess": [],
             "termination": [],
             "root_orientation": [],
             "height": [],
@@ -1756,38 +1744,10 @@ class LytRobotAmpEnv:
                 reward_parts["invalid_state"] = 1.0
                 reward_parts["termination"] = 1.0
             rewards[env_id] = reward
-            forward_distance = max(
-                float(np.nan_to_num(float(data.qpos[0]) - start_x, nan=0.0)),
-                0.0,
-            )
-            cot_distance = max(
-                forward_distance,
-                float(self.cfg.cot_min_forward_speed) * self.dt,
-                1.0e-6,
-            )
-            specific_cot = float(
-                np.nan_to_num(
-                    mechanical_energy
-                    / max(self.robot_mass * cot_distance, 1.0e-6),
-                    nan=1.0e6,
-                    posinf=1.0e6,
-                    neginf=1.0e6,
-                )
-            )
-            cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
-            specific_cot_excess = float(
-                _bounded_specific_cot_excess(specific_cot, cot_limit)
-            )
-            if self.cfg.specific_cot_penalty_coef != 0.0:
-                rewards[env_id] -= (
-                    float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
-                )
             reward_parts.update(
                 {
                     "actuator_power": mechanical_energy / max(self.dt, 1.0e-6),
                     "mechanical_energy": mechanical_energy,
-                    "specific_cot": specific_cot,
-                    "specific_cot_excess": specific_cot_excess,
                     "course_phase_sync_limited": float(
                         course_phase_sync_limited[env_id]
                     ),

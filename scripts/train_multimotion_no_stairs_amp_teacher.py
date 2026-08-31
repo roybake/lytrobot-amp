@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a sensor-only no-stairs policy with a privileged asymmetric Critic."""
+"""Train the 08-06 privileged Teacher at 100 Hz without stair terrain."""
 
 from __future__ import annotations
 
@@ -12,40 +12,271 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from scripts.train_no_stairs_old import default_train_args as baseline_args
-
-
-def _replace(args: list[str], option: str, values: list[str]) -> None:
-    start = args.index(option)
-    end = start + 1
-    while end < len(args) and not args[end].startswith("--"):
-        end += 1
-    args[start:end] = [option, *values]
+REFERENCE_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 
 
 def default_train_args() -> list[str]:
-    """Current-safe approximation of 08-06, with stairs already removed."""
+    """Return the recorded 08-06 settings with only clock/terrain changes.
 
-    args = baseline_args()
-    _replace(args, "--training-task", ["multimotion_no_stairs_amp_sensor_teacher_v2"])
-    _replace(args, "--log-group", ["multimotion_no_stairs_amp_sensor_teacher_v2"])
-    args.extend(
-        [
-            "--log-root",
-            str(ROOT / "logs" / "multimotion"),
-            "--wandb-tags",
-            "lytrobot,bpo,amp,no-stairs,amp-teacher,sensor-only,asymmetric-critic,"
-            "privileged-v2,rough,slope-up,slope-down",
-        ]
-    )
-    return args
+    The four reference clips, their weights, optimizer settings, and privileged
+    Actor contract come from the saved 08-06 run and commit 6162570.
+    Control-step durations are doubled for the 50->100 Hz migration introduced
+    by commit a6f45cf.  Only ``stairs`` is removed from the terrain course; the
+    stair reference clips remain part of AMP training.  The explicit slip,
+    reference-tracking, and 100 Hz action-rate corrections below address the
+    gait defects observed in the recorded policy.
+    """
+
+    return [
+        "--training-task",
+        "multimotion_no_stairs_amp_teacher",
+        "--model-xml",
+        str(ROOT / "robot" / "MJCFmodelposition_0806.xml"),
+        "--terrain-asset-dir",
+        str(ROOT / "robot" / "terrains" / "more_discolrl"),
+        "--motion-files",
+        str(REFERENCE_DIR / "walk_omniretarget.npz"),
+        str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
+        str(REFERENCE_DIR / "stair_up_omniretarget.npz"),
+        str(REFERENCE_DIR / "stair_down_omniretarget.npz"),
+        "--motion-names",
+        "walk",
+        "rough_walk",
+        "stair_up",
+        "stair_down",
+        "--motion-weights",
+        "0.25",
+        "0.25",
+        "0.25",
+        "0.25",
+        "--motion-loop",
+        "true",
+        "false",
+        "false",
+        "false",
+        "--skill-conditioning",
+        "--legacy-reference-conditioned-actor",
+        "--seed",
+        "42",
+        "--decimation",
+        "2",
+        "--robot-collision-profile",
+        "feet",
+        "--num-envs",
+        "4096",
+        "--num-steps",
+        "24",
+        "--epochs",
+        "4",
+        "--minibatches",
+        "8",
+        "--amp-minibatch-size",
+        "4096",
+        "--amp-disc-updates",
+        "2",
+        "--episode-metric-window",
+        "4096",
+        "--warp-nconmax",
+        "32",
+        "--warp-njmax",
+        "128",
+        "--use-reference-velocity",
+        "--target-velocity",
+        "0.862295",
+        "--forward-velocity-tracking-sigma",
+        "0.20",
+        "--forward-velocity-reward-coef",
+        "2.0",
+        "--forward-progress-reward-coef",
+        "1.0",
+        "--forward-velocity-deficit-penalty-coef",
+        "1.5",
+        "--forward-velocity-excess-penalty-coef",
+        "3.0",
+        "--min-forward-progress-speed",
+        "0.10",
+        "--forward-progress-grace-steps",
+        "100",
+        "--forward-progress-window-steps",
+        "100",
+        "--forward-progress-termination-penalty",
+        "2.0",
+        "--fall-penalty",
+        "10.0",
+        "--terminate-incomplete-motion-end",
+        "--side-foot-pos-coef",
+        "0.50",
+        "--step-gap-coef",
+        "0.50",
+        "--swing-advance-coef",
+        "0.75",
+        "--symmetry-reward-coef",
+        "0.50",
+        "--terrain-types",
+        "rough",
+        "slope_up",
+        "slope_down",
+        "--no-stair-terrain",
+        "--serial-terrain-course",
+        "--no-serial-course-single-motion",
+        "--legacy-0806-terrain-model",
+        "--terrain-course-variants",
+        "2",
+        "--terrain-course-lane-spacing",
+        "3.0",
+        "--terrain-course-run-in",
+        "2.90",
+        "--terrain-course-run-out",
+        "0.30",
+        "--terrain-course-base-height",
+        "0.30",
+        "--terrain-course-completion-reward",
+        "25.0",
+        "--terrain-course-random-start-prob",
+        "0.80",
+        "--terrain-course-random-start-warmup-iterations",
+        "5000",
+        "--terrain-course-random-start-ramp-iterations",
+        "10000",
+        "--terrain-course-random-assignment",
+        "--no-terrain-course-phase-sync",
+        "--no-serial-reference-state-init",
+        "--terrain-course-stage-reward",
+        "5.0",
+        "--terrain-course-stage-tolerance",
+        "0.35",
+        "--rough-terrain-height",
+        "0.05",
+        "--flat-lane-y",
+        "3.0",
+        "--rough-lane-y",
+        "6.0",
+        "--pit-lane-y",
+        "9.0",
+        "--gap-lane-y",
+        "12.0",
+        "--terrain-lane-width",
+        "2.0",
+        "--gap-terrain-width",
+        "0.20",
+        "--slope-angle-deg",
+        "6",
+        "--stair-step-height",
+        "0.2",
+        "--stair-step-depth",
+        "0.22",
+        "--stair-step-count",
+        "3",
+        "--stair-start-x",
+        "-0.95",
+        "--stair-down-offset",
+        "0.25",
+        "--reset-noise-scale",
+        "0.01",
+        "--action-residual-scale",
+        "0.5",
+        "--distal-action-scale",
+        "1.0",
+        "--reference-ctrl-blend",
+        "1.0",
+        "--motion-reset-prob",
+        "1.0",
+        "--motion-transition-blend-steps",
+        "30",
+        "--foot-vel-tracking-sigma",
+        "1.0",
+        "--stance-foot-vel-sigma",
+        "0.15",
+        "--foot-vel-reward-coef",
+        "0.35",
+        "--stance-foot-reward-coef",
+        "1.0",
+        "--foot-slip-velocity-threshold",
+        "0.04",
+        "--foot-slip-penalty-coef",
+        "2.0",
+        "--contact-reward-coef",
+        "0.7",
+        "--missed-contact-penalty-coef",
+        "0.8",
+        "--side-foot-pos-sigma",
+        "0.08",
+        "--step-gap-sigma",
+        "0.12",
+        "--swing-advance-sigma",
+        "0.10",
+        "--distal-joint-vel-sigma",
+        "2.0",
+        "--startup-action-ramp-steps",
+        "0",
+        "--stand-start-prob",
+        "0.0",
+        "--stand-start-phase-delay-steps",
+        "50",
+        "--stand-start-transition-min-steps",
+        "160",
+        "--stand-start-transition-max-steps",
+        "320",
+        "--stand-start-push-delay-steps",
+        "200",
+        "--episode-steps",
+        "3600",
+        "--episode-timeout-jitter-steps",
+        "480",
+        "--solver-iterations",
+        "10",
+        "--push-interval-min-steps",
+        "50",
+        "--push-interval-max-steps",
+        "200",
+        "--push-duration-min-steps",
+        "4",
+        "--push-duration-max-steps",
+        "16",
+        "--ctrl-penalty-coef",
+        "0.04",
+        "--action-rate-penalty-coef",
+        "0.4",
+        "--distal-action-penalty-coef",
+        "0.03",
+        "--distal-action-rate-penalty-coef",
+        "0.48",
+        "--learning-rate",
+        "0.0003",
+        "--reward-scale",
+        "0.25",
+        "--disc-learning-rate",
+        "0.00003",
+        "--amp-reward-coef",
+        "1.2",
+        "--task-reward-lerp",
+        "0.65",
+        "--min-action-std",
+        "0.05",
+        "--max-action-std",
+        "0.6",
+        "--log-root",
+        str(ROOT / "logs" / "multimotion"),
+        "--log-group",
+        "multimotion_no_stairs_amp_teacher",
+        "--wandb-tags",
+        "lytrobot,bpo,amp,multimotion,no-stairs,amp-teacher,0806,100hz,"
+        "privileged,reference-conditioned,rough,slope-up,slope-down",
+        "--max-iterations",
+        "30000",
+    ]
 
 
 def main() -> None:
-    sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
-    from sensor_training.train import main as train_main
+    import scripts.train as runner
+    from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+    from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
 
-    train_main()
+    runner.LytRobotWarpAmpEnv = LytRobotWarpAmpEnv
+    runner.PPOAMPConfig = PPOAMPConfig
+    runner.PPOAMPTrainer = PPOAMPTrainer
+    sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
+    runner.main()
 
 
 if __name__ == "__main__":

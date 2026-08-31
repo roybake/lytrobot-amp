@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train one AMP+RL policy across flat, rough, slope, and stair terrains."""
+"""Train the 08-09 visual, stair-free multimotion serial terrain course."""
 
 from __future__ import annotations
 
@@ -13,14 +13,13 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
         sys.path.insert(0, str(path))
 
 from lytrobot_amp.training_defaults import (
-    MULTIMOTION_STAIR_STEP_DEPTH_M,
-    MULTIMOTION_STAIR_STEP_HEIGHT_M,
     ROUGH_TERRAIN_HEIGHT_M,
     SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
 )
 
 REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
+SERIAL_TERRAIN_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
 PARALLEL_ENVS = 4096
 ROLLOUT_STEPS = 24
 PPO_MINIBATCHES = 8
@@ -33,26 +32,24 @@ COURSE_RANDOM_START_RAMP_ITERATIONS = 10000
 def default_train_args() -> list[str]:
     return [
         "--training-task",
-        "multimotion",
+        "multimotion_0809_no_stairs",
+        # The 08-09 replay scene has the near-black checker floor and bright
+        # white terrain fixtures seen in the reference recording.  It is kept
+        # separate from the default robot scene so unrelated tasks retain
+        # their own appearance.
+        "--model-xml",
+        str(SERIAL_TERRAIN_MODEL_XML),
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
-        str(REFERENCE_DIR / "stair_up_omniretarget.npz"),
-        str(REFERENCE_DIR / "stair_down_omniretarget.npz"),
         "--motion-names",
         "walk",
         "rough_walk",
-        "stair_up",
-        "stair_down",
         "--motion-weights",
-        "0.25",
-        "0.25",
-        "0.25",
-        "0.25",
+        "0.50",
+        "0.50",
         "--motion-loop",
         "true",
-        "false",
-        "false",
         "false",
         "--no-skill-conditioning",
         # 4096 worlds x 24 steps = 98,304 transitions per rollout.  Eight PPO
@@ -66,7 +63,8 @@ def default_train_args() -> list[str]:
         "4",
         "--minibatches",
         str(PPO_MINIBATCHES),
-        # Draw enough AMP examples to cover all four skills on every update.
+        # Draw enough AMP examples to cover both terrain-aligned skills on
+        # every update.
         "--amp-minibatch-size",
         str(AMP_MINIBATCH_SIZE),
         "--amp-disc-updates",
@@ -123,10 +121,15 @@ def default_train_args() -> list[str]:
         "rough",
         "slope_up",
         "slope_down",
-        "stairs",
         "--serial-terrain-course",
         "--terrain-course-variants",
-        "8",
+        "6",
+        "--terrain-course-run-in",
+        "2.90",
+        "--terrain-course-run-out",
+        "0.30",
+        "--terrain-course-base-height",
+        "0.30",
         "--terrain-course-random-start-prob",
         "0.80",
         "--terrain-course-random-start-warmup-iterations",
@@ -142,18 +145,6 @@ def default_train_args() -> list[str]:
         f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
         f"{SLOPE_ANGLE_DEG:g}",
-        "--stair-step-height",
-        f"{MULTIMOTION_STAIR_STEP_HEIGHT_M:g}",
-        "--stair-step-depth",
-        f"{MULTIMOTION_STAIR_STEP_DEPTH_M:g}",
-        "--stair-step-count",
-        "3",
-        "--stair-start-x",
-        "-0.95",
-        "--stair-down-offset",
-        "0.25",
-        "--specific-cot-penalty-coef",
-        "0.0",
         "--task-reward-lerp",
         "0.60",
         "--min-action-std",
@@ -169,11 +160,11 @@ def default_train_args() -> list[str]:
         "--episode-steps",
         "3600",
         "--log-group",
-        "multimotion",
+        "multimotion_0809_no_stairs",
         "--wandb-tags",
         (
-            "lytrobot,bpo,amp,multimotion,more,serial-course,random-order,"
-            "flat,rough,slope-up,slope-down,stairs"
+            "lytrobot,bpo,amp,multimotion,0809-scene,no-stairs,more,"
+            "serial-course,random-order,rough,slope-up,slope-down"
         ),
     ]
 

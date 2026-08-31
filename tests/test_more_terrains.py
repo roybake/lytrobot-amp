@@ -88,6 +88,25 @@ def test_scene_uses_more_xml_visual_palette() -> None:
     assert floor.attrib["rgba"] == "0.5 0.5 0.5 1"
 
 
+def test_0809_serial_scene_is_frozen_for_multimotion_training() -> None:
+    scene = ET.parse(ROOT / "robot" / "scene_0809.xml").getroot()
+    visual_rgba = scene.find("./visual/rgba")
+    assert visual_rgba is not None
+    assert visual_rgba.attrib["haze"] == "0.871 0.616 0.4 0.5"
+
+    checker = scene.find("./asset/texture[@name='texplane']")
+    assert checker is not None
+    assert checker.attrib["rgb1"] == ".2 .19 .2"
+    assert checker.attrib["rgb2"] == ".1 0.11 0.11"
+
+    floor = scene.find("./worldbody/geom[@name='floor']")
+    assert floor is not None
+    assert floor.attrib["material"] == "MatPlane"
+    light = scene.find("./worldbody/light")
+    assert light is not None
+    assert light.attrib["diffuse"] == "1.5 1.5 1.5"
+
+
 def test_more_scene_contains_gap_pit_rough_and_stairs() -> None:
     more = MoreTerrainCfg(enabled=True)
     stairs = StairTerrainCfg(

@@ -59,7 +59,7 @@ uv run python squat_training/play.py \
   --stage stage2 --viewer --steps 0
 ```
 
-### 3. 全地形多动作（平地、崎岖地、坡道、上下楼梯）
+### 3. 08-09 多地形串联（崎岖地、上下坡；无楼梯）
 
 ```bash
 # Stage 1 训练
@@ -67,17 +67,17 @@ uv run python scripts/train_multimotion_stage1.py
 
 # Stage 1 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/stage1/<run>/model_final.pt \
-  --stage multimotion --viewer --steps 0
+  --checkpoint logs/multimotion_0809_no_stairs/stage1/<run>/model_final.onnx \
+  --stage stage1 --viewer --steps 0
 
 # Stage 2 训练
 uv run python scripts/train_multimotion_stage2.py \
-  --stage1-checkpoint logs/multimotion/stage1/<run>/model_final.pt
+  --stage1-checkpoint logs/multimotion_0809_no_stairs/stage1/<run>/model_final.pt
 
 # Stage 2 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/stage2/<run>/model_final.pt \
-  --stage multimotion --viewer --steps 0
+  --checkpoint logs/multimotion_0809_no_stairs/stage2/<run>/model_final.pt \
+  --stage stage2 --viewer --steps 0
 ```
 
 ### 4. 无阶梯单参考 AMP（平地、崎岖地、上下坡）
@@ -88,7 +88,7 @@ uv run python scripts/train_multimotion_no_stairs_stage1.py
 
 # Stage 1 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/<run>/model_final.pt \
+  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/08-28-15:20:45/model_best.onnx \
   --stage stage1 --viewer --steps 0
 
 # Stage 2 训练
@@ -102,22 +102,39 @@ uv run python sensor_training/play.py \
   --stage stage2 --viewer --steps 0
 ```
 
-### 5. 无阶梯 Sensor Teacher
+### 5. 无阶梯 AMP Teacher
 
 ```bash
 # 训练
 uv run python scripts/train_multimotion_no_stairs_amp_teacher.py
 
-# 测试
-uv run python sensor_training/play.py \
+# 测试（Teacher 是参考条件化的特权策略，obs_dim=131，
+# 必须用 scripts/play.py 回放；sensor_training/play.py 只适用于
+# 仅 IMU+肌腱长度输入的传感器策略，obs_dim=56）
+uv run python scripts/play.py \
   --checkpoint \
-  logs/multimotion/multimotion_no_stairs_amp_sensor_teacher_v2/<run>/model_final.pt \
+  logs/multimotion/multimotion_no_stairs_amp_teacher/08-28-22:55:45/model_best.onnx \
   --viewer --steps 0
+```
+
+历史 08-06 多动作 checkpoint 的公平回放使用冻结模型与地形兼容配置，例如：
+
+```bash
+uv run python scripts/play.py \
+  --checkpoint logs/multimotion/08-06-10:56:09/model_final.pt \
+  --legacy-0806-compat --seed 42 --no-episode-random-seed \
+  --num-robots 1 --viewer --steps 0 --no-record
 ```
 
 ### 6. 无阶梯 Student 蒸馏
 
-`--teacher-checkpoint` 只接受改造前保存的冻结特权 Teacher，不要传入新的 Sensor Teacher checkpoint。
+Teacher 使用 `logs/multimotion/08-06-10:56:09` 的训练配置，完整保留
+`walk/rough_walk/stair_up/stair_down` 四段动作及原权重，仅从串联路线中去掉
+`stairs` 地形；地形 XML 参数、64×32 rough 高度图、路线几何及接触参数保持
+08-06 版本，并将按控制步计的持续时间换算到 100 Hz。Student 蒸馏时使用与
+Teacher 完全相同的四动作顺序、权重和控制时钟，以保证 Teacher checkpoint 的
+观测/动作维度可直接加载；Teacher 所需标签只保留在底层环境，Student Actor 输入
+仍严格只有 IMU 和肌腱长度。
 
 ```bash
 # 训练
@@ -183,7 +200,7 @@ uv run python scripts/train_no_stairs_old.py
 # 测试
 uv run python sensor_training/play.py \
   --checkpoint \
-  logs/sensor_policy/no_stairs_old_sensor_privileged_v2/<run>/model_final.pt \
+  logs/sensor_policy/no_stairs_old_0806_teacher/<run>/model_final.pt \
   --viewer --steps 0
 ```
 

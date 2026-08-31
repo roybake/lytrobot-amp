@@ -40,6 +40,10 @@ def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> Non
     assert _values(args, "--motion-reset-prob") == ["0.50"]
     assert "--serial-course-single-motion" in args
     assert "--amp-task-only" in args
+    # Pure AMP: the discriminator is the only reward source, so the style
+    # coefficient must stay positive while the physical task mix is exactly 0.
+    assert float(_values(args, "--task-reward-lerp")[0]) == 0.0
+    assert float(_values(args, "--amp-reward-coef")[0]) > 0.0
     assert _values(args, "--terrain-course-random-start-prob") == ["0.8"]
     assert _values(args, "--warp-nconmax") == ["128"]
     assert _values(args, "--warp-njmax") == ["512"]

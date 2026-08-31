@@ -143,8 +143,6 @@ def default_train_args() -> list[str]:
         "-0.95",
         "--stair-down-offset",
         "0.25",
-        "--specific-cot-penalty-coef",
-        "0.0",
         "--task-reward-lerp",
         "0.50",
         "--min-action-std",

@@ -20,8 +20,6 @@ from scripts.train_multimotion import (
     default_train_args,
 )
 from lytrobot_amp.training_defaults import (
-    MULTIMOTION_STAIR_STEP_DEPTH_M,
-    MULTIMOTION_STAIR_STEP_HEIGHT_M,
     ROUGH_TERRAIN_HEIGHT_M,
     SLOPE_ANGLE_DEG,
     TRAINING_TARGET_SPEED_MPS,
@@ -33,7 +31,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         args = default_train_args()
 
         group_index = args.index("--log-group")
-        self.assertEqual(args[group_index + 1], "multimotion")
+        self.assertEqual(args[group_index + 1], "multimotion_0809_no_stairs")
         self.assertNotIn("--run-name", args)
 
     def test_multimotion_defaults_reward_forward_course_progress(self) -> None:
@@ -85,7 +83,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         ]
         self.assertEqual(
             names,
-            ["walk", "rough_walk", "stair_up", "stair_down"],
+            ["walk", "rough_walk"],
         )
 
     def test_random_stage_curriculum_preserves_full_route_warmup(self) -> None:
@@ -150,13 +148,17 @@ class MultimotionLogPathTests(unittest.TestCase):
         start = args.index("--terrain-types") + 1
         end = next(index for index in range(start, len(args)) if args[index].startswith("--"))
         terrains = set(args[start:end])
-        self.assertEqual(terrains, {"rough", "slope_up", "slope_down", "stairs"})
+        self.assertEqual(terrains, {"rough", "slope_up", "slope_down"})
+        self.assertEqual(
+            args[args.index("--model-xml") + 1],
+            str(Path(__file__).resolve().parents[1] / "robot" / "MJCFmodelposition_0806.xml"),
+        )
+        self.assertEqual(value("--terrain-course-variants"), 6.0)
+        self.assertEqual(value("--terrain-course-run-in"), 2.90)
+        self.assertEqual(value("--terrain-course-run-out"), 0.30)
+        self.assertEqual(value("--terrain-course-base-height"), 0.30)
         self.assertEqual(value("--rough-terrain-height"), ROUGH_TERRAIN_HEIGHT_M)
         self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
-        self.assertEqual(value("--stair-step-height"), MULTIMOTION_STAIR_STEP_HEIGHT_M)
-        self.assertEqual(value("--stair-step-depth"), MULTIMOTION_STAIR_STEP_DEPTH_M)
-        self.assertNotIn("--specific-cot-limit", args)
-        self.assertEqual(value("--specific-cot-penalty-coef"), 0.0)
 
     def test_multimotion_group_creates_timestamp_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
