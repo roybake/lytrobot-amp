@@ -24,6 +24,16 @@ for path in (REPO_ROOT, SRC_ROOT):
         sys.path.insert(0, str(path))
 
 LEGACY_0806_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
+CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS = frozenset(
+    {
+        "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_student",
+        "multimotion_no_stairs_amp_single",
+        "multimotion_0809_no_stairs",
+        "no_stairs_old_0806_teacher",
+    }
+)
+CANONICAL_NO_STAIRS_TERRAINS = ("rough", "slope_up", "slope_down")
 
 import torch
 import mujoco
@@ -370,6 +380,9 @@ def make_env_cfg(
         for key, value in checkpoint_env_cfg.items():
             if key in valid_fields and key not in {"model_xml", "motion_file", "num_envs", "seed", "target_velocity"}:
                 setattr(cfg, key, value)
+    checkpoint_task = str(checkpoint.get("training_task", "")).strip()
+    if not checkpoint_task and isinstance(checkpoint_env_cfg, dict):
+        checkpoint_task = str(checkpoint_env_cfg.get("training_task", "")).strip()
     if getattr(args, "legacy_0806_compat", False):
         cfg.terrain_course_run_out = 0.30
         cfg.legacy_0806_terrain_model = True
@@ -383,6 +396,20 @@ def make_env_cfg(
         if getattr(args, "legacy_0806_compat", False)
         else (args.model_xml or saved_model_xml)
     )
+    if checkpoint_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
+        # No-stairs multimotion always evaluates on the same 0809 scene and
+        # two non-duplicate rough/up/down serial courses as training.
+        cfg.model_xml = str(LEGACY_0806_MODEL_XML)
+        cfg.terrain_types = CANONICAL_NO_STAIRS_TERRAINS
+        cfg.stair_terrain = False
+        cfg.serial_terrain_course = True
+        cfg.terrain_course_variants = 2
+        cfg.terrain_course_run_in = 2.90
+        cfg.terrain_course_run_out = 0.30
+        cfg.terrain_course_base_height = 0.30
+        cfg.rough_terrain_height = 0.05
+        cfg.slope_angle_deg = 6.0
+        cfg.legacy_0806_terrain_model = True
     cfg.motion_file = args.motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
@@ -390,14 +417,7 @@ def make_env_cfg(
         # Keep the 0809 no-stairs layout one robot per unique course.  The
         # up/down slope pair is a fixed height-preserving block, so this course
         # has exactly two non-duplicate routes.
-        if (
-            isinstance(checkpoint_env_cfg, dict)
-            and str(checkpoint_env_cfg.get("training_task", ""))
-            in {
-                "multimotion_no_stairs_amp_teacher",
-                "multimotion_no_stairs_amp_student",
-            }
-        ):
+        if checkpoint_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
             robot_count = max(1, int(cfg.terrain_course_variants))
         else:
             robot_count = 3 if resolved_stage == "multimotion" else 1
@@ -483,11 +503,7 @@ def infer_stage(checkpoint_path: str | Path, checkpoint: dict, stage_arg: str) -
     env_cfg = checkpoint.get("env_config", {})
     if not training_task and isinstance(env_cfg, dict):
         training_task = str(env_cfg.get("training_task", "")).strip()
-    if training_task in {
-        "multimotion",
-        "multimotion_no_stairs_amp_teacher",
-        "multimotion_no_stairs_amp_student",
-    }:
+    if training_task == "multimotion" or training_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
         return "multimotion"
     if training_task in {
         "multimotion_no_stairs",
@@ -542,10 +558,7 @@ def checkpoint_recording_path(
     checkpoint_env_cfg = checkpoint.get("env_config", {})
     if not training_task and isinstance(checkpoint_env_cfg, dict):
         training_task = str(checkpoint_env_cfg.get("training_task", "")).strip()
-    if record_dir is None and training_task in {
-        "multimotion_no_stairs_amp_teacher",
-        "multimotion_no_stairs_amp_student",
-    }:
+    if record_dir is None and training_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
         output_dir = checkpoint_stage_dir.resolve() / "recording"
     elif record_dir is None and checkpoint_stage_dir.name in {"stage1", "stage2"}:
         output_dir = checkpoint_stage_dir.resolve() / "recordings"

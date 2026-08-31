@@ -1468,9 +1468,13 @@ def main() -> None:
     if args.legacy_0806_terrain_model and args.training_task not in {
         "multimotion_no_stairs_amp_teacher",
         "multimotion_no_stairs_amp_student",
+        "multimotion_no_stairs_amp_single",
+        "multimotion_0809_no_stairs",
+        "no_stairs_old_0806_teacher",
     }:
         raise ValueError(
-            "--legacy-0806-terrain-model is reserved for the 08-06 Teacher/Student tasks."
+            "--legacy-0806-terrain-model is reserved for canonical 0809 "
+            "no-stairs multimotion tasks."
         )
     if (
         args.serial_terrain_course
