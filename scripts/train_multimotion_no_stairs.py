@@ -268,18 +268,14 @@ def default_train_args() -> list[str]:
         "0.35",
         "--alternating-step-reward-coef",
         "1.50",
-        # Pure AMP: the retargeted reference is the ONLY reward source.  The
-        # 08-28 15:20 run mixed a 25% physical task component into the reward;
-        # the policy then maximised upright/velocity shaping with a stiff
-        # shuffle gait (AMP reward pinned at 0.27, agent prob 0.234, episode
-        # length 242 steps, zero course success).  With task-reward-lerp 0.0
-        # every reward bit must come from the discriminator, and the style
-        # coefficient is raised so the per-step reward magnitude matches the
-        # previous mix (reward_scale 0.25 * 3.0 * amp ~ 0.19 at amp 0.27).
+        # Keep AMP as a style constraint, but retain an explicit physical
+        # locomotion objective.  AMP is translation-invariant apart from the
+        # root velocity feature, so a zero task mix otherwise leaves an
+        # in-place leg swing as a viable local optimum.
         "--amp-reward-coef",
         "3.0",
         "--task-reward-lerp",
-        "0.0",
+        "0.50",
         "--min-action-std",
         "0.05",
         # Match the stable 08-06 multi-motion optimizer/AMP sampling regime.

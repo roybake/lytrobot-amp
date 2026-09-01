@@ -195,7 +195,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rough-lane-y", type=float, default=6.0)
     parser.add_argument("--pit-lane-y", type=float, default=9.0)
     parser.add_argument("--gap-lane-y", type=float, default=12.0)
-    parser.add_argument("--terrain-lane-width", type=float, default=2.0)
+    parser.add_argument(
+        "--terrain-lane-width",
+        type=float,
+        # default=2.0,  # 原始多地形赛道宽度
+        default=3.0,
+    )
     parser.add_argument("--rough-terrain-height", type=float, default=0.05)
     parser.add_argument("--slope-angle-deg", type=float, default=6.0)
     parser.add_argument("--gap-terrain-width", type=float, default=0.20)
@@ -215,7 +220,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--terrain-course-variants", type=int, default=8)
-    parser.add_argument("--terrain-course-lane-spacing", type=float, default=3.0)
+    parser.add_argument(
+        "--terrain-course-lane-spacing",
+        type=float,
+        # default=3.0,  # 原始车道中心间距
+        default=4.0,
+    )
     parser.add_argument("--terrain-course-run-in", type=float, default=2.90)
     parser.add_argument("--terrain-course-run-out", type=float, default=3.10)
     parser.add_argument("--terrain-course-base-height", type=float, default=0.30)

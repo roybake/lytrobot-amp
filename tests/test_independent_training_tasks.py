@@ -58,13 +58,12 @@ def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None
     assert "--serial-course-single-motion" in args
     assert "--amp-task-only" in args
     assert set(_option_values(args, "--terrain-types")) == {
-        "flat",
         "rough",
         "slope_up",
         "slope_down",
     }
     assert "--serial-terrain-course" in args
-    assert _option_values(args, "--terrain-course-variants") == ["6"]
+    assert _option_values(args, "--terrain-course-variants") == ["2"]
     assert "--terrain-course-random-assignment" in args
     assert float(_option_values(args, "--terrain-course-random-start-prob")[0]) == (
         NO_STAIRS_RANDOM_START_PROBABILITY

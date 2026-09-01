@@ -229,7 +229,8 @@ class LytRobotEnvCfg:
     rough_lane_y: float = 6.0
     pit_lane_y: float = 9.0
     gap_lane_y: float = 12.0
-    terrain_lane_width: float = 2.0
+    # terrain_lane_width: float = 2.0  # 原始多地形赛道宽度
+    terrain_lane_width: float = 3.0
     rough_terrain_height: float = 0.05
     slope_angle_deg: float = 6.0
     gap_terrain_width: float = 0.20
@@ -239,7 +240,8 @@ class LytRobotEnvCfg:
     # terrain-aligned multi-motion library.
     serial_course_single_motion: bool = False
     terrain_course_variants: int = 8
-    terrain_course_lane_spacing: float = 3.0
+    # terrain_course_lane_spacing: float = 3.0  # 原始车道中心间距
+    terrain_course_lane_spacing: float = 4.0
     terrain_course_run_in: float = 2.90
     terrain_course_run_out: float = 3.10
     terrain_course_base_height: float = 0.30

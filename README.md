@@ -88,7 +88,7 @@ uv run python scripts/train_multimotion_no_stairs_stage1.py
 
 # Stage 1 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/08-28-15:20:45/model_best.onnx \
+  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/08-31-10:07:02/model_final.onnx\
   --stage stage1 --viewer --steps 0
 
 # Stage 2 训练
@@ -113,7 +113,7 @@ uv run python scripts/train_multimotion_no_stairs_amp_teacher.py
 # 仅 IMU+肌腱长度输入的传感器策略，obs_dim=56）
 uv run python scripts/play.py \
   --checkpoint \
-  logs/multimotion/multimotion_no_stairs_amp_teacher/08-28-22:55:45/model_best.onnx \
+  logs/multimotion/multimotion_no_stairs_amp_teacher/08-31-12:49:45/model_final.onnx\
   --viewer --steps 0
 ```
 

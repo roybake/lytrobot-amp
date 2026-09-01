@@ -50,12 +50,25 @@ def test_motion_library_balances_clips_and_uses_shared_amp_normalization() -> No
         motion_loop=(True, False, False, False, False),
     )
     assert library.motion_count == 5
-    assert library.feature_dim == 45
+    assert library.feature_dim == 51
     assert library.frame_counts.tolist() == [48, 173, 161, 141, 157]
     assert [motion.frequency for motion in library.motions] == [40.0] * 5
     features = library.sample_features(128, np.random.default_rng(7))
-    assert features.shape == (128, 45)
+    assert features.shape == (128, 51)
     assert np.isfinite(features).all()
+    # AMP contains root linear/angular velocity so a stationary imitation
+    # cannot match a translating reference solely by swinging its legs.
+    raw = library.motions[0]._features_from_parts(
+        library.motions[0].reference_root_height[:1, None],
+        library.motions[0].reference_root_quat[:1],
+        library.motions[0].reference_root_lin_vel[:1],
+        library.motions[0].reference_root_ang_vel[:1],
+        library.motions[0].reference_joint_pos[:1],
+        library.motions[0].reference_joint_vel[:1],
+        library.motions[0].reference_foot_pos[:1].reshape(1, -1),
+    )
+    np.testing.assert_allclose(raw[0, 5:8], library.motions[0].reference_root_lin_vel[0])
+    np.testing.assert_allclose(raw[0, 8:11], library.motions[0].reference_root_ang_vel[0])
 
 
 def test_cpu_multimotion_environment_observation_and_step() -> None:
@@ -81,7 +94,7 @@ def test_cpu_multimotion_environment_observation_and_step() -> None:
     try:
         assert env.obs_dim == 132
         assert env.last_obs.shape == (4, 132)
-        assert env.amp_observe().shape == (4, 45)
+        assert env.amp_observe().shape == (4, 51)
         observation, reward, done, _ = env.step(
             np.zeros((4, env.action_dim), dtype=np.float32)
         )

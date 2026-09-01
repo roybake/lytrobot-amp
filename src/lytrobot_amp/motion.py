@@ -252,7 +252,10 @@ class MotionReference:
         self.root_xy0 = self.source_qpos[0, :2].copy()
         self.foot_pos_dim = int(len(CONTACT_GEOM_NAMES) * 3)
         self.contact_dim = 2
-        self.feature_dim = int(1 + 4 + 2 * len(self.common_joint_names) + self.foot_pos_dim)
+        # AMP must distinguish genuine locomotion from an in-place leg swing.
+        # Root linear/angular velocity contributes six motion-state dimensions
+        # in addition to the pose, joint, and local-foot features.
+        self.feature_dim = int(1 + 4 + 6 + 2 * len(self.common_joint_names) + self.foot_pos_dim)
 
         self._precompute_robot_reference()
 
@@ -340,6 +343,8 @@ class MotionReference:
         raw_features = self._features_from_parts(
             self.reference_root_height[:, None],
             self.reference_root_quat,
+            self.reference_root_lin_vel,
+            self.reference_root_ang_vel,
             self.reference_joint_pos,
             self.reference_joint_vel,
             self.reference_foot_pos.reshape(self.frame_count, -1),
@@ -356,6 +361,8 @@ class MotionReference:
             (
                 np.full(1, 0.05, dtype=np.float32),
                 np.full(4, 0.05, dtype=np.float32),
+                np.full(3, 0.35, dtype=np.float32),
+                np.full(3, 0.75, dtype=np.float32),
                 np.full(joint_count, 0.12, dtype=np.float32),
                 np.full(joint_count, 1.00, dtype=np.float32),
                 np.full(self.foot_pos_dim, 0.05, dtype=np.float32),
@@ -412,6 +419,8 @@ class MotionReference:
         self,
         root_height: np.ndarray,
         root_quat: np.ndarray,
+        root_lin_vel: np.ndarray,
+        root_ang_vel: np.ndarray,
         joint_pos: np.ndarray,
         joint_vel: np.ndarray,
         foot_pos: np.ndarray,
@@ -420,6 +429,8 @@ class MotionReference:
             (
                 root_height,
                 _normalize_quat(root_quat),
+                root_lin_vel,
+                root_ang_vel,
                 joint_pos,
                 joint_vel,
                 foot_pos,
@@ -435,13 +446,20 @@ class MotionReference:
     def _mirror_raw_features(self, features: np.ndarray) -> np.ndarray:
         mirrored = np.asarray(features, dtype=np.float32).copy()
         joint_count = len(self.common_joint_names)
-        joint_pos_start = 5
+        root_lin_vel_start = 5
+        root_ang_vel_start = root_lin_vel_start + 3
+        joint_pos_start = root_ang_vel_start + 3
         joint_vel_start = joint_pos_start + joint_count
         foot_start = joint_vel_start + joint_count
 
         # Mirror root orientation across the sagittal plane: roll/yaw change sign.
         mirrored[:, 2] *= -1.0
         mirrored[:, 4] *= -1.0
+        # Polar linear velocity flips only lateral Y; axial angular velocity
+        # flips roll X and yaw Z under this reflection.
+        mirrored[:, root_lin_vel_start + 1] *= -1.0
+        mirrored[:, root_ang_vel_start + 0] *= -1.0
+        mirrored[:, root_ang_vel_start + 2] *= -1.0
 
         half = joint_count // 2
         if joint_count == 2 * half:
@@ -487,6 +505,8 @@ class MotionReference:
         raw_features = self._features_from_parts(
             qpos_arr[:, 2:3],
             qpos_arr[:, 3:7],
+            qvel_arr[:, 0:3],
+            qvel_arr[:, 3:6],
             qpos_arr[:, self.robot_qpos_adrs],
             qvel_arr[:, self.robot_qvel_adrs],
             foot_pos_arr,
@@ -587,6 +607,8 @@ class MotionLibrary:
             motion._features_from_parts(
                 motion.reference_root_height[:, None],
                 motion.reference_root_quat,
+                motion.reference_root_lin_vel,
+                motion.reference_root_ang_vel,
                 motion.reference_joint_pos,
                 motion.reference_joint_vel,
                 motion.reference_foot_pos.reshape(motion.frame_count, -1),
@@ -728,6 +750,8 @@ class MotionLibrary:
         raw = self.motions[0]._features_from_parts(
             qpos_arr[:, 2:3],
             qpos_arr[:, 3:7],
+            qvel_arr[:, 0:3],
+            qvel_arr[:, 3:6],
             qpos_arr[:, self.robot_qpos_adrs],
             qvel_arr[:, self.robot_qvel_adrs],
             foot,

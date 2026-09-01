@@ -396,17 +396,31 @@ def make_env_cfg(
         if getattr(args, "legacy_0806_compat", False)
         else (args.model_xml or saved_model_xml)
     )
-    if checkpoint_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
-        # No-stairs multimotion always evaluates on the same 0809 scene and
-        # two non-duplicate rough/up/down serial courses as training.
+    effective_model_xml = Path(cfg.model_xml).expanduser().resolve()
+    uses_0806_no_stairs_contract = (
+        effective_model_xml == LEGACY_0806_MODEL_XML.resolve()
+    )
+    if (
+        checkpoint_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS
+        and uses_0806_no_stairs_contract
+    ):
+        # Standardized no-stairs checkpoints train on this 0806 scene and the
+        # two non-duplicate rough/up/down serial courses.  Historical
+        # checkpoints that saved another XML must instead be replayed exactly
+        # as saved; silently replacing their model changes the policy's
+        # kinematic and control contract and can cause an immediate reset.
         cfg.model_xml = str(LEGACY_0806_MODEL_XML)
         cfg.terrain_types = CANONICAL_NO_STAIRS_TERRAINS
         cfg.stair_terrain = False
         cfg.serial_terrain_course = True
         cfg.terrain_course_variants = 2
+        # cfg.terrain_course_lane_spacing = 3.0  # 原始车道中心间距
+        cfg.terrain_course_lane_spacing = 4.0
         cfg.terrain_course_run_in = 2.90
         cfg.terrain_course_run_out = 0.30
         cfg.terrain_course_base_height = 0.30
+        # cfg.terrain_lane_width = 2.0  # 原始赛道宽度
+        cfg.terrain_lane_width = 3.0
         cfg.rough_terrain_height = 0.05
         cfg.slope_angle_deg = 6.0
         cfg.legacy_0806_terrain_model = True
@@ -480,6 +494,25 @@ def make_env_cfg(
         # This also keeps old deterministic checkpoints random by default.
         cfg.randomize_episode_seed = True
     return cfg
+
+
+def checkpoint_playback_contract_warning(checkpoint: dict) -> str | None:
+    """Warn when a historical no-stairs checkpoint predates the 0806 contract."""
+
+    env_config = checkpoint.get("env_config", {})
+    if not isinstance(env_config, dict):
+        return None
+    task = str(checkpoint.get("training_task") or env_config.get("training_task", ""))
+    saved_model = env_config.get("model_xml")
+    if task not in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS or not saved_model:
+        return None
+    if Path(str(saved_model)).expanduser().resolve() == LEGACY_0806_MODEL_XML.resolve():
+        return None
+    return (
+        "Historical no-stairs checkpoint uses a non-0806 robot XML; replaying "
+        "its saved environment for compatibility. It is not compatible with "
+        "the corrected Teacher training contract."
+    )
 
 
 def validate_recurrent_sensor_architecture(checkpoint: dict) -> None:
@@ -803,6 +836,9 @@ def main() -> None:
     quality_warning = best_checkpoint_quality_warning(checkpoint_path)
     if quality_warning is not None:
         print(f"[WARN] {quality_warning}")
+    contract_warning = checkpoint_playback_contract_warning(checkpoint)
+    if contract_warning is not None:
+        print(f"[WARN] {contract_warning}")
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
     stage = infer_stage(args.checkpoint, checkpoint, args.stage)
     validate_recurrent_sensor_architecture(checkpoint)

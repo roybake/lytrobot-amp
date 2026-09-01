@@ -32,7 +32,7 @@ def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> Non
     assert np.isclose(
         float(_values(args, "--target-velocity")[0]), NO_STAIRS_FAST_TARGET_SPEED_MPS
     )
-    assert _values(args, "--terrain-types") == ["flat", "rough", "slope_up", "slope_down"]
+    assert _values(args, "--terrain-types") == ["rough", "slope_up", "slope_down"]
     assert not any(arg.startswith("--stair-") for arg in args)
     assert "--no-skill-conditioning" in args
     assert "--serial-reference-state-init" in args
@@ -40,9 +40,9 @@ def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> Non
     assert _values(args, "--motion-reset-prob") == ["0.50"]
     assert "--serial-course-single-motion" in args
     assert "--amp-task-only" in args
-    # Pure AMP: the discriminator is the only reward source, so the style
-    # coefficient must stay positive while the physical task mix is exactly 0.
-    assert float(_values(args, "--task-reward-lerp")[0]) == 0.0
+    # AMP constrains gait style while task reward keeps forward progress in
+    # the PPO objective and prevents an in-place leg-swing local optimum.
+    assert float(_values(args, "--task-reward-lerp")[0]) == 0.50
     assert float(_values(args, "--amp-reward-coef")[0]) > 0.0
     assert _values(args, "--terrain-course-random-start-prob") == ["0.8"]
     assert _values(args, "--warp-nconmax") == ["128"]

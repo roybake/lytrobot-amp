@@ -11,6 +11,8 @@ from scripts.train_multimotion import default_train_args as multimotion_args
 from scripts.train_multimotion_no_stairs import default_train_args as no_stairs_args
 from scripts.train_multimotion_walk import default_train_args as walk_only_args
 from scripts.train_multimotion_no_stairs_amp_teacher import (
+    REFERENCE_MODEL_XML,
+    _assert_reference_model_override_is_compatible,
     default_train_args as sensor_teacher_args,
 )
 from scripts.train_multimotion_no_stairs_amp_student import (
@@ -87,6 +89,16 @@ def test_legacy_teacher_is_the_only_reference_conditioned_training_exception() -
     assert _option_values(args, "--warp-nconmax") == ["32"]
     assert _option_values(args, "--warp-njmax") == ["128"]
     assert "stairs" not in _option_values(args, "--terrain-types")
+    assert _option_values(args, "--model-xml") == [str(REFERENCE_MODEL_XML)]
+    _assert_reference_model_override_is_compatible([])
+    try:
+        _assert_reference_model_override_is_compatible(
+            ["--model-xml", "robot/MJCFmodelposition.xml"]
+        )
+    except SystemExit as exc:
+        assert "incompatible" in str(exc)
+    else:  # pragma: no cover - failure branch for a regressed model contract.
+        raise AssertionError("Teacher accepted an incompatible model override.")
 
 
 def test_every_multimotion_task_disables_commands_and_reference_control() -> None:
@@ -158,12 +170,12 @@ def test_sensor_observation_contract_is_exactly_imu_plus_tendon_length() -> None
         sensor_observation_cfg=SensorObservationConfig(),
         imu_layout=SimpleNamespace(names=tuple(f"imu_{index}" for index in range(14)), dim=42),
         base_env=SimpleNamespace(position_action_dim=14),
-        base_motion=SimpleNamespace(feature_dim=45),
+        base_motion=SimpleNamespace(feature_dim=51),
         sensor_frame_dim=56,
         obs_dim=56,
         sensor_history_obs_dim=336,
         actor_history_enabled=False,
-        amp_obs_dim=270,
+        amp_obs_dim=306,
         privileged_context_metadata={
             "version": 2,
             "actor_input": False,

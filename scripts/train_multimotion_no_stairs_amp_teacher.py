@@ -13,6 +13,27 @@ for path in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(path))
 
 REFERENCE_DIR = ROOT / "robot" / "reference_data" / "multimotion"
+REFERENCE_MODEL_XML = ROOT / "robot" / "MJCFmodelposition_0806.xml"
+
+
+def _assert_reference_model_override_is_compatible(argv: list[str]) -> None:
+    """Reject a model override that cannot consume the Teacher reference clips."""
+
+    expected = REFERENCE_MODEL_XML.resolve()
+    for index, arg in enumerate(argv):
+        if arg == "--model-xml":
+            if index + 1 >= len(argv):
+                raise SystemExit("--model-xml requires a path.")
+            supplied = Path(argv[index + 1]).resolve()
+        elif arg.startswith("--model-xml="):
+            supplied = Path(arg.split("=", 1)[1]).resolve()
+        else:
+            continue
+        if supplied != expected:
+            raise SystemExit(
+                "multimotion_no_stairs_amp_teacher requires "
+                f"{expected}; received incompatible --model-xml {supplied}."
+            )
 
 
 def default_train_args() -> list[str]:
@@ -31,7 +52,7 @@ def default_train_args() -> list[str]:
         "--training-task",
         "multimotion_no_stairs_amp_teacher",
         "--model-xml",
-        str(ROOT / "robot" / "MJCFmodelposition_0806.xml"),
+        str(REFERENCE_MODEL_XML),
         "--terrain-asset-dir",
         str(ROOT / "robot" / "terrains" / "more_discolrl"),
         "--motion-files",
@@ -123,7 +144,8 @@ def default_train_args() -> list[str]:
         "--terrain-course-variants",
         "2",
         "--terrain-course-lane-spacing",
-        "3.0",
+        # "3.0",  # 原始赛道中心间距；必须大于 terrain-lane-width
+        "4.0",
         "--terrain-course-run-in",
         "2.90",
         "--terrain-course-run-out",
@@ -156,7 +178,8 @@ def default_train_args() -> list[str]:
         "--gap-lane-y",
         "12.0",
         "--terrain-lane-width",
-        "2.0",
+        # "2.0",  # 原始赛道宽度
+        "3.0",
         "--gap-terrain-width",
         "0.20",
         "--slope-angle-deg",
@@ -272,6 +295,7 @@ def main() -> None:
     from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
     from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
 
+    _assert_reference_model_override_is_compatible(sys.argv[1:])
     runner.LytRobotWarpAmpEnv = LytRobotWarpAmpEnv
     runner.PPOAMPConfig = PPOAMPConfig
     runner.PPOAMPTrainer = PPOAMPTrainer

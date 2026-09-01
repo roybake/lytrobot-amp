@@ -11,6 +11,7 @@ from scripts.play import (
     RealTimePacer,
     SimulationFrameScheduler,
     best_checkpoint_quality_warning,
+    checkpoint_playback_contract_warning,
     checkpoint_recording_path,
     infer_stage,
     make_env_cfg,
@@ -218,6 +219,42 @@ def test_play_can_disable_checkpoint_serial_course() -> None:
     cfg = make_env_cfg(args, checkpoint, "multimotion")
 
     assert cfg.serial_terrain_course is False
+
+
+def test_historical_teacher_replays_its_saved_model_instead_of_forcing_0806() -> None:
+    args = SimpleNamespace(
+        model_xml=None,
+        motion_file="walk.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=None,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/multimotion/run/model.pt",
+        stage="multimotion",
+    )
+    checkpoint = {
+        "training_task": "multimotion_no_stairs_amp_teacher",
+        "env_config": {
+            "training_task": "multimotion_no_stairs_amp_teacher",
+            "model_xml": "robot/MJCFmodelposition.xml",
+            "terrain_course_variants": 8,
+            "serial_terrain_course": True,
+        },
+    }
+
+    cfg = make_env_cfg(args, checkpoint, "multimotion")
+
+    assert Path(cfg.model_xml).resolve().name == "MJCFmodelposition.xml"
+    assert cfg.terrain_course_variants == 8
+    assert checkpoint_playback_contract_warning(checkpoint) is not None
 
 
 def test_stair_playback_preserves_full_route_and_disables_stage_jumps() -> None:
