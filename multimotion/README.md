@@ -47,7 +47,7 @@ done
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_references.py
 
-# 4. 生成 rough、pit、gap 地形接触 IK 数据
+# 4. 生成 rough、slope_up、slope_down、pit、gap 地形接触 IK 数据
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_terrain_references.py
 
@@ -237,14 +237,16 @@ uv run python scripts/play.py \
 
 训练机制包括：
 
-- 一个策略共享 `walk` 与 `rough_walk` 两种直线参考；actor 仅使用 IMU 和肌腱长度，
-  不接收动作 one-hot 或地形标签；
+- 一个策略共享 `walk`、`rough_walk`、`slope_up` 与 `slope_down` 四种地形对齐参考；
+  actor 仅使用 IMU 和肌腱长度，不接收动作 one-hot 或地形标签；
+- `multimotion_no_stairs_amp_teacher` 额外使用由平地 `walk` 地形 IK 适配出的
+  `slope_up`/`slope_down` 参考，使 AMP 专家分布与上下坡地形对应；
 - reset 后立即启用策略的肌腱残差纠偏，不再用前20步渐增限制压制动态平衡动作；
 - 前进速度与进度奖励乘以根部姿态/高度稳定度，倾倒前冲不再获得完整正奖励；
 - 速度跟踪带宽收紧到 `0.20 m/s`，超速惩罚系数提高到 `3.0`，抑制超过参考速度后继续前冲；
 - 摔倒终止额外扣 `10`，确保高速前冲后立即倒地的回报低于持续稳定行走；
 - 完整评测 episode 从走路开始，依次通过随机排列的 rough、6°上/下坡全部地形；
-- AMP 判别器从 `walk` 与 `rough_walk` 的共享归一化混合分布采样；
+- 无阶梯单策略 AMP 与坡面 AMP Teacher 均从四个地形对应参考的共享归一化分布采样；
 - PPO/BPO 强化学习奖励继续跟踪根姿态、线/角速度、关节、足端与接触；
 - 动作片段结束后自动切换下一路段，完成整条串联路线后才成功重置；
 - 粗糙面、坡面和地面均参与足端接触奖励与摩擦领域随机化。

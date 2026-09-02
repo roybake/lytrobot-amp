@@ -37,8 +37,11 @@ COURSE_TERRAIN_LENGTHS = {
     # reference-stage changes remain spatially aligned with terrain seams.
     "flat": 3.10,
     "rough": 3.10,
-    "slope_up": 3.10,
-    "slope_down": 3.10,
+    # A 48-frame walk reference travels about 3.08 m.  Leave room for the
+    # 0.30 m root lead-in and the front toe at the other end; otherwise the
+    # first/last support frames straddle the neighboring course segment.
+    "slope_up": 3.70,
+    "slope_down": 3.70,
     "pit": 3.10,
     "gap": 4.12,
     "stairs": 3.88,
@@ -52,6 +55,9 @@ STRICT_CONTACT_MARGIN = 0.005
 STRICT_CONTACT_SOLREF = (0.005, 1.0)
 STRICT_CONTACT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2.0)
 STRICT_RESET_CLEARANCE = 0.001
+# Local terrain-adapted references keep a small root lead-in so the rear heel
+# is already over the ramp when the first support frame is evaluated.
+TERRAIN_REFERENCE_ROOT_MARGIN = 0.30
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,30 @@ class MoreTerrainCfg:
     rough_base_depth: float = 0.05
     rough_spawn_x: float = 0.30
     slope_angle_deg: float = 6.0
+    # Standalone slope training uses one ramp at the same world origin as the
+    # terrain-aligned reference clips.  Serial courses keep using their
+    # per-segment ramp geometry below.
+    slope_center_x: float = 1.85
+    slope_half_length: float = 1.85
+    slope_lane_y: float = 3.0
+    slope_base_height: float = 0.0
+    slope_thickness: float = 0.10
+    # Optional runtime-only field for independent terrain tasks.  The source
+    # heightmap remains read-only; rough terrain reuses it as tiled hfield
+    # geoms, while slopes become one continuous field-wide plane.
+    standalone_field: bool = False
+    standalone_field_x_min: float = -2.0
+    standalone_field_x_max: float = 22.0
+    standalone_field_y_min: float = -10.0
+    standalone_field_y_max: float = 14.0
+    standalone_field_tile_width: float = 3.0
+    # Runtime reset translations calibrated against the two terrain-adapted
+    # slope clips.  They are deliberately separate from the ramp geometry so
+    # the source motion archives and terrain assets remain unchanged.
+    standalone_slope_up_spawn_x: float = 0.60
+    standalone_slope_up_spawn_z: float = 0.04
+    standalone_slope_down_spawn_x: float = -0.20
+    standalone_slope_down_spawn_z: float = 0.06
 
     # The upstream training curriculum varies gaps continuously; 0.20 m is a
     # stable LYT starting level.  The copied evaluation XML uses 0.40 m.
@@ -241,11 +271,24 @@ def course_end_x(cfg: MoreTerrainCfg, variant: int) -> float:
 
 
 def course_motion_sequence(
-    order: Sequence[str], *, legacy_0806_model: bool = False
+    order: Sequence[str],
+    *,
+    legacy_0806_model: bool = False,
+    available_motion_names: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
-    """Expand a terrain order into the multi-action reference sequence."""
+    """Expand a terrain order into the multi-action reference sequence.
+
+    Slope-specific references are preferred when the motion library provides
+    them.  Older stair-free libraries only contain ``rough_walk``; those keep
+    the established terrain-adaptation fallback.
+    """
 
     result = list(COURSE_PREFIX_MOTIONS)
+    available = (
+        {str(name).lower() for name in available_motion_names}
+        if available_motion_names is not None
+        else set()
+    )
     for kind in order:
         if kind == "flat":
             result.append("walk")
@@ -256,9 +299,9 @@ def course_motion_sequence(
         elif kind == "rough":
             result.append("rough_walk")
         elif kind in {"slope_up", "slope_down"}:
-            # The assessment policy has no terrain/skill command.  Reusing the
-            # unrolled walking reference leaves adaptation to IMU+tendon input.
-            result.append("rough_walk")
+            # Prefer terrain-retargeted clips when present.  Reusing the
+            # unrolled walking reference remains valid for older libraries.
+            result.append(kind if kind in available else "rough_walk")
         elif kind == "pit":
             result.append("pit_walk")
         else:
@@ -373,10 +416,28 @@ def _validate_more(cfg: MoreTerrainCfg) -> None:
         "gap_platform_height": cfg.gap_platform_height,
         "pit_half_length": cfg.pit_half_length,
         "pit_platform_height": cfg.pit_platform_height,
+        "slope_half_length": cfg.slope_half_length,
+        "slope_thickness": cfg.slope_thickness,
     }
     invalid = [name for name, value in positive.items() if value <= 0.0]
     if invalid or cfg.gap_width <= 0.0 or cfg.gap_count < 2:
         raise ValueError(f"Invalid MoRE terrain configuration: {invalid} must be positive.")
+    if {"slope_up", "slope_down"} & set(cfg.terrain_types):
+        if not 0.0 < float(cfg.slope_angle_deg) <= 6.0:
+            raise ValueError("slope_angle_deg must be in (0, 6].")
+    if cfg.standalone_field:
+        if cfg.serial_course:
+            raise ValueError("standalone_field cannot be combined with serial_course.")
+        if len(cfg.terrain_types) != 1:
+            raise ValueError(
+                "standalone_field requires exactly one terrain type so fields do not overlap."
+            )
+        if cfg.standalone_field_x_max <= cfg.standalone_field_x_min:
+            raise ValueError("standalone field x bounds must be increasing.")
+        if cfg.standalone_field_y_max <= cfg.standalone_field_y_min:
+            raise ValueError("standalone field y bounds must be increasing.")
+        if cfg.standalone_field_tile_width <= 0.0:
+            raise ValueError("standalone_field_tile_width must be positive.")
     if cfg.serial_course:
         if ("slope_up" in cfg.terrain_types) != ("slope_down" in cfg.terrain_types):
             raise ValueError("serial courses must include slope_up and slope_down together.")
@@ -538,6 +599,36 @@ def more_boxes(cfg: MoreTerrainCfg) -> list[tuple[str, np.ndarray, np.ndarray]]:
     return boxes
 
 
+def standalone_rough_field_placements(
+    cfg: MoreTerrainCfg,
+) -> list[tuple[str, float, float, float]]:
+    """Return a complete runtime-only rough-heightfield tile grid."""
+
+    _validate_more(cfg)
+    if not cfg.standalone_field or cfg.terrain_types != ("rough",):
+        return []
+    tile_length = 2.0 * float(cfg.rough_half_length)
+    tile_width = float(cfg.standalone_field_tile_width)
+    x_count = max(
+        1,
+        int(np.ceil((cfg.standalone_field_x_max - cfg.standalone_field_x_min) / tile_length)),
+    )
+    y_count = max(
+        1,
+        int(np.ceil((cfg.standalone_field_y_max - cfg.standalone_field_y_min) / tile_width)),
+    )
+    return [
+        (
+            f"standalone_field_rough_{x_index:02d}_{y_index:02d}",
+            float(cfg.standalone_field_x_min + (x_index + 0.5) * tile_length),
+            float(cfg.standalone_field_y_min + (y_index + 0.5) * tile_width),
+            0.0,
+        )
+        for x_index in range(x_count)
+        for y_index in range(y_count)
+    ]
+
+
 def serial_course_boxes(
     cfg: MoreTerrainCfg,
     stairs: StairTerrainCfg,
@@ -663,6 +754,101 @@ def serial_course_ramps(
     return result
 
 
+def standalone_slope_ramps(
+    cfg: MoreTerrainCfg,
+) -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
+    """Return non-serial ramps for single-terrain slope tasks.
+
+    The slope references contain the terrain-relative root-height change.  The
+    ramp therefore starts at ``slope_base_height`` and is placed at x=0 in the
+    reference frame, leaving the reference's local x trajectory unchanged.
+    ``slope_up`` and ``slope_down`` share the same dimensions but use opposite
+    signs so the downhill clip starts at the high end of the ramp.
+    """
+
+    _validate_more(cfg)
+    angle = np.deg2rad(float(cfg.slope_angle_deg))
+    reference_length = 2.0 * float(cfg.slope_half_length)
+    rise = reference_length * np.tan(angle)
+    thickness = max(float(cfg.slope_thickness), 0.05)
+    if cfg.standalone_field:
+        horizontal_length = (
+            float(cfg.standalone_field_x_max)
+            - float(cfg.standalone_field_x_min)
+            + 0.40
+        )
+        field_center_x = 0.5 * (
+            float(cfg.standalone_field_x_min)
+            + float(cfg.standalone_field_x_max)
+        )
+        field_width = float(cfg.standalone_field_y_max) - float(cfg.standalone_field_y_min)
+        field_center_y = 0.5 * (
+            float(cfg.standalone_field_y_min)
+            + float(cfg.standalone_field_y_max)
+        )
+    else:
+        horizontal_length = reference_length
+        field_center_x = float(cfg.slope_center_x)
+        field_width = float(cfg.lane_width)
+        field_center_y = float(cfg.slope_lane_y)
+    slope_length = horizontal_length / np.cos(angle)
+    reference_start_x = float(cfg.slope_center_x) - float(cfg.slope_half_length)
+    result: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    for kind in ("slope_up", "slope_down"):
+        if kind not in cfg.terrain_types:
+            continue
+        signed_angle = -angle if kind == "slope_up" else angle
+        slope = np.tan(angle) if kind == "slope_up" else -np.tan(angle)
+        reference_surface_z = float(cfg.slope_base_height) + (
+            rise if kind == "slope_down" else 0.0
+        )
+        top_center_z = reference_surface_z + slope * (
+            field_center_x - reference_start_x
+        )
+        center = np.asarray(
+            [
+                field_center_x,
+                field_center_y,
+                top_center_z - 0.5 * thickness * np.cos(angle),
+            ],
+            dtype=np.float64,
+        )
+        half_size = np.asarray(
+            [0.5 * slope_length, 0.5 * field_width, 0.5 * thickness],
+            dtype=np.float64,
+        )
+        quat = np.asarray(
+            [np.cos(0.5 * signed_angle), 0.0, np.sin(0.5 * signed_angle), 0.0],
+            dtype=np.float64,
+        )
+        name_prefix = "standalone_field" if cfg.standalone_field else "more"
+        result.append((f"{name_prefix}_{kind}", center, half_size, quat))
+    return result
+
+
+def standalone_field_floor_height(cfg: MoreTerrainCfg, kind: str) -> float:
+    """Return a safe lower floor height for a full-field slope."""
+
+    _validate_more(cfg)
+    if not cfg.standalone_field or kind not in {"slope_up", "slope_down"}:
+        return 0.0
+    angle = np.deg2rad(float(cfg.slope_angle_deg))
+    slope = np.tan(angle) if kind == "slope_up" else -np.tan(angle)
+    reference_start_x = float(cfg.slope_center_x) - float(cfg.slope_half_length)
+    reference_surface_z = float(cfg.slope_base_height) + (
+        2.0 * float(cfg.slope_half_length) * np.tan(angle)
+        if kind == "slope_down"
+        else 0.0
+    )
+    x_min = float(cfg.standalone_field_x_min)
+    x_max = float(cfg.standalone_field_x_max)
+    lowest_surface = min(
+        reference_surface_z + slope * (x_min - reference_start_x),
+        reference_surface_z + slope * (x_max - reference_start_x),
+    )
+    return float(lowest_surface - max(float(cfg.slope_thickness), 0.05) - 0.50)
+
+
 def _default_asset_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "robot" / "terrains" / "more_discolrl"
 
@@ -750,6 +936,16 @@ def _add_ramp(
         geom.solimp = STRICT_CONTACT_SOLIMP
 
 
+def _set_world_floor_height(spec: mujoco.MjSpec, height: float) -> None:
+    """Move the source scene floor below a continuous downhill field."""
+
+    for geom in spec.worldbody.find_all("geom"):
+        if getattr(geom, "name", "") == "floor":
+            geom.pos = (0.0, 0.0, float(height))
+            return
+    raise RuntimeError("Expected source scene floor geom for standalone terrain field.")
+
+
 def _attach_terrain(
     spec: mujoco.MjSpec,
     stairs: StairTerrainCfg | None,
@@ -806,6 +1002,28 @@ def _attach_terrain(
                     more.legacy_0806_model,
                 )
 
+        if not serial_course and ({"slope_up", "slope_down"} & set(more.terrain_types)):
+            if more.standalone_field:
+                slope_kind = next(
+                    kind
+                    for kind in ("slope_up", "slope_down")
+                    if kind in more.terrain_types
+                )
+                _set_world_floor_height(
+                    spec,
+                    standalone_field_floor_height(more, slope_kind),
+                )
+            for name, center, half_size, quat in standalone_slope_ramps(more):
+                _add_ramp(
+                    spec,
+                    name,
+                    center,
+                    half_size,
+                    quat,
+                    terrain_material,
+                    more.legacy_0806_model,
+                )
+
         if "rough" in more.terrain_types:
             asset_dir = (
                 Path(more.asset_dir).expanduser().resolve()
@@ -822,13 +1040,18 @@ def _attach_terrain(
                 "course_rough_hfield" if serial_course else "more_rough_hfield"
             )
             hfield.file = str(heightmap)
+            rough_tile_width = (
+                more.standalone_field_tile_width
+                if more.standalone_field
+                else more.lane_width
+            )
             hfield.size = (
                 (
                     0.5 * COURSE_TERRAIN_LENGTHS["rough"]
                     if serial_course
                     else more.rough_half_length
                 ),
-                0.5 * more.lane_width,
+                0.5 * rough_tile_width,
                 more.rough_height,
                 more.rough_base_depth,
             )
@@ -845,6 +1068,8 @@ def _attach_terrain(
                     if segment.kind == "rough"
                 ]
                 if serial_course
+                else standalone_rough_field_placements(more)
+                if more.standalone_field
                 else [
                     (
                         "more_rough",
@@ -990,6 +1215,57 @@ def terrain_kind_from_motion(name: str) -> str:
     return "flat"
 
 
+def course_terrain_reference_height_at(
+    x: np.ndarray | float,
+    cfg: MoreTerrainCfg,
+    course_variant: np.ndarray | int = 0,
+) -> np.ndarray:
+    """Return the root-height datum for a serial course at world ``x``.
+
+    This is deliberately a *reference* height rather than a collision query.
+    Gap and pit clips retain their historical zero datum, while stair clips
+    encode their own vertical motion through the stair-height transform.  The
+    remaining course sections use the platform datum; slope sections add their
+    continuous ramp elevation.  Reset placement, task-height targets and AMP
+    normalization must use this same convention.
+    """
+
+    if not cfg.serial_course:
+        values = np.asarray(x, dtype=np.float32)
+        return np.zeros_like(values, dtype=np.float32)
+
+    values, variants = np.broadcast_arrays(
+        np.asarray(x, dtype=np.float32),
+        np.asarray(course_variant, dtype=np.int64),
+    )
+    variant_count = len(cfg.normalized_course_orders)
+    if np.any((variants < 0) | (variants >= variant_count)):
+        raise IndexError(f"course variant outside [0, {variant_count}).")
+    result = np.full(values.shape, float(cfg.course_base_height), dtype=np.float32)
+    slope = float(np.tan(np.deg2rad(float(cfg.slope_angle_deg))))
+    for variant in range(variant_count):
+        variant_mask = variants == variant
+        if not np.any(variant_mask):
+            continue
+        for segment in course_segments(cfg, variant):
+            inside = variant_mask & (values >= segment.start_x) & (values <= segment.end_x)
+            if segment.kind in {"gap", "pit"}:
+                result = np.where(inside, 0.0, result)
+            elif segment.kind == "slope_up":
+                result = np.where(
+                    inside,
+                    float(cfg.course_base_height) + (values - segment.start_x) * slope,
+                    result,
+                )
+            elif segment.kind == "slope_down":
+                result = np.where(
+                    inside,
+                    float(cfg.course_base_height) + (segment.end_x - values) * slope,
+                    result,
+                )
+    return result.astype(np.float32)
+
+
 def terrain_spawn_offset(
     kind: str,
     more: MoreTerrainCfg,
@@ -999,6 +1275,7 @@ def terrain_spawn_offset(
     stair_down_offset: float = 0.0,
     course_variant: int = 0,
     course_stage: int | None = None,
+    reference_contains_slope_elevation: bool = False,
 ) -> np.ndarray:
     """Return the world translation applied to a local retargeted trajectory."""
 
@@ -1006,15 +1283,13 @@ def terrain_spawn_offset(
         lane_y = more.course_lane_ys[int(course_variant)]
         if course_stage is not None:
             stage_x: list[float] = [0.30]
-            stage_z: list[float] = [more.course_base_height]
+            stage_kinds: list[str] = ["flat"]
             for segment in course_segments(more, int(course_variant)):
                 if segment.kind == "stairs":
                     stage_x.extend(
                         [segment.start_x, segment.center_x + stair_down_offset]
                     )
-                    stage_z.extend(
-                        [more.course_base_height, more.course_base_height]
-                    )
+                    stage_kinds.extend(["stair_up", "stair_down"])
                 else:
                     local_x = {
                         "flat": 0.30,
@@ -1025,29 +1300,29 @@ def terrain_spawn_offset(
                         "slope_down": 0.0,
                     }[segment.kind]
                     stage_x.append(segment.start_x + local_x)
-                    if segment.kind in {"gap", "pit"}:
-                        spawn_z = 0.0
-                    elif segment.kind == "slope_down":
-                        # A downhill segment starts at the crest shared with
-                        # the preceding uphill ramp.  Spawning at the common
-                        # course datum embedded the whole robot about 0.19 m
-                        # inside this ramp.
-                        spawn_z = more.course_base_height + (
-                            segment.length
-                            * np.tan(np.deg2rad(float(more.slope_angle_deg)))
-                        )
-                    else:
-                        spawn_z = more.course_base_height
-                    stage_z.append(spawn_z)
+                    stage_kinds.append(segment.kind)
             last_x = course_segments(more, int(course_variant))[-1].end_x
             stage_x.append(last_x + 0.30)
-            stage_z.append(more.course_base_height)
+            stage_kinds.append("flat")
             index = int(course_stage)
             if not 0 <= index < len(stage_x):
                 raise IndexError(
                     f"course stage {index} outside [0, {len(stage_x)})."
                 )
-            return np.asarray([stage_x[index], lane_y, stage_z[index]], dtype=np.float32)
+            spawn_x = stage_x[index]
+            # Terrain-adapted slope references already contain the ramp rise
+            # in qpos[2].  Only add the common course datum here; adding the
+            # slope elevation a second time makes the down-slope clip float.
+            if (
+                reference_contains_slope_elevation
+                and stage_kinds[index] in {"slope_up", "slope_down"}
+            ):
+                spawn_z = more.course_base_height
+            else:
+                spawn_z = course_terrain_reference_height_at(
+                    spawn_x, more, int(course_variant)
+                )
+            return np.asarray([spawn_x, lane_y, spawn_z], dtype=np.float32)
         if kind == "flat":
             return np.asarray(
                 [0.30, lane_y, more.course_base_height], dtype=np.float32
@@ -1074,13 +1349,22 @@ def terrain_spawn_offset(
                 [x, lane_y, more.course_base_height], dtype=np.float32
             )
         if kind in {"slope_up", "slope_down"}:
-            spawn_z = more.course_base_height
-            if kind == "slope_down":
-                spawn_z += segment.length * np.tan(
-                    np.deg2rad(float(more.slope_angle_deg))
+            if reference_contains_slope_elevation:
+                # The slope-specific reference qpos already carries the
+                # terrain-relative rise/fall.  This offset is only the common
+                # world datum, otherwise slope_down receives the crest
+                # elevation twice and starts with a visibly unsupported foot.
+                spawn_z = more.course_base_height
+            else:
+                spawn_z = course_terrain_reference_height_at(
+                    segment.start_x, more, int(course_variant)
                 )
             return np.asarray(
-                [segment.start_x, lane_y, spawn_z],
+                [
+                    segment.start_x + TERRAIN_REFERENCE_ROOT_MARGIN,
+                    lane_y,
+                    spawn_z,
+                ],
                 dtype=np.float32,
             )
 
@@ -1091,6 +1375,30 @@ def terrain_spawn_offset(
     if kind == "rough":
         return np.asarray(
             [more.rough_spawn_x, more.rough_lane_y, 0.0], dtype=np.float32
+        )
+    if kind in {"slope_up", "slope_down"}:
+        if more.standalone_field:
+            spawn_x, spawn_z = (
+                (
+                    more.standalone_slope_up_spawn_x,
+                    more.standalone_slope_up_spawn_z,
+                )
+                if kind == "slope_up"
+                else (
+                    more.standalone_slope_down_spawn_x,
+                    more.standalone_slope_down_spawn_z,
+                )
+            )
+            return np.asarray(
+                [spawn_x, more.slope_lane_y, spawn_z], dtype=np.float32
+            )
+        return np.asarray(
+            [
+                more.slope_center_x - more.slope_half_length,
+                more.slope_lane_y,
+                more.slope_base_height,
+            ],
+            dtype=np.float32,
         )
     if kind == "stairs":
         x = stairs.descent_start + stair_down_offset if stair_down else 0.0

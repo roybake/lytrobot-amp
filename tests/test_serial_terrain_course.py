@@ -25,6 +25,7 @@ from lytrobot_amp.terrain import (
     MoreTerrainCfg,
     StairTerrainCfg,
     course_motion_sequence,
+    course_terrain_reference_height_at,
     course_end_x,
     course_stage_end_positions,
     course_segments,
@@ -36,6 +37,7 @@ from lytrobot_amp.terrain import (
     serial_course_stair_cfg,
     terrain_height_at,
     terrain_height_from_model,
+    terrain_spawn_offset,
 )
 from scripts.play import playback_pelvis_body_ids, sync_multi_robot_state
 
@@ -91,6 +93,96 @@ def test_stair_free_course_has_all_six_random_block_orders() -> None:
     assert all(order.index("slope_down") == order.index("slope_up") + 1 for order in orders)
 
 
+def test_serial_stair_free_course_rejects_stair_reference_clips() -> None:
+    with pytest.raises(ValueError, match="terrain-conditioned clips"):
+        LytRobotAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
+                motion_files=(
+                    str(MOTION_DIR / "walk_omniretarget.npz"),
+                    str(MOTION_DIR / "stair_up_omniretarget.npz"),
+                    str(MOTION_DIR / "stair_down_omniretarget.npz"),
+                ),
+                motion_names=("walk", "stair_up", "stair_down"),
+                motion_loop=(True, False, False),
+                terrain_types=("rough", "slope_up", "slope_down"),
+                serial_terrain_course=True,
+                num_envs=1,
+            )
+        )
+
+
+def test_course_root_height_datum_matches_reset_cpu_and_warp() -> None:
+    more = MoreTerrainCfg(
+        enabled=True,
+        terrain_types=("flat", "rough", "slope_up", "slope_down"),
+        serial_course=True,
+        course_orders=(("flat", "rough", "slope_up", "slope_down"),),
+    )
+    stairs = StairTerrainCfg(enabled=True)
+    segments = course_segments(more, 0)
+    slope_up = next(segment for segment in segments if segment.kind == "slope_up")
+    slope_down = next(segment for segment in segments if segment.kind == "slope_down")
+    root_x = np.asarray(
+        [
+            0.5,
+            slope_up.start_x + 0.5 * slope_up.length,
+            slope_down.start_x + 0.5 * slope_down.length,
+        ],
+        dtype=np.float32,
+    )
+    expected = course_terrain_reference_height_at(root_x, more, 0)
+    rise = slope_up.length * np.tan(np.deg2rad(more.slope_angle_deg))
+    np.testing.assert_allclose(
+        expected,
+        [
+            more.course_base_height,
+            more.course_base_height + 0.5 * rise,
+            more.course_base_height + 0.5 * rise,
+        ],
+        atol=1.0e-6,
+    )
+
+    cpu_env = object.__new__(LytRobotAmpEnv)
+    cpu_env.more_terrain_cfg = more
+    cpu_env.num_envs = len(root_x)
+    cpu_env.datas = [SimpleNamespace(qpos=np.asarray([x])) for x in root_x]
+    cpu_env.course_variant_ids = np.zeros(len(root_x), dtype=np.int64)
+    np.testing.assert_allclose(cpu_env._course_height_offsets(), expected)
+
+    warp_env = object.__new__(LytRobotWarpAmpEnv)
+    warp_env.more_terrain_cfg = more
+    warp_env.qpos = torch.zeros((len(root_x), 3), dtype=torch.float32)
+    warp_env.qpos[:, 0] = torch.as_tensor(root_x)
+    warp_env.course_variant_ids = torch.zeros(len(root_x), dtype=torch.long)
+    torch.testing.assert_close(warp_env._course_height_offsets(), torch.as_tensor(expected))
+
+    slope_down_stage = 4
+    reset_offset = terrain_spawn_offset(
+        "slope_down",
+        more,
+        stairs,
+        course_variant=0,
+        course_stage=slope_down_stage,
+    )
+    np.testing.assert_allclose(
+        reset_offset[2],
+        course_terrain_reference_height_at(reset_offset[0], more, 0),
+    )
+    baked_reset_offset = terrain_spawn_offset(
+        "slope_down",
+        more,
+        stairs,
+        course_variant=0,
+        course_stage=slope_down_stage,
+        reference_contains_slope_elevation=True,
+    )
+    np.testing.assert_allclose(
+        baked_reset_offset[2],
+        more.course_base_height,
+    )
+
+
 def test_straight_course_excludes_turns_and_uses_geometry_boundaries() -> None:
     more, _stairs = course_cfg(variants=3)
     for variant, order in enumerate(more.normalized_course_orders):
@@ -103,6 +195,15 @@ def test_straight_course_excludes_turns_and_uses_geometry_boundaries() -> None:
         assert boundaries[0] == more.course_run_in
         assert sequence[-1] == "walk"
         assert boundaries[-1] == course_end_x(more, variant)
+
+
+def test_course_prefers_slope_references_when_available() -> None:
+    order = ("flat", "rough", "slope_up", "slope_down")
+    assert course_motion_sequence(
+        order,
+        legacy_0806_model=True,
+        available_motion_names=("walk", "rough_walk", "slope_up", "slope_down"),
+    ) == ("walk", "walk", "rough_walk", "slope_up", "slope_down")
 
 
 def test_serial_stair_descent_begins_at_ascent_descent_stage_split() -> None:
@@ -273,6 +374,30 @@ def test_warp_partial_reset_uses_authoritative_per_world_reset(
     torch.testing.assert_close(
         calls[0][2], torch.tensor([False, True, False, True])
     )
+
+
+def test_warp_amp_observe_matches_motion_feature_contract() -> None:
+    """Warp AMP state must include the six root-velocity features."""
+
+    env = object.__new__(LytRobotWarpAmpEnv)
+    env.num_envs = 2
+    env.qpos = torch.zeros((2, 21), dtype=torch.float32)
+    env.qpos[:, 3] = 1.0
+    env.qvel = torch.arange(20, dtype=torch.float32).repeat(2, 1)
+    env.robot_qpos_adrs = torch.arange(7, 21, dtype=torch.long)
+    env.robot_qvel_adrs = torch.arange(6, 20, dtype=torch.long)
+    env.more_terrain_cfg = SimpleNamespace(serial_course=False)
+    env.motion_ids = torch.zeros(2, dtype=torch.long)
+    env.motion_stair_height_anchor = torch.zeros(1, dtype=torch.float32)
+    env.motion_stair_height_scale = torch.ones(1, dtype=torch.float32)
+    env.feature_mean = torch.zeros(51, dtype=torch.float32)
+    env.feature_std = torch.ones(51, dtype=torch.float32)
+    env._foot_positions_local = lambda: torch.zeros((2, 4, 3), dtype=torch.float32)
+
+    features = env.amp_observe()
+
+    assert features.shape == (2, 51)
+    torch.testing.assert_close(features[:, 5:11], env.qvel[:, :6])
 
 
 def test_stair_reference_height_matches_compiled_hard_stair_rise() -> None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a single-reference, sensor-only AMP walker on a stair-free course."""
+"""Train one sensor-only AMP policy with terrain-aligned stair-free references."""
 
 from __future__ import annotations
 
@@ -10,9 +10,6 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 ORDINARY_REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 SERIAL_TERRAIN_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
-AMP_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "no_stairs_fast" / "walk_omniretarget.npz"
-)
 for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -20,7 +17,6 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
 from lytrobot_amp.training_defaults import (
     ROUGH_TERRAIN_HEIGHT_M,
     SLOPE_ANGLE_DEG,
-    NO_STAIRS_FAST_TARGET_SPEED_MPS,
     TRAINING_TARGET_SPEED_MPS,
 )
 
@@ -36,8 +32,8 @@ COURSE_RANDOM_START_RAMP_ITERATIONS = 10000
 
 def _stair_free_course_args(
     *,
-    motion_files: tuple[Path, Path],
-    motion_loop: tuple[bool, bool],
+    motion_files: tuple[Path, ...],
+    motion_loop: tuple[bool, ...],
     target_velocity: float,
     use_reference_velocity: bool,
     forward_velocity_reward_coef: float,
@@ -53,9 +49,13 @@ def _stair_free_course_args(
         "--motion-names",
         "walk",
         "rough_walk",
+        "slope_up",
+        "slope_down",
         "--motion-weights",
-        "0.50",
-        "0.50",
+        "0.25",
+        "0.25",
+        "0.25",
+        "0.25",
         "--motion-loop",
         *("true" if value else "false" for value in motion_loop),
         "--no-skill-conditioning",
@@ -84,8 +84,8 @@ def _stair_free_course_args(
         "slope_down",
         "--no-stair-terrain",
         "--serial-terrain-course",
-        # 上下坡必须保持相邻以回到共同高度基准；配合 rough 仅有两条
-        # 不重复的 0809 无阶梯路线。
+        # 上下坡必须保持相邻以回到共同高度基准；当前参考库为四段
+        # flat/rough/slope_up/slope_down 地形对齐动作。
         "--terrain-course-variants",
         "2",
         "--legacy-0806-terrain-model",
@@ -136,14 +136,16 @@ def _stair_free_course_args(
 
 
 def default_ordinary_stair_free_course_args() -> list[str]:
-    """Keep ordinary Stage 1/2 on the original stable-speed references."""
+    """Keep ordinary Stage 1/2 on stable terrain-aligned references."""
 
     return _stair_free_course_args(
         motion_files=(
             ORDINARY_REFERENCE_DIR / "walk_omniretarget.npz",
             ORDINARY_REFERENCE_DIR / "rough_walk_omniretarget.npz",
+            ORDINARY_REFERENCE_DIR / "slope_up_omniretarget.npz",
+            ORDINARY_REFERENCE_DIR / "slope_down_omniretarget.npz",
         ),
-        motion_loop=(True, False),
+        motion_loop=(True, False, False, False),
         target_velocity=TRAINING_TARGET_SPEED_MPS,
         use_reference_velocity=False,
         forward_velocity_reward_coef=3.0,
@@ -154,34 +156,45 @@ def default_ordinary_stair_free_course_args() -> list[str]:
 
 
 def default_stair_free_course_args() -> list[str]:
-    """Single OmniRetarget gait reused explicitly at every course stage.
+    """Use terrain-aligned references with one shared sensor-only policy.
 
-    ``walk_omniretarget`` is the only expert clip.  Its data are consumed by
-    AMP, while task rewards use physical velocity, contacts and stability only.
-    The serial-course adapter deliberately maps that same looping gait to flat,
-    rough and both slope stages; terrain adaptation must therefore come from
-    IMU/tendon feedback rather than a terrain-labelled reference.
+    The policy remains one deployable sensor-only Actor, but AMP receives
+    ``walk``, ``rough_walk``, ``slope_up`` and ``slope_down`` as separate expert
+    clips.  The serial-course adapter selects the matching clip for each stage,
+    so terrain adaptation is supported by both the reference distribution and
+    IMU/tendon feedback.
     """
 
     return [
         "--model-xml",
         str(SERIAL_TERRAIN_MODEL_XML),
         "--motion-files",
-        str(AMP_REFERENCE),
+        str(ORDINARY_REFERENCE_DIR / "walk_omniretarget.npz"),
+        str(ORDINARY_REFERENCE_DIR / "rough_walk_omniretarget.npz"),
+        str(ORDINARY_REFERENCE_DIR / "slope_up_omniretarget.npz"),
+        str(ORDINARY_REFERENCE_DIR / "slope_down_omniretarget.npz"),
         "--motion-names",
         "walk",
+        "rough_walk",
+        "slope_up",
+        "slope_down",
         "--motion-weights",
-        "1.0",
+        "0.25",
+        "0.25",
+        "0.25",
+        "0.25",
         "--motion-loop",
         "true",
-        "--serial-course-single-motion",
+        "false",
+        "false",
+        "false",
         "--no-skill-conditioning",
         "--reference-ctrl-blend",
         "0.0",
         "--amp",
         "--amp-task-only",
         "--target-velocity",
-        f"{NO_STAIRS_FAST_TARGET_SPEED_MPS:g}",
+        f"{TRAINING_TARGET_SPEED_MPS:g}",
         "--forward-velocity-tracking-sigma",
         "0.30",
         "--forward-velocity-reward-coef",
@@ -232,8 +245,9 @@ def default_stair_free_course_args() -> list[str]:
         f"{ROUGH_TERRAIN_HEIGHT_M:g}",
         "--slope-angle-deg",
         f"{SLOPE_ANGLE_DEG:g}",
+        "--use-reference-velocity",
         "--motion-transition-blend-steps",
-        "0",
+        "30",
         "--serial-reference-state-init",
         "--motion-reset-prob",
         "0.50",
@@ -301,8 +315,8 @@ def default_train_args() -> list[str]:
         str(REPO_ROOT / "logs" / "multimotion" / "no_stairs_amp_single"),
         "--wandb-tags",
         (
-            "lytrobot,bpo,amp,amp-task-only,pure-amp,single-omniretarget,walk,no-stairs,"
-            "serial-course,random-order,flat,rough,slope-up,slope-down,"
+            "lytrobot,bpo,amp,amp-task-only,pure-amp,terrain-aligned,no-stairs,"
+            "serial-course,random-order,terrain-aligned,flat,rough,slope-up,slope-down,"
             "alternating-feet,velocity-tracking,imu,tendon,recurrent,gru,sensor-only"
         ),
     ]

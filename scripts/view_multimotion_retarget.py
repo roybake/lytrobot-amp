@@ -41,6 +41,8 @@ CLIP_ORDER = (
     "turn_left",
     "turn_right",
     "rough_walk",
+    "slope_up",
+    "slope_down",
     "pit_walk",
     "gap_cross",
     "stair_up",
@@ -110,6 +112,22 @@ CLIP_SPECS = {
         azimuth=105.0,
         distance=2.55,
     ),
+    "slope_up": ClipSpec(
+        key="slope_up",
+        title="SLOPE WALK UP",
+        subtitle="derived from flat walk  |  6 deg full-foot terrain IK",
+        filename="slope_up_omniretarget.npz",
+        azimuth=105.0,
+        distance=2.55,
+    ),
+    "slope_down": ClipSpec(
+        key="slope_down",
+        title="SLOPE WALK DOWN",
+        subtitle="derived from flat walk  |  6 deg full-foot terrain IK",
+        filename="slope_down_omniretarget.npz",
+        azimuth=105.0,
+        distance=2.55,
+    ),
     "pit_walk": ClipSpec(
         key="pit_walk",
         title="PIT WALK",
@@ -153,6 +171,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-xml", default=str(MODEL_XML))
     parser.add_argument("--motion-dir", default=str(MOTION_DIR))
     parser.add_argument("--viewer", action="store_true", help="Also open the interactive MuJoCo viewer.")
+    parser.add_argument(
+        "--hold-viewer",
+        action="store_true",
+        help="Keep the interactive viewer open after playback until its window closes.",
+    )
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--contact-sheet", action=argparse.BooleanOptionalAction, default=True)
@@ -180,8 +203,23 @@ def reference_stairs() -> StairTerrainCfg:
     )
 
 
-def reference_more_terrains() -> MoreTerrainCfg:
-    """Return the gap, pit, and rough lanes used by training."""
+def reference_more_terrains(clip_keys: list[str] | None = None) -> MoreTerrainCfg:
+    """Return visualization terrain, including a serial slope course if needed."""
+
+    requested = set(clip_keys or ())
+    if requested & {"slope_up", "slope_down"}:
+        terrain_types = ["gap", "pit", "rough", "slope_up", "slope_down", "stairs"]
+        if requested <= {"slope_up", "slope_down"}:
+            terrain_types = ["slope_up", "slope_down"]
+        return MoreTerrainCfg(
+            enabled=True,
+            terrain_types=tuple(terrain_types),
+            serial_course=True,
+            course_orders=(tuple(terrain_types),),
+            course_lane_spacing=3.0,
+            course_base_height=0.30,
+            lane_width=2.0,
+        )
 
     return MoreTerrainCfg(
         enabled=True,
@@ -290,6 +328,7 @@ def clip_pose(
         stairs,
         stair_down=segment.spec.key == "stair_down",
         stair_down_offset=0.25,
+        reference_contains_slope_elevation=terrain_kind in {"slope_up", "slope_down"},
     )
     return qpos, source_index, float(np.clip(progress, 0.0, 1.0))
 
@@ -499,7 +538,7 @@ def main() -> None:
         raise ValueError("--walk-cycles must be at least one.")
 
     stairs = reference_stairs()
-    more = reference_more_terrains()
+    more = reference_more_terrains(args.clips)
     model = load_model(args.model_xml, stairs, more)
     data = mujoco.MjData(model)
     segments = build_segments(
@@ -576,6 +615,9 @@ def main() -> None:
                             break
                 if viewer is not None and not viewer.is_running():
                     break
+            if viewer is not None and args.hold_viewer and viewer.is_running():
+                while viewer.is_running():
+                    time.sleep(0.1)
     finally:
         if recorder is not None:
             recorder.close()

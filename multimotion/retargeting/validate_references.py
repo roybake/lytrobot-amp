@@ -33,6 +33,8 @@ CLIPS = (
     "turn_left",
     "turn_right",
     "rough_walk",
+    "slope_up",
+    "slope_down",
     "pit_walk",
     "gap_cross",
     "stair_up",
@@ -111,17 +113,41 @@ def clip_metrics(model: mujoco.MjModel, motion_path: Path) -> dict[str, object]:
         "minimum_cross_leg_distance_m": float(distances.min()),
         "penetration_frames": int(np.count_nonzero(np.min(distances, axis=1) < -1.0e-5)),
         "heel_phase_toe_minus_heel_min_m": float(
-            metadata["heel_phase_toe_minus_heel_min"]
+            metadata.get(
+                "heel_phase_foot_mesh_toe_minus_heel_min",
+                metadata["heel_phase_toe_minus_heel_min"],
+            )
         ),
         "toe_phase_toe_minus_heel_max_m": float(
-            metadata["toe_phase_toe_minus_heel_max"]
+            metadata.get(
+                "toe_phase_foot_mesh_toe_minus_heel_max",
+                metadata["toe_phase_toe_minus_heel_max"],
+            )
         ),
         "maximum_roll_target_error_m": float(
-            metadata["maximum_roll_target_error"]
+            metadata.get(
+                "maximum_roll_target_error",
+                metadata.get("maximum_landmark_roll_target_error", 0.0),
+            )
         ),
         "terrain_kind": metadata.get("terrain_kind", "flat"),
         "support_clearance_min_m": metadata.get("support_clearance_min"),
         "support_clearance_max_m": metadata.get("support_clearance_max"),
+        "support_surface_clearance_min_m": metadata.get(
+            "support_surface_clearance_min"
+        ),
+        "support_surface_clearance_max_m": metadata.get(
+            "support_surface_clearance_max"
+        ),
+        "maximum_foot_surface_penetration_m": metadata.get(
+            "maximum_foot_surface_penetration"
+        ),
+        "swing_knee_min_flexion_rad": metadata.get(
+            "swing_knee_min_flexion_rad"
+        ),
+        "swing_knee_straight_violation_frames": metadata.get(
+            "swing_knee_straight_violation_frames"
+        ),
         "unsupported_gap_contact_frames": metadata.get(
             "unsupported_gap_contact_frames", 0
         ),
@@ -161,6 +187,18 @@ def main() -> None:
             failures.append(f"{clip}: toe lands before heel during heel phase")
         if metrics["toe_phase_toe_minus_heel_max_m"] > 0.002:
             failures.append(f"{clip}: heel remains below toe during toe phase")
+        if clip in {"walk", "rough_walk", "slope_up", "slope_down"}:
+            minimum_flexion = metrics["swing_knee_min_flexion_rad"]
+            if minimum_flexion is not None and float(minimum_flexion) < 0.30:
+                failures.append(
+                    f"{clip}: swing knee flexion falls below 0.30 rad "
+                    f"({float(minimum_flexion):.3f} rad)"
+                )
+            straight_frames = metrics["swing_knee_straight_violation_frames"]
+            if straight_frames is not None and int(straight_frames) != 0:
+                failures.append(
+                    f"{clip}: {int(straight_frames)} swing frames have a straight knee"
+                )
         if metrics["unsupported_gap_contact_frames"] != 0:
             failures.append(f"{clip}: a support foot lands in the gap")
         if (
@@ -182,6 +220,11 @@ def main() -> None:
             and metrics["support_clearance_min_m"] < -0.003
         ):
             failures.append(f"{clip}: support foot penetrates terrain by over 3 mm")
+        if (
+            metrics["maximum_foot_surface_penetration_m"] is not None
+            and metrics["maximum_foot_surface_penetration_m"] > 1.0e-5
+        ):
+            failures.append(f"{clip}: foot surface penetrates terrain")
     for turn in (() if args.no_stairs_fast else ("turn_left", "turn_right")):
         if clips[turn]["duration_s"] < 3.5:
             failures.append(f"{turn}: duration remains too short")
@@ -194,7 +237,14 @@ def main() -> None:
     if not args.no_stairs_fast and clips["turn_right"]["yaw_change_deg"] >= 0.0:
         failures.append("turn_right: expected negative Z-up yaw")
     target_speed = NO_STAIRS_FAST_TARGET_SPEED_MPS if args.no_stairs_fast else TRAINING_TARGET_SPEED_MPS
-    for locomotion in ("walk", "rough_walk") if args.no_stairs_fast else ("walk", "rough_walk", "pit_walk", "gap_cross"):
+    for locomotion in ("walk", "rough_walk") if args.no_stairs_fast else (
+        "walk",
+        "rough_walk",
+        "slope_up",
+        "slope_down",
+        "pit_walk",
+        "gap_cross",
+    ):
         speed = float(clips[locomotion]["mean_forward_speed_mps"])
         if abs(speed - target_speed) > 0.02:
             failures.append(
@@ -219,6 +269,7 @@ def main() -> None:
             "turn_maximum_yaw_rate_deg_s": 50.0,
             "turn_maximum_angle_deg": 90.0,
             "heel_then_toe_tolerance_m": 0.002,
+            "swing_knee_min_flexion_rad": 0.30,
             "stair_maximum_joint_step_rad": MAX_JOINT_STEP_RAD,
             "stair_maximum_joint_speed_rad_s": MAX_JOINT_SPEED_RAD_S,
             "output_frequency_hz": 40.0,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 1 for the single-OmniRetarget, sensor-only stair-free AMP task."""
+"""Stage 1 for the terrain-aligned, sensor-only stair-free AMP task."""
 
 from __future__ import annotations
 

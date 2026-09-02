@@ -45,17 +45,30 @@ def _option_values(args: list[str], option: str) -> list[str]:
     return args[start:end]
 
 
-def test_stair_free_task_reuses_walking_policy_on_random_serial_course() -> None:
+def test_stair_free_task_uses_terrain_aligned_references_on_random_course() -> None:
     args = no_stairs_args()
 
     assert _option_values(args, "--training-task") == ["multimotion_no_stairs_amp_single"]
-    assert _option_values(args, "--motion-names") == ["walk"]
-    assert [Path(value) for value in _option_values(args, "--motion-files")] == [
-        NO_STAIRS_MOTION_DIR / "walk_omniretarget.npz",
+    assert _option_values(args, "--motion-names") == [
+        "walk",
+        "rough_walk",
+        "slope_up",
+        "slope_down",
     ]
-    assert _option_values(args, "--motion-weights") == ["1.0"]
-    assert _option_values(args, "--motion-loop") == ["true"]
-    assert "--serial-course-single-motion" in args
+    assert [Path(value) for value in _option_values(args, "--motion-files")] == [
+        MOTION_DIR / "walk_omniretarget.npz",
+        MOTION_DIR / "rough_walk_omniretarget.npz",
+        MOTION_DIR / "slope_up_omniretarget.npz",
+        MOTION_DIR / "slope_down_omniretarget.npz",
+    ]
+    assert _option_values(args, "--motion-weights") == ["0.25"] * 4
+    assert _option_values(args, "--motion-loop") == [
+        "true",
+        "false",
+        "false",
+        "false",
+    ]
+    assert "--serial-course-single-motion" not in args
     assert "--amp-task-only" in args
     assert set(_option_values(args, "--terrain-types")) == {
         "rough",

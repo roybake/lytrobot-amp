@@ -156,6 +156,37 @@ def test_default_recording_path_lives_in_task_stage_logs(tmp_path: Path) -> None
     )
 
 
+def test_independent_terrain_recording_uses_shared_terrain_directory(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = (
+        tmp_path
+        / "logs"
+        / "independent_terrain"
+        / "slope_down"
+        / "stage2"
+        / "run"
+        / "model_best.pt"
+    )
+    checkpoint_path.parent.mkdir(parents=True)
+
+    output = checkpoint_recording_path(
+        checkpoint_path,
+        {"training_task": "independent_slope_down", "iteration": 7500},
+        None,
+        "stage2",
+    )
+
+    assert output == (
+        tmp_path
+        / "logs"
+        / "independent_terrain"
+        / "slope_down"
+        / "recording"
+        / "run-7500.mp4"
+    )
+
+
 def test_best_checkpoint_recording_uses_selected_iteration(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "logs" / "stairs" / "stage1" / "run" / "model_best.pt"
     checkpoint_path.parent.mkdir(parents=True)
@@ -255,6 +286,76 @@ def test_historical_teacher_replays_its_saved_model_instead_of_forcing_0806() ->
     assert Path(cfg.model_xml).resolve().name == "MJCFmodelposition.xml"
     assert cfg.terrain_course_variants == 8
     assert checkpoint_playback_contract_warning(checkpoint) is not None
+
+
+def test_historical_no_stairs_checkpoint_with_stair_clips_enables_stairs_geometry() -> None:
+    args = SimpleNamespace(
+        model_xml=None,
+        terrain_types=None,
+        motion_file="walk.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=None,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/multimotion/run/model.onnx",
+        stage="multimotion",
+    )
+    checkpoint = {
+        "training_task": "multimotion_no_stairs_amp_teacher",
+        "env_config": {
+            "model_xml": "robot/MJCFmodelposition_0806.xml",
+            "motion_files": ("walk.npz", "stair_up.npz", "stair_down.npz"),
+            "motion_names": ("walk", "stair_up", "stair_down"),
+            "terrain_types": ("rough", "slope_up", "slope_down"),
+            "serial_terrain_course": True,
+        },
+    }
+
+    cfg = make_env_cfg(args, checkpoint, "multimotion")
+
+    assert cfg.terrain_types == ("rough", "slope_up", "slope_down", "stairs")
+
+
+def test_explicit_playback_terrain_override_is_not_replaced_by_no_stairs_contract() -> None:
+    args = SimpleNamespace(
+        model_xml=None,
+        terrain_types=("rough", "slope_up", "slope_down", "stairs"),
+        motion_file="walk.npz",
+        num_robots=1,
+        seed=42,
+        target_velocity=None,
+        serial_terrain_course=None,
+        stand_start_prob=None,
+        stand_start_phase_delay_steps=None,
+        stand_start_transition_min_steps=None,
+        stand_start_transition_max_steps=None,
+        stand_start_push_delay_steps=None,
+        domain_randomization=None,
+        episode_random_seed=None,
+        seed_was_provided=True,
+        checkpoint="logs/multimotion/run/model.onnx",
+        stage="multimotion",
+    )
+    checkpoint = {
+        "training_task": "multimotion_no_stairs_amp_teacher",
+        "env_config": {
+            "model_xml": "robot/MJCFmodelposition_0806.xml",
+            "terrain_types": ("rough", "slope_up", "slope_down"),
+            "serial_terrain_course": True,
+        },
+    }
+
+    cfg = make_env_cfg(args, checkpoint, "multimotion")
+
+    assert cfg.terrain_types == args.terrain_types
 
 
 def test_stair_playback_preserves_full_route_and_disables_stage_jumps() -> None:

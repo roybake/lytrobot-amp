@@ -5,6 +5,114 @@
 参考相位或地形真值。蹲起任务另行使用反馈校正的 `sin/cos` 相位，不改变这里的独立
 任务。checkpoint 和日志目录彼此隔离。
 
+## 四个独立地形任务
+
+下面四个入口是真正的单地形任务，不是串联课程的不同日志别名。每个任务只加载一段
+对应的 terrain-aligned 参考动作，Actor 仍严格只接收 IMU 和肌腱长度；Stage 1 关闭域
+随机化，Stage 2 从 Stage 1 checkpoint 开始并开启域随机化。非串联模式的独立上坡/下坡
+会生成实际坡面碰撞体，坡面几何与参考动作的根部高度变化方向一致。四个独立任务默认
+启用运行时训练场：不平路面用同一份原始高度图平铺约 `24 m × 24 m` 区域，上坡/下坡
+用连续斜面覆盖同一区域，平地使用原有无限平面。原始地形文件以只读方式复用，不会被
+移动、覆盖或修改。
+
+```bash
+# 平地训练（Stage 1，无随机化）
+uv run python scripts/train_flat_stage1.py
+# 平地训练（Stage 2，加载 Stage 1 并开启随机化）
+uv run python scripts/train_flat_stage2.py \
+  --stage1-checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt
+
+# 平地测试（Stage 1）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt \
+  --stage stage1 --viewer --steps 0
+# 平地测试（Stage 2）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/flat/stage2/<run>/model_best.pt \
+  --stage stage2 --viewer --steps 0
+
+# 不平路面训练（Stage 1，无随机化）
+uv run python scripts/train_rough_stage1.py
+# 不平路面训练（Stage 2，加载 Stage 1 并开启随机化）
+uv run python scripts/train_rough_stage2.py \
+  --stage1-checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt
+
+# 不平路面测试（Stage 1）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt \
+  --stage stage1 --viewer --steps 0
+# 不平路面测试（Stage 2）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/rough/stage2/<run>/model_best.pt \
+  --stage stage2 --viewer --steps 0
+
+# 上坡训练（Stage 1，无随机化）
+uv run python scripts/train_slope_up_stage1.py
+# 上坡训练（Stage 2，加载 Stage 1 并开启随机化）
+uv run python scripts/train_slope_up_stage2.py \
+  --stage1-checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt
+
+# 上坡测试（Stage 1）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt \
+  --stage stage1 --viewer --steps 0
+# 上坡测试（Stage 2）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/slope_up/stage2/<run>/model_best.pt \
+  --stage stage2 --viewer --steps 0
+
+# 下坡训练（Stage 1，无随机化）
+uv run python scripts/train_slope_down_stage1.py
+# 下坡训练（Stage 2，加载 Stage 1 并开启随机化）
+uv run python scripts/train_slope_down_stage2.py \
+  --stage1-checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt
+
+# 下坡测试（Stage 1）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt \
+  --stage stage1 --viewer --steps 0
+# 下坡测试（Stage 2）
+uv run python sensor_training/play.py \
+  --checkpoint logs/independent_terrain/slope_down/stage2/<run>/model_best.pt \
+  --stage stage2 --viewer --steps 0
+```
+
+上面命令中的 `<run>` 要替换成实际运行目录名。如果只生成了最新 checkpoint，
+可以把测试命令里的 `model_best.pt` 换成同目录的 `model_final.pt`。
+测试命令默认会录屏；录像保持与仿真控制步一致的 1 倍时间速度，并统一保存到各自地形的
+`logs/independent_terrain/<地形>/recording/`，例如下坡为
+`logs/independent_terrain/slope_down/recording/`。如只想看画面、不保存录像，可追加
+`--no-record`。
+
+代码接口快速测试（不启动训练）：
+
+```bash
+PYTHONPATH=. uv run pytest -q tests/test_independent_terrain_tasks.py tests/test_more_terrains.py
+```
+
+对应的稳定任务 ID 分别是 `independent_flat`、`independent_rough`、
+`independent_slope_up` 和 `independent_slope_down`。四者均使用直接传感器 Actor + AMP，
+不启用 action distillation；`model_final` 用于中断恢复，`model_best` 用于评估和导出。
+独立任务显式循环步态参考，使机器人能够走完整个铺满后的训练场；任务速度统一使用固定的
+物理目标速度，不把参考片段边界处的速度跳变传给策略。上下坡的出生位姿使用运行时校准
+偏移，使参考脚底贴合连续坡面；原始动作文件和地形文件均不修改。
+
+## 蒸馏还是直接训练
+
+对这四个独立任务，建议先直接训练，不蒸馏。原因是每个任务只有一种地形和一种参考动作，
+Teacher 的额外动作标签/参考条件并不能提供跨技能选择信息；直接传感器训练可以让 GRU
+从真实 IMU、肌腱长度和接触反馈中学习该地形的闭环适应，避免 Teacher 的参考控制残差、
+观测分布和 Student 控制空间之间产生偏差。当前实现仍保留 asymmetric critic 和训练期
+特权上下文/estimator loss，它们是降低训练方差的训练辅助，不是把 Teacher action 蒸馏进
+部署 Actor。
+
+只有在直接训练出现明显的探索困难、而且已经有同一模型/同一地形/同一时钟下稳定的
+privileged Teacher 时，才建议为单个任务增加蒸馏对照实验。蒸馏必须使用同任务 Teacher，
+不能把现有四地形 Teacher 或其他坡向 Teacher 交叉使用；并单独建立新的 task ID、日志树
+和 checkpoint。实验顺序建议是：先以直接训练为基线，再以较小的
+`distillation_coef`（例如 `0.1`）做对照，最后只在成功率、滑移和能耗都改善时保留蒸馏
+版本。未经这组对照，不建议把蒸馏作为四个独立任务的默认方案。
+
 ## 去掉阶梯的多动作训练
 
 该入口继续复用普通行走 `scripts/train_stage1.py` / `scripts/train_stage2.py` 的传感器

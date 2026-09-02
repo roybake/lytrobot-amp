@@ -27,6 +27,7 @@ from .terrain import (
     StairTerrainCfg,
     course_end_x,
     course_motion_sequence,
+    course_segments,
     course_stage_end_positions,
     course_stage_scenarios,
     load_model,
@@ -176,6 +177,14 @@ class LytRobotWarpAmpEnv:
             raise ValueError(f"Unknown reward mode: {cfg.reward_mode!r}.")
         if cfg.serial_terrain_course and not terrain_types:
             raise ValueError("serial terrain course requires at least one terrain type.")
+        if cfg.course_lane_hold and not cfg.serial_terrain_course:
+            raise ValueError("course lane hold requires a serial terrain course.")
+        if cfg.course_lane_position_sigma <= 0.0:
+            raise ValueError("course_lane_position_sigma must be positive.")
+        if cfg.course_lane_velocity_sigma <= 0.0:
+            raise ValueError("course_lane_velocity_sigma must be positive.")
+        if cfg.course_lane_termination_margin < 0.0:
+            raise ValueError("course_lane_termination_margin must be non-negative.")
         self.stair_cfg = StairTerrainCfg(
             enabled=bool(cfg.stair_terrain or "stairs" in terrain_types),
             step_height=cfg.stair_step_height,
@@ -213,6 +222,21 @@ class LytRobotWarpAmpEnv:
             lane_width=cfg.terrain_lane_width,
             rough_height=cfg.rough_terrain_height,
             slope_angle_deg=cfg.slope_angle_deg,
+            slope_center_x=cfg.slope_center_x,
+            slope_half_length=cfg.slope_half_length,
+            slope_lane_y=cfg.slope_lane_y,
+            slope_base_height=cfg.slope_base_height,
+            slope_thickness=cfg.slope_thickness,
+            standalone_field=bool(cfg.standalone_terrain_field),
+            standalone_field_x_min=cfg.standalone_field_x_min,
+            standalone_field_x_max=cfg.standalone_field_x_max,
+            standalone_field_y_min=cfg.standalone_field_y_min,
+            standalone_field_y_max=cfg.standalone_field_y_max,
+            standalone_field_tile_width=cfg.standalone_field_tile_width,
+            standalone_slope_up_spawn_x=cfg.standalone_slope_up_spawn_x,
+            standalone_slope_up_spawn_z=cfg.standalone_slope_up_spawn_z,
+            standalone_slope_down_spawn_x=cfg.standalone_slope_down_spawn_x,
+            standalone_slope_down_spawn_z=cfg.standalone_slope_down_spawn_z,
             gap_width=cfg.gap_terrain_width,
             legacy_0806_model=bool(cfg.legacy_0806_terrain_model),
         )
@@ -256,7 +280,10 @@ class LytRobotWarpAmpEnv:
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
-            force_library=bool(cfg.serial_terrain_course and cfg.serial_course_single_motion),
+            force_library=bool(
+                cfg.motion_loop
+                or (cfg.serial_terrain_course and cfg.serial_course_single_motion)
+            ),
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -311,11 +338,14 @@ class LytRobotWarpAmpEnv:
         self.motion_terrain_kinds = tuple(
             terrain_kind_from_motion(name) for name in motion_names
         )
+        available_terrain_kinds = set(terrain_types)
+        if not self.more_terrain_cfg.serial_course and self.stair_cfg.enabled:
+            available_terrain_kinds.add("stairs")
         missing_terrains = sorted(
             {
                 kind
                 for kind in self.motion_terrain_kinds
-                if kind not in {"flat", "stairs"} and kind not in terrain_types
+                if kind != "flat" and kind not in available_terrain_kinds
             }
         )
         if missing_terrains:
@@ -510,7 +540,8 @@ class LytRobotWarpAmpEnv:
             + self.motion.contact_dim
         )
         skill_dim = self.motion_count if self.cfg.skill_conditioning and self.motion_count > 1 else 0
-        return int(current_state_dim + tracking_dim + skill_dim)
+        lane_hold_dim = 2 if self.cfg.course_lane_hold else 0
+        return int(current_state_dim + tracking_dim + skill_dim + lane_hold_dim)
 
     @property
     def amp_obs_dim(self) -> int:
@@ -545,6 +576,7 @@ class LytRobotWarpAmpEnv:
             names = course_motion_sequence(
                 order,
                 legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+                available_motion_names=motion_names,
             )
             missing = [name for name in names if name not in name_to_id]
             if missing:
@@ -1255,6 +1287,91 @@ class LytRobotWarpAmpEnv:
             "foot_contact": blend(self.stand_foot_contact, targets["foot_contact"]),
         }
 
+    def _course_height_offsets(
+        self,
+        root_x: torch.Tensor | None = None,
+        course_variants: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Terrain-relative root-height datum shared by targets and AMP.
+
+        The formulas intentionally mirror
+        :func:`terrain.course_terrain_reference_height_at`, which also drives
+        serial-course reset placement.  Gap/pit preserve their zero reference
+        datum; stairs retain their motion-specific height transform.
+        """
+
+        if root_x is None:
+            root_x = self.qpos[:, 0]
+        if not self.more_terrain_cfg.serial_course:
+            return torch.zeros_like(root_x)
+        if course_variants is None:
+            course_variants = self.course_variant_ids
+        result = torch.full_like(
+            root_x, float(self.more_terrain_cfg.course_base_height)
+        )
+        slope = float(np.tan(np.deg2rad(float(self.more_terrain_cfg.slope_angle_deg))))
+        for variant in range(len(self.more_terrain_cfg.normalized_course_orders)):
+            variant_mask = course_variants == variant
+            for segment in course_segments(self.more_terrain_cfg, variant):
+                inside = variant_mask & (root_x >= segment.start_x) & (root_x <= segment.end_x)
+                if segment.kind in {"gap", "pit"}:
+                    result = torch.where(inside, torch.zeros_like(result), result)
+                elif segment.kind == "slope_up":
+                    result = torch.where(
+                        inside,
+                        float(self.more_terrain_cfg.course_base_height)
+                        + (root_x - segment.start_x) * slope,
+                        result,
+                    )
+                elif segment.kind == "slope_down":
+                    result = torch.where(
+                        inside,
+                        float(self.more_terrain_cfg.course_base_height)
+                        + (segment.end_x - root_x) * slope,
+                        result,
+                    )
+        return result
+
+    def _course_lane_center_y(self) -> torch.Tensor:
+        """Return the physical world-Y center for every serial-course world."""
+
+        if not self.more_terrain_cfg.serial_course:
+            return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        lane_ys = torch.as_tensor(
+            self.more_terrain_cfg.course_lane_ys,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return lane_ys[self.course_variant_ids]
+
+    def _course_reference_height_offsets(
+        self,
+        root_x: torch.Tensor | None = None,
+        course_variants: torch.Tensor | None = None,
+        motion_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the course offset in the active reference's height datum.
+
+        Slope-specific references already contain their continuous ramp
+        elevation.  Applying the dynamic slope height again would double the
+        rise/fall in actor targets and AMP normalization; they only receive
+        the common course platform height.
+        """
+
+        offsets = self._course_height_offsets(root_x, course_variants)
+        if not self.more_terrain_cfg.serial_course:
+            return offsets
+        active_motion_ids = self.motion_ids if motion_ids is None else motion_ids
+        baked_slope = torch.zeros_like(active_motion_ids, dtype=torch.bool)
+        for motion_id, kind in enumerate(self.motion_terrain_kinds):
+            if kind in {"slope_up", "slope_down"}:
+                baked_slope |= active_motion_ids == motion_id
+        return torch.where(
+            baked_slope,
+            torch.full_like(offsets, float(self.more_terrain_cfg.course_base_height)),
+            offsets,
+        )
+
     def _targets_at_current_phase(self, env_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         phase = self.motion_phase if env_ids is None else self.motion_phase[env_ids]
         motion_ids = self.motion_ids if env_ids is None else self.motion_ids[env_ids]
@@ -1268,17 +1385,14 @@ class LytRobotWarpAmpEnv:
         targets["root_lin_vel"][:, 2] *= stair_scale
         targets = self._blend_start_targets(targets, env_ids=env_ids)
         if self.more_terrain_cfg.serial_course:
-            terrain_offset = torch.full_like(
-                targets["root_height"],
-                float(self.more_terrain_cfg.course_base_height),
+            root_x = self.qpos[:, 0] if env_ids is None else self.qpos[env_ids, 0]
+            variants = (
+                self.course_variant_ids
+                if env_ids is None
+                else self.course_variant_ids[env_ids]
             )
-            no_offset = torch.zeros_like(terrain_offset)
-            pit_gap = torch.zeros_like(motion_ids, dtype=torch.bool)
-            for motion_id, kind in enumerate(self.motion_terrain_kinds):
-                if kind in {"gap", "pit"}:
-                    pit_gap = pit_gap | (motion_ids == motion_id)
-            targets["root_height"] = targets["root_height"] + torch.where(
-                pit_gap, no_offset, terrain_offset
+            targets["root_height"] = targets["root_height"] + self._course_reference_height_offsets(
+                root_x, variants, motion_ids
             )
         return targets
 
@@ -1611,6 +1725,11 @@ class LytRobotWarpAmpEnv:
                     stair_down_offset=self.cfg.stair_down_offset,
                     course_variant=(int(variants[row]) if serial_course else 0),
                     course_stage=(int(start_stages[row]) if serial_course else None),
+                    reference_contains_slope_elevation=(
+                        bool(use_motion_reset[row])
+                        and self.motion_terrain_kinds[int(motion_id)]
+                        in {"slope_up", "slope_down"}
+                    ),
                 )
                 qpos[row, :3] += offset
 
@@ -1722,6 +1841,19 @@ class LytRobotWarpAmpEnv:
                 foot_pos - ref_foot_pos,
                 targets["foot_contact"],
         ]
+        if self.cfg.course_lane_hold:
+            lane_width = max(float(self.more_terrain_cfg.lane_width), 1.0e-6)
+            lane_position_error = self.qpos[:, 1] - self._course_lane_center_y()
+            lane_velocity_error = self.qvel[:, 1] - root_lin_vel_target[:, 1]
+            parts.append(
+                torch.stack(
+                    (
+                        torch.clamp(lane_position_error / lane_width, -2.0, 2.0),
+                        torch.clamp(lane_velocity_error, -5.0, 5.0),
+                    ),
+                    dim=1,
+                )
+            )
         if self.cfg.skill_conditioning and self.motion_count > 1:
             parts.append(
                 torch.nn.functional.one_hot(
@@ -1739,17 +1871,7 @@ class LytRobotWarpAmpEnv:
         foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
         root_height = self.qpos[:, 2]
         if self.more_terrain_cfg.serial_course:
-            terrain_offset = torch.full_like(
-                root_height, float(self.more_terrain_cfg.course_base_height)
-            )
-            no_offset = torch.zeros_like(terrain_offset)
-            pit_gap = torch.zeros_like(self.motion_ids, dtype=torch.bool)
-            for motion_id, kind in enumerate(self.motion_terrain_kinds):
-                if kind in {"gap", "pit"}:
-                    pit_gap = pit_gap | (self.motion_ids == motion_id)
-            root_height = root_height - torch.where(
-                pit_gap, no_offset, terrain_offset
-            )
+            root_height = root_height - self._course_reference_height_offsets()
         stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
         stair_scale = self.motion_stair_height_scale[self.motion_ids]
         root_height = stair_anchor + (root_height - stair_anchor) / stair_scale
@@ -1757,6 +1879,7 @@ class LytRobotWarpAmpEnv:
             (
                 root_height[:, None],
                 _canonical_quat(self.qpos[:, 3:7]),
+                self.qvel[:, :6],
                 self.qpos[:, self.robot_qpos_adrs],
                 self.qvel[:, self.robot_qvel_adrs],
                 foot_pos,
@@ -2107,6 +2230,23 @@ class LytRobotWarpAmpEnv:
 
         root_lin_vel_target = targets["root_lin_vel"].clone()
         root_lin_vel_target[:, 0] = target_forward_velocity
+        course_lane_position_error = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        course_lane_velocity_error = torch.zeros_like(course_lane_position_error)
+        course_lane_position_track = torch.zeros_like(course_lane_position_error)
+        course_lane_velocity_track = torch.zeros_like(course_lane_position_error)
+        if self.cfg.course_lane_hold:
+            course_lane_position_error = self.qpos[:, 1] - self._course_lane_center_y()
+            course_lane_velocity_error = self.qvel[:, 1] - root_lin_vel_target[:, 1]
+            course_lane_position_track = torch.exp(
+                -course_lane_position_error.square()
+                / (float(self.cfg.course_lane_position_sigma) ** 2)
+            )
+            course_lane_velocity_track = torch.exp(
+                -course_lane_velocity_error.square()
+                / (float(self.cfg.course_lane_velocity_sigma) ** 2)
+            )
         lin_vel_error = self.qvel[:, :3] - root_lin_vel_target
         ang_vel_error = self.qvel[:, 3:6] - targets["root_ang_vel"]
         lin_vel_track = torch.exp(-torch.mean(lin_vel_error.square(), dim=1) / (0.75**2))
@@ -2302,11 +2442,7 @@ class LytRobotWarpAmpEnv:
                 (touchdown[:, 0] & (previous_contact[:, 1] > 0.5))
                 | (touchdown[:, 1] & (previous_contact[:, 0] > 0.5))
             ).to(torch.float32)
-            terrain_height = (
-                float(self.more_terrain_cfg.course_base_height)
-                if self.more_terrain_cfg.serial_course
-                else 0.0
-            )
+            terrain_height = self._course_height_offsets()
             physical_height = torch.exp(
                 -(
                     (root_height - (self.nominal_root_height + terrain_height)).square()
@@ -2339,20 +2475,17 @@ class LytRobotWarpAmpEnv:
                 - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
             )
 
+        reward += (
+            self.cfg.course_lane_position_reward_coef * course_lane_position_track
+            + self.cfg.course_lane_velocity_reward_coef * course_lane_velocity_track
+        )
+
         bad_state = ~(
             torch.isfinite(self.qpos).all(dim=1)
             & torch.isfinite(self.qvel).all(dim=1)
             & torch.isfinite(self.ctrl).all(dim=1)
         )
-        physical_root_height = torch.full_like(
-            root_height,
-            self.nominal_root_height
-            + (
-                float(self.more_terrain_cfg.course_base_height)
-                if self.more_terrain_cfg.serial_course
-                else 0.0
-            ),
-        )
+        physical_root_height = self.nominal_root_height + self._course_height_offsets()
         height_reference = (
             physical_root_height if self.cfg.amp_task_only else targets["root_height"]
         )
@@ -2367,6 +2500,18 @@ class LytRobotWarpAmpEnv:
             | (root_height > max_root_height)
             | (up_z < self.cfg.min_upright_z)
         )
+        if self.cfg.course_lane_hold:
+            lane_boundary = max(
+                0.5 * float(self.more_terrain_cfg.lane_width)
+                - float(self.cfg.course_lane_termination_margin),
+                0.0,
+            )
+            course_lane_outside = (
+                torch.abs(course_lane_position_error) > lane_boundary
+            )
+            fallen = fallen | course_lane_outside
+        else:
+            course_lane_outside = torch.zeros_like(fallen)
         terrain_penetration = terrain_penetration_depth > max(
             float(self.cfg.terrain_penetration_tolerance), 0.0
         )
@@ -2406,6 +2551,11 @@ class LytRobotWarpAmpEnv:
             "stable_forward_progress": stable_forward_progress,
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
+            "course_lane_position_error": course_lane_position_error,
+            "course_lane_velocity_error": course_lane_velocity_error,
+            "course_lane_position_track": course_lane_position_track,
+            "course_lane_velocity_track": course_lane_velocity_track,
+            "course_lane_outside": course_lane_outside.to(torch.float32),
             "root_orientation": root_orientation,
             "height": height,
             "pose_track": pose_track,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt the retargeted walking gait to MoRE gap, pit, and rough terrains."""
+"""Adapt the retargeted walking gait to rough, slope, gap, and pit terrains."""
 
 from __future__ import annotations
 
@@ -20,12 +20,14 @@ from build_references import (  # noqa: E402
     CONTACT_CLEARANCE,
     JOINT_NAMES,
     OUTPUT_FREQUENCY,
+    SLOPE_REFERENCE_BASE_HEIGHT,
     clip_joint_limits,
     forward_speed,
     landmark_positions,
     refine_contacts_and_collisions,
     retarget_terrain_model,
     sole_landmarks,
+    validate_roll_order,
     velocities,
 )
 from lytrobot_amp.terrain import terrain_height_from_model  # noqa: E402
@@ -35,6 +37,8 @@ MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 TASK_CYCLES = {
     "rough_walk": 3,
+    "slope_up": 3,
+    "slope_down": 3,
     "pit_walk": 3,
     "gap_cross": 4,
 }
@@ -181,9 +185,30 @@ def build_task(
         model_xml,
         False,
     )
+    validate_roll_order(task, refinement)
     clip_joint_limits(base_model, qpos)
     support_correction = enforce_support_clearance(qpos, contact, task, model_xml)
     audit = audit_terrain_contacts(qpos, contact, task, model_xml)
+    # The historical audit sampled one averaged landmark per heel/toe mesh.
+    # Publish the full lower-envelope support values as the canonical
+    # clearance fields; retain the landmark result for diagnosing source-fit
+    # drift without allowing it to hide a real mesh collision.
+    for suffix in ("min", "max", "rms"):
+        audit[f"landmark_support_clearance_{suffix}"] = audit[
+            f"support_clearance_{suffix}"
+        ]
+        audit[f"support_clearance_{suffix}"] = refinement[
+            f"support_surface_clearance_{suffix}"
+        ]
+    terrain_reference_z_shift = (
+        SLOPE_REFERENCE_BASE_HEIGHT
+        if task in {"slope_up", "slope_down"}
+        else 0.0
+    )
+    if terrain_reference_z_shift:
+        # The temporary slope model needs a positive construction thickness,
+        # while training references use zero at the common terrain datum.
+        qpos[:, 2] -= terrain_reference_z_shift
     qvel = velocities(base_model, qpos, OUTPUT_FREQUENCY, loop=False)
     retargeted_forward_speed = forward_speed(qpos, OUTPUT_FREQUENCY, loop=False)
 
@@ -204,6 +229,7 @@ def build_task(
         "cycles": TASK_CYCLES[task],
         "target_forward_speed_mps": source_metadata.get("target_forward_speed_mps"),
         "retargeted_forward_speed_mps": retargeted_forward_speed,
+        "terrain_reference_z_shift": -terrain_reference_z_shift,
         **refinement,
         **support_correction,
         **audit,

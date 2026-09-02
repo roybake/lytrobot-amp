@@ -39,13 +39,15 @@ def _assert_reference_model_override_is_compatible(argv: list[str]) -> None:
 def default_train_args() -> list[str]:
     """Return the recorded 08-06 settings with only clock/terrain changes.
 
-    The four reference clips, their weights, optimizer settings, and privileged
-    Actor contract come from the saved 08-06 run and commit 6162570.
+    The no-stairs Teacher uses terrain-aligned references: ``walk`` for flat,
+    ``rough_walk`` for rough, and the two slope-adapted clips for the uphill
+    and downhill stages.  Their equal weights, optimizer settings, and
+    privileged Actor contract come from the saved 08-06 run and commit 6162570.
     Control-step durations are doubled for the 50->100 Hz migration introduced
-    by commit a6f45cf.  Only ``stairs`` is removed from the terrain course; the
-    stair reference clips remain part of AMP training.  The explicit slip,
-    reference-tracking, and 100 Hz action-rate corrections below address the
-    gait defects observed in the recorded policy.
+    by commit a6f45cf.  Stair reference clips are excluded, so AMP expert
+    samples cannot teach stair-only contacts on a no-stairs course. The
+    explicit slip, reference-tracking, and 100 Hz action-rate corrections below
+    address the gait defects observed in the recorded policy.
     """
 
     return [
@@ -58,13 +60,13 @@ def default_train_args() -> list[str]:
         "--motion-files",
         str(REFERENCE_DIR / "walk_omniretarget.npz"),
         str(REFERENCE_DIR / "rough_walk_omniretarget.npz"),
-        str(REFERENCE_DIR / "stair_up_omniretarget.npz"),
-        str(REFERENCE_DIR / "stair_down_omniretarget.npz"),
+        str(REFERENCE_DIR / "slope_up_omniretarget.npz"),
+        str(REFERENCE_DIR / "slope_down_omniretarget.npz"),
         "--motion-names",
         "walk",
         "rough_walk",
-        "stair_up",
-        "stair_down",
+        "slope_up",
+        "slope_down",
         "--motion-weights",
         "0.25",
         "0.25",

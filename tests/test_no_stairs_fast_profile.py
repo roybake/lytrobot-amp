@@ -7,6 +7,7 @@ import pytest
 
 from lytrobot_amp.training_defaults import (
     NO_STAIRS_FAST_TARGET_SPEED_MPS,
+    TRAINING_TARGET_SPEED_MPS,
 )
 from multimotion.retargeting.analyze_gait import analyze_reference
 from scripts.train_multimotion_no_stairs import default_train_args
@@ -14,6 +15,7 @@ from scripts.train_multimotion_no_stairs import default_train_args
 
 ROOT = Path(__file__).resolve().parents[1]
 FAST_DIR = ROOT / "robot" / "reference_data" / "no_stairs_fast"
+MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 
 
 def _values(args: list[str], option: str) -> list[str]:
@@ -24,21 +26,33 @@ def _values(args: list[str], option: str) -> list[str]:
     return args[start:end]
 
 
-def test_no_stairs_entrypoint_prioritizes_stable_sensor_only_completion() -> None:
+def test_no_stairs_entrypoint_uses_terrain_aligned_references() -> None:
     args = default_train_args()
     assert [Path(value) for value in _values(args, "--motion-files")] == [
-        FAST_DIR / "walk_omniretarget.npz",
+        MOTION_DIR / "walk_omniretarget.npz",
+        MOTION_DIR / "rough_walk_omniretarget.npz",
+        MOTION_DIR / "slope_up_omniretarget.npz",
+        MOTION_DIR / "slope_down_omniretarget.npz",
     ]
     assert np.isclose(
-        float(_values(args, "--target-velocity")[0]), NO_STAIRS_FAST_TARGET_SPEED_MPS
+        float(_values(args, "--target-velocity")[0]), TRAINING_TARGET_SPEED_MPS
     )
+    assert _values(args, "--motion-names") == [
+        "walk",
+        "rough_walk",
+        "slope_up",
+        "slope_down",
+    ]
+    assert _values(args, "--motion-weights") == ["0.25"] * 4
     assert _values(args, "--terrain-types") == ["rough", "slope_up", "slope_down"]
     assert not any(arg.startswith("--stair-") for arg in args)
     assert "--no-skill-conditioning" in args
     assert "--serial-reference-state-init" in args
-    assert _values(args, "--motion-loop") == ["true"]
+    assert _values(args, "--motion-loop") == ["true", "false", "false", "false"]
     assert _values(args, "--motion-reset-prob") == ["0.50"]
-    assert "--serial-course-single-motion" in args
+    assert "--serial-course-single-motion" not in args
+    assert "--use-reference-velocity" in args
+    assert _values(args, "--motion-transition-blend-steps") == ["30"]
     assert "--amp-task-only" in args
     # AMP constrains gait style while task reward keeps forward progress in
     # the PPO objective and prevents an in-place leg-swing local optimum.

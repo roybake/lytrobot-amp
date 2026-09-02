@@ -16,6 +16,7 @@ from scripts.train_multimotion_no_stairs_amp_teacher import (
     default_train_args as sensor_teacher_args,
 )
 from scripts.train_multimotion_no_stairs_amp_student import (
+    _assert_teacher_checkpoint_matches_slope_distillation,
     default_train_args as sensor_student_args,
 )
 from scripts.train_stairs import default_train_args as stairs_args
@@ -89,6 +90,19 @@ def test_legacy_teacher_is_the_only_reference_conditioned_training_exception() -
     assert _option_values(args, "--warp-nconmax") == ["32"]
     assert _option_values(args, "--warp-njmax") == ["128"]
     assert "stairs" not in _option_values(args, "--terrain-types")
+    assert _option_values(args, "--motion-names") == [
+        "walk", "rough_walk", "slope_up", "slope_down"
+    ]
+    assert _option_values(args, "--motion-weights") == [
+        "0.25", "0.25", "0.25", "0.25"
+    ]
+    assert _option_values(args, "--motion-loop") == [
+        "true", "false", "false", "false"
+    ]
+    assert all(
+        "stair_" not in path
+        for path in _option_values(args, "--motion-files")
+    )
     assert _option_values(args, "--model-xml") == [str(REFERENCE_MODEL_XML)]
     _assert_reference_model_override_is_compatible([])
     try:
@@ -126,6 +140,44 @@ def test_student_distillation_keeps_teacher_labels_out_of_actor_inputs() -> None
     assert _option_values(args, "--warp-nconmax") == ["32"]
     assert _option_values(args, "--warp-njmax") == ["128"]
     assert "stairs" not in _option_values(args, "--terrain-types")
+    assert _option_values(args, "--motion-names") == [
+        "walk", "rough_walk", "slope_up", "slope_down"
+    ]
+    assert _option_values(args, "--motion-weights") == [
+        "0.25", "0.25", "0.25", "0.25"
+    ]
+    assert _option_values(args, "--motion-loop") == [
+        "true", "false", "false", "false"
+    ]
+
+
+def test_student_rejects_old_stair_teacher_checkpoint(tmp_path) -> None:
+    checkpoint = tmp_path / "old_teacher.pt"
+    torch.save(
+        {
+            "env_config": {
+                "motion_names": ("walk", "rough_walk", "stair_up", "stair_down"),
+                "motion_files": (
+                    "walk_omniretarget.npz",
+                    "rough_walk_omniretarget.npz",
+                    "stair_up_omniretarget.npz",
+                    "stair_down_omniretarget.npz",
+                ),
+                "motion_weights": (0.25, 0.25, 0.25, 0.25),
+                "motion_loop": (True, False, False, False),
+                "terrain_types": ("rough", "slope_up", "slope_down"),
+            }
+        },
+        checkpoint,
+    )
+    try:
+        _assert_teacher_checkpoint_matches_slope_distillation(
+            ["--teacher-checkpoint", str(checkpoint)]
+        )
+    except SystemExit as exc:
+        assert "slope-aware" in str(exc)
+    else:  # pragma: no cover - failure branch for a regressed guard.
+        raise AssertionError("Student accepted an old stair Teacher checkpoint.")
 
 
 def test_every_training_task_resolves_to_full_body_collision_defaults() -> None:

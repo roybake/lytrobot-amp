@@ -27,9 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 NO_STAIRS_REFERENCES = (
     ROOT / "robot" / "reference_data" / "multimotion" / "walk_omniretarget.npz",
     ROOT / "robot" / "reference_data" / "multimotion" / "rough_walk_omniretarget.npz",
-)
-AMP_SINGLE_REFERENCE = (
-    ROOT / "robot" / "reference_data" / "no_stairs_fast" / "walk_omniretarget.npz"
+    ROOT / "robot" / "reference_data" / "multimotion" / "slope_up_omniretarget.npz",
+    ROOT / "robot" / "reference_data" / "multimotion" / "slope_down_omniretarget.npz",
 )
 
 
@@ -43,7 +42,7 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
                 ["--stage1-checkpoint", "/tmp/stage1.pt"],
             ),
         )
-        expected_terrains = {"flat", "rough", "slope_up", "slope_down"}
+        expected_terrains = {"rough", "slope_up", "slope_down"}
         for launcher, run_path_target, extra_args in cases:
             with self.subTest(launcher=launcher.__name__), patch.object(
                 sys,
@@ -59,18 +58,24 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             self.assertEqual(parsed.training_task, "walk")
             self.assertEqual(set(parsed.terrain_types), expected_terrains)
             self.assertTrue(parsed.serial_terrain_course)
-            self.assertEqual(parsed.terrain_course_variants, 6)
+            self.assertEqual(parsed.terrain_course_variants, 2)
             self.assertTrue(parsed.terrain_course_random_assignment)
             self.assertEqual(parsed.rough_terrain_height, 0.05)
             self.assertEqual(parsed.slope_angle_deg, 6.0)
             self.assertEqual(parsed.decimation, 2)
             self.assertEqual(parsed.episode_steps, 3600)
-            self.assertEqual(parsed.motion_names, ["walk", "rough_walk"])
+            self.assertEqual(
+                parsed.motion_names,
+                ["walk", "rough_walk", "slope_up", "slope_down"],
+            )
             self.assertEqual(
                 [Path(path).parent.name for path in parsed.motion_files],
-                ["multimotion", "multimotion"],
+                ["multimotion"] * 4,
             )
-            self.assertEqual(parsed.motion_loop, ["true", "false"])
+            self.assertEqual(
+                parsed.motion_loop,
+                ["true", "false", "false", "false"],
+            )
             self.assertFalse(parsed.skill_conditioning)
             self.assertEqual(parsed.reference_ctrl_blend, 0.0)
             self.assertFalse(parsed.serial_reference_state_init)
@@ -116,15 +121,18 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
         self.assertEqual(parsed.training_task, "multimotion_no_stairs_amp_single")
         self.assertEqual(
             parsed.terrain_types,
-            ["flat", "rough", "slope_up", "slope_down"],
+            ["rough", "slope_up", "slope_down"],
         )
         self.assertNotIn("stairs", parsed.terrain_types)
-        self.assertEqual(parsed.motion_names, ["walk"])
-        self.assertEqual(parsed.motion_weights, [1.0])
-        self.assertEqual(parsed.motion_loop, ["true"])
+        self.assertEqual(
+            parsed.motion_names,
+            ["walk", "rough_walk", "slope_up", "slope_down"],
+        )
+        self.assertEqual(parsed.motion_weights, [0.25, 0.25, 0.25, 0.25])
+        self.assertEqual(parsed.motion_loop, ["true", "false", "false", "false"])
         self.assertEqual(
             [Path(path) for path in parsed.motion_files],
-            [AMP_SINGLE_REFERENCE],
+            list(NO_STAIRS_REFERENCES),
         )
         self.assertEqual(
             Path(parsed.log_root),
@@ -174,7 +182,7 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
                 )
                 self.assertIn("--no-wandb", sys.argv)
 
-    def test_stair_free_stage_overrides_canonical_ordinary_reference_defaults(self) -> None:
+    def test_stair_free_stage_uses_terrain_aligned_reference_defaults(self) -> None:
         with patch.object(
             sys,
             "argv",
@@ -187,14 +195,14 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             parsed = train.parse_args()
         self.assertEqual(
             [Path(path) for path in parsed.motion_files],
-            [AMP_SINGLE_REFERENCE],
+            list(NO_STAIRS_REFERENCES),
         )
-        self.assertEqual(parsed.motion_loop, ["true"])
-        self.assertTrue(parsed.serial_course_single_motion)
+        self.assertEqual(parsed.motion_loop, ["true", "false", "false", "false"])
+        self.assertFalse(parsed.serial_course_single_motion)
         self.assertTrue(parsed.amp_task_only)
         self.assertTrue(parsed.serial_reference_state_init)
         self.assertEqual(parsed.motion_reset_prob, 0.5)
-        self.assertAlmostEqual(parsed.target_velocity, 1.38889, places=5)
+        self.assertAlmostEqual(parsed.target_velocity, 0.862295, places=5)
 
     def test_task_defaults_do_not_enable_domain_randomization(self) -> None:
         for args in (no_stairs_args(), stairs_args(), sensor_multimotion_args()):

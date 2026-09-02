@@ -27,6 +27,7 @@ LEGACY_0806_MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"
 CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS = frozenset(
     {
         "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_teacher_lane_hold",
         "multimotion_no_stairs_amp_student",
         "multimotion_no_stairs_amp_single",
         "multimotion_0809_no_stairs",
@@ -34,6 +35,7 @@ CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS = frozenset(
     }
 )
 CANONICAL_NO_STAIRS_TERRAINS = ("rough", "slope_up", "slope_down")
+INDEPENDENT_TERRAIN_TASK_PREFIX = "independent_"
 
 import torch
 import mujoco
@@ -305,7 +307,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Recording root override. By default videos are stored beside the "
-            "checkpoint under logs/<task>/<stage>/recordings/."
+            "checkpoint; independent-terrain tasks use "
+            "logs/independent_terrain/<terrain>/recording/."
         ),
     )
     parser.add_argument(
@@ -351,6 +354,19 @@ def make_env_cfg(
     stage: str | None = None,
 ) -> LytRobotEnvCfg:
     checkpoint_env_cfg = checkpoint.get("env_config", {})
+    explicit_terrain_types = getattr(args, "terrain_types", None) is not None
+    saved_motion_names: tuple[str, ...] = ()
+    if isinstance(checkpoint_env_cfg, dict):
+        raw_motion_names = checkpoint_env_cfg.get("motion_names", ())
+        if isinstance(raw_motion_names, (list, tuple)):
+            saved_motion_names = tuple(str(name) for name in raw_motion_names)
+        elif isinstance(raw_motion_names, str) and raw_motion_names:
+            saved_motion_names = (raw_motion_names,)
+        if not saved_motion_names:
+            raw_motion_files = checkpoint_env_cfg.get("motion_files", ())
+            if isinstance(raw_motion_files, (list, tuple)):
+                saved_motion_names = tuple(Path(path).stem for path in raw_motion_files)
+    saved_stair_motion = any("stair" in name.lower() for name in saved_motion_names)
     saved_target_velocity = (
         float(checkpoint_env_cfg.get("target_velocity", 1.0))
         if isinstance(checkpoint_env_cfg, dict)
@@ -403,27 +419,45 @@ def make_env_cfg(
     if (
         checkpoint_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS
         and uses_0806_no_stairs_contract
+        and not explicit_terrain_types
     ):
-        # Standardized no-stairs checkpoints train on this 0806 scene and the
-        # two non-duplicate rough/up/down serial courses.  Historical
-        # checkpoints that saved another XML must instead be replayed exactly
-        # as saved; silently replacing their model changes the policy's
-        # kinematic and control contract and can cause an immediate reset.
-        cfg.model_xml = str(LEGACY_0806_MODEL_XML)
-        cfg.terrain_types = CANONICAL_NO_STAIRS_TERRAINS
-        cfg.stair_terrain = False
-        cfg.serial_terrain_course = True
-        cfg.terrain_course_variants = 2
-        # cfg.terrain_course_lane_spacing = 3.0  # 原始车道中心间距
-        cfg.terrain_course_lane_spacing = 4.0
-        cfg.terrain_course_run_in = 2.90
-        cfg.terrain_course_run_out = 0.30
-        cfg.terrain_course_base_height = 0.30
-        # cfg.terrain_lane_width = 2.0  # 原始赛道宽度
-        cfg.terrain_lane_width = 3.0
-        cfg.rough_terrain_height = 0.05
-        cfg.slope_angle_deg = 6.0
-        cfg.legacy_0806_terrain_model = True
+        if saved_stair_motion:
+            # Some historical checkpoints were labelled no-stairs while their
+            # saved motion library still contained stair-conditioned clips.
+            # The current environment rejects that unsafe combination.  Add
+            # the matching geometry for playback, but keep the saved course
+            # parameters and make the compatibility path visible to the user.
+            if "stairs" not in tuple(cfg.terrain_types):
+                cfg.terrain_types = tuple((*cfg.terrain_types, "stairs"))
+            cfg.stair_terrain = False
+            print(
+                "[WARN] This historical no-stairs checkpoint contains "
+                "stair-conditioned motion clips; enabling stairs geometry "
+                "for playback compatibility. It is not the corrected "
+                "stair-free Teacher contract."
+            )
+        else:
+            # Standardized no-stairs checkpoints train on this 0806 scene and
+            # the two non-duplicate rough/up/down serial courses. Historical
+            # checkpoints that saved another XML must instead be replayed
+            # exactly as saved; silently replacing their model changes the
+            # policy's kinematic and control contract and can cause an
+            # immediate reset.
+            cfg.model_xml = str(LEGACY_0806_MODEL_XML)
+            cfg.terrain_types = CANONICAL_NO_STAIRS_TERRAINS
+            cfg.stair_terrain = False
+            cfg.serial_terrain_course = True
+            cfg.terrain_course_variants = 2
+            # cfg.terrain_course_lane_spacing = 3.0  # 原始车道中心间距
+            cfg.terrain_course_lane_spacing = 4.0
+            cfg.terrain_course_run_in = 2.90
+            cfg.terrain_course_run_out = 0.30
+            cfg.terrain_course_base_height = 0.30
+            # cfg.terrain_lane_width = 2.0  # 原始赛道宽度
+            cfg.terrain_lane_width = 3.0
+            cfg.rough_terrain_height = 0.05
+            cfg.slope_angle_deg = 6.0
+            cfg.legacy_0806_terrain_model = True
     cfg.motion_file = args.motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
@@ -591,7 +625,25 @@ def checkpoint_recording_path(
     checkpoint_env_cfg = checkpoint.get("env_config", {})
     if not training_task and isinstance(checkpoint_env_cfg, dict):
         training_task = str(checkpoint_env_cfg.get("training_task", "")).strip()
-    if record_dir is None and training_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
+    independent_terrain_root: Path | None = None
+    if record_dir is None:
+        try:
+            independent_index = checkpoint_path.parts.index("independent_terrain")
+        except ValueError:
+            independent_index = -1
+        if independent_index >= 0 and len(checkpoint_path.parts) > independent_index + 1:
+            independent_terrain_root = Path(
+                *checkpoint_path.parts[: independent_index + 2]
+            ).resolve()
+        elif training_task.startswith(INDEPENDENT_TERRAIN_TASK_PREFIX):
+            independent_terrain_root = (
+                checkpoint_stage_dir.parent
+                if checkpoint_stage_dir.name in {"stage1", "stage2"}
+                else checkpoint_stage_dir
+            ).resolve()
+    if independent_terrain_root is not None:
+        output_dir = independent_terrain_root / "recording"
+    elif record_dir is None and training_task in CANONICAL_NO_STAIRS_MULTITERRAIN_TASKS:
         output_dir = checkpoint_stage_dir.resolve() / "recording"
     elif record_dir is None and checkpoint_stage_dir.name in {"stage1", "stage2"}:
         output_dir = checkpoint_stage_dir.resolve() / "recordings"

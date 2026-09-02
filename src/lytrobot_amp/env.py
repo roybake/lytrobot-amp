@@ -24,6 +24,7 @@ from .terrain import (
     StairTerrainCfg,
     course_end_x,
     course_motion_sequence,
+    course_terrain_reference_height_at,
     course_stage_end_positions,
     course_stage_scenarios,
     load_model,
@@ -252,6 +253,15 @@ class LytRobotEnvCfg:
     # spatial entrance.  Deployment playback sets motion_reset_prob=0 and
     # therefore still starts from rest at phase zero.
     serial_reference_state_init: bool = False
+    # Keep a serial-course policy near the center of its assigned world-Y lane.
+    # This is opt-in because adding the two actor inputs changes checkpoint
+    # compatibility and is not appropriate for historical policies.
+    course_lane_hold: bool = False
+    course_lane_position_reward_coef: float = 0.0
+    course_lane_velocity_reward_coef: float = 0.0
+    course_lane_position_sigma: float = 0.35
+    course_lane_velocity_sigma: float = 0.25
+    course_lane_termination_margin: float = 0.35
     terrain_course_completion_reward: float = 25.0
     terrain_course_stage_reward: float = 0.0
     terrain_course_stage_tolerance: float = 0.35
@@ -280,6 +290,23 @@ class LytRobotEnvCfg:
     terrain_penetration_penalty_coef: float = 0.0
     episode_steps: int = 2000
     episode_timeout_jitter_steps: int = 480
+    # Geometry parameters for non-serial, single-slope tasks.  Serial courses
+    # derive their slope placement from the course segments instead.
+    slope_center_x: float = 1.85
+    slope_half_length: float = 1.85
+    slope_lane_y: float = 3.0
+    slope_base_height: float = 0.0
+    slope_thickness: float = 0.10
+    standalone_terrain_field: bool = False
+    standalone_field_x_min: float = -2.0
+    standalone_field_x_max: float = 22.0
+    standalone_field_y_min: float = -10.0
+    standalone_field_y_max: float = 14.0
+    standalone_field_tile_width: float = 3.0
+    standalone_slope_up_spawn_x: float = 0.60
+    standalone_slope_up_spawn_z: float = 0.04
+    standalone_slope_down_spawn_x: float = -0.20
+    standalone_slope_down_spawn_z: float = 0.06
     target_velocity: float = 1.0
     reward_mode: str = "default"
     # Keep retargeted data exclusively inside the AMP discriminator.  The task
@@ -402,6 +429,14 @@ class LytRobotAmpEnv:
             raise ValueError(f"Unknown reward mode: {cfg.reward_mode!r}.")
         if cfg.serial_terrain_course and not terrain_types:
             raise ValueError("serial terrain course requires at least one terrain type.")
+        if cfg.course_lane_hold and not cfg.serial_terrain_course:
+            raise ValueError("course lane hold requires a serial terrain course.")
+        if cfg.course_lane_position_sigma <= 0.0:
+            raise ValueError("course_lane_position_sigma must be positive.")
+        if cfg.course_lane_velocity_sigma <= 0.0:
+            raise ValueError("course_lane_velocity_sigma must be positive.")
+        if cfg.course_lane_termination_margin < 0.0:
+            raise ValueError("course_lane_termination_margin must be non-negative.")
         self.stair_cfg = StairTerrainCfg(
             enabled=bool(cfg.stair_terrain or "stairs" in terrain_types),
             step_height=cfg.stair_step_height,
@@ -439,6 +474,21 @@ class LytRobotAmpEnv:
             lane_width=cfg.terrain_lane_width,
             rough_height=cfg.rough_terrain_height,
             slope_angle_deg=cfg.slope_angle_deg,
+            slope_center_x=cfg.slope_center_x,
+            slope_half_length=cfg.slope_half_length,
+            slope_lane_y=cfg.slope_lane_y,
+            slope_base_height=cfg.slope_base_height,
+            slope_thickness=cfg.slope_thickness,
+            standalone_field=bool(cfg.standalone_terrain_field),
+            standalone_field_x_min=cfg.standalone_field_x_min,
+            standalone_field_x_max=cfg.standalone_field_x_max,
+            standalone_field_y_min=cfg.standalone_field_y_min,
+            standalone_field_y_max=cfg.standalone_field_y_max,
+            standalone_field_tile_width=cfg.standalone_field_tile_width,
+            standalone_slope_up_spawn_x=cfg.standalone_slope_up_spawn_x,
+            standalone_slope_up_spawn_z=cfg.standalone_slope_up_spawn_z,
+            standalone_slope_down_spawn_x=cfg.standalone_slope_down_spawn_x,
+            standalone_slope_down_spawn_z=cfg.standalone_slope_down_spawn_z,
             gap_width=cfg.gap_terrain_width,
             legacy_0806_model=bool(cfg.legacy_0806_terrain_model),
         )
@@ -473,7 +523,13 @@ class LytRobotAmpEnv:
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
-            force_library=bool(cfg.serial_terrain_course and cfg.serial_course_single_motion),
+            # An explicit one-entry motion_loop tuple is still a contract.  A
+            # MotionReference always wraps phase, so use MotionLibrary whenever
+            # the caller supplied loop semantics instead of silently ignoring it.
+            force_library=bool(
+                cfg.motion_loop
+                or (cfg.serial_terrain_course and cfg.serial_course_single_motion)
+            ),
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -524,11 +580,14 @@ class LytRobotAmpEnv:
         self.motion_terrain_kinds = tuple(
             terrain_kind_from_motion(name) for name in motion_names
         )
+        available_terrain_kinds = set(terrain_types)
+        if not self.more_terrain_cfg.serial_course and self.stair_cfg.enabled:
+            available_terrain_kinds.add("stairs")
         missing_terrains = sorted(
             {
                 kind
                 for kind in self.motion_terrain_kinds
-                if kind not in {"flat", "stairs"} and kind not in terrain_types
+                if kind != "flat" and kind not in available_terrain_kinds
             }
         )
         if missing_terrains:
@@ -650,7 +709,8 @@ class LytRobotAmpEnv:
             + self.motion.contact_dim
         )
         skill_dim = self.motion_count if self.cfg.skill_conditioning and self.motion_count > 1 else 0
-        return int(current_state_dim + tracking_dim + skill_dim)
+        lane_hold_dim = 2 if self.cfg.course_lane_hold else 0
+        return int(current_state_dim + tracking_dim + skill_dim + lane_hold_dim)
 
     @property
     def amp_obs_dim(self) -> int:
@@ -685,6 +745,7 @@ class LytRobotAmpEnv:
             names = course_motion_sequence(
                 order,
                 legacy_0806_model=self.more_terrain_cfg.legacy_0806_model,
+                available_motion_names=motion_names,
             )
             missing = [name for name in names if name not in name_to_id]
             if missing:
@@ -712,20 +773,60 @@ class LytRobotAmpEnv:
             )
         return result
 
-    def _course_height_offsets(self) -> np.ndarray:
+    def _course_height_offsets(
+        self,
+        root_x: np.ndarray | None = None,
+        course_variants: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Terrain-relative root-height datum for the current root position."""
+
         if not self.more_terrain_cfg.serial_course:
-            return np.zeros(self.num_envs, dtype=np.float32)
-        # Gap/pit clips were retargeted on the original 0.30 m platforms;
-        # the other references use zero as their terrain datum.
-        return np.asarray(
+            if root_x is None:
+                return np.zeros(self.num_envs, dtype=np.float32)
+            return np.zeros_like(np.asarray(root_x, dtype=np.float32))
+        if root_x is None:
+            root_x = np.asarray([data.qpos[0] for data in self.datas], dtype=np.float32)
+        if course_variants is None:
+            course_variants = self.course_variant_ids
+        return course_terrain_reference_height_at(
+            root_x,
+            self.more_terrain_cfg,
+            course_variants,
+        )
+
+    def _course_lane_center_y(self, env_id: int) -> float:
+        """Return the physical world-Y center of one serial-course lane."""
+
+        if not self.more_terrain_cfg.serial_course:
+            return 0.0
+        variant = int(self.course_variant_ids[int(env_id)])
+        return float(self.more_terrain_cfg.course_lane_ys[variant])
+
+    def _course_reference_height_offsets(self) -> np.ndarray:
+        """Return the offset expected by the active motion reference.
+
+        Generic walk/rough references are terrain-neutral and need the
+        current course datum.  The dedicated slope references, however, have
+        the ramp rise/fall baked into their root trajectory by terrain IK, so
+        only the common platform height is added at reset/target time.
+        """
+
+        offsets = self._course_height_offsets()
+        if not self.more_terrain_cfg.serial_course:
+            return offsets
+        baked_slope = np.asarray(
             [
-                0.0
-                if self.motion_terrain_kinds[int(motion_id)] in {"gap", "pit"}
-                else self.more_terrain_cfg.course_base_height
+                self.motion_terrain_kinds[int(motion_id)]
+                in {"slope_up", "slope_down"}
                 for motion_id in self.motion_ids
             ],
-            dtype=np.float32,
+            dtype=bool,
         )
+        return np.where(
+            baked_slope,
+            float(self.more_terrain_cfg.course_base_height),
+            offsets,
+        ).astype(np.float32)
 
     def _get_nonroot_joint_adrs(self) -> tuple[np.ndarray, np.ndarray]:
         qpos_adrs: list[int] = []
@@ -935,7 +1036,7 @@ class LytRobotAmpEnv:
         if not self.more_terrain_cfg.serial_course:
             return targets
         return MotionTargets(
-            root_height=(targets.root_height + self._course_height_offsets()).astype(np.float32),
+            root_height=(targets.root_height + self._course_reference_height_offsets()).astype(np.float32),
             root_quat=targets.root_quat,
             root_lin_vel=targets.root_lin_vel,
             root_ang_vel=targets.root_ang_vel,
@@ -1364,6 +1465,11 @@ class LytRobotAmpEnv:
                     stair_down_offset=self.cfg.stair_down_offset,
                     course_variant=int(self.course_variant_ids[int(env_id)]),
                     course_stage=(int(start_stages[row]) if serial_course else None),
+                    reference_contains_slope_elevation=(
+                        bool(use_motion_reset[row])
+                        and self.motion_terrain_kinds[int(sampled_motion_ids[row])]
+                        in {"slope_up", "slope_down"}
+                    ),
                 )
                 qpos[:3] += offset
 
@@ -1487,6 +1593,22 @@ class LytRobotAmpEnv:
                     foot_pos - ref_foot_pos,
                     reference_targets.foot_contact[env_id],
             ]
+            if self.cfg.course_lane_hold:
+                lane_y = self._course_lane_center_y(env_id)
+                lane_width = max(float(self.more_terrain_cfg.lane_width), 1.0e-6)
+                parts.append(
+                    np.asarray(
+                        [
+                            np.clip((float(data.qpos[1]) - lane_y) / lane_width, -2.0, 2.0),
+                            np.clip(
+                                (float(data.qvel[1]) - float(root_vel_target[1])),
+                                -5.0,
+                                5.0,
+                            ),
+                        ],
+                        dtype=np.float32,
+                    )
+                )
             if self.cfg.skill_conditioning and self.motion_count > 1:
                 skill = np.zeros(self.motion_count, dtype=np.float32)
                 skill[self.motion_ids[env_id]] = 1.0
@@ -1507,7 +1629,7 @@ class LytRobotAmpEnv:
         foot_pos = np.stack([self._foot_positions_local(data) for data in self.datas], axis=0)
         qpos = qpos.copy()
         if self.more_terrain_cfg.serial_course:
-            qpos[:, 2] -= self._course_height_offsets()
+            qpos[:, 2] -= self._course_reference_height_offsets()
         stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
         stair_scale = self.motion_stair_height_scale[self.motion_ids]
         qpos[:, 2] = stair_anchor + (qpos[:, 2] - stair_anchor) / stair_scale
@@ -1862,6 +1984,37 @@ class LytRobotAmpEnv:
 
         root_lin_vel_target = reference_targets.root_lin_vel[env_id].copy()
         root_lin_vel_target[0] = target_forward_velocity
+        course_lane_position_error = 0.0
+        course_lane_velocity_error = 0.0
+        course_lane_position_track = 0.0
+        course_lane_velocity_track = 0.0
+        course_lane_outside = False
+        if self.cfg.course_lane_hold:
+            lane_y = self._course_lane_center_y(env_id)
+            course_lane_position_error = float(data.qpos[1]) - lane_y
+            course_lane_velocity_error = float(data.qvel[1]) - float(
+                root_lin_vel_target[1]
+            )
+            course_lane_position_track = float(
+                np.exp(
+                    -(course_lane_position_error**2)
+                    / (float(self.cfg.course_lane_position_sigma) ** 2)
+                )
+            )
+            course_lane_velocity_track = float(
+                np.exp(
+                    -(course_lane_velocity_error**2)
+                    / (float(self.cfg.course_lane_velocity_sigma) ** 2)
+                )
+            )
+            lane_boundary = max(
+                0.5 * float(self.more_terrain_cfg.lane_width)
+                - float(self.cfg.course_lane_termination_margin),
+                0.0,
+            )
+            course_lane_outside = bool(
+                abs(course_lane_position_error) > lane_boundary
+            )
         lin_vel_error = np.asarray(data.qvel[:3], dtype=np.float32) - root_lin_vel_target
         ang_vel_error = np.asarray(data.qvel[3:6], dtype=np.float32) - reference_targets.root_ang_vel[env_id]
         lin_vel_track = np.exp(-float(np.mean(np.square(lin_vel_error))) / (0.75**2))
@@ -2071,10 +2224,11 @@ class LytRobotAmpEnv:
                 (touchdown[0] and previous_contact[1] > 0.5)
                 or (touchdown[1] and previous_contact[0] > 0.5)
             )
-            terrain_height = (
-                float(self.more_terrain_cfg.course_base_height)
-                if self.more_terrain_cfg.serial_course
-                else 0.0
+            terrain_height = float(
+                self._course_height_offsets(
+                    np.asarray([data.qpos[0]], dtype=np.float32),
+                    np.asarray([self.course_variant_ids[env_id]], dtype=np.int64),
+                )[0]
             )
             physical_height = float(
                 np.exp(
@@ -2110,15 +2264,21 @@ class LytRobotAmpEnv:
                 - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
             )
 
+        reward += (
+            self.cfg.course_lane_position_reward_coef * course_lane_position_track
+            + self.cfg.course_lane_velocity_reward_coef * course_lane_velocity_track
+        )
+
         bad_state = not (
             np.isfinite(data.qpos).all()
             and np.isfinite(data.qvel).all()
             and np.isfinite(data.ctrl).all()
         )
-        physical_root_height = self.nominal_root_height + (
-            float(self.more_terrain_cfg.course_base_height)
-            if self.more_terrain_cfg.serial_course
-            else 0.0
+        physical_root_height = self.nominal_root_height + float(
+            self._course_height_offsets(
+                np.asarray([data.qpos[0]], dtype=np.float32),
+                np.asarray([self.course_variant_ids[env_id]], dtype=np.int64),
+            )[0]
         )
         height_reference = (
             physical_root_height if self.cfg.amp_task_only else ref_root_height
@@ -2134,6 +2294,8 @@ class LytRobotAmpEnv:
             or root_height > max_root_height
             or up_z < self.cfg.min_upright_z
         )
+        if self.cfg.course_lane_hold:
+            fallen = fallen or course_lane_outside
         terrain_penetration_depth = self._terrain_penetration_depth(data)
         terrain_penetration = terrain_penetration_depth > max(
             float(self.cfg.terrain_penetration_tolerance), 0.0
@@ -2175,6 +2337,11 @@ class LytRobotAmpEnv:
             "stable_forward_progress": stable_forward_progress,
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
+            "course_lane_position_error": course_lane_position_error,
+            "course_lane_velocity_error": course_lane_velocity_error,
+            "course_lane_position_track": course_lane_position_track,
+            "course_lane_velocity_track": course_lane_velocity_track,
+            "course_lane_outside": float(course_lane_outside),
             "root_orientation": root_orientation,
             "height": height,
             "pose_track": pose_track,

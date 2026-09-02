@@ -204,6 +204,8 @@ def test_terrain_references_pass_contact_and_collision_audits() -> None:
         walk_frames = len(archive["qpos"])
     expected_frames = {
         "rough_walk": 3 * walk_frames,
+        "slope_up": 3 * walk_frames,
+        "slope_down": 3 * walk_frames,
         "pit_walk": 3 * walk_frames,
         "gap_cross": 4 * walk_frames,
     }
@@ -221,6 +223,27 @@ def test_terrain_references_pass_contact_and_collision_audits() -> None:
         assert metadata["maximum_roll_target_error"] <= 0.011
         if task == "gap_cross":
             assert metadata["unsupported_gap_contact_frames"] == 0
+
+
+def test_no_stairs_locomotion_references_keep_heel_sole_toe_order() -> None:
+    for task in ("walk", "rough_walk", "slope_up", "slope_down"):
+        with np.load(MOTION_DIR / f"{task}_omniretarget.npz") as archive:
+            metadata = json.loads(str(archive["metadata"]))
+        assert metadata["contact_sequence"] == "heel -> full sole -> toe"
+        heel_key = (
+            "heel_phase_foot_mesh_toe_minus_heel_min"
+            if "heel_phase_foot_mesh_toe_minus_heel_min" in metadata
+            else "heel_phase_toe_minus_heel_min"
+        )
+        toe_key = (
+            "toe_phase_foot_mesh_toe_minus_heel_max"
+            if "toe_phase_foot_mesh_toe_minus_heel_max" in metadata
+            else "toe_phase_toe_minus_heel_max"
+        )
+        assert metadata[heel_key] >= -0.002
+        assert metadata[toe_key] <= 0.002
+        assert metadata["swing_knee_min_flexion_rad"] >= 0.30
+        assert metadata["swing_knee_straight_violation_frames"] == 0
 
 
 def test_forward_locomotion_references_preserve_original_retargeted_speed() -> None:

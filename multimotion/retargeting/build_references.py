@@ -21,6 +21,8 @@ sys.path[:0] = [str(SRC_ROOT), str(LEGACY_RETARGET)]
 from lytrobot_amp.terrain import (  # noqa: E402
     MoreTerrainCfg,
     StairTerrainCfg,
+    TERRAIN_REFERENCE_ROOT_MARGIN,
+    course_segments,
     load_model,
     terrain_geom_ids,
     terrain_height_from_model,
@@ -83,15 +85,60 @@ STAIR_DOWN_OFFSET = 0.25
 CONTACT_CLEARANCE = 0.0015
 HEEL_STRIKE_TOE_LIFT = 0.025
 TOE_OFF_HEEL_LIFT = 0.020
+# A generated reference must not let the toe precede the heel in heel phase,
+# nor leave the heel below the toe in toe phase.  Keep this equal to the
+# tolerance used by validate_references.py.
+ROLL_ORDER_TOLERANCE = 0.002
+# Keep a visible, auditable separation between the heel and toe meshes.  The
+# old one-sided tolerance allowed a numerically valid but visually flat foot
+# roll, which made toe-first landings hard to distinguish in playback.
+ROLL_ORDER_MIN_SEPARATION = 0.005
+SLOPE_REFERENCE_BASE_HEIGHT = 0.05
 SWING_CLEARANCE = 0.003
+# Keep a lower envelope of the STL foot meshes, not just one averaged
+# landmark.  The wider band catches a vertex that is locally higher but is
+# lower relative to a tilted ramp; XY binning keeps the IK tractable.
+CONTACT_SURFACE_VERTEX_BAND = 0.05
+CONTACT_SURFACE_X_BINS = 64
+CONTACT_SURFACE_Y_BINS = 4
 # The contact IK is deliberately local.  Without a per-frame trust region the
 # under-constrained ankle/subtalar/toe chain can jump to another valid IK branch
 # while keeping the sole on the same surface.  Those jumps used to reach
 # 0.9 rad in one 40 Hz frame and taught the policy an unrecoverable impulse.
-CONTACT_IK_JOINT_TRUST_REGION = 0.30
+CONTACT_IK_JOINT_TRUST_REGION = 0.20
 CONTACT_IK_SUPPORT_WEIGHT = 60.0
+# Match the requested roll targets against the signed distance of the actual
+# heel/toe meshes as well as the diagnostic landmarks.
+CONTACT_IK_FOOT_MESH_SUPPORT_WEIGHT = 120.0
+# Landmark IK alone can put the sampled heel/toe points above a ramp while a
+# different part of the STL sole is already inside it.  Keep the full mesh
+# non-penetration residual strong enough to win over that under-constrained
+# point fit; the support residual still determines the requested roll order.
+CONTACT_IK_FOOT_MESH_WEIGHT = 250.0
+CONTACT_IK_ROLL_TARGET_WEIGHT = 220.0
 CONTACT_IK_NOMINAL_WEIGHT = 0.20
-CONTACT_IK_TEMPORAL_WEIGHT = 0.10
+CONTACT_IK_TEMPORAL_WEIGHT = 0.25
+CONTACT_IK_ACCELERATION_WEIGHT = 0.0
+# Bound the local IK solution by the previous frame as well as by the nominal
+# pose.  At 40 Hz this prevents a valid but different ankle/MTP IK branch from
+# appearing as a visible impulse at heel strike or toe-off.
+CONTACT_IK_MAX_JOINT_STEP = 0.30
+CONTACT_IK_SUPPORT_MAX_JOINT_STEP = np.inf
+CONTACT_IK_MAX_ROOT_Z_STEP = np.inf
+# MuJoCo's knee coordinates use zero for a straight leg and negative values
+# for flexion.  Give every swing phase an explicit bent-knee target instead of
+# allowing the terrain solver to satisfy foot clearance by extending the knee.
+SWING_KNEE_MIN_FLEXION = 0.30
+SWING_KNEE_PEAK_FLEXION = 0.65
+SWING_KNEE_TARGET_WEIGHT = 0.55
+# Keep the knee flexed through heel strike and the first part of flat support;
+# releasing this target smoothly avoids a one-frame extension impulse.
+LANDING_KNEE_MIN_FLEXION = 0.22
+LANDING_KNEE_RELEASE_PHASE = 0.40
+LANDING_KNEE_TARGET_WEIGHT = 0.20
+SWING_CORRECTION_TRUST_REGION = 0.04
+SWING_CORRECTION_STEP = 0.01
+KNEE_QPOS_ADDRESSES = (10, 18)
 # Signed MuJoCo geometry distance: zero is touching and negative is overlap.
 # The post-pass removes all negative distances without unnecessarily widening
 # already valid stair poses (which can lower a swing heel into the next tread).
@@ -242,6 +289,88 @@ def roll_clearance_targets(phase: float, mode: int) -> np.ndarray:
     raise ValueError(f"Unexpected support roll mode: {mode}.")
 
 
+def swing_knee_targets(contact: np.ndarray, loop: bool) -> np.ndarray:
+    """Return bent-knee qpos targets for each foot's swing interval.
+
+    The LYT knee range is ``[-2, 0]`` radians, so the negative of the returned
+    value is the requested flexion.  The target is least bent at toe-off and
+    before heel strike, with a smooth peak in mid-swing.  Contact labels are
+    used only to locate the swing interval; the source joint trajectory still
+    remains the primary pose prior through the IK nominal/temporal residuals.
+    """
+
+    contacts = np.asarray(contact, dtype=np.float32)
+    if contacts.ndim != 2 or contacts.shape[1] != 2:
+        raise ValueError(f"Expected contact shape (T, 2), got {contacts.shape}.")
+    result = np.full(contacts.shape, np.nan, dtype=np.float64)
+    frame_count = len(contacts)
+    if frame_count == 0:
+        return result
+    for side in range(2):
+        swing = contacts[:, side] <= 0.5
+        if loop:
+            starts = np.flatnonzero(swing & ~np.roll(swing, 1))
+        else:
+            starts = np.flatnonzero(swing & ~np.r_[False, swing[:-1]])
+        for start_value in starts:
+            start = int(start_value)
+            indices: list[int] = []
+            frame = start
+            while swing[frame]:
+                indices.append(frame)
+                frame = (frame + 1) % frame_count if loop else frame + 1
+                if not loop and frame >= frame_count:
+                    break
+                if loop and frame == start:
+                    break
+            progress = np.linspace(0.0, 1.0, len(indices), dtype=np.float64)
+            shaped = np.asarray([smoothstep(value) for value in progress])
+            peak = np.sin(np.pi * shaped)
+            flexion = SWING_KNEE_MIN_FLEXION + (
+                SWING_KNEE_PEAK_FLEXION - SWING_KNEE_MIN_FLEXION
+            ) * peak
+            result[np.asarray(indices, dtype=np.int64), side] = -flexion
+    return result
+
+
+def landing_knee_targets(
+    contact: np.ndarray,
+    roll_phase: np.ndarray,
+    roll_mode: np.ndarray,
+) -> np.ndarray:
+    """Return smoothly released knee-flexion targets after heel strike."""
+
+    contacts = np.asarray(contact, dtype=np.float32)
+    phases = np.asarray(roll_phase, dtype=np.float64)
+    modes = np.asarray(roll_mode, dtype=np.int8)
+    if contacts.shape != phases.shape or contacts.shape != modes.shape:
+        raise ValueError(
+            "contact, roll_phase and roll_mode must have the same shape, got "
+            f"{contacts.shape}, {phases.shape}, {modes.shape}."
+        )
+    result = np.full(contacts.shape, np.nan, dtype=np.float64)
+    release_start = float(HEEL_PHASE_END)
+    release_end = max(float(LANDING_KNEE_RELEASE_PHASE), release_start + 1.0e-6)
+    for side in range(2):
+        for frame in range(len(contacts)):
+            if contacts[frame, side] <= 0.5:
+                continue
+            phase = float(phases[frame, side])
+            mode = int(modes[frame, side])
+            if mode == ROLL_HEEL:
+                flexion = LANDING_KNEE_MIN_FLEXION
+            elif mode == ROLL_FLAT and phase < release_end:
+                release = smoothstep(
+                    (phase - release_start) / (release_end - release_start)
+                )
+                flexion = LANDING_KNEE_MIN_FLEXION * (1.0 - release)
+            else:
+                continue
+            if flexion > 1.0e-6:
+                result[frame, side] = -flexion
+    return result
+
+
 def interpolate_qpos(
     qpos: np.ndarray,
     source_frequency: float,
@@ -376,6 +505,40 @@ def retarget_terrain_model(
         more = MoreTerrainCfg(enabled=True, terrain_types=(kind,))
         model = load_model(model_xml, None, more)
         offset = terrain_spawn_offset(kind, more, StairTerrainCfg())
+    elif kind in {"slope_up", "slope_down"}:
+        # Build a two-ramp reference scene so the same flat human gait can be
+        # solved against either ramp.  The selected ramp is translated to the
+        # local clip origin below; the companion ramp keeps the geometry
+        # validator's up/down ordering invariant intact.
+        more = MoreTerrainCfg(
+            enabled=True,
+            terrain_types=("slope_up", "slope_down"),
+            serial_course=True,
+            course_orders=(("slope_up", "slope_down"),),
+            course_run_in=0.05,
+            course_run_out=0.05,
+            # MuJoCo rejects zero-thickness support boxes.  The positive
+            # construction height is part of the terrain model; it is not
+            # included in the pose offset, so IK emits the terrain-relative
+            # root/foot height exactly once.
+            course_base_height=SLOPE_REFERENCE_BASE_HEIGHT,
+            course_lane_spacing=3.0,
+            lane_width=2.0,
+        )
+        model = load_model(model_xml, None, more)
+        segment = next(
+            item
+            for item in course_segments(more, 0)
+            if item.kind == kind
+        )
+        offset = np.asarray(
+                [
+                    segment.start_x + TERRAIN_REFERENCE_ROOT_MARGIN,
+                    0.0,
+                    0.0,
+                ],
+            dtype=np.float32,
+        )
     else:
         model = load_model(model_xml)
         offset = np.zeros(3, dtype=np.float32)
@@ -395,7 +558,41 @@ def refine_contacts_and_collisions(
 
     model, pose_offset, terrain_kind = retarget_terrain_model(task, model_xml)
     data = mujoco.MjData(model)
-    _, landmark_body_ids, landmark_points = sole_landmarks(model)
+    foot_geom_ids, landmark_body_ids, landmark_points = sole_landmarks(model)
+    terrain_ids = terrain_geom_ids(model)
+    surface_points: list[np.ndarray] = []
+    for geom_id in foot_geom_ids:
+        mesh_id = int(model.geom_dataid[geom_id])
+        start = int(model.mesh_vertadr[mesh_id])
+        stop = start + int(model.mesh_vertnum[mesh_id])
+        vertices = np.asarray(model.mesh_vert[start:stop], dtype=np.float64)
+        rotation = np.empty(9, dtype=np.float64)
+        mujoco.mju_quat2Mat(rotation, model.geom_quat[geom_id])
+        local_vertices = model.geom_pos[geom_id] + vertices @ rotation.reshape(3, 3).T
+        z_min = float(local_vertices[:, 2].min())
+        candidates = local_vertices[
+            local_vertices[:, 2] <= z_min + CONTACT_SURFACE_VERTEX_BAND
+        ]
+        x_span = max(float(np.ptp(candidates[:, 0])), 1.0e-6)
+        y_span = max(float(np.ptp(candidates[:, 1])), 1.0e-6)
+        x_bin = np.floor(
+            (candidates[:, 0] - candidates[:, 0].min())
+            / x_span
+            * CONTACT_SURFACE_X_BINS
+        ).astype(np.int32)
+        y_bin = np.floor(
+            (candidates[:, 1] - candidates[:, 1].min())
+            / y_span
+            * CONTACT_SURFACE_Y_BINS
+        ).astype(np.int32)
+        x_bin = np.clip(x_bin, 0, CONTACT_SURFACE_X_BINS - 1)
+        y_bin = np.clip(y_bin, 0, CONTACT_SURFACE_Y_BINS - 1)
+        keys = x_bin * CONTACT_SURFACE_Y_BINS + y_bin
+        selected: list[int] = []
+        for key in np.unique(keys):
+            indices = np.flatnonzero(keys == key)
+            selected.append(int(indices[np.argmin(candidates[indices, 2])]))
+        surface_points.append(candidates[np.asarray(selected, dtype=np.int32)])
     collision_pairs = [
         (geom_for_body(model, left), geom_for_body(model, right))
         for left, right in COLLISION_BODY_PAIRS
@@ -407,6 +604,15 @@ def refine_contacts_and_collisions(
     joint_ids = [by_address[int(index)] for index in joint_indices]
     joint_lower = np.asarray([model.jnt_range[joint_id, 0] for joint_id in joint_ids])
     joint_upper = np.asarray([model.jnt_range[joint_id, 1] for joint_id in joint_ids])
+    joint_variable_indices = {
+        int(address): index + 1 for index, address in enumerate(joint_indices)
+    }
+    swing_knee_target_qpos = swing_knee_targets(contact, loop)
+    landing_knee_target_qpos = (
+        landing_knee_targets(contact, roll_phase, roll_mode)
+        if task in {"walk", "rough_walk"}
+        else np.full_like(swing_knee_target_qpos, np.nan)
+    )
     refined = np.asarray(qpos, dtype=np.float64).copy()
     fromto = np.zeros(6, dtype=np.float64)
 
@@ -433,14 +639,72 @@ def refine_contacts_and_collisions(
             points[:, 1],
         )
 
+    def foot_terrain_distances() -> np.ndarray:
+        """Return the closest signed distance for each complete foot mesh."""
+
+        if len(terrain_ids) == 0:
+            return np.full(len(foot_geom_ids), np.inf, dtype=np.float64)
+        return np.asarray(
+            [
+                min(
+                    mujoco.mj_geomDistance(
+                        model,
+                        data,
+                        int(foot_id),
+                        int(terrain_id),
+                        0.20,
+                        fromto,
+                    )
+                    for terrain_id in terrain_ids
+                )
+                for foot_id in foot_geom_ids
+            ],
+            dtype=np.float64,
+        )
+
+    def foot_surface_point_clearances() -> list[np.ndarray]:
+        """Return sampled STL-vertex clearances to the exact terrain."""
+
+        result = []
+        for body_id, points in zip(
+            landmark_body_ids,
+            surface_points,
+            strict=True,
+        ):
+            world_points = (
+                data.xpos[body_id]
+                + points @ data.xmat[body_id].reshape(3, 3).T
+            )
+            ground = ground_heights(world_points[:, :2])
+            result.append(world_points[:, 2] - ground)
+        return result
+
+    def foot_surface_clearances() -> np.ndarray:
+        """Return lowest sampled STL-vertex clearance to the exact terrain."""
+
+        return np.asarray(
+            [float(np.min(values)) for values in foot_surface_point_clearances()],
+            dtype=np.float64,
+        )
+
     minimum_before = np.inf
     minimum_after = np.inf
+    minimum_mesh_before = np.inf
+    minimum_mesh_after = np.inf
+    minimum_surface_before = np.inf
+    minimum_surface_after = np.inf
     roll_errors: list[float] = []
     heel_order_values: list[float] = []
     toe_order_values: list[float] = []
     previous_frame = refined[-1] if loop else refined[0]
     previous = np.concatenate(
         ([previous_frame[2]], previous_frame[joint_indices])
+    )
+    previous_previous_frame = (
+        refined[-2] if loop and len(refined) > 1 else refined[0]
+    )
+    previous_previous = np.concatenate(
+        ([previous_previous_frame[2]], previous_previous_frame[joint_indices])
     )
 
     for frame in range(len(refined)):
@@ -453,8 +717,16 @@ def refine_contacts_and_collisions(
         fixed_ground = ground_heights(nominal_landmarks[:, :2])
         nominal_clearance = nominal_landmarks[:, 2] - fixed_ground
         minimum_before = min(minimum_before, float(nominal_clearance.min()))
+        minimum_mesh_before = min(
+            minimum_mesh_before,
+            float(foot_terrain_distances().min()),
+        )
+        minimum_surface_before = min(
+            minimum_surface_before,
+            float(foot_surface_clearances().min()),
+        )
 
-        support_constraints: list[tuple[slice, np.ndarray, int]] = []
+        support_constraints: list[tuple[slice, np.ndarray, int, int]] = []
         root_offsets: list[float] = []
         for side in np.flatnonzero(contact[frame] > 0.5):
             support_slice = slice(2 * int(side), 2 * int(side) + 2)
@@ -462,13 +734,17 @@ def refine_contacts_and_collisions(
                 float(roll_phase[frame, side]),
                 int(roll_mode[frame, side]),
             )
-            support_constraints.append((support_slice, targets, int(side)))
+            support_constraints.append(
+                (support_slice, targets, int(side), int(roll_mode[frame, side]))
+            )
             root_offsets.extend(targets - nominal_clearance[support_slice])
         if not support_constraints:
             lower_side = int(np.argmin([nominal_clearance[:2].min(), nominal_clearance[2:].min()]))
             support_slice = slice(2 * lower_side, 2 * lower_side + 2)
             targets = np.full(2, CONTACT_CLEARANCE, dtype=np.float64)
-            support_constraints.append((support_slice, targets, lower_side))
+            support_constraints.append(
+                (support_slice, targets, lower_side, int(roll_mode[frame, lower_side]))
+            )
             root_offsets.extend(targets - nominal_clearance[support_slice])
 
         nominal_root = float(nominal_pose[2] + np.mean(root_offsets))
@@ -493,6 +769,44 @@ def refine_contacts_and_collisions(
                 ),
             )
         )
+        step_limits = np.concatenate(
+            (
+                [CONTACT_IK_MAX_ROOT_Z_STEP],
+                np.full(
+                    len(joint_indices),
+                    CONTACT_IK_MAX_JOINT_STEP,
+                    dtype=np.float64,
+                ),
+            )
+        )
+        for side, addresses in enumerate(
+            ((10, 12, 13, 14), (18, 20, 21, 22))
+        ):
+            if contact[frame, side] <= 0.5:
+                continue
+            for address in addresses:
+                step_limits[joint_variable_indices[address]] = (
+                    CONTACT_IK_SUPPORT_MAX_JOINT_STEP
+                )
+        variable_lower = np.maximum(variable_lower, previous - step_limits)
+        variable_upper = np.minimum(variable_upper, previous + step_limits)
+        # Zero is a straight knee in the LYT model.  Only swing flexion is a
+        # hard safety bound.  The landing target remains soft because a hard
+        # post-strike knee bound can fight the full-foot support constraint on
+        # a ramp and push the sole into the terrain.
+        for side, address in enumerate(KNEE_QPOS_ADDRESSES):
+            variable_index = joint_variable_indices[address]
+            target = swing_knee_target_qpos[frame, side]
+            if np.isfinite(target):
+                variable_upper[variable_index] = min(
+                    variable_upper[variable_index], float(target)
+                )
+        # A source frame can already sit exactly on a joint limit.  Keep the
+        # hard knee bound while giving scipy's bounded least-squares solver a
+        # tiny non-zero interval instead of presenting equal lower/upper
+        # bounds.
+        zero_width = variable_lower >= variable_upper
+        variable_lower[zero_width] = variable_upper[zero_width] - 1.0e-7
 
         def residual(variables: np.ndarray) -> np.ndarray:
             pose = nominal_pose.copy()
@@ -507,14 +821,14 @@ def refine_contacts_and_collisions(
             support_error = np.concatenate(
                 [
                     clearance[support_slice] - targets
-                    for support_slice, targets, _ in support_constraints
+                    for support_slice, targets, _, _ in support_constraints
                 ]
             )
             support_x_error = np.concatenate(
                 [
                     landmarks[support_slice, 0]
                     - nominal_landmarks[support_slice, 0]
-                    for support_slice, _, _ in support_constraints
+                    for support_slice, _, _, _ in support_constraints
                 ]
             )
             # Use the complete STL geometry for foot/leg non-interference.
@@ -523,17 +837,76 @@ def refine_contacts_and_collisions(
                 current_clearance - 0.25 * CONTACT_CLEARANCE,
                 0.0,
             )
+            # The four landmarks do not cover all vertices of the foot/toe
+            # meshes.  A signed geometry distance catches sole-edge and
+            # toe-tip penetration on a tilted ramp, including swing feet.
+            surface_point_distances = foot_surface_point_clearances()
+            foot_distances = np.asarray(
+                [float(np.min(values)) for values in surface_point_distances],
+                dtype=np.float64,
+            )
+            mesh_support_error = np.concatenate(
+                [
+                    foot_distances[2 * side : 2 * side + 2] - targets
+                    for _, targets, side, _ in support_constraints
+                ]
+            )
+            surface_targets = np.full(4, SWING_CLEARANCE, dtype=np.float64)
+            for _, targets, side, _ in support_constraints:
+                surface_targets[2 * side : 2 * side + 2] = targets
+            mesh_penetration = np.concatenate(
+                [
+                    np.minimum(values - surface_targets[index], 0.0)
+                    for index, values in enumerate(surface_point_distances)
+                ]
+            )
+            mesh_roll_order: list[float] = []
+            for _, _, side, mode in support_constraints:
+                toe_minus_heel = (
+                    foot_distances[2 * side + 1] - foot_distances[2 * side]
+                )
+                target_delta = (
+                    roll_clearance_targets(float(roll_phase[frame, side]), mode)[1]
+                    - roll_clearance_targets(float(roll_phase[frame, side]), mode)[0]
+                )
+                mesh_roll_order.append(toe_minus_heel - target_delta)
+            knee_target_errors: list[float] = []
+            for side, address in enumerate(KNEE_QPOS_ADDRESSES):
+                variable_index = joint_variable_indices[address]
+                for target, weight in (
+                    (
+                        swing_knee_target_qpos[frame, side],
+                        SWING_KNEE_TARGET_WEIGHT,
+                    ),
+                    (
+                        landing_knee_target_qpos[frame, side],
+                        LANDING_KNEE_TARGET_WEIGHT,
+                    ),
+                ):
+                    if np.isfinite(target):
+                        knee_target_errors.append(
+                            weight
+                            * (variables[variable_index] - float(target))
+                        )
+            acceleration_target = previous + (previous - previous_previous)
             return np.concatenate(
                 (
                     CONTACT_IK_SUPPORT_WEIGHT * support_error,
+                    CONTACT_IK_FOOT_MESH_SUPPORT_WEIGHT * mesh_support_error,
                     4.0 * support_x_error,
                     18.0 * ground_penetration,
+                    CONTACT_IK_FOOT_MESH_WEIGHT * mesh_penetration,
+                    CONTACT_IK_ROLL_TARGET_WEIGHT
+                    * np.asarray(mesh_roll_order, dtype=np.float64),
+                    np.asarray(knee_target_errors, dtype=np.float64),
                     [0.18 * (variables[0] - nominal_root)],
                     CONTACT_IK_NOMINAL_WEIGHT
                     * (variables[1:] - nominal_variables[1:]),
                     [0.03 * (variables[0] - previous[0])],
                     CONTACT_IK_TEMPORAL_WEIGHT
                     * (variables[1:] - previous[1:]),
+                    CONTACT_IK_ACCELERATION_WEIGHT
+                    * (variables - acceleration_target),
                 )
             )
 
@@ -548,6 +921,7 @@ def refine_contacts_and_collisions(
         )
         refined[frame, 2] = solution.x[0]
         refined[frame, joint_indices] = solution.x[1:]
+        previous_previous = previous
         previous = solution.x.copy()
 
         evaluated = refined[frame].copy()
@@ -556,8 +930,16 @@ def refine_contacts_and_collisions(
         mujoco.mj_forward(model, data)
         landmarks = landmark_positions(data, landmark_body_ids, landmark_points)
         clearance = landmarks[:, 2] - ground_heights(landmarks[:, :2])
+        minimum_mesh_after = min(
+            minimum_mesh_after,
+            float(foot_terrain_distances().min()),
+        )
+        minimum_surface_after = min(
+            minimum_surface_after,
+            float(foot_surface_clearances().min()),
+        )
         minimum_after = min(minimum_after, float(clearance.min()))
-        for support_slice, targets, _ in support_constraints:
+        for support_slice, targets, _, _ in support_constraints:
             roll_errors.extend(np.abs(clearance[support_slice] - targets))
         for side in range(2):
             mode = int(roll_mode[frame, side])
@@ -575,6 +957,121 @@ def refine_contacts_and_collisions(
     # geometry violates the requested clearance.  The stance leg is left
     # untouched whenever one foot is in swing, preserving the contact IK.
     hip_adduction_indices = (8, 16)
+    # Swing clearance needs hip flexion as well: a knee/ankle-only correction
+    # can run into the joint limit while the toe is still below a ramp.
+    leg_contact_indices = (
+        (7, 10, 12, 13, 14),
+        (15, 18, 20, 21, 22),
+    )
+    joint_range_by_address = {
+        int(model.jnt_qposadr[joint_id]): model.jnt_range[joint_id].copy()
+        for joint_id in range(model.njnt)
+        if model.jnt_type[joint_id] != mujoco.mjtJoint.mjJNT_FREE
+    }
+    swing_corrections = np.zeros((len(refined), 2), dtype=np.float64)
+    main_refined = refined.copy()
+
+    # The main IK solves stance and swing together.  At heel-off/foot-pass
+    # frames a swing foot can still sit a few millimetres inside the ramp even
+    # though the stance fit is valid.  Correct that leg locally with a bounded
+    # coordinate descent; changing the root here would lift the supporting
+    # foot, while changing only the swing leg preserves the contact datum.
+    for frame, pose in enumerate(refined):
+        swing_sides = np.flatnonzero(contact[frame] <= 0.5)
+        if len(swing_sides) == 0:
+            continue
+        evaluated = pose.copy()
+        evaluated[:3] += pose_offset
+        data.qpos[:] = evaluated
+        mujoco.mj_forward(model, data)
+        for side in swing_sides:
+            side = int(side)
+            current = foot_surface_clearances()[2 * side : 2 * side + 2]
+            if float(current.min()) >= SWING_CLEARANCE:
+                continue
+            candidate = refined[frame].copy()
+            base_candidate = candidate.copy()
+            best = float(current.min())
+            previous_pose = (
+                main_refined[(frame - 1) % len(main_refined)]
+                if loop or frame > 0
+                else None
+            )
+            next_pose = (
+                main_refined[(frame + 1) % len(main_refined)]
+                if loop or frame + 1 < len(main_refined)
+                else None
+            )
+            for _ in range(12):
+                improved = False
+                for address in leg_contact_indices[side]:
+                    for delta in (-SWING_CORRECTION_STEP, SWING_CORRECTION_STEP):
+                        trial = candidate.copy()
+                        trial[address] += delta
+                        lower = max(
+                            joint_range_by_address[address][0],
+                            base_candidate[address] - SWING_CORRECTION_TRUST_REGION,
+                        )
+                        upper = min(
+                            joint_range_by_address[address][1],
+                            base_candidate[address] + SWING_CORRECTION_TRUST_REGION,
+                        )
+                        if previous_pose is not None:
+                            lower = max(
+                                lower,
+                                previous_pose[address] - CONTACT_IK_MAX_JOINT_STEP,
+                            )
+                            upper = min(
+                                upper,
+                                previous_pose[address] + CONTACT_IK_MAX_JOINT_STEP,
+                            )
+                        if next_pose is not None:
+                            lower = max(
+                                lower,
+                                next_pose[address] - CONTACT_IK_MAX_JOINT_STEP,
+                            )
+                            upper = min(
+                                upper,
+                                next_pose[address] + CONTACT_IK_MAX_JOINT_STEP,
+                            )
+                        if address == KNEE_QPOS_ADDRESSES[side]:
+                            target = swing_knee_target_qpos[frame, side]
+                            if np.isfinite(target):
+                                upper = min(upper, float(target))
+                        if lower > upper:
+                            continue
+                        trial[address] = np.clip(
+                            trial[address],
+                            lower,
+                            upper,
+                        )
+                        trial_world = trial.copy()
+                        trial_world[:3] += pose_offset
+                        data.qpos[:] = trial_world
+                        mujoco.mj_forward(model, data)
+                        trial_clearance = foot_surface_clearances()[
+                            2 * side : 2 * side + 2
+                        ]
+                        score = float(trial_clearance.min())
+                        if score > best + 1.0e-5:
+                            candidate = trial
+                            best = score
+                            improved = True
+                if not improved:
+                    break
+            refined[frame] = candidate
+            swing_corrections[frame, side] = float(
+                np.max(
+                    np.abs(
+                        candidate[list(leg_contact_indices[side])]
+                        - base_candidate[list(leg_contact_indices[side])]
+                    )
+                )
+            )
+        previous = np.concatenate(
+            ([refined[frame, 2]], refined[frame, joint_indices])
+        )
+
     hip_lower = np.asarray(
         [
             model.jnt_range[
@@ -631,9 +1128,18 @@ def refine_contacts_and_collisions(
     # Recompute all quality statistics after the abduction correction.
     collision_minima: list[float] = []
     minimum_after = np.inf
+    minimum_mesh_after = np.inf
+    minimum_surface_after = np.inf
     roll_errors = []
+    surface_roll_errors: list[float] = []
+    support_surface_values: list[float] = []
     heel_order_values = []
     toe_order_values = []
+    mesh_heel_order_values: list[float] = []
+    mesh_toe_order_values: list[float] = []
+    swing_knee_flexions: list[float] = []
+    swing_knee_target_errors: list[float] = []
+    swing_knee_straight_frames = 0
     for pose in refined:
         collision_minima.append(collision_distance(pose))
     for frame, pose in enumerate(refined):
@@ -641,6 +1147,24 @@ def refine_contacts_and_collisions(
         evaluated[:3] += pose_offset
         data.qpos[:] = evaluated
         mujoco.mj_forward(model, data)
+        foot_distances = foot_surface_clearances()
+        minimum_mesh_after = min(
+            minimum_mesh_after,
+            float(foot_terrain_distances().min()),
+        )
+        minimum_surface_after = min(
+            minimum_surface_after,
+            float(foot_distances.min()),
+        )
+        for side, address in enumerate(KNEE_QPOS_ADDRESSES):
+            target = swing_knee_target_qpos[frame, side]
+            if not np.isfinite(target):
+                continue
+            flexion = float(-pose[address])
+            swing_knee_flexions.append(flexion)
+            swing_knee_target_errors.append(abs(float(pose[address]) - float(target)))
+            if flexion < SWING_KNEE_MIN_FLEXION - 1.0e-6:
+                swing_knee_straight_frames += 1
         landmarks = landmark_positions(data, landmark_body_ids, landmark_points)
         clearance = landmarks[:, 2] - ground_heights(landmarks[:, :2])
         minimum_after = min(minimum_after, float(clearance.min()))
@@ -651,13 +1175,24 @@ def refine_contacts_and_collisions(
                 int(roll_mode[frame, side]),
             )
             roll_errors.extend(np.abs(clearance[support_slice] - targets))
+            surface_values = foot_distances[support_slice]
+            support_surface_values.extend(float(value) for value in surface_values)
+            surface_roll_errors.extend(np.abs(surface_values - targets))
             toe_minus_heel = float(
                 clearance[2 * int(side) + 1] - clearance[2 * int(side)]
             )
             if int(roll_mode[frame, side]) == ROLL_HEEL:
                 heel_order_values.append(toe_minus_heel)
+                mesh_heel_order_values.append(
+                    float(foot_distances[2 * int(side) + 1]
+                    - foot_distances[2 * int(side)])
+                )
             elif int(roll_mode[frame, side]) == ROLL_TOE:
                 toe_order_values.append(toe_minus_heel)
+                mesh_toe_order_values.append(
+                    float(foot_distances[2 * int(side) + 1]
+                    - foot_distances[2 * int(side)])
+                )
     return refined, {
         "terrain_kind": terrain_kind,
         "terrain_pose_offset": pose_offset.tolist(),
@@ -666,11 +1201,43 @@ def refine_contacts_and_collisions(
         "toe_off_heel_lift": TOE_OFF_HEEL_LIFT,
         "minimum_landmark_clearance_before": float(minimum_before),
         "minimum_landmark_clearance_after": float(minimum_after),
-        "maximum_roll_target_error": float(max(roll_errors, default=0.0)),
+        "minimum_foot_mesh_distance_before": float(minimum_mesh_before),
+        "minimum_foot_mesh_distance_after": float(minimum_mesh_after),
+        "maximum_foot_mesh_penetration": float(max(0.0, -minimum_mesh_after)),
+        "minimum_foot_surface_clearance_before": float(minimum_surface_before),
+        "minimum_foot_surface_clearance_after": float(minimum_surface_after),
+        "maximum_foot_surface_penetration": float(max(0.0, -minimum_surface_after)),
+        "maximum_swing_surface_correction": float(np.max(swing_corrections)),
+        "swing_knee_min_flexion_rad": float(min(swing_knee_flexions, default=0.0)),
+        "swing_knee_max_target_error_rad": float(
+            max(swing_knee_target_errors, default=0.0)
+        ),
+        "swing_knee_straight_violation_frames": int(swing_knee_straight_frames),
+        "maximum_roll_target_error": float(
+            max(surface_roll_errors, default=max(roll_errors, default=0.0))
+        ),
+        "maximum_landmark_roll_target_error": float(max(roll_errors, default=0.0)),
+        "support_surface_clearance_min": float(
+            min(support_surface_values, default=0.0)
+        ),
+        "support_surface_clearance_max": float(
+            max(support_surface_values, default=0.0)
+        ),
+        "support_surface_clearance_rms": float(
+            np.sqrt(np.mean(np.square(support_surface_values)))
+            if support_surface_values
+            else 0.0
+        ),
         "heel_phase_toe_minus_heel_min": float(
             min(heel_order_values, default=0.0)
         ),
         "toe_phase_toe_minus_heel_max": float(max(toe_order_values, default=0.0)),
+        "heel_phase_foot_mesh_toe_minus_heel_min": float(
+            min(mesh_heel_order_values, default=0.0)
+        ),
+        "toe_phase_foot_mesh_toe_minus_heel_max": float(
+            max(mesh_toe_order_values, default=0.0)
+        ),
         "minimum_cross_leg_geometry_distance": float(min(collision_minima)),
         "collision_clearance_target": LEG_CLEARANCE,
         "maximum_collision_abduction_correction": float(
@@ -678,6 +1245,41 @@ def refine_contacts_and_collisions(
         ),
         "ik_success_frames": int(len(refined)),
     }
+
+
+def validate_roll_order(task: str, refinement: dict[str, float | int]) -> None:
+    """Reject references that violate the heel -> sole -> toe roll order."""
+
+    heel_min = float(refinement["heel_phase_toe_minus_heel_min"])
+    toe_max = float(refinement["toe_phase_toe_minus_heel_max"])
+    mesh_heel_min = refinement.get("heel_phase_foot_mesh_toe_minus_heel_min")
+    mesh_toe_max = refinement.get("toe_phase_foot_mesh_toe_minus_heel_max")
+    # The target separation intentionally tapers to zero at heel-off/toe-off;
+    # validating a fixed positive gap over the whole phase would reject the
+    # correct transition frames.  The invariant is the ordering sign, with a
+    # small tolerance for mesh sampling and the contact solver.
+    heel_limit = -ROLL_ORDER_TOLERANCE
+    toe_limit = ROLL_ORDER_TOLERANCE
+    if mesh_heel_min is not None:
+        if float(mesh_heel_min) < heel_limit:
+            raise RuntimeError(
+                f"{task}: full foot mesh lets toe land before heel during heel phase "
+                f"({float(mesh_heel_min):.6f}m)."
+            )
+        if mesh_toe_max is not None and float(mesh_toe_max) > toe_limit:
+            raise RuntimeError(
+                f"{task}: full foot mesh keeps heel below toe during toe phase "
+                f"({float(mesh_toe_max):.6f}m)."
+            )
+        return
+    if heel_min < heel_limit:
+        raise RuntimeError(
+            f"{task}: toe lands before heel during heel phase ({heel_min:.6f}m)."
+        )
+    if toe_max > toe_limit:
+        raise RuntimeError(
+            f"{task}: heel remains below toe during toe phase ({toe_max:.6f}m)."
+        )
 
 
 def velocities(
@@ -896,6 +1498,7 @@ def build(
         model_xml,
         loop,
     )
+    validate_roll_order(task, refinement)
     clip_joint_limits(model, qpos)
     retargeted_forward_speed = forward_speed(qpos, frequency, loop)
     if task == "walk":

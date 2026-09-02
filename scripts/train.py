@@ -203,6 +203,54 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rough-terrain-height", type=float, default=0.05)
     parser.add_argument("--slope-angle-deg", type=float, default=6.0)
+    parser.add_argument(
+        "--slope-center-x",
+        type=float,
+        default=1.85,
+        help="World-X center of a standalone non-serial slope ramp.",
+    )
+    parser.add_argument(
+        "--slope-half-length",
+        type=float,
+        default=1.85,
+        help="Half of the horizontal length of a standalone slope ramp.",
+    )
+    parser.add_argument(
+        "--slope-lane-y",
+        type=float,
+        default=3.0,
+        help="World-Y center of a standalone non-serial slope ramp.",
+    )
+    parser.add_argument(
+        "--slope-base-height",
+        type=float,
+        default=0.0,
+        help="Low-end terrain height used by standalone slope references.",
+    )
+    parser.add_argument(
+        "--slope-thickness",
+        type=float,
+        default=0.10,
+        help="Collision thickness of a standalone slope ramp.",
+    )
+    parser.add_argument(
+        "--standalone-terrain-field",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fill the runtime training field with the selected non-serial terrain. "
+            "The source terrain assets remain unchanged."
+        ),
+    )
+    parser.add_argument("--standalone-field-x-min", type=float, default=-2.0)
+    parser.add_argument("--standalone-field-x-max", type=float, default=22.0)
+    parser.add_argument("--standalone-field-y-min", type=float, default=-10.0)
+    parser.add_argument("--standalone-field-y-max", type=float, default=14.0)
+    parser.add_argument("--standalone-field-tile-width", type=float, default=3.0)
+    parser.add_argument("--standalone-slope-up-spawn-x", type=float, default=0.60)
+    parser.add_argument("--standalone-slope-up-spawn-z", type=float, default=0.04)
+    parser.add_argument("--standalone-slope-down-spawn-x", type=float, default=-0.20)
+    parser.add_argument("--standalone-slope-down-spawn-z", type=float, default=0.06)
     parser.add_argument("--gap-terrain-width", type=float, default=0.20)
     parser.add_argument(
         "--serial-terrain-course",
@@ -301,6 +349,25 @@ def parse_args() -> argparse.Namespace:
             "Allow motion_reset_prob to initialize a serial-course training "
             "episode from a moving reference gait state at the stage entrance."
         ),
+    )
+    parser.add_argument(
+        "--course-lane-hold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Expose the assigned serial-course lane error to the actor and add "
+            "world-Y centering/edge termination objectives."
+        ),
+    )
+    parser.add_argument("--course-lane-position-reward-coef", type=float, default=0.0)
+    parser.add_argument("--course-lane-velocity-reward-coef", type=float, default=0.0)
+    parser.add_argument("--course-lane-position-sigma", type=float, default=0.35)
+    parser.add_argument("--course-lane-velocity-sigma", type=float, default=0.25)
+    parser.add_argument(
+        "--course-lane-termination-margin",
+        type=float,
+        default=0.35,
+        help="Distance kept inside each lane edge before course-lane termination.",
     )
     parser.add_argument("--log-root", default=str(REPO_ROOT / "logs" / "sensor_policy"))
     parser.add_argument(
@@ -1469,6 +1536,7 @@ def main() -> None:
         args.seed = secrets.randbits(32)
     if args.legacy_reference_conditioned_actor and args.training_task not in {
         "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_teacher_lane_hold",
         "no_stairs_old_0806_teacher",
     }:
         raise ValueError(
@@ -1477,6 +1545,7 @@ def main() -> None:
         )
     if args.legacy_0806_terrain_model and args.training_task not in {
         "multimotion_no_stairs_amp_teacher",
+        "multimotion_no_stairs_amp_teacher_lane_hold",
         "multimotion_no_stairs_amp_student",
         "multimotion_no_stairs_amp_single",
         "multimotion_0809_no_stairs",
@@ -1504,6 +1573,19 @@ def main() -> None:
         )
     if args.amp_task_only and not args.amp:
         raise ValueError("--amp-task-only requires AMP to remain enabled.")
+    if args.course_lane_hold:
+        if not args.serial_terrain_course:
+            raise ValueError("--course-lane-hold requires --serial-terrain-course.")
+        if args.course_lane_position_reward_coef < 0.0:
+            raise ValueError("--course-lane-position-reward-coef must be non-negative.")
+        if args.course_lane_velocity_reward_coef < 0.0:
+            raise ValueError("--course-lane-velocity-reward-coef must be non-negative.")
+        if args.course_lane_position_sigma <= 0.0:
+            raise ValueError("--course-lane-position-sigma must be positive.")
+        if args.course_lane_velocity_sigma <= 0.0:
+            raise ValueError("--course-lane-velocity-sigma must be positive.")
+        if args.course_lane_termination_margin < 0.0:
+            raise ValueError("--course-lane-termination-margin must be non-negative.")
     if args.distillation_coef < 0.0:
         raise ValueError("--distillation-coef must be non-negative.")
     if args.teacher_checkpoint is None and args.distillation_coef > 0.0:
@@ -1586,6 +1668,16 @@ def main() -> None:
         raise ValueError(
             "--serial-course-single-motion requires its one motion to use --motion-loop true."
         )
+    if args.standalone_terrain_field:
+        if args.serial_terrain_course:
+            raise ValueError(
+                "--standalone-terrain-field cannot be combined with "
+                "--serial-terrain-course."
+            )
+        if args.terrain_types is None or len(args.terrain_types) != 1:
+            raise ValueError(
+                "--standalone-terrain-field requires exactly one --terrain-types value."
+            )
     if args.alternating_step_reward_coef < 0.0:
         raise ValueError("--alternating-step-reward-coef must be non-negative.")
     if not 0.0 <= args.terrain_course_random_start_prob <= 1.0:
@@ -1762,6 +1854,12 @@ def main() -> None:
         terrain_course_base_height=args.terrain_course_base_height,
         terrain_course_random_assignment=bool(args.terrain_course_random_assignment),
         serial_reference_state_init=bool(args.serial_reference_state_init),
+        course_lane_hold=bool(args.course_lane_hold),
+        course_lane_position_reward_coef=args.course_lane_position_reward_coef,
+        course_lane_velocity_reward_coef=args.course_lane_velocity_reward_coef,
+        course_lane_position_sigma=args.course_lane_position_sigma,
+        course_lane_velocity_sigma=args.course_lane_velocity_sigma,
+        course_lane_termination_margin=args.course_lane_termination_margin,
         terrain_course_completion_reward=args.terrain_course_completion_reward,
         terrain_course_stage_reward=args.terrain_course_stage_reward,
         terrain_course_stage_tolerance=args.terrain_course_stage_tolerance,
@@ -1775,6 +1873,21 @@ def main() -> None:
         decimation=args.decimation,
         episode_steps=args.episode_steps,
         episode_timeout_jitter_steps=args.episode_timeout_jitter_steps,
+        slope_center_x=args.slope_center_x,
+        slope_half_length=args.slope_half_length,
+        slope_lane_y=args.slope_lane_y,
+        slope_base_height=args.slope_base_height,
+        slope_thickness=args.slope_thickness,
+        standalone_terrain_field=bool(args.standalone_terrain_field),
+        standalone_field_x_min=args.standalone_field_x_min,
+        standalone_field_x_max=args.standalone_field_x_max,
+        standalone_field_y_min=args.standalone_field_y_min,
+        standalone_field_y_max=args.standalone_field_y_max,
+        standalone_field_tile_width=args.standalone_field_tile_width,
+        standalone_slope_up_spawn_x=args.standalone_slope_up_spawn_x,
+        standalone_slope_up_spawn_z=args.standalone_slope_up_spawn_z,
+        standalone_slope_down_spawn_x=args.standalone_slope_down_spawn_x,
+        standalone_slope_down_spawn_z=args.standalone_slope_down_spawn_z,
         robot_collision_profile=args.robot_collision_profile,
         allow_collision_profile_migration=bool(
             args.allow_collision_profile_migration
