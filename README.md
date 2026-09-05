@@ -64,6 +64,66 @@ uv run python scripts/play.py \
 仅依赖 IMU 与肌腱长度实现跨地形过渡的论文选型、训练期特权监督和部署边界见
 [`docs/proprioceptive_terrain_transition.md`](docs/proprioceptive_terrain_transition.md)。
 
+## 2026-08-06 历史训练恢复命令
+
+本分支恢复了日志 `logs/multimotion/08-06-10:56:09` 对应的四动作训练和测试。请从恢复目录执行
+`recovery/run.py`，它会把 checkpoint 元数据中的旧绝对路径重定位到本目录，并把重新训练输出隔离到
+`logs/multimotion_recovered_20260806/`，不会覆盖原始模型或日志。
+
+```bash
+cd /home/yeah/code/LYTrobot_amp_recovered_20260806
+
+# 只解析并显示原训练参数，不启动训练
+.venv/bin/python recovery/run.py train --dry-run
+
+# 按历史配置重新训练：4096 环境、24 rollout steps、30000 iterations
+.venv/bin/python recovery/run.py train
+```
+
+测试历史 PyTorch checkpoint：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp_recovered_20260806
+
+# 无窗口测试，默认 3 个机器人和完整串联地形路线
+.venv/bin/python recovery/run.py play \
+  --steps 1000 \
+  --num-robots 3 \
+  --seed 42
+
+# 打开 viewer 并录制视频，使用 1 个机器人
+.venv/bin/python recovery/run.py play \
+  --viewer \
+  --steps 3000 \
+  --num-robots 1 \
+  --seed 42
+```
+
+测试历史 ONNX checkpoint：
+
+```bash
+.venv/bin/python recovery/run.py play \
+  --checkpoint logs/multimotion/08-06-10:56:09/model_final.onnx \
+  --steps 1000 \
+  --num-robots 3 \
+  --seed 42
+```
+
+运行恢复代码和同期测试：
+
+```bash
+cd /home/yeah/code/LYTrobot_amp_recovered_20260806
+PYTHONPATH=src:. OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q \
+  recovery/test_recovery.py \
+  tests/test_multimotion_log_paths.py \
+  tests/test_multimotion_stairs.py \
+  tests/test_serial_terrain_course.py \
+  tests/test_play_recording.py \
+  tests/test_model_export.py
+```
+
+训练配置、提交定位依据、模型契约和验证结果见 [`RECOVERY.md`](RECOVERY.md)。
+
 ## 代码结构
 
 ```text
