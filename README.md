@@ -67,20 +67,25 @@ uv run python scripts/train_multimotion_stage1.py
 
 # Stage 1 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion_0809_no_stairs/stage1/<run>/model_final.onnx \
+  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/<run>/model_final.onnx \
   --stage stage1 --viewer --steps 0
 
 # Stage 2 训练
 uv run python scripts/train_multimotion_stage2.py \
-  --stage1-checkpoint logs/multimotion_0809_no_stairs/stage1/<run>/model_final.pt
+  --stage1-checkpoint logs/multimotion/no_stairs_amp_single/stage1/<run>/model_final.pt
 
 # Stage 2 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion_0809_no_stairs/stage2/<run>/model_final.pt \
+  --checkpoint logs/multimotion/no_stairs_amp_single/stage2/<run>/model_final.pt \
   --stage stage2 --viewer --steps 0
 ```
 
 ### 4. 四个独立地形任务
+
+2026-09-05 起，新训练默认写入 `logs/independent_terrain_v2/`。下方旧 checkpoint
+路径可用于复查历史结果；新实验的 Stage 2 和回放请使用 v2 目录中的实际路径。
+本轮修复了独立坡面高度基准、下坡静止出生和起步检查时机，并调整了最佳模型选择。
+从头训练及验收说明见 [独立训练任务](docs/independent_training_tasks.md)。
 
 平地、上坡、下坡和不平路面现在分别作为独立任务训练；每个任务只使用自己的参考
 动作和地形，不共享串联课程的 terrain 序列。四个任务默认把运行时地形铺满约
@@ -93,11 +98,11 @@ Actor，不使用 Teacher action distillation；训练期 asymmetric critic 仍�
 uv run python scripts/train_flat_stage1.py
 # 平地训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_flat_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain/flat/stage1/09-02-15:24:59/model_final.pt
 
 # 平地测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/flat/stage1/09-07-10:12:43/model_best.onnx\
   --stage stage1 --viewer --steps 0
 # 平地测试（Stage 2）
 uv run python sensor_training/play.py \
@@ -112,7 +117,7 @@ uv run python scripts/train_rough_stage2.py \
 
 # 不平路面测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v2/rough/stage1/09-05-19:59:10/model_best.onnx \
   --stage stage1 --viewer --steps 0
 # 不平路面测试（Stage 2）
 uv run python sensor_training/play.py \
@@ -176,7 +181,7 @@ uv run python scripts/train_multimotion_no_stairs_stage1.py
 
 # Stage 1 测试
 uv run python sensor_training/play.py \
-  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/09-01-23:13:40/model_final.onnx\
+  --checkpoint logs/multimotion/no_stairs_amp_single/stage1/09-01-23:13:40/model_best.pt\
   --stage stage1 --viewer --steps 0
 
 # Stage 2 训练
@@ -303,6 +308,3 @@ uv run python -m pytest -q
 # 录屏逻辑测试
 uv run python -m pytest -q tests/test_play_recording.py
 ```
-
-任务实现、参考动作和重定向说明分别见 [multimotion/README.md](multimotion/README.md)、
-[sensor_training/README.md](sensor_training/README.md) 与 [squat_training/README.md](squat_training/README.md)。

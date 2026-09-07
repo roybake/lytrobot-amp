@@ -48,7 +48,7 @@ def test_no_stairs_old_matches_0806_config_without_stairs() -> None:
     assert _values(args, "--warp-nconmax") == ["32"]
     assert _values(args, "--warp-njmax") == ["128"]
     assert _values(args, "--terrain-course-stage-reward") == ["5.0"]
-    assert _values(args, "--terrain-course-variants") == ["6"]
+    assert _values(args, "--terrain-course-variants") == ["2"]
     assert _values(args, "--terrain-course-run-out") == ["0.30"]
 
     with patch.object(sys, "argv", ["train.py", *args]):

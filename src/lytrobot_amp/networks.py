@@ -95,15 +95,44 @@ class AmpDiscriminator(nn.Module):
         self,
         input_dim: int,
         hidden_dims: tuple[int, ...] = (256, 128),
+        condition_dim: int = 0,
     ) -> None:
         super().__init__()
-        self.net = build_mlp(input_dim, hidden_dims, 1, activation=nn.LeakyReLU)
+        self.input_dim = int(input_dim)
+        self.condition_dim = max(int(condition_dim), 0)
+        self.net = build_mlp(
+            self.input_dim + self.condition_dim,
+            hidden_dims,
+            1,
+            activation=nn.LeakyReLU,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.condition_dim:
+            if condition is None:
+                raise ValueError("Conditional AMP requires motion/terrain condition IDs.")
+            if condition.ndim == 1:
+                condition = torch.nn.functional.one_hot(
+                    condition.to(torch.long), num_classes=self.condition_dim
+                ).to(dtype=x.dtype)
+            if condition.shape != (x.shape[0], self.condition_dim):
+                raise ValueError(
+                    "AMP condition shape must be "
+                    f"{(x.shape[0], self.condition_dim)}, got {tuple(condition.shape)}."
+                )
+            x = torch.cat((x, condition.to(device=x.device, dtype=x.dtype)), dim=-1)
         return self.net(x).squeeze(-1)
 
     @torch.no_grad()
-    def reward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = self.forward(x)
+    def reward(
+        self,
+        x: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        logits = self.forward(x, condition)
         reward = -torch.log(torch.clamp(torch.sigmoid(-logits), min=1.0e-4))
         return torch.clamp(reward, 0.0, 5.0)

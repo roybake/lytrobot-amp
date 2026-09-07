@@ -19,6 +19,9 @@ def _replace_option_values(
     option: str,
     values: list[str],
 ) -> None:
+    if option not in args:
+        args.extend([option, *values])
+        return
     start = args.index(option)
     end = start + 1
     while end < len(args) and not args[end].startswith("--"):
@@ -33,7 +36,7 @@ def default_train_args() -> list[str]:
     _replace_option_values(
         args,
         "--motion-weights",
-        ["1.0", "0.0"],
+        ["1.0", "0.0", "0.0", "0.0"],
     )
     _replace_option_values(args, "--episode-steps", ["2000"])
     _replace_option_values(args, "--log-group", ["multimotion_walk_warmup"])

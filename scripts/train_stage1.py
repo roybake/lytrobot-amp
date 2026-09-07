@@ -31,7 +31,7 @@ def run_stage1() -> None:
     if not _has_arg("--stage"):
         sys.argv.extend(["--stage", "stage1"])
     if not _has_arg("--training-task"):
-        sys.argv.extend(["--training-task", "walk"])
+        sys.argv.extend(["--training-task", "multimotion_no_stairs_amp_single"])
     domain_flags = (
         "--domain-randomization",
         "--no-domain-randomization",

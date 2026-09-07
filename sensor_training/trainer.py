@@ -71,9 +71,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             privileged_context_dim=env.privileged_context_dim,
             estimator_context_dim=env.estimator_context_dim,
         ).to(self.device)
+        self.amp_condition_dim = (
+            int(getattr(env, "motion_count", 1))
+            if int(getattr(env, "motion_count", 1)) > 1
+            else 0
+        )
+        self.conditional_amp_version = 1 if self.amp_condition_dim else 0
         self.discriminator = AmpDiscriminator(
             input_dim=env.amp_obs_dim,
             hidden_dims=cfg.discriminator_hidden_dims,
+            condition_dim=self.amp_condition_dim,
         ).to(self.device)
         self.teacher_actor_critic: ActorCritic | None = None
         teacher_path = cfg.teacher_checkpoint
@@ -217,6 +224,19 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             (num_steps, num_envs, self.env.amp_obs_dim),
             device=self.device,
         )
+        amp_motion_ids = torch.empty(
+            (num_steps, num_envs), dtype=torch.long, device=self.device
+        )
+        terrain_scenario_ids = torch.empty(
+            (num_steps, num_envs), dtype=torch.long, device=self.device
+        )
+        forward_velocities = torch.empty((num_steps, num_envs), device=self.device)
+        forward_progresses = torch.empty((num_steps, num_envs), device=self.device)
+        foot_slips = torch.empty((num_steps, num_envs), device=self.device)
+        transition_from = torch.empty((num_steps, num_envs), device=self.device)
+        transition_to = torch.empty((num_steps, num_envs), device=self.device)
+        transition_success_from = torch.empty((num_steps, num_envs), device=self.device)
+        transition_success_to = torch.empty((num_steps, num_envs), device=self.device)
         teacher_actions = torch.empty_like(actions) if self.teacher_actor_critic else None
         privileged_contexts = torch.empty(
             (num_steps, num_envs, self.env.privileged_context_dim),
@@ -243,6 +263,18 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             estimator_context = self._as_device_tensor(
                 self.env.estimator_observe()
             )
+            amp_condition = self._as_device_tensor(
+                getattr(self.env, "motion_ids", np.zeros(num_envs, dtype=np.int64)),
+                dtype=torch.long,
+            )
+            terrain_condition = self._as_device_tensor(
+                getattr(
+                    self.env,
+                    "_terrain_scenario_ids",
+                    lambda: np.zeros(num_envs, dtype=np.int64),
+                )(),
+                dtype=torch.long,
+            )
             current_episode_starts = self.episode_starts
             with torch.no_grad():
                 (
@@ -259,7 +291,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     privileged_context=privileged_context,
                 )
                 amp_reward = (
-                    self.discriminator.reward(amp_tensor)
+                    self.discriminator.reward(
+                        amp_tensor,
+                        amp_condition if self.amp_condition_dim else None,
+                    )
                     if self.cfg.amp_enabled
                     else torch.zeros(num_envs, device=self.device)
                 )
@@ -314,6 +349,27 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 info.get("time_outs", np.zeros(num_envs, dtype=np.float32))
             )
             success = self._as_device_tensor(info.get("successes", time_out))
+            forward_velocities[step] = self._as_device_tensor(
+                info.get("forward_velocity", torch.zeros(num_envs, device=self.device))
+            )
+            forward_progresses[step] = self._as_device_tensor(
+                info.get("forward_progress", torch.zeros(num_envs, device=self.device))
+            )
+            foot_slips[step] = self._as_device_tensor(
+                info.get("foot_slip", torch.zeros(num_envs, device=self.device))
+            )
+            transition_from[step] = self._as_device_tensor(
+                info.get("terrain_transition_from", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_to[step] = self._as_device_tensor(
+                info.get("terrain_transition_to", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_success_from[step] = self._as_device_tensor(
+                info.get("terrain_transition_success_from", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_success_to[step] = self._as_device_tensor(
+                info.get("terrain_transition_success_to", torch.full((num_envs,), -1.0, device=self.device))
+            )
             amp_reward = torch.nan_to_num(amp_reward, nan=0.0, posinf=0.0, neginf=0.0)
             total_reward = self.cfg.task_reward_lerp * task_reward
             if self.cfg.amp_enabled:
@@ -364,6 +420,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             successes[step] = success
             episode_starts[step] = current_episode_starts
             amp_features[step] = amp_tensor
+            amp_motion_ids[step] = amp_condition
+            terrain_scenario_ids[step] = terrain_condition
             privileged_contexts[step] = privileged_context
             estimator_contexts[step] = estimator_context
             self.obs = next_obs
@@ -451,6 +509,15 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "episode_starts": episode_starts,
             "initial_recurrent_state": initial_recurrent_state,
             "amp_features": amp_features,
+            "amp_motion_ids": amp_motion_ids,
+            "terrain_scenario_ids": terrain_scenario_ids,
+            "forward_velocities": forward_velocities,
+            "forward_progresses": forward_progresses,
+            "foot_slips": foot_slips,
+            "transition_from": transition_from,
+            "transition_to": transition_to,
+            "transition_success_from": transition_success_from,
+            "transition_success_to": transition_success_to,
             "teacher_actions": teacher_actions,
             "privileged_contexts": privileged_contexts,
             "estimator_contexts": estimator_contexts,
@@ -868,6 +935,12 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 ),
                 "recurrent_state_reset": "episode_start",
             },
+            "conditional_amp": {
+                "version": int(self.conditional_amp_version),
+                "condition_fields": ["motion_id"] if self.amp_condition_dim else [],
+                "condition_dim": int(self.amp_condition_dim),
+                "actor_input": False,
+            },
         })
         return checkpoint
 
@@ -921,6 +994,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "common_joint_names": checkpoint["common_joint_names"],
             "sensor_observation": checkpoint["sensor_observation"],
             "sensor_policy_architecture": checkpoint["sensor_policy_architecture"],
+            "conditional_amp": checkpoint.get("conditional_amp", {}),
         }
         onnx.helper.set_model_props(
             model,

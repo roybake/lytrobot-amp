@@ -93,6 +93,10 @@ def _replace(args: list[str], option: str, values: list[str]) -> None:
     args[start:end] = [option, *values]
 
 
+def _remove_flag(args: list[str], *options: str) -> None:
+    args[:] = [arg for arg in args if arg not in options]
+
+
 def default_train_args() -> list[str]:
     """Match the 100 Hz Teacher environment while hiding Teacher inputs."""
 
@@ -100,6 +104,7 @@ def default_train_args() -> list[str]:
     _replace(args, "--training-task", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--log-group", ["multimotion_no_stairs_amp_student"])
     _replace(args, "--reference-ctrl-blend", ["0.0"])
+    _remove_flag(args, "--use-reference-velocity", "--no-use-reference-velocity")
     _replace(
         args,
         "--wandb-tags",
@@ -121,6 +126,7 @@ def default_train_args() -> list[str]:
             # The Teacher action is a residual around the retargeted control;
             # convert it to the Student's measured-tendon control space.
             "--distill-teacher-control-target",
+            "--no-use-reference-velocity",
         ]
     )
     return args

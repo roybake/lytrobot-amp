@@ -95,9 +95,16 @@ class PPOAMPTrainer:
             min_action_std=cfg.min_action_std,
             max_action_std=cfg.max_action_std,
         ).to(self.device)
+        self.amp_condition_dim = (
+            int(getattr(env, "motion_count", 1))
+            if int(getattr(env, "motion_count", 1)) > 1
+            else 0
+        )
+        self.conditional_amp_version = 1 if self.amp_condition_dim else 0
         self.discriminator = AmpDiscriminator(
             input_dim=env.amp_obs_dim,
             hidden_dims=cfg.discriminator_hidden_dims,
+            condition_dim=self.amp_condition_dim,
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=cfg.learning_rate)
@@ -237,6 +244,19 @@ class PPOAMPTrainer:
         time_outs = torch.empty((num_steps, num_envs), device=self.device)
         successes = torch.empty((num_steps, num_envs), device=self.device)
         amp_features = torch.empty((num_steps, num_envs, amp_dim), device=self.device)
+        amp_motion_ids = torch.empty(
+            (num_steps, num_envs), dtype=torch.long, device=self.device
+        )
+        terrain_scenario_ids = torch.empty(
+            (num_steps, num_envs), dtype=torch.long, device=self.device
+        )
+        forward_velocities = torch.empty((num_steps, num_envs), device=self.device)
+        forward_progresses = torch.empty((num_steps, num_envs), device=self.device)
+        foot_slips = torch.empty((num_steps, num_envs), device=self.device)
+        transition_from = torch.empty((num_steps, num_envs), device=self.device)
+        transition_to = torch.empty((num_steps, num_envs), device=self.device)
+        transition_success_from = torch.empty((num_steps, num_envs), device=self.device)
+        transition_success_to = torch.empty((num_steps, num_envs), device=self.device)
         completed_reward_values = torch.zeros((num_steps, num_envs), device=self.device)
         completed_length_values = torch.zeros((num_steps, num_envs), device=self.device)
         episode_progress_sum = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -247,10 +267,25 @@ class PPOAMPTrainer:
         for step in range(num_steps):
             obs_tensor = self._as_device_tensor(self.obs)
             amp_tensor = self._as_device_tensor(self.env.amp_observe())
+            amp_condition = self._as_device_tensor(
+                getattr(self.env, "motion_ids", np.zeros(num_envs, dtype=np.int64)),
+                dtype=torch.long,
+            )
+            terrain_condition = self._as_device_tensor(
+                getattr(
+                    self.env,
+                    "_terrain_scenario_ids",
+                    lambda: np.zeros(num_envs, dtype=np.int64),
+                )(),
+                dtype=torch.long,
+            )
             with torch.no_grad():
                 action, log_prob, _, value = self.actor_critic.get_action_and_value(obs_tensor)
                 if self.cfg.amp_enabled:
-                    amp_reward = self.discriminator.reward(amp_tensor)
+                    amp_reward = self.discriminator.reward(
+                        amp_tensor,
+                        amp_condition if self.amp_condition_dim else None,
+                    )
                 else:
                     amp_reward = torch.zeros(num_envs, device=self.device)
 
@@ -292,6 +327,27 @@ class PPOAMPTrainer:
             done = torch.maximum(done, invalid_task_reward.to(done.dtype))
             time_out = self._as_device_tensor(_info.get("time_outs", np.zeros(num_envs, dtype=np.float32)))
             success = self._as_device_tensor(_info.get("successes", time_out))
+            forward_velocities[step] = self._as_device_tensor(
+                _info.get("forward_velocity", torch.zeros(num_envs, device=self.device))
+            )
+            forward_progresses[step] = self._as_device_tensor(
+                _info.get("forward_progress", torch.zeros(num_envs, device=self.device))
+            )
+            foot_slips[step] = self._as_device_tensor(
+                _info.get("foot_slip", torch.zeros(num_envs, device=self.device))
+            )
+            transition_from[step] = self._as_device_tensor(
+                _info.get("terrain_transition_from", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_to[step] = self._as_device_tensor(
+                _info.get("terrain_transition_to", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_success_from[step] = self._as_device_tensor(
+                _info.get("terrain_transition_success_from", torch.full((num_envs,), -1.0, device=self.device))
+            )
+            transition_success_to[step] = self._as_device_tensor(
+                _info.get("terrain_transition_success_to", torch.full((num_envs,), -1.0, device=self.device))
+            )
             amp_reward = torch.nan_to_num(amp_reward, nan=0.0, posinf=0.0, neginf=0.0)
             total_reward = self.cfg.task_reward_lerp * task_reward
             if self.cfg.amp_enabled:
@@ -327,6 +383,8 @@ class PPOAMPTrainer:
             time_outs[step] = time_out
             successes[step] = success
             amp_features[step] = amp_tensor
+            amp_motion_ids[step] = amp_condition
+            terrain_scenario_ids[step] = terrain_condition
             self.obs = next_obs
             self.global_step += num_envs
 
@@ -394,6 +452,15 @@ class PPOAMPTrainer:
             "time_outs": time_outs,
             "successes": successes,
             "amp_features": amp_features,
+            "amp_motion_ids": amp_motion_ids,
+            "terrain_scenario_ids": terrain_scenario_ids,
+            "forward_velocities": forward_velocities,
+            "forward_progresses": forward_progresses,
+            "foot_slips": foot_slips,
+            "transition_from": transition_from,
+            "transition_to": transition_to,
+            "transition_success_from": transition_success_from,
+            "transition_success_to": transition_success_to,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
             "episode_progress": episode_progress,
@@ -565,6 +632,11 @@ class PPOAMPTrainer:
             return {"amp_loss": 0.0, "amp_grad_penalty": 0.0, "amp_agent_prob": 0.0, "amp_ref_prob": 0.0}
 
         agent_features = rollout["amp_features"].reshape((-1, self.env.amp_obs_dim)).detach()
+        agent_motion_ids = rollout.get("amp_motion_ids")
+        if torch.is_tensor(agent_motion_ids):
+            agent_motion_ids = agent_motion_ids.reshape(-1).detach().to(
+                device=self.device, dtype=torch.long
+            )
         batch_size = agent_features.shape[0]
         amp_batch_size = max(1, min(self.cfg.amp_minibatch_size, batch_size))
         metric_names = ("amp_loss", "amp_grad_penalty", "amp_agent_prob", "amp_ref_prob")
@@ -580,24 +652,44 @@ class PPOAMPTrainer:
                 device=self.device,
             )
             agent_batch = agent_features[idx]
-            ref_np = self.env.motion.sample_features(
-                amp_batch_size,
-                self.rng,
-                mirror_prob=self.cfg.amp_mirror_ref_prob,
+            condition_batch = (
+                agent_motion_ids[idx]
+                if self.amp_condition_dim and torch.is_tensor(agent_motion_ids)
+                else None
             )
+            condition_np = (
+                condition_batch.detach().cpu().numpy()
+                if condition_batch is not None
+                else None
+            )
+            if condition_np is None:
+                ref_np = self.env.motion.sample_features(
+                    amp_batch_size,
+                    self.rng,
+                    mirror_prob=self.cfg.amp_mirror_ref_prob,
+                )
+            else:
+                ref_np = self.env.motion.sample_features(
+                    amp_batch_size,
+                    self.rng,
+                    mirror_prob=self.cfg.amp_mirror_ref_prob,
+                    motion_ids=condition_np,
+                )
             ref_batch = torch.as_tensor(ref_np, dtype=torch.float32, device=self.device)
 
             noisy_agent_batch = self._amp_noisy_batch(agent_batch)
             noisy_ref_batch = self._amp_noisy_batch(ref_batch)
-            logits_agent = self.discriminator(noisy_agent_batch)
-            logits_ref = self.discriminator(noisy_ref_batch)
+            logits_agent = self.discriminator(noisy_agent_batch, condition_batch)
+            logits_ref = self.discriminator(noisy_ref_batch, condition_batch)
             smoothing = float(np.clip(self.cfg.amp_label_smoothing, 0.0, 0.45))
             agent_target = torch.full_like(logits_agent, smoothing)
             ref_target = torch.full_like(logits_ref, 1.0 - smoothing)
             loss_agent = F.binary_cross_entropy_with_logits(logits_agent, agent_target)
             loss_ref = F.binary_cross_entropy_with_logits(logits_ref, ref_target)
             amp_loss = 0.5 * (loss_agent + loss_ref)
-            grad_penalty = self._gradient_penalty(agent_batch, ref_batch)
+            grad_penalty = self._gradient_penalty(
+                agent_batch, ref_batch, condition_batch
+            )
             loss = amp_loss + self.cfg.amp_grad_penalty_coef * grad_penalty
 
             stepped = self._optimizer_step_if_finite(
@@ -632,11 +724,19 @@ class PPOAMPTrainer:
             return batch
         return batch + noise_std * torch.randn_like(batch)
 
-    def _gradient_penalty(self, agent_batch: torch.Tensor, ref_batch: torch.Tensor) -> torch.Tensor:
+    def _gradient_penalty(
+        self,
+        agent_batch: torch.Tensor,
+        ref_batch: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.cfg.amp_grad_penalty_coef <= 0.0:
             return torch.zeros((), device=self.device)
         penalty_batch = torch.cat((agent_batch, ref_batch), dim=0).detach().requires_grad_(True)
-        logits = self.discriminator(penalty_batch)
+        penalty_condition = (
+            torch.cat((condition, condition), dim=0) if condition is not None else None
+        )
+        logits = self.discriminator(penalty_batch, penalty_condition)
         gradients = torch.autograd.grad(
             logits.sum(),
             penalty_batch,
@@ -802,7 +902,102 @@ class PPOAMPTrainer:
             metrics["bottom_depth_success_rate"] = 0.0
         metrics.update(policy_metrics)
         metrics.update(amp_metrics)
+        self._add_per_terrain_metrics(metrics, rollout)
         return metrics
+
+    def _add_per_terrain_metrics(
+        self,
+        metrics: dict[str, float],
+        rollout: dict[str, torch.Tensor | np.ndarray],
+    ) -> None:
+        """Add terrain-stratified rollout metrics and worst-terrain quality."""
+
+        scenario_ids = rollout.get("terrain_scenario_ids")
+        if not torch.is_tensor(scenario_ids):
+            return
+        names = ("flat", "rough", "slope_up", "slope_down")
+        ids = scenario_ids.reshape(-1)
+        done = rollout["dones"].reshape(-1)
+        time_out = rollout["time_outs"].reshape(-1)
+        success = rollout["successes"].reshape(-1)
+        task = rollout["task_rewards"].reshape(-1)
+        amp = rollout["amp_rewards"].reshape(-1)
+        forward_velocity = rollout["forward_velocities"].reshape(-1)
+        forward_progress = rollout["forward_progresses"].reshape(-1)
+        foot_slip = rollout["foot_slips"].reshape(-1)
+        transition_from = rollout.get("transition_from")
+        transition_to = rollout.get("transition_to")
+        transition_success_from = rollout.get("transition_success_from")
+        transition_success_to = rollout.get("transition_success_to")
+        success_rates: list[float] = []
+        for index, name in enumerate(names):
+            mask = ids == index
+            count = int(mask.sum().detach().cpu())
+            prefix = f"terrain_{name}_"
+            metrics[f"{prefix}sample_count"] = float(count)
+            if count == 0:
+                continue
+            metrics[f"{prefix}mean_forward_velocity"] = float(
+                forward_velocity[mask].mean().detach().cpu()
+            )
+            metrics[f"{prefix}mean_forward_progress"] = float(
+                forward_progress[mask].mean().detach().cpu()
+            )
+            metrics[f"{prefix}task_reward"] = float(task[mask].mean().detach().cpu())
+            metrics[f"{prefix}amp_reward"] = float(amp[mask].mean().detach().cpu())
+            metrics[f"{prefix}foot_slip"] = float(foot_slip[mask].mean().detach().cpu())
+            metrics[f"{prefix}termination_fraction"] = float(
+                torch.clamp(done[mask] - time_out[mask], 0.0, 1.0)
+                .mean()
+                .detach()
+                .cpu()
+            )
+            done_count = float(done[mask].sum().detach().cpu())
+            terrain_success = float(success[mask].sum().detach().cpu()) / max(done_count, 1.0)
+            metrics[f"{prefix}success_rate"] = terrain_success
+            if done_count > 0.0:
+                success_rates.append(terrain_success)
+        transition_names = names
+        if torch.is_tensor(transition_from) and torch.is_tensor(transition_to):
+            entered_from = transition_from.reshape(-1)
+            entered_to = transition_to.reshape(-1)
+            successful_from = (
+                transition_success_from.reshape(-1)
+                if torch.is_tensor(transition_success_from)
+                else torch.full_like(entered_from, -1.0)
+            )
+            successful_to = (
+                transition_success_to.reshape(-1)
+                if torch.is_tensor(transition_success_to)
+                else torch.full_like(entered_to, -1.0)
+            )
+            for source_id, source_name in enumerate(transition_names):
+                for target_id, target_name in enumerate(transition_names):
+                    key = f"transition_{source_name}_to_{target_name}"
+                    count_value = float(
+                        ((entered_from == source_id) & (entered_to == target_id))
+                        .sum()
+                        .detach()
+                        .cpu()
+                    )
+                    success_value = float(
+                        ((successful_from == source_id) & (successful_to == target_id))
+                        .sum()
+                        .detach()
+                        .cpu()
+                    )
+                    metrics[f"{key}_count"] = count_value
+                    metrics[f"{key}_success"] = success_value
+                    metrics[f"{source_name}_to_{target_name}_success"] = success_value
+        if success_rates:
+            metrics["worst_terrain_success"] = float(min(success_rates))
+            inverse = sum(1.0 / max(value, 1.0e-6) for value in success_rates)
+            metrics["harmonic_mean_terrain_success"] = float(
+                len(success_rates) / max(inverse, 1.0e-6)
+            )
+        else:
+            metrics["worst_terrain_success"] = 0.0
+            metrics["harmonic_mean_terrain_success"] = 0.0
 
     def load(self, path: str | Path, *, load_optimizers: bool = True) -> int:
         checkpoint = torch.load(Path(path), map_location=self.device)
@@ -815,6 +1010,15 @@ class PPOAMPTrainer:
         for key, value in expected.items():
             if key in checkpoint and int(checkpoint[key]) != int(value):
                 raise ValueError(f"Checkpoint {key}={checkpoint[key]} does not match current environment {value}.")
+        saved_conditional_amp = checkpoint.get("conditional_amp", {})
+        if isinstance(saved_conditional_amp, dict):
+            saved_condition_dim = int(saved_conditional_amp.get("condition_dim", 0))
+            if saved_condition_dim != int(self.amp_condition_dim):
+                raise ValueError(
+                    "Checkpoint conditional AMP contract does not match current motion set: "
+                    f"saved condition_dim={saved_condition_dim}, "
+                    f"current={self.amp_condition_dim}."
+                )
 
         actor_state = checkpoint["actor_critic"]
         missing, unexpected = self.actor_critic.load_state_dict(actor_state, strict=False)
@@ -866,6 +1070,12 @@ class PPOAMPTrainer:
             "action_dim": self.env.action_dim,
             "amp_obs_dim": self.env.amp_obs_dim,
             "common_joint_names": self.env.motion.common_joint_names,
+            "conditional_amp": {
+                "version": int(self.conditional_amp_version),
+                "condition_fields": ["motion_id"] if self.amp_condition_dim else [],
+                "condition_dim": int(self.amp_condition_dim),
+                "actor_input": False,
+            },
         }
         self._assert_checkpoint_finite(checkpoint)
         return checkpoint
@@ -909,6 +1119,8 @@ class PPOAMPTrainer:
         }
         if "sensor_observation" in checkpoint:
             metadata["sensor_observation"] = checkpoint["sensor_observation"]
+        if "conditional_amp" in checkpoint:
+            metadata["conditional_amp"] = checkpoint["conditional_amp"]
         onnx.helper.set_model_props(
             model,
             {"lytrobot_amp.metadata": json.dumps(metadata, ensure_ascii=False)},

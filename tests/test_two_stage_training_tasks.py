@@ -55,10 +55,10 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             with patch.object(sys, "argv", ["train.py", *effective_argv[1:]]):
                 parsed = train.parse_args()
 
-            self.assertEqual(parsed.training_task, "walk")
+            self.assertEqual(parsed.training_task, "multimotion_no_stairs_amp_single")
             self.assertEqual(set(parsed.terrain_types), expected_terrains)
             self.assertTrue(parsed.serial_terrain_course)
-            self.assertEqual(parsed.terrain_course_variants, 2)
+            self.assertEqual(parsed.terrain_course_variants, 6)
             self.assertTrue(parsed.terrain_course_random_assignment)
             self.assertEqual(parsed.rough_terrain_height, 0.05)
             self.assertEqual(parsed.slope_angle_deg, 6.0)
@@ -78,16 +78,21 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             )
             self.assertFalse(parsed.skill_conditioning)
             self.assertEqual(parsed.reference_ctrl_blend, 0.0)
-            self.assertFalse(parsed.serial_reference_state_init)
+            self.assertTrue(parsed.serial_reference_state_init)
+            if launcher is run_stage2:
+                self.assertTrue(parsed.resume_reset_progress)
+                self.assertTrue(parsed.resume_reset_optimizer)
 
     def test_task_launchers_use_the_requested_log_trees(self) -> None:
         expected_roots = {
-            "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion_0809_no_stairs",
-            "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion_0809_no_stairs",
+            "scripts/train_multimotion_stage1.py": ROOT / "logs" / "multimotion" / "no_stairs_amp_single",
+            "scripts/train_multimotion_stage2.py": ROOT / "logs" / "multimotion" / "no_stairs_amp_single",
             "sensor_training/train_multimotion_stage1.py": (
                 ROOT / "logs" / "multimotion" / "no_stairs_amp_single"
             ),
-            "sensor_training/train_multimotion_stage2.py": ROOT / "logs" / "multimotion_0809_no_stairs",
+            "sensor_training/train_multimotion_stage2.py": (
+                ROOT / "logs" / "multimotion" / "no_stairs_amp_single"
+            ),
             "scripts/train_stairs_stage1.py": ROOT / "logs" / "stairs",
             "scripts/train_stairs_stage2.py": ROOT / "logs" / "stairs",
         }
@@ -157,27 +162,18 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
 
     def test_stair_free_launchers_call_the_canonical_walking_stages(self) -> None:
         cases = (
-            (
-                no_stairs_stage1_main,
-                "scripts.train_multimotion_no_stairs_stage1.run_stage1",
-            ),
-            (
-                no_stairs_stage2_main,
-                "scripts.train_multimotion_no_stairs_stage2.run_stage2",
-            ),
+            (no_stairs_stage1_main, "scripts.train_multimotion_no_stairs_stage1.run_task_stage", "stage1"),
+            (no_stairs_stage2_main, "scripts.train_multimotion_no_stairs_stage2.run_task_stage", "stage2"),
         )
-        for launcher, target in cases:
+        for launcher, target, stage in cases:
             with self.subTest(target=target), patch(target) as canonical_stage, patch.object(
                 sys, "argv", ["launcher.py", "--no-wandb"]
             ):
                 launcher()
-                canonical_stage.assert_called_once_with()
+                canonical_stage.assert_called_once()
+                self.assertEqual(canonical_stage.call_args.kwargs["stage"], stage)
                 self.assertEqual(
-                    sys.argv[sys.argv.index("--training-task") + 1],
-                    "multimotion_no_stairs_amp_single",
-                )
-                self.assertEqual(
-                    Path(sys.argv[sys.argv.index("--log-root") + 1]),
+                    canonical_stage.call_args.kwargs["log_root"],
                     ROOT / "logs" / "multimotion" / "no_stairs_amp_single",
                 )
                 self.assertIn("--no-wandb", sys.argv)
@@ -187,7 +183,7 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
             sys,
             "argv",
             ["launcher.py", *no_stairs_args(), "--no-wandb"],
-        ), patch("scripts.train_multimotion_no_stairs_stage1.runpy.run_path"):
+        ), patch("scripts.train_stage1.runpy.run_path"):
             run_stage1()
             effective_argv = list(sys.argv)
 
@@ -203,6 +199,8 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
         self.assertTrue(parsed.serial_reference_state_init)
         self.assertEqual(parsed.motion_reset_prob, 0.5)
         self.assertAlmostEqual(parsed.target_velocity, 0.862295, places=5)
+        self.assertFalse(parsed.use_reference_velocity)
+        self.assertEqual(parsed.terrain_course_variants, 6)
 
     def test_task_defaults_do_not_enable_domain_randomization(self) -> None:
         for args in (no_stairs_args(), stairs_args(), sensor_multimotion_args()):
@@ -262,6 +260,86 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
         self.assertEqual(args[args.index("--stage") + 1], "stage2")
         self.assertEqual(args[args.index("--log-group") + 1], "stage2")
 
+    def test_real_no_stairs_stage_launchers_have_equal_effective_task_contract(self) -> None:
+        effective: dict[str, dict[str, object]] = {}
+        final_argvs: dict[str, list[str]] = {}
+        for stage, launcher, module_name, extra in (
+            (
+                "stage1",
+                no_stairs_stage1_main,
+                "scripts.train_multimotion_no_stairs_stage1",
+                ["--no-wandb"],
+            ),
+            (
+                "stage2",
+                no_stairs_stage2_main,
+                "scripts.train_multimotion_no_stairs_stage2",
+                ["--stage1-checkpoint", "/tmp/canonical-stage1.pt", "--no-wandb"],
+            ),
+        ):
+            with self.subTest(stage=stage), patch.object(
+                sys, "argv", ["launcher.py", *extra]
+            ), patch("scripts.two_stage_task.runpy.run_path"):
+                launcher()
+                final_argv = list(sys.argv)
+            final_argvs[stage] = final_argv
+            with patch.object(sys, "argv", final_argv):
+                effective[stage] = vars(train.parse_args())
+
+        stage1 = effective["stage1"]
+        stage2 = effective["stage2"]
+        allowed = {
+            "stage",
+            "domain_randomization",
+            "warp_global_domain_randomization",
+            "dr_curriculum_mode",
+            "dr_curriculum_initial_scale",
+            "global_dr_resample_interval",
+            "resume_checkpoint",
+            "resume_reset_progress",
+            "resume_reset_optimizer",
+            "max_iterations",
+            "log_group",
+            "run_name",
+        }
+        self.assertEqual(
+            {
+                key: value
+                for key, value in stage1.items()
+                if key not in allowed
+            },
+            {
+                key: value
+                for key, value in stage2.items()
+                if key not in allowed
+            },
+        )
+        for final in (stage1, stage2):
+            self.assertEqual(final["training_task"], "multimotion_no_stairs_amp_single")
+            self.assertEqual(final["terrain_course_variants"], 6)
+            self.assertEqual(final["motion_names"], ["walk", "rough_walk", "slope_up", "slope_down"])
+            self.assertFalse(final["use_reference_velocity"])
+            self.assertEqual(final["reference_ctrl_blend"], 0.0)
+            self.assertEqual(final["terrain_types"], ["rough", "slope_up", "slope_down"])
+        self.assertTrue(stage2["resume_reset_progress"])
+        self.assertTrue(stage2["resume_reset_optimizer"])
+        for option in (
+            "--target-velocity",
+            "--reference-ctrl-blend",
+            "--terrain-course-variants",
+            "--terrain-course-random-start-prob",
+            "--motion-reset-prob",
+            "--foot-slip-penalty-coef",
+            "--num-envs",
+            "--minibatches",
+            "--amp-minibatch-size",
+        ):
+            for stage in ("stage1", "stage2"):
+                self.assertEqual(
+                    final_argvs[stage].count(option),
+                    1,
+                )
+
     def test_every_missing_task_now_has_two_stage_launchers(self) -> None:
         launchers = (
             "train_multimotion_stage1.py",
@@ -284,7 +362,7 @@ class TwoStageTrainingTaskTests(unittest.TestCase):
 
     def test_effective_parser_contract_for_every_new_two_stage_task(self) -> None:
         tasks = (
-            ("multimotion_0809_no_stairs", multimotion_args()),
+            ("multimotion_no_stairs_amp_single", multimotion_args()),
             ("stairs_up_down", stairs_args()),
         )
         for task_name, task_args in tasks:

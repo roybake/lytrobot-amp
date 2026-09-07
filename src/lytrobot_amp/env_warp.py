@@ -32,11 +32,13 @@ from .terrain import (
     course_stage_scenarios,
     load_model,
     randomized_course_orders,
+    rebase_reference_root_x_to_segment,
     sample_course_start_stages,
     serial_course_stair_cfg,
     terrain_geom_ids,
     terrain_kind_from_motion,
     terrain_spawn_offset,
+    standalone_slope_datum,
     validate_terrain_types,
 )
 
@@ -179,6 +181,10 @@ class LytRobotWarpAmpEnv:
             raise ValueError("serial terrain course requires at least one terrain type.")
         if cfg.course_lane_hold and not cfg.serial_terrain_course:
             raise ValueError("course lane hold requires a serial terrain course.")
+        if cfg.terrain_course_transition_survival_steps < 0:
+            raise ValueError("terrain transition survival steps cannot be negative.")
+        if cfg.terrain_course_transition_success_reward < 0.0:
+            raise ValueError("terrain transition success reward cannot be negative.")
         if cfg.course_lane_position_sigma <= 0.0:
             raise ValueError("course_lane_position_sigma must be positive.")
         if cfg.course_lane_velocity_sigma <= 0.0:
@@ -502,6 +508,15 @@ class LytRobotWarpAmpEnv:
         self.motion_transition_steps_left = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
+        self.transition_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.transition_pending = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.transition_source_scenario = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
         self.last_foot_pos = torch.zeros(
             (self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=torch.float32, device=self.device
         )
@@ -671,6 +686,7 @@ class LytRobotWarpAmpEnv:
             return np.asarray(getattr(self.motion, attribute))[None, ...]
 
         self.ref_root_height = tensor(packed("reference_root_height"))
+        self.ref_root_x = tensor(packed("reference_qpos")[:, :, 0])
         self.ref_root_quat = tensor(packed("reference_root_quat"))
         self.ref_root_lin_vel = tensor(packed("reference_root_lin_vel"))
         self.ref_root_ang_vel = tensor(packed("reference_root_ang_vel"))
@@ -1302,6 +1318,9 @@ class LytRobotWarpAmpEnv:
 
         if root_x is None:
             root_x = self.qpos[:, 0]
+        if self.more_terrain_cfg.standalone_field and self.more_terrain_cfg.terrain_types in {("slope_up",), ("slope_down",)}:
+            slope, intercept, _, _ = standalone_slope_datum(self.more_terrain_cfg)
+            return slope * root_x + intercept
         if not self.more_terrain_cfg.serial_course:
             return torch.zeros_like(root_x)
         if course_variants is None:
@@ -1344,11 +1363,40 @@ class LytRobotWarpAmpEnv:
         )
         return lane_ys[self.course_variant_ids]
 
+    def _terrain_scenario_ids(self) -> torch.Tensor:
+        """Return training-only terrain labels for per-terrain metrics."""
+
+        ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        names = ("flat", "rough", "slope_up", "slope_down")
+        if self.more_terrain_cfg.serial_course:
+            for index, name in enumerate(names):
+                mask_np = np.asarray(
+                    [
+                        self.course_stage_scenario_names[int(variant)][int(stage)] == name
+                        for variant, stage in zip(
+                            self.course_variant_ids.detach().cpu().numpy(),
+                            self.course_stage_ids.detach().cpu().numpy(),
+                            strict=True,
+                        )
+                    ],
+                    dtype=bool,
+                )
+                ids[torch.as_tensor(mask_np, dtype=torch.bool, device=self.device)] = index
+            return ids
+        active_kinds = np.asarray(self.motion_terrain_kinds, dtype=object)[
+            self.motion_ids.detach().cpu().numpy()
+        ]
+        values = np.zeros(self.num_envs, dtype=np.int64)
+        for index, name in enumerate(names):
+            values[active_kinds == name] = index
+        return torch.as_tensor(values, dtype=torch.long, device=self.device)
+
     def _course_reference_height_offsets(
         self,
         root_x: torch.Tensor | None = None,
         course_variants: torch.Tensor | None = None,
         motion_ids: torch.Tensor | None = None,
+        env_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the course offset in the active reference's height datum.
 
@@ -1358,6 +1406,21 @@ class LytRobotWarpAmpEnv:
         the common course platform height.
         """
 
+        if self.more_terrain_cfg.standalone_field and self.more_terrain_cfg.terrain_types in {("slope_up",), ("slope_down",)}:
+            slope, intercept, spawn_x, spawn_z = standalone_slope_datum(self.more_terrain_cfg)
+            phase = self.motion_phase if env_ids is None else self.motion_phase[env_ids]
+            low = torch.floor(phase).long() % self.motion_frame_counts[0]
+            high = (low + 1) % self.motion_frame_counts[0]
+            low = torch.where(self.motion_loop[0], low, torch.floor(phase).long().clamp(0, self.motion_frame_counts[0] - 1))
+            high = torch.where(self.motion_loop[0], high, torch.minimum(low + 1, self.motion_frame_counts[0] - 1))
+            blend = phase - torch.floor(phase)
+            ref_x = (1.0 - blend) * self.ref_root_x[0, low] + blend * self.ref_root_x[0, high]
+            progress = self._stand_start_progress(env_ids)
+            if root_x is None:
+                root_x = self.qpos[:, 0] if env_ids is None else self.qpos[env_ids, 0]
+            return (slope * (root_x - spawn_x - progress * ref_x)
+                    + progress * spawn_z
+                    + (1.0 - progress) * (slope * spawn_x + intercept))
         offsets = self._course_height_offsets(root_x, course_variants)
         if not self.more_terrain_cfg.serial_course:
             return offsets
@@ -1384,7 +1447,7 @@ class LytRobotWarpAmpEnv:
         targets["root_lin_vel"] = targets["root_lin_vel"].clone()
         targets["root_lin_vel"][:, 2] *= stair_scale
         targets = self._blend_start_targets(targets, env_ids=env_ids)
-        if self.more_terrain_cfg.serial_course:
+        if self.more_terrain_cfg.serial_course or self.more_terrain_cfg.standalone_field:
             root_x = self.qpos[:, 0] if env_ids is None else self.qpos[env_ids, 0]
             variants = (
                 self.course_variant_ids
@@ -1392,7 +1455,7 @@ class LytRobotWarpAmpEnv:
                 else self.course_variant_ids[env_ids]
             )
             targets["root_height"] = targets["root_height"] + self._course_reference_height_offsets(
-                root_x, variants, motion_ids
+                root_x, variants, motion_ids, env_ids
             )
         return targets
 
@@ -1636,13 +1699,7 @@ class LytRobotWarpAmpEnv:
             states = self.motion.sample_states(
                 len(ids_np), self.rng, motion_ids=sampled_motion_ids
             )
-            if self.cfg.serial_reference_state_init:
-                for row, motion_id in enumerate(sampled_motion_ids):
-                    # Retain the sampled gait pose/velocity/phase while
-                    # rebasing local clip travel to the course-stage entrance.
-                    motion = self.motion.motions[int(motion_id)]
-                    states.qpos[row, :2] = motion.reference_qpos[0, :2]
-            else:
+            if not self.cfg.serial_reference_state_init:
                 for row, motion_id in enumerate(sampled_motion_ids):
                     states.qpos[row] = self.motion.motions[
                         int(motion_id)
@@ -1689,6 +1746,9 @@ class LytRobotWarpAmpEnv:
         )
         self.stand_start[ids] = torch.as_tensor(use_stand_start, dtype=torch.bool, device=self.device)
         self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids_np))
+        self.transition_steps[ids] = 0
+        self.transition_pending[ids] = False
+        self.transition_source_scenario[ids] = -1
         qpos = np.repeat(self.motion.model_qpos0[None, :], len(ids_np), axis=0).astype(np.float32)
         qvel = np.zeros((len(ids_np), self.model.nv), dtype=np.float32)
         phase = np.zeros(len(ids_np), dtype=np.float32)
@@ -1702,6 +1762,7 @@ class LytRobotWarpAmpEnv:
             qpos[use_motion_reset, 2] - reset_height_anchor
         ) * reset_height_scale
         qvel[use_motion_reset, 2] *= reset_height_scale
+        local_reference_qpos = qpos.copy()
         if self.complex_terrain_enabled:
             for row, motion_id in enumerate(sampled_motion_ids):
                 if serial_course:
@@ -1732,6 +1793,32 @@ class LytRobotWarpAmpEnv:
                     ),
                 )
                 qpos[row, :3] += offset
+                if serial_course and use_motion_reset[row]:
+                    motion_reference = self.motion.motions[int(motion_id)]
+                    stage_id = int(start_stages[row])
+                    stage_end = float(
+                        self.course_stage_end_x_np[int(variants[row]), stage_id]
+                    )
+                    stage_start = (
+                        0.0
+                        if stage_id == 0
+                        else float(
+                            self.course_stage_end_x_np[int(variants[row]), stage_id - 1]
+                        )
+                    )
+                    qpos[row, 0] = rebase_reference_root_x_to_segment(
+                        local_reference_qpos[row, 0],
+                        motion_reference.reference_qpos[:, 0],
+                        stage_start,
+                        stage_end,
+                    )
+                    qpos[row, 1] = offset[1] + (
+                        local_reference_qpos[row, 1]
+                        - motion_reference.reference_qpos[0, 1]
+                    )
+                if use_stand_start[row] and self.more_terrain_cfg.standalone_field and terrain_kind in {"slope_up", "slope_down"}:
+                    slope, intercept, _, _ = standalone_slope_datum(self.more_terrain_cfg)
+                    qpos[row, 2] += slope * qpos[row, 0] + intercept - offset[2]
 
         if self.cfg.reset_noise_scale > 0.0:
             qpos[:, self.motion.robot_qpos_adrs] += self.rng.normal(
@@ -1870,7 +1957,7 @@ class LytRobotWarpAmpEnv:
     def amp_observe(self) -> torch.Tensor:
         foot_pos = self._foot_positions_local().reshape(self.num_envs, -1)
         root_height = self.qpos[:, 2]
-        if self.more_terrain_cfg.serial_course:
+        if self.more_terrain_cfg.serial_course or self.more_terrain_cfg.standalone_field:
             root_height = root_height - self._course_reference_height_offsets()
         stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
         stair_scale = self.motion_stair_height_scale[self.motion_ids]
@@ -1903,6 +1990,11 @@ class LytRobotWarpAmpEnv:
         commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
         commanded_action = commanded_action * self._startup_action_ramp()
         phase_scale = self._motion_phase_progress()
+        active_terrain_scenario = self._terrain_scenario_ids()
+        transition_entry_from = torch.full_like(active_terrain_scenario, -1)
+        transition_entry_to = torch.full_like(active_terrain_scenario, -1)
+        transition_success_from = torch.full_like(active_terrain_scenario, -1)
+        transition_success_to = torch.full_like(active_terrain_scenario, -1)
         frame_counts = self.motion_frame_counts[self.motion_ids].to(torch.float32)
         next_phase = (
             self.motion_phase
@@ -2019,6 +2111,7 @@ class LytRobotWarpAmpEnv:
             )
             motion_complete = (~looping) & (next_phase >= frame_counts - 1.0)
         targets = self._targets_at_current_phase()
+        post_transition_terrain_scenario = self._terrain_scenario_ids()
         transitioned_reference_ctrl = self._transition_reference_ctrl(
             targets["tendon_ctrl"]
         )
@@ -2137,6 +2230,83 @@ class LytRobotWarpAmpEnv:
             }
         )
         if self.more_terrain_cfg.serial_course:
+            self.transition_pending = torch.where(
+                course_stage_advance,
+                torch.ones_like(self.transition_pending),
+                self.transition_pending,
+            )
+            transition_entry_from = torch.where(
+                course_stage_advance,
+                active_terrain_scenario,
+                transition_entry_from,
+            )
+            transition_entry_to = torch.where(
+                course_stage_advance,
+                post_transition_terrain_scenario,
+                transition_entry_to,
+            )
+            self.transition_source_scenario = torch.where(
+                course_stage_advance,
+                active_terrain_scenario,
+                self.transition_source_scenario,
+            )
+            self.transition_steps = torch.where(
+                course_stage_advance,
+                torch.zeros_like(self.transition_steps),
+                self.transition_steps,
+            )
+            transition_active = self.transition_pending & ~course_stage_advance & ~dones
+            self.transition_steps = torch.where(
+                transition_active,
+                self.transition_steps + 1,
+                self.transition_steps,
+            )
+            stable_transition = (
+                (components["root_orientation"] > 0.75)
+                & (
+                    self.qvel[:, 0]
+                    > 0.50 * max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+                )
+                & (course_stage_progress > 0.05)
+            )
+            transition_success = (
+                transition_active
+                & stable_transition
+                & (
+                    self.transition_steps
+                    >= int(self.cfg.terrain_course_transition_survival_steps)
+                )
+            )
+            rewards = rewards + (
+                float(self.cfg.terrain_course_transition_success_reward)
+                * transition_success.to(torch.float32)
+            )
+            transition_success_from = torch.where(
+                transition_success,
+                self.transition_source_scenario,
+                transition_success_from,
+            )
+            transition_success_to = torch.where(
+                transition_success,
+                active_terrain_scenario,
+                transition_success_to,
+            )
+            self.transition_pending = torch.where(
+                transition_success | dones,
+                torch.zeros_like(self.transition_pending),
+                self.transition_pending,
+            )
+            self.transition_steps = torch.where(
+                transition_success | dones,
+                torch.zeros_like(self.transition_steps),
+                self.transition_steps,
+            )
+            self.transition_source_scenario = torch.where(
+                transition_success | dones,
+                torch.full_like(self.transition_source_scenario, -1),
+                self.transition_source_scenario,
+            )
+            components["transition_success"] = transition_success.to(torch.float32)
             rewards = rewards + (
                 float(self.cfg.terrain_course_completion_reward)
                 * course_suffix_complete.to(torch.float32)
@@ -2197,6 +2367,11 @@ class LytRobotWarpAmpEnv:
         info = {key: value for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.to(torch.float32)
+        info["terrain_scenario_id"] = active_terrain_scenario.to(torch.float32)
+        info["terrain_transition_from"] = transition_entry_from.to(torch.float32)
+        info["terrain_transition_to"] = transition_entry_to.to(torch.float32)
+        info["terrain_transition_success_from"] = transition_success_from.to(torch.float32)
+        info["terrain_transition_success_to"] = transition_success_to.to(torch.float32)
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.to(torch.float32)
             info["course_suffix_complete"] = course_suffix_complete.to(torch.float32)
@@ -2293,6 +2468,9 @@ class LytRobotWarpAmpEnv:
         foot_pos_error = torch.mean((foot_pos - targets["foot_pos"]).square(), dim=(1, 2))
         foot_pos_track = torch.exp(-foot_pos_error / (0.075**2))
         side_metrics = self._side_foot_tracks(foot_pos, targets["foot_pos"], targets["foot_contact"])
+        forward_step = self._forward_step_reward(
+            foot_world_vel, foot_contact, targets["foot_contact"]
+        ) * locomotion_stability
         foot_vel_track = self._swing_foot_vel_track(
             foot_vel,
             targets["foot_vel"],
@@ -2419,6 +2597,7 @@ class LytRobotWarpAmpEnv:
                 + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
                 + self.cfg.step_gap_coef * side_metrics["step_gap"]
                 + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
+                + self.cfg.forward_step_reward_coef * forward_step
                 + self.cfg.foot_vel_reward_coef * foot_vel_track
                 + self.cfg.stance_foot_reward_coef * stance_foot_track
                 - self.cfg.foot_slip_penalty_coef * foot_slip
@@ -2455,15 +2634,17 @@ class LytRobotWarpAmpEnv:
                 0.0,
                 1.0,
             )
-            stable_velocity = forward_velocity_track * upright * physical_height
-            forward_only_progress = torch.clamp(forward_progress, 0.0, 1.0)
             support = torch.any(foot_contact > 0.5, dim=1).to(torch.float32)
             reward = (
                 0.05
                 + 1.20 * upright
                 + 0.80 * physical_height
-                + self.cfg.forward_velocity_reward_coef * stable_velocity
-                + self.cfg.forward_progress_reward_coef * forward_only_progress
+                + self.cfg.forward_velocity_reward_coef
+                * forward_velocity_track
+                * upright
+                * physical_height
+                + self.cfg.forward_progress_reward_coef
+                * torch.clamp(forward_progress, 0.0, 1.0)
                 - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
                 - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
                 + self.cfg.contact_reward_coef * support
@@ -2567,6 +2748,7 @@ class LytRobotWarpAmpEnv:
             "step_gap": side_metrics["step_gap"],
             "step_gap_error": side_metrics["step_gap_error"],
             "swing_advance": side_metrics["swing_advance"],
+            "forward_step": forward_step,
             "right_swing_advance": side_metrics["right_swing_advance"],
             "left_swing_advance": side_metrics["left_swing_advance"],
             "foot_vel": foot_vel_track,
@@ -2776,6 +2958,12 @@ class LytRobotWarpAmpEnv:
             "right_swing_advance": side_swing[:, 0],
             "left_swing_advance": side_swing[:, 1],
         }
+
+    def _forward_step_reward(self, foot_world_vel, contact, reference_contact) -> torch.Tensor:
+        speed = foot_world_vel.reshape(-1, 2, 2, 3)[:, :, :, 0].mean(dim=2)
+        advance = (speed / max(2.0 * abs(self.cfg.target_velocity), 1e-6)).clamp(0.0, 1.0)
+        eligible = (1.0 - reference_contact) * (1.0 - contact) * contact.flip(dims=(1,))
+        return torch.sum(advance * eligible, dim=1)
 
     def _swing_foot_vel_track(
         self,

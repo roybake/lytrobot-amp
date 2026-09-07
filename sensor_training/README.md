@@ -58,13 +58,17 @@ uv run python sensor_training/train_multimotion_stage1.py \
 
 uv run python scripts/train_multimotion_no_stairs_stage2.py \
   --stage1-checkpoint \
-    logs/multimotion/no_stairs/stage1/<run>/model_final.pt \
+    logs/multimotion/no_stairs_amp_single/stage1/<run>/model_final.pt \
   --num-envs 4096 --max-iterations 7500
 ```
 
-`sensor_training/train_multimotion_stage1.py` 默认使用无阶梯串联路线，日志写入
-`logs/multimotion/no_stairs/stage1/`。全地形两阶段训练请使用
-`scripts/train_multimotion_stage1.py` / `scripts/train_multimotion_stage2.py`。
+`sensor_training/train_multimotion_stage1.py`、`sensor_training/train_multimotion_stage2.py`、
+`scripts/train_multimotion_no_stairs_stage1.py` 和 `scripts/train_multimotion_no_stairs_stage2.py`
+都指向唯一 canonical 任务 `multimotion_no_stairs_amp_single`，使用相同的四段参考
+动作、6 个无阶梯课程变体和 `logs/multimotion/no_stairs_amp_single/` 日志树。
+Stage 2 只改变阶段、随机化、checkpoint/reset 和训练迭代数；从 Stage 1 checkpoint
+启动时同时重置 progress 与 optimizer。AMP 判别器按 motion ID 条件化，但该条件不进入
+Student Actor。
 
 所有 Stage 1 入口关闭域随机化，所有 Stage 2 入口必须加载对应任务的 Stage 1
 checkpoint，并强制开启逐环境随机化以及定期重采样的 Warp 共享质量、惯量、摩擦和

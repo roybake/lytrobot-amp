@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.independent_terrain_task import ROOT, get_spec
+from scripts.independent_terrain_task import LOG_ROOT, ROOT, get_spec
 from scripts.two_stage_task import run_task_stage
 
 
@@ -11,5 +11,5 @@ def run(key: str, stage: str) -> None:
     run_task_stage(
         ROOT / "scripts" / f"train_{spec.key}.py",
         stage=stage,
-        log_root=ROOT / "logs" / "independent_terrain" / spec.key,
+        log_root=LOG_ROOT / spec.key,
     )

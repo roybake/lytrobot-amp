@@ -284,6 +284,18 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Dense reward paid whenever a serial-course stage is completed.",
     )
+    parser.add_argument(
+        "--terrain-course-transition-survival-steps",
+        type=int,
+        default=75,
+        help="Policy steps that must survive on a new terrain before transition reward.",
+    )
+    parser.add_argument(
+        "--terrain-course-transition-success-reward",
+        type=float,
+        default=2.0,
+        help="Delayed bonus for stable forward progress after a terrain transition.",
+    )
     parser.add_argument("--terrain-course-stage-tolerance", type=float, default=0.35)
     parser.add_argument(
         "--terrain-course-phase-sync",
@@ -543,6 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-foot-pos-coef", type=float, default=0.0)
     parser.add_argument("--step-gap-coef", type=float, default=0.0)
     parser.add_argument("--swing-advance-coef", type=float, default=0.0)
+    parser.add_argument("--forward-step-reward-coef", type=float, default=0.0)
     parser.add_argument(
         "--alternating-step-reward-coef",
         type=float,
@@ -797,7 +810,12 @@ def parse_args() -> argparse.Namespace:
         "--wandb-tags",
         default="lytrobot,bpo,amp,walk,imu,tendon,recurrent,gru,sensor-only",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.training_task == "independent_rough" and not 0.0 < args.rough_terrain_height <= 0.05:
+        parser.error("independent_rough requires 0 < --rough-terrain-height <= 0.05 m (peak-to-valley).")
+    if not np.isfinite(args.forward_step_reward_coef) or args.forward_step_reward_coef < 0.0:
+        parser.error("--forward-step-reward-coef must be finite and non-negative.")
+    return args
 
 
 def select_device(device_arg: str) -> str:
@@ -985,6 +1003,7 @@ def _setup_wandb_metrics() -> None:
         "domain_randomization_scale", "domain_randomization_scale_next",
         "dr_window_success_rate", "dr_window_depth_success_rate",
         "dr_window_termination_fraction", "dr_curriculum_decision",
+        "worst_terrain_success", "harmonic_mean_terrain_success",
         "terrain_course_random_start_probability",
         "terrain_course_random_start_target_probability",
         "checkpoint_window_iterations",
@@ -1116,6 +1135,8 @@ class BestCheckpointTracker:
         "rollout_mean_reward",
         "termination_fraction",
         "task_foot_slip",
+        "worst_terrain_success",
+        "harmonic_mean_terrain_success",
     )
 
     def __init__(
@@ -1124,9 +1145,11 @@ class BestCheckpointTracker:
         *,
         serial_course: bool,
         window_size: int,
+        independent_terrain: bool = False,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.serial_course = bool(serial_course)
+        self.independent_terrain = bool(independent_terrain)
         self.window_size = max(int(window_size), 1)
         self._window: deque[dict[str, float]] = deque(maxlen=self.window_size)
         self.best_score: tuple[float, ...] | None = None
@@ -1151,6 +1174,7 @@ class BestCheckpointTracker:
             if (
                 int(summary.get("version", -1)) != self._SUMMARY_VERSION
                 or bool(summary.get("serial_course")) != self.serial_course
+                or bool(summary.get("independent_terrain", False)) != self.independent_terrain
             ):
                 return
             score = tuple(float(value) for value in summary["score"])
@@ -1177,6 +1201,8 @@ class BestCheckpointTracker:
                 "checkpoint_score_reward_per_step": 0.0,
                 "checkpoint_score_termination": 0.0,
                 "checkpoint_score_foot_slip": 0.0,
+                "checkpoint_score_worst_terrain_success": 0.0,
+                "checkpoint_score_harmonic_terrain_success": 0.0,
                 "checkpoint_best_iteration": float(self.best_iteration),
             }
 
@@ -1207,18 +1233,34 @@ class BestCheckpointTracker:
             "checkpoint_score_reward_per_step": reward_per_step,
             "checkpoint_score_termination": mean("termination_fraction"),
             "checkpoint_score_foot_slip": mean("task_foot_slip"),
+            "checkpoint_score_worst_terrain_success": mean(
+                "worst_terrain_success"
+            ),
+            "checkpoint_score_harmonic_terrain_success": mean(
+                "harmonic_mean_terrain_success"
+            ),
             "checkpoint_best_iteration": float(self.best_iteration),
         }
 
     def score(self) -> tuple[float, ...]:
         values = self.selection_metrics()
         if not self.serial_course:
+            if self.independent_terrain:
+                return (
+                    values["checkpoint_score_worst_terrain_success"],
+                    values["checkpoint_score_full_success"],
+                    -values["checkpoint_score_termination"],
+                    -values["checkpoint_score_foot_slip"],
+                    values["checkpoint_score_reward_per_step"],
+                )
             return (
                 values["checkpoint_score_reward_per_step"],
                 -values["checkpoint_score_termination"],
                 -values["checkpoint_score_foot_slip"],
             )
         return (
+            values["checkpoint_score_worst_terrain_success"],
+            values["checkpoint_score_harmonic_terrain_success"],
             values["checkpoint_score_full_success"],
             values["checkpoint_score_suffix_completion"],
             values["checkpoint_score_stage_completion"],
@@ -1257,6 +1299,7 @@ class BestCheckpointTracker:
             "version": self._SUMMARY_VERSION,
             "iteration": int(iteration),
             "serial_course": self.serial_course,
+            "independent_terrain": self.independent_terrain,
             "window_size": self.window_size,
             "score": list(score),
             "selection_metrics": selection,
@@ -1285,20 +1328,26 @@ def adaptive_domain_randomization_step(
     backoff_success_rate: float,
     backoff_depth_success_rate: float,
     backoff_termination: float,
+    worst_terrain_success: float | None = None,
 ) -> tuple[float, int]:
     """Return next DR scale and decision (-1 backoff, 0 hold, +1 promote)."""
 
     current_scale = float(np.clip(current_scale, 0.0, 1.0))
     step = max(float(step), 0.0)
+    effective_success_rate = (
+        min(float(success_rate), float(worst_terrain_success))
+        if worst_terrain_success is not None
+        else float(success_rate)
+    )
     if (
-        success_rate >= promote_success_rate
+        effective_success_rate >= promote_success_rate
         and depth_success_rate >= promote_depth_success_rate
         and termination_fraction <= promote_max_termination
     ):
         next_scale = float(min(1.0, current_scale + step))
         return next_scale, int(next_scale > current_scale)
     if (
-        success_rate < backoff_success_rate
+        effective_success_rate < backoff_success_rate
         or depth_success_rate < backoff_depth_success_rate
         or termination_fraction > backoff_termination
     ):
@@ -1862,6 +1911,8 @@ def main() -> None:
         course_lane_termination_margin=args.course_lane_termination_margin,
         terrain_course_completion_reward=args.terrain_course_completion_reward,
         terrain_course_stage_reward=args.terrain_course_stage_reward,
+        terrain_course_transition_survival_steps=args.terrain_course_transition_survival_steps,
+        terrain_course_transition_success_reward=args.terrain_course_transition_success_reward,
         terrain_course_stage_tolerance=args.terrain_course_stage_tolerance,
         terrain_course_random_start_prob=initial_course_random_start_prob,
         terrain_course_phase_sync=bool(args.terrain_course_phase_sync),
@@ -1936,6 +1987,7 @@ def main() -> None:
         side_foot_pos_coef=args.side_foot_pos_coef,
         step_gap_coef=args.step_gap_coef,
         swing_advance_coef=args.swing_advance_coef,
+        forward_step_reward_coef=args.forward_step_reward_coef,
         alternating_step_reward_coef=args.alternating_step_reward_coef,
         stair_vertical_velocity_sigma=args.stair_vertical_velocity_sigma,
         stair_vertical_velocity_reward_coef=args.stair_vertical_velocity_reward_coef,
@@ -2189,6 +2241,7 @@ def main() -> None:
     best_checkpoint = BestCheckpointTracker(
         log_dir,
         serial_course=bool(args.serial_terrain_course),
+        independent_terrain=str(args.training_task).startswith("independent_"),
         window_size=args.best_checkpoint_window,
     )
     if best_checkpoint.best_score is not None:
@@ -2285,6 +2338,7 @@ def main() -> None:
                         backoff_success_rate=args.dr_backoff_success_rate,
                         backoff_depth_success_rate=args.dr_backoff_depth_success_rate,
                         backoff_termination=args.dr_backoff_termination,
+                        worst_terrain_success=metrics.get("worst_terrain_success"),
                     )
                     current_dr_scale = next_dr_scale
                     env.set_domain_randomization_scale(current_dr_scale)

@@ -764,8 +764,17 @@ class MotionLibrary:
         batch_size: int,
         rng: np.random.Generator,
         mirror_prob: float = 0.5,
+        motion_ids: np.ndarray | None = None,
     ) -> np.ndarray:
-        motion_ids = self.sample_motion_ids(batch_size, rng)
+        motion_ids = (
+            self.sample_motion_ids(batch_size, rng)
+            if motion_ids is None
+            else np.asarray(motion_ids, dtype=np.int32)
+        )
+        if motion_ids.shape != (batch_size,):
+            raise ValueError(
+                f"Expected motion_ids shape {(batch_size,)}, got {motion_ids.shape}."
+            )
         output = np.empty((batch_size, self.feature_dim), dtype=np.float32)
         prob = float(np.clip(mirror_prob, 0.0, 1.0))
         for row, motion_id in enumerate(motion_ids):
@@ -777,6 +786,19 @@ class MotionLibrary:
             )
             output[row] = source[frame]
         return output
+
+    def sample_features_for_motion_ids(
+        self,
+        motion_ids: np.ndarray,
+        rng: np.random.Generator,
+        mirror_prob: float = 0.5,
+    ) -> np.ndarray:
+        """Sample expert features from an explicit motion-id batch."""
+
+        ids = np.asarray(motion_ids, dtype=np.int32)
+        return self.sample_features(
+            int(ids.size), rng, mirror_prob=mirror_prob, motion_ids=ids
+        )
 
     def packed(self, attribute: str) -> np.ndarray:
         """Pad a per-frame MotionReference attribute for GPU indexed lookup."""

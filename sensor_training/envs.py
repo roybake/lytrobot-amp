@@ -191,6 +191,7 @@ class SensorHistoryEnv:
 
     @property
     def observation_metadata(self) -> dict[str, Any]:
+        motion_count = int(getattr(self.base_env, "motion_count", 1))
         return {
             "config": asdict(self.sensor_observation_cfg),
             "frame_order": "current_only",
@@ -207,6 +208,13 @@ class SensorHistoryEnv:
             "actor_uses_stacked_history": bool(self.actor_history_enabled),
             "amp_frame_dim": self.base_motion.feature_dim,
             "amp_obs_dim": self.amp_obs_dim,
+            "conditional_amp": {
+                "version": 1 if motion_count > 1 else 0,
+                "condition": "motion_id" if motion_count > 1 else None,
+                "condition_dim": motion_count if motion_count > 1 else 0,
+                "actor_input": False,
+                "training_only": True,
+            },
             "privileged_training_context": self.privileged_context_metadata,
             "estimator_training_target": self.estimator_context_metadata,
         }

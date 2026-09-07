@@ -15,6 +15,12 @@ for path in (ROOT, ROOT / "src"):
 REFERENCE_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 REFERENCE_MODEL_XML = ROOT / "robot" / "MJCFmodelposition_0806.xml"
 
+from scripts.train_multimotion_no_stairs import (
+    COURSE_RANDOM_START_RAMP_ITERATIONS,
+    COURSE_RANDOM_START_WARMUP_ITERATIONS,
+    COURSE_VARIANTS,
+)
+
 
 def _assert_reference_model_override_is_compatible(argv: list[str]) -> None:
     """Reject a model override that cannot consume the Teacher reference clips."""
@@ -144,7 +150,7 @@ def default_train_args() -> list[str]:
         "--no-serial-course-single-motion",
         "--legacy-0806-terrain-model",
         "--terrain-course-variants",
-        "2",
+        str(COURSE_VARIANTS),
         "--terrain-course-lane-spacing",
         # "3.0",  # 原始赛道中心间距；必须大于 terrain-lane-width
         "4.0",
@@ -157,16 +163,20 @@ def default_train_args() -> list[str]:
         "--terrain-course-completion-reward",
         "25.0",
         "--terrain-course-random-start-prob",
-        "0.80",
+        "0.70",
         "--terrain-course-random-start-warmup-iterations",
-        "5000",
+        str(COURSE_RANDOM_START_WARMUP_ITERATIONS),
         "--terrain-course-random-start-ramp-iterations",
-        "10000",
+        str(COURSE_RANDOM_START_RAMP_ITERATIONS),
         "--terrain-course-random-assignment",
         "--no-terrain-course-phase-sync",
         "--no-serial-reference-state-init",
         "--terrain-course-stage-reward",
-        "5.0",
+        "0.50",
+        "--terrain-course-transition-survival-steps",
+        "75",
+        "--terrain-course-transition-success-reward",
+        "2.0",
         "--terrain-course-stage-tolerance",
         "0.35",
         "--rough-terrain-height",
@@ -217,9 +227,9 @@ def default_train_args() -> list[str]:
         "--stance-foot-reward-coef",
         "1.0",
         "--foot-slip-velocity-threshold",
-        "0.04",
+        "0.08",
         "--foot-slip-penalty-coef",
-        "2.0",
+        "0.50",
         "--contact-reward-coef",
         "0.7",
         "--missed-contact-penalty-coef",

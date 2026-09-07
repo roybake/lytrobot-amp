@@ -29,12 +29,14 @@ from .terrain import (
     course_stage_scenarios,
     load_model,
     randomized_course_orders,
+    rebase_reference_root_x_to_segment,
     sample_course_start_stages,
     serial_course_stair_cfg,
     terrain_geom_ids,
     terrain_height_at,
     terrain_kind_from_motion,
     terrain_spawn_offset,
+    standalone_slope_datum,
     validate_terrain_types,
 )
 
@@ -56,6 +58,11 @@ def configure_robot_collision_profile(
     foot_names = set(CONTACT_GEOM_NAMES)
     for geom_id in range(model.ngeom):
         if model.geom_bodyid[geom_id] == 0:
+            # Static terrain/floor is the collision receiver.  It should not
+            # advertise itself as a dynamic collision partner in the feet-only
+            # profile (the foot geoms opt in through conaffinity below).
+            model.geom_contype[geom_id] = 1
+            model.geom_conaffinity[geom_id] = 0
             continue
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
         model.geom_contype[geom_id] = 0
@@ -143,6 +150,74 @@ def _stability_gated_locomotion_terms(
     progress = float(forward_progress)
     gated_progress = min(progress, 0.0) + max(progress, 0.0) * stability
     return stability, gated_track, gated_progress
+
+
+def locomotion_task_reward_contract(
+    *,
+    forward_velocity: float,
+    target_velocity: float,
+    upright: float,
+    physical_height: float,
+    support: float,
+    slip: float = 0.0,
+    action_penalty: float = 0.0,
+    action_rate_penalty: float = 0.0,
+    distal_action_penalty: float = 0.0,
+    distal_action_rate_penalty: float = 0.0,
+    forward_velocity_tracking_sigma: float = 0.35,
+    forward_velocity_reward_coef: float = 3.0,
+    forward_progress_reward_coef: float = 2.0,
+    forward_velocity_deficit_penalty_coef: float = 4.0,
+    forward_velocity_excess_penalty_coef: float = 3.0,
+    contact_reward_coef: float = 0.35,
+    foot_slip_penalty_coef: float = 0.50,
+    ctrl_penalty_coef: float = 0.040,
+    action_rate_penalty_coef: float = 0.100,
+    distal_action_penalty_coef: float = 0.030,
+    distal_action_rate_penalty_coef: float = 0.120,
+) -> float:
+    """Evaluate the anti-standing task reward using only physical terms.
+
+    This is also the executable reward contract used by ``amp_task_only``;
+    keeping it pure makes the standing-vs-target-speed invariant testable
+    without constructing a simulator or leaking reference state to Actor.
+    """
+
+    target_scale = max(abs(float(target_velocity)), 1.0e-6)
+    error = float(forward_velocity) - float(target_velocity)
+    track = float(
+        np.exp(
+            -(error**2)
+            / max(float(forward_velocity_tracking_sigma), 1.0e-6) ** 2
+        )
+    )
+    upright_value = float(np.clip(upright, 0.0, 1.0))
+    height_value = float(np.clip(physical_height, 0.0, 1.0))
+    stable_velocity = track * upright_value * height_value
+    progress = float(np.clip(forward_velocity / target_scale, -1.0, 1.0))
+    positive_progress = max(progress, 0.0)
+    deficit = float(
+        np.clip((float(target_velocity) - float(forward_velocity)) / target_scale, 0.0, 2.0)
+    )
+    excess = float(
+        np.clip((float(forward_velocity) - float(target_velocity)) / target_scale, 0.0, 2.0)
+    )
+    return float(
+        0.05
+        + 1.20 * upright_value
+        + 0.80 * height_value
+        + float(forward_velocity_reward_coef) * stable_velocity
+        + float(forward_progress_reward_coef) * positive_progress
+        - float(forward_velocity_deficit_penalty_coef) * deficit
+        - float(forward_velocity_excess_penalty_coef) * excess
+        + float(contact_reward_coef) * float(np.clip(support, 0.0, 1.0))
+        - float(foot_slip_penalty_coef) * max(float(slip), 0.0)
+        - float(ctrl_penalty_coef) * max(float(action_penalty), 0.0)
+        - float(action_rate_penalty_coef) * max(float(action_rate_penalty), 0.0)
+        - float(distal_action_penalty_coef) * max(float(distal_action_penalty), 0.0)
+        - float(distal_action_rate_penalty_coef)
+        * max(float(distal_action_rate_penalty), 0.0)
+    )
 
 
 def _forward_progress_guard(
@@ -264,6 +339,8 @@ class LytRobotEnvCfg:
     course_lane_termination_margin: float = 0.35
     terrain_course_completion_reward: float = 25.0
     terrain_course_stage_reward: float = 0.0
+    terrain_course_transition_survival_steps: int = 75
+    terrain_course_transition_success_reward: float = 2.0
     terrain_course_stage_tolerance: float = 0.35
     terrain_course_random_start_prob: float = 0.0
     # Keep finite, non-looping terrain references spatially aligned with the
@@ -347,6 +424,7 @@ class LytRobotEnvCfg:
     side_foot_pos_coef: float = 0.0
     step_gap_coef: float = 0.0
     swing_advance_coef: float = 0.0
+    forward_step_reward_coef: float = 0.0
     alternating_step_reward_coef: float = 0.0
     stair_vertical_velocity_sigma: float = 0.25
     stair_vertical_velocity_reward_coef: float = 1.0
@@ -431,6 +509,10 @@ class LytRobotAmpEnv:
             raise ValueError("serial terrain course requires at least one terrain type.")
         if cfg.course_lane_hold and not cfg.serial_terrain_course:
             raise ValueError("course lane hold requires a serial terrain course.")
+        if cfg.terrain_course_transition_survival_steps < 0:
+            raise ValueError("terrain transition survival steps cannot be negative.")
+        if cfg.terrain_course_transition_success_reward < 0.0:
+            raise ValueError("terrain transition success reward cannot be negative.")
         if cfg.course_lane_position_sigma <= 0.0:
             raise ValueError("course_lane_position_sigma must be positive.")
         if cfg.course_lane_velocity_sigma <= 0.0:
@@ -678,6 +760,11 @@ class LytRobotAmpEnv:
         )
         self.motion_transition_from_ctrl = np.zeros_like(self.last_reference_ctrl)
         self.motion_transition_steps_left = np.zeros(self.num_envs, dtype=np.int32)
+        self.transition_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.transition_pending = np.zeros(self.num_envs, dtype=bool)
+        self.transition_source_scenario = np.full(
+            self.num_envs, -1, dtype=np.int32
+        )
         self.last_foot_pos = np.zeros((self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
         self.last_foot_world_pos = np.zeros_like(self.last_foot_pos)
         self.last_foot_contact = np.zeros((self.num_envs, 2), dtype=np.float32)
@@ -780,6 +867,11 @@ class LytRobotAmpEnv:
     ) -> np.ndarray:
         """Terrain-relative root-height datum for the current root position."""
 
+        if self.more_terrain_cfg.standalone_field and self.more_terrain_cfg.terrain_types in {("slope_up",), ("slope_down",)}:
+            slope, intercept, _, _ = standalone_slope_datum(self.more_terrain_cfg)
+            if root_x is None:
+                root_x = np.asarray([data.qpos[0] for data in self.datas], dtype=np.float32)
+            return slope * np.asarray(root_x, dtype=np.float32) + intercept
         if not self.more_terrain_cfg.serial_course:
             if root_x is None:
                 return np.zeros(self.num_envs, dtype=np.float32)
@@ -802,6 +894,29 @@ class LytRobotAmpEnv:
         variant = int(self.course_variant_ids[int(env_id)])
         return float(self.more_terrain_cfg.course_lane_ys[variant])
 
+    def _terrain_scenario_ids(self) -> np.ndarray:
+        """Return training-only terrain labels for per-terrain metrics."""
+
+        names = ("flat", "rough", "slope_up", "slope_down")
+        ids = np.zeros(self.num_envs, dtype=np.int32)
+        if self.more_terrain_cfg.serial_course:
+            for index, name in enumerate(names):
+                mask = np.asarray(
+                    [
+                        self.course_stage_scenario_names[int(variant)][int(stage)] == name
+                        for variant, stage in zip(
+                            self.course_variant_ids, self.course_stage_ids, strict=True
+                        )
+                    ],
+                    dtype=bool,
+                )
+                ids[mask] = index
+            return ids
+        active_kinds = np.asarray(self.motion_terrain_kinds, dtype=object)[self.motion_ids]
+        for index, name in enumerate(names):
+            ids[active_kinds == name] = index
+        return ids
+
     def _course_reference_height_offsets(self) -> np.ndarray:
         """Return the offset expected by the active motion reference.
 
@@ -811,6 +926,21 @@ class LytRobotAmpEnv:
         only the common platform height is added at reset/target time.
         """
 
+        if self.more_terrain_cfg.standalone_field and self.more_terrain_cfg.terrain_types in {("slope_up",), ("slope_down",)}:
+            slope, intercept, spawn_x, spawn_z = standalone_slope_datum(self.more_terrain_cfg)
+            motion = self.motion.motions[0] if isinstance(self.motion, MotionLibrary) else self.motion
+            phase = self.motion_phase
+            low = np.floor(phase).astype(np.int32) % motion.frame_count
+            high = (low + 1) % motion.frame_count
+            if isinstance(self.motion, MotionLibrary) and not self.motion.motion_loop[0]:
+                low = np.clip(np.floor(phase).astype(np.int32), 0, motion.frame_count - 1)
+                high = np.minimum(low + 1, motion.frame_count - 1)
+            ref_x = motion._interp(motion.reference_qpos[:, 0], low, high, phase - np.floor(phase))
+            progress = self._stand_start_progress()
+            root_x = np.asarray([data.qpos[0] for data in self.datas])
+            return (slope * (root_x - spawn_x - progress * ref_x)
+                    + progress * spawn_z
+                    + (1.0 - progress) * (slope * spawn_x + intercept)).astype(np.float32)
         offsets = self._course_height_offsets()
         if not self.more_terrain_cfg.serial_course:
             return offsets
@@ -1033,7 +1163,7 @@ class LytRobotAmpEnv:
             foot_contact=targets.foot_contact,
         )
         targets = self._blend_start_targets(targets)
-        if not self.more_terrain_cfg.serial_course:
+        if not (self.more_terrain_cfg.serial_course or self.more_terrain_cfg.standalone_field):
             return targets
         return MotionTargets(
             root_height=(targets.root_height + self._course_reference_height_offsets()).astype(np.float32),
@@ -1375,16 +1505,7 @@ class LytRobotAmpEnv:
             states = self.motion.sample_states(
                 len(ids), self.rng, motion_ids=sampled_motion_ids
             )
-            if self.cfg.serial_reference_state_init:
-                for row, motion_id in enumerate(sampled_motion_ids):
-                    # MotionReference root X/Y is local clip travel.  Preserve
-                    # the sampled gait pose, velocity and phase, but let the
-                    # terrain spawn offset place it at the physical stage
-                    # entrance.  This keeps full-route success honest instead
-                    # of moving a reset several metres down the course.
-                    motion = self.motion.motions[int(motion_id)]
-                    states.qpos[row, :2] = motion.reference_qpos[0, :2]
-            else:
+            if not self.cfg.serial_reference_state_init:
                 for row, motion_id in enumerate(sampled_motion_ids):
                     states.qpos[row] = self.motion.motions[
                         int(motion_id)
@@ -1418,6 +1539,9 @@ class LytRobotAmpEnv:
         self._sample_domain_randomization(ids)
         self.stand_start[ids] = use_stand_start
         self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids))
+        self.transition_steps[ids] = 0
+        self.transition_pending[ids] = False
+        self.transition_source_scenario[ids] = -1
         for row, env_id in enumerate(ids):
             self._apply_model_randomization(int(env_id))
             data = self.datas[int(env_id)]
@@ -1436,6 +1560,7 @@ class LytRobotAmpEnv:
                 qvel = np.zeros(self.model.nv, dtype=np.float32)
                 phase = 0.0
 
+            local_reference_qpos = qpos.copy()
             if use_motion_reset[row]:
                 motion_id = int(sampled_motion_ids[row])
                 height_anchor = self.motion_stair_height_anchor[motion_id]
@@ -1472,6 +1597,34 @@ class LytRobotAmpEnv:
                     ),
                 )
                 qpos[:3] += offset
+                if serial_course and use_motion_reset[row]:
+                    motion_reference = self.motion.motions[int(sampled_motion_ids[row])]
+                    stage_id = int(start_stages[row])
+                    stage_end = float(
+                        self.course_stage_end_x[int(variants[row]), stage_id]
+                    )
+                    stage_start = (
+                        0.0
+                        if stage_id == 0
+                        else float(
+                            self.course_stage_end_x[int(variants[row]), stage_id - 1]
+                        )
+                    )
+                    # Keep sampled phase progress, but place it inside the
+                    # physical segment. Do not carry the clip's original X
+                    # coordinate into a new terrain lane.
+                    qpos[0] = rebase_reference_root_x_to_segment(
+                        local_reference_qpos[0],
+                        motion_reference.reference_qpos[:, 0],
+                        stage_start,
+                        stage_end,
+                    )
+                    qpos[1] = offset[1] + (
+                        local_reference_qpos[1] - motion_reference.reference_qpos[0, 1]
+                    )
+                if use_stand_start[row] and self.more_terrain_cfg.standalone_field and terrain_kind in {"slope_up", "slope_down"}:
+                    slope, intercept, _, _ = standalone_slope_datum(self.more_terrain_cfg)
+                    qpos[2] += slope * qpos[0] + intercept - offset[2]
 
             if self.cfg.reset_noise_scale > 0.0:
                 qpos[self.motion.robot_qpos_adrs] += self.rng.normal(
@@ -1628,7 +1781,7 @@ class LytRobotAmpEnv:
         qvel = np.stack([np.asarray(data.qvel, dtype=np.float32) for data in self.datas], axis=0)
         foot_pos = np.stack([self._foot_positions_local(data) for data in self.datas], axis=0)
         qpos = qpos.copy()
-        if self.more_terrain_cfg.serial_course:
+        if self.more_terrain_cfg.serial_course or self.more_terrain_cfg.standalone_field:
             qpos[:, 2] -= self._course_reference_height_offsets()
         stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
         stair_scale = self.motion_stair_height_scale[self.motion_ids]
@@ -1688,6 +1841,7 @@ class LytRobotAmpEnv:
             "distal_action_rate": [],
         }
         phase_scale = self._motion_phase_progress()
+        active_terrain_scenario = self._terrain_scenario_ids()
         course_complete = np.zeros(self.num_envs, dtype=bool)
         course_suffix_complete = np.zeros(self.num_envs, dtype=bool)
         course_stage_advance = np.zeros(self.num_envs, dtype=bool)
@@ -1792,6 +1946,11 @@ class LytRobotAmpEnv:
             ) % self.motion.frame_count
             motion_complete = np.zeros(self.num_envs, dtype=bool)
         reference_targets = self._targets_at_current_phase()
+        post_transition_terrain_scenario = self._terrain_scenario_ids()
+        transition_entry_from = np.full(self.num_envs, -1, dtype=np.int32)
+        transition_entry_to = np.full(self.num_envs, -1, dtype=np.int32)
+        transition_success_from = np.full(self.num_envs, -1, dtype=np.int32)
+        transition_success_to = np.full(self.num_envs, -1, dtype=np.int32)
 
         for env_id, data in enumerate(self.datas):
             self._apply_model_randomization(env_id)
@@ -1898,6 +2057,38 @@ class LytRobotAmpEnv:
             )
             incomplete_motion_end_flags[env_id] = incomplete_motion_end
             reward_parts["incomplete_motion_end"] = float(incomplete_motion_end)
+            transition_success = False
+            if self.more_terrain_cfg.serial_course:
+                if course_stage_advance[env_id]:
+                    self.transition_pending[env_id] = True
+                    self.transition_steps[env_id] = 0
+                    self.transition_source_scenario[env_id] = active_terrain_scenario[env_id]
+                    transition_entry_from[env_id] = active_terrain_scenario[env_id]
+                    transition_entry_to[env_id] = post_transition_terrain_scenario[env_id]
+                elif self.transition_pending[env_id] and not done:
+                    self.transition_steps[env_id] += 1
+                    stable = (
+                        float(reward_parts.get("root_orientation", 0.0)) > 0.75
+                        and float(data.qvel[0])
+                        > 0.50 * max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+                        and float(course_stage_progress[env_id]) > 0.05
+                    )
+                    if (
+                        stable
+                        and self.transition_steps[env_id]
+                        >= int(self.cfg.terrain_course_transition_survival_steps)
+                    ):
+                        reward += float(self.cfg.terrain_course_transition_success_reward)
+                        transition_success = True
+                        transition_success_from[env_id] = self.transition_source_scenario[env_id]
+                        transition_success_to[env_id] = active_terrain_scenario[env_id]
+                        self.transition_pending[env_id] = False
+                        self.transition_steps[env_id] = 0
+                if done:
+                    self.transition_pending[env_id] = False
+                    self.transition_steps[env_id] = 0
+                    self.transition_source_scenario[env_id] = -1
+            reward_parts["transition_success"] = float(transition_success)
             dones[env_id] = done or successful_motion_end or incomplete_motion_end
             time_outs[env_id] = timed_out or successful_motion_end
             episode_steps[env_id] = self.episode_step[env_id]
@@ -1949,6 +2140,11 @@ class LytRobotAmpEnv:
         info = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.astype(np.float32)
+        info["terrain_scenario_id"] = active_terrain_scenario.astype(np.float32)
+        info["terrain_transition_from"] = transition_entry_from.astype(np.float32)
+        info["terrain_transition_to"] = transition_entry_to.astype(np.float32)
+        info["terrain_transition_success_from"] = transition_success_from.astype(np.float32)
+        info["terrain_transition_success_to"] = transition_success_to.astype(np.float32)
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.astype(np.float32)
             info["course_suffix_complete"] = course_suffix_complete.astype(np.float32)
@@ -2066,6 +2262,9 @@ class LytRobotAmpEnv:
             reference_targets.foot_pos[env_id],
             reference_targets.foot_contact[env_id],
         )
+        forward_step = self._forward_step_reward(
+            foot_world_vel, foot_contact, reference_targets.foot_contact[env_id]
+        ) * locomotion_stability
         foot_vel_track = self._swing_foot_vel_track(
             foot_vel,
             reference_targets.foot_vel[env_id],
@@ -2200,6 +2399,7 @@ class LytRobotAmpEnv:
                 + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
                 + self.cfg.step_gap_coef * side_metrics["step_gap"]
                 + self.cfg.swing_advance_coef * side_metrics["swing_advance"]
+                + self.cfg.forward_step_reward_coef * forward_step
                 + self.cfg.foot_vel_reward_coef * foot_vel_track
                 + self.cfg.stance_foot_reward_coef * stance_foot_track
                 - self.cfg.foot_slip_penalty_coef * foot_slip
@@ -2247,22 +2447,29 @@ class LytRobotAmpEnv:
             stable_velocity = forward_velocity_track * upright * physical_height
             forward_only_progress = float(np.clip(forward_progress, 0.0, 1.0))
             support = float(np.any(foot_contact > 0.5))
-            reward = (
-                0.05
-                + 1.20 * upright
-                + 0.80 * physical_height
-                + self.cfg.forward_velocity_reward_coef * stable_velocity
-                + self.cfg.forward_progress_reward_coef * forward_only_progress
-                - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
-                - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
-                + self.cfg.contact_reward_coef * support
-                + self.cfg.alternating_step_reward_coef * alternating_step
-                - self.cfg.foot_slip_penalty_coef * foot_slip
-                - self.cfg.ctrl_penalty_coef * ctrl_penalty
-                - self.cfg.action_rate_penalty_coef * action_rate
-                - self.cfg.distal_action_penalty_coef * distal_action
-                - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
-            )
+            reward = locomotion_task_reward_contract(
+                forward_velocity=forward_velocity,
+                target_velocity=target_forward_velocity,
+                upright=upright,
+                physical_height=physical_height,
+                support=support,
+                slip=foot_slip,
+                action_penalty=ctrl_penalty,
+                action_rate_penalty=action_rate,
+                distal_action_penalty=distal_action,
+                distal_action_rate_penalty=distal_action_rate,
+                forward_velocity_tracking_sigma=self.cfg.forward_velocity_tracking_sigma,
+                forward_velocity_reward_coef=self.cfg.forward_velocity_reward_coef,
+                forward_progress_reward_coef=self.cfg.forward_progress_reward_coef,
+                forward_velocity_deficit_penalty_coef=self.cfg.forward_velocity_deficit_penalty_coef,
+                forward_velocity_excess_penalty_coef=self.cfg.forward_velocity_excess_penalty_coef,
+                contact_reward_coef=self.cfg.contact_reward_coef,
+                foot_slip_penalty_coef=self.cfg.foot_slip_penalty_coef,
+                ctrl_penalty_coef=self.cfg.ctrl_penalty_coef,
+                action_rate_penalty_coef=self.cfg.action_rate_penalty_coef,
+                distal_action_penalty_coef=self.cfg.distal_action_penalty_coef,
+                distal_action_rate_penalty_coef=self.cfg.distal_action_rate_penalty_coef,
+            ) + self.cfg.alternating_step_reward_coef * alternating_step
 
         reward += (
             self.cfg.course_lane_position_reward_coef * course_lane_position_track
@@ -2353,6 +2560,7 @@ class LytRobotAmpEnv:
             "step_gap": side_metrics["step_gap"],
             "step_gap_error": side_metrics["step_gap_error"],
             "swing_advance": side_metrics["swing_advance"],
+            "forward_step": forward_step,
             "right_swing_advance": side_metrics["right_swing_advance"],
             "left_swing_advance": side_metrics["left_swing_advance"],
             "foot_vel": foot_vel_track,
@@ -2539,6 +2747,15 @@ class LytRobotAmpEnv:
             "right_swing_advance": float(side_swing[0]),
             "left_swing_advance": float(side_swing[1]),
         }
+
+    def _forward_step_reward(self, foot_world_vel, contact, reference_contact) -> float:
+        """Reward a supported, airborne forward swing; standing/sliding earns zero."""
+        speed = np.asarray(foot_world_vel).reshape(2, 2, 3)[:, :, 0].mean(axis=1)
+        # A swing travels about twice the pelvis speed. Saturation prevents
+        # rewarding arbitrarily fast kicks; the reference terms bound pose.
+        advance = np.clip(speed / max(2.0 * abs(self.cfg.target_velocity), 1e-6), 0.0, 1.0)
+        eligible = (1.0 - np.asarray(reference_contact)) * (1.0 - contact) * contact[::-1]
+        return float(np.sum(advance * eligible))
 
     def _swing_foot_vel_track(
         self,

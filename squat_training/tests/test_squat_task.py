@@ -135,7 +135,7 @@ class SquatTaskTests(unittest.TestCase):
             self.assertEqual(env.sensor_frame_dim, 56)
             self.assertEqual(env.sensor_history_obs_dim, 336)
             self.assertEqual(env.obs_dim, 56)
-            self.assertEqual(env.amp_obs_dim, 270)
+            self.assertEqual(env.amp_obs_dim, 306)
             self.assertEqual(observation.shape, (1, 56))
             self.assertEqual(env.observation_metadata["command_dim"], 0)
             self.assertEqual(env.observation_metadata["command_fields"], ())

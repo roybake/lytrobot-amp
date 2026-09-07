@@ -122,6 +122,21 @@ class SensorObservationTests(unittest.TestCase):
         self.assertTrue(np.all(features[0::2] < 100.0))
         self.assertTrue(np.all(features[1::2] >= 100.0))
 
+    def test_amp_reference_sampling_accepts_explicit_motion_ids(self) -> None:
+        motion = HistoryMotionReference(
+            _FakeMotionLibrary(),
+            frame_count=6,
+            policy_dt=0.02,
+        )
+        ids = np.asarray([1, 0, 1, 0], dtype=np.int32)
+        features = motion.sample_features_for_motion_ids(
+            ids,
+            _FixedRng(),
+            mirror_prob=0.0,
+        )
+        self.assertTrue(np.all(features[ids == 0] < 100.0))
+        self.assertTrue(np.all(features[ids == 1] >= 100.0))
+
     def test_actor_observation_contains_only_current_imu_and_tendon_frame(self) -> None:
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(

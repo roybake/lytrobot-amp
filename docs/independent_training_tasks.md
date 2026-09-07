@@ -7,6 +7,48 @@
 
 ## 四个独立地形任务
 
+2026-09-07 修订（v4）：独立四地形任务统一采用固定目标速度 `0.862295 m/s`、
+`sigma=0.35`、前向速度/进度系数 `3.0/2.0`、缺速/超速惩罚 `4.0/3.0`，
+`task_reward_lerp=0.75`，AMP 系数 `1.5`。任务奖励使用物理可观测的 anti-collapse
+合约，禁止 reference control 混入 Student；`amp_task_only` 保留为训练入口标记。
+足滑阈值/系数为 `0.08/0.50`，`motion_reset_prob=0.50`，`stand_start_prob=0.0`。
+保留 `forward_step_reward_coef=1.0`：仅在
+参考摆动侧实际离地、另一侧接触地面且摆动脚向前运动时奖励，并乘以躯干稳定度。
+两脚拖地、原地站立、腾空和反向摆动不获得这项奖励；CPU 测试与 Warp 训练使用
+相同公式。原有姿态跟踪、前进速度、停滞终止和足滑惩罚继续启用。
+
+粗糙路面使用原高度图，**最高点与最低点的总高差不超过 0.05 m**，不是正负各
+0.05 m。独立 rough 入口拒绝超过该幅值的命令行参数。铺设保持重定向使用的
+5 m × 2 m 尺度，并在原始 `(2, 6)` 中心对齐；旧场地的 3 m 横向缩放与平移
+会改变脚下地形。测试从 checkpoint 恢复这些几何参数；独立任务默认也恢复训练
+的 2000 步回合长度，静止起步验收默认仍为 100%，训练静止起步比例为 50%。
+
+只读参考检查：`PYTHONPATH=.:src uv run python scripts/audit_independent_references.py`。
+检查覆盖实际碰撞、接触标签、步距、支撑脚滑移、循环接缝，以及平移 3/9 米后的
+地形适配。详见 [本次检查结果](independent_walking_audit_20260907.md)。粗糙参考现已
+另存修复版本 `robot/reference_data/multimotion/independent_collision_v1/rough_walk_omniretarget.npz`，
+独立 rough 训练默认使用该文件。它将五个步态周期对应到高度图的 5 m 空间周期，
+使用训练碰撞几何修正根部净空，并重新计算速度；其余三种地形继续使用原参考。
+四种地形在本次采样检查中均无穿透，但不能代替新策略训练与多 seed 回放。
+现有动作及 checkpoint 均未覆盖。
+
+2026-09-05 的初始化修订继续保留；新实验默认写入 `logs/independent_terrain_v3/`，任务 ID 和传感器
+Actor 输入维度不变。建议 Stage 1 从头训练；旧失败策略的续训不能验证新初始化分布。
+原有日志、模型和动作文件保持不变。上下坡高度目标和 AMP 高度现在按当前位置与
+参考相位位置之间的坡面高差校正，避免循环片段结束后高度基准跳回原点。
+独立任务的 `model_best` 优先比较完成率，再比较终止率、足滑和奖励；这仍是训练
+分布上的指标，不能代替从静止起步的确定性回放验收。
+
+当前可读历史日志只有两次平地训练：旧任务末轮平均速度约 0.844 m/s、完成率 94.3%，
+补充静止起步后的续训约 0.803 m/s、完成率 80.4%。这些统计混合了参考状态起步、
+静止起步及随机动作，不能证明部署能稳定行走。代码回归覆盖坡面前移后的高度目标、
+AMP 一致性和下坡静止出生；尚未通过新训练证明四种地形均能稳定行走。
+
+验收时四个任务分别测试 Stage 1/2，并使用多个固定 seed 从静止起步，以 2000 控制步
+（默认 20 秒）为一回合；同时记录净前进距离、跌倒/停滞、横向偏移和足滑。可先以
+至少 20 个 seed 中 90% 走完且净前进不少于 10 米作为实验门槛，再检查录像步态质量。
+这只是建议验收标准，并非已取得的结果。
+
 下面四个入口是真正的单地形任务，不是串联课程的不同日志别名。每个任务只加载一段
 对应的 terrain-aligned 参考动作，Actor 仍严格只接收 IMU 和肌腱长度；Stage 1 关闭域
 随机化，Stage 2 从 Stage 1 checkpoint 开始并开启域随机化。非串联模式的独立上坡/下坡
@@ -15,73 +57,82 @@
 用连续斜面覆盖同一区域，平地使用原有无限平面。原始地形文件以只读方式复用，不会被
 移动、覆盖或修改。
 
+四个地形的训练 reset 默认关闭站立起步，使用 50% reference-state reset；部署验收
+仍应额外覆盖自然站立起步。这样可以先消除静止吸引子，再单独验证部署起步鲁棒性。
+上下坡静止起步按出生位置的真实坡面高度放置，再进行碰撞穿透校正。停滞检查在
+400 步后开始计时，晚于默认最长 370 步的站立到行走过渡，首个检查窗口结束于 500 步。
+
+任务奖励同时保留参考姿态、关节速度、足端轨迹、接触和对称性跟踪，AMP 作为额外的
+整体动作风格约束；不再使用只含速度、直立和支撑目标的 `amp_task_only` 奖励。这样可
+避免策略以锁膝、大跨步和持续倾斜的方式投机满足前向速度目标。
+
 ```bash
 # 平地训练（Stage 1，无随机化）
 uv run python scripts/train_flat_stage1.py
 # 平地训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_flat_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain_v3/flat/stage1/<run>/model_best.pt
 
 # 平地测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/flat/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 平地测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/flat/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/flat/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 不平路面训练（Stage 1，无随机化）
 uv run python scripts/train_rough_stage1.py
 # 不平路面训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_rough_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain_v3/rough/stage1/<run>/model_best.pt
 
 # 不平路面测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/rough/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 不平路面测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/rough/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/rough/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 上坡训练（Stage 1，无随机化）
 uv run python scripts/train_slope_up_stage1.py
 # 上坡训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_slope_up_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain_v3/slope_up/stage1/<run>/model_best.pt
 
 # 上坡测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/slope_up/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 上坡测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/slope_up/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/slope_up/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 下坡训练（Stage 1，无随机化）
 uv run python scripts/train_slope_down_stage1.py
 # 下坡训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_slope_down_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain_v3/slope_down/stage1/<run>/model_best.pt
 
 # 下坡测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/slope_down/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 下坡测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain/slope_down/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain_v3/slope_down/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 ```
 
 上面命令中的 `<run>` 要替换成实际运行目录名。如果只生成了最新 checkpoint，
 可以把测试命令里的 `model_best.pt` 换成同目录的 `model_final.pt`。
 测试命令默认会录屏；录像保持与仿真控制步一致的 1 倍时间速度，并统一保存到各自地形的
-`logs/independent_terrain/<地形>/recording/`，例如下坡为
-`logs/independent_terrain/slope_down/recording/`。如只想看画面、不保存录像，可追加
+`logs/independent_terrain_v3/<地形>/recording/`，例如下坡为
+`logs/independent_terrain_v3/slope_down/recording/`。如只想看画面、不保存录像，可追加
 `--no-record`。
 
 代码接口快速测试（不启动训练）：
@@ -115,8 +166,8 @@ privileged Teacher 时，才建议为单个任务增加蒸馏对照实验。蒸�
 
 ## 去掉阶梯的多动作训练
 
-该入口继续复用普通行走 `scripts/train_stage1.py` / `scripts/train_stage2.py` 的传感器
-Actor、奖励主体、PPO/AMP 默认值和两阶段规则，同时保留原来的无阶梯串联课程。
+该入口使用唯一 canonical `multimotion_no_stairs_amp_single` 传感器 Actor、奖励主体、
+PPO/AMP 默认值和两阶段规则，同时保留无阶梯串联课程。
 每条路线恰好包含一次 `flat`、`rough` 和相邻的 `slope_up → slope_down`，三个地形块共有
 6 种唯一排列；训练 episode 随机分配路线，测试启动时也用新 seed 随机生成路线。
 Actor 仍看不到地形顺序，只能依靠 IMU 和肌腱长度适应地形。
@@ -127,18 +178,19 @@ uv run python scripts/train_multimotion_no_stairs_stage1.py \
 
 uv run python scripts/train_multimotion_no_stairs_stage2.py \
   --stage1-checkpoint \
-    logs/multimotion/no_stairs/stage1/<run>/model_best.pt \
+    logs/multimotion/no_stairs_amp_single/stage1/<run>/model_best.pt \
   --num-envs 4096 --max-iterations 7500
 ```
 
-Stage 1 和 Stage 2 的领域随机化、恢复优化器及训练轮数规则与普通行走入口一致。
-当前课程不把机械能计入奖励；功率和机械能指标仍正常记录，仅用于离线分析。奖励优先推动持续前进，同时保留足滑惩罚。
-训练前 18000 轮全部从入口开始，先学会持续前进；随后用 8000 轮把随机后续阶段
-reset 概率缓慢提高到 25%，为后段地形补充直接样本，同时至少保留 75% 的完整路线
-episode，避免后段 reset 淹没入口行走并导致遗忘。完整路线成功率仍只统计入口起步的
-episode。测试始终从路线入口开始。输出分别写入
-`logs/multimotion/no_stairs/stage1/<timestamp>/` 和
-`logs/multimotion/no_stairs/stage2/<timestamp>/`。
+Stage 1 关闭 DR；Stage 2 从 Stage 1 checkpoint 加载权重并默认追加
+`--resume-reset-progress --resume-reset-optimizer`，再开启 adaptive DR。当前课程不把
+机械能计入奖励；功率和机械能指标仍正常记录，仅用于离线分析。随机起始概率前 750
+轮 warmup，随后 4000 轮 ramp 到 0.70；完整路线 success 只统计 `start_stage==0`。
+跨地形即时奖励为 `0.50`，进入新 terrain 后连续生存 75 个 policy step 且保持前进
+才支付 `2.0` delayed transition bonus。AMP 训练按 motion ID 对齐 expert，condition
+只进入 discriminator，不进入 Student Actor。输出分别写入
+`logs/multimotion/no_stairs_amp_single/stage1/<timestamp>/` 和
+`logs/multimotion/no_stairs_amp_single/stage2/<timestamp>/`。
 
 ## 独立上下楼梯训练
 

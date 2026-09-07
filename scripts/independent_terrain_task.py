@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 MODEL_XML = ROOT / "robot" / "MJCFmodelposition.xml"
 TERRAIN_ASSET_DIR = ROOT / "robot" / "terrains" / "more_discolrl"
+LOG_ROOT = ROOT / "logs" / "independent_terrain_v3"
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class IndependentTerrainSpec:
     terrain_type: str
     motion_loop: bool
     episode_steps: int
+    stand_start_prob: float
 
 
 INDEPENDENT_TERRAIN_SPECS = {
@@ -34,15 +36,17 @@ INDEPENDENT_TERRAIN_SPECS = {
         terrain_type="flat",
         motion_loop=True,
         episode_steps=2000,
+        stand_start_prob=0.0,
     ),
     "rough": IndependentTerrainSpec(
         key="rough",
         task_name="independent_rough",
         motion_name="rough_walk",
-        motion_filename="rough_walk_omniretarget.npz",
+        motion_filename="independent_collision_v1/rough_walk_omniretarget.npz",
         terrain_type="rough",
         motion_loop=True,
         episode_steps=2000,
+        stand_start_prob=0.0,
     ),
     "slope_up": IndependentTerrainSpec(
         key="slope_up",
@@ -52,6 +56,7 @@ INDEPENDENT_TERRAIN_SPECS = {
         terrain_type="slope_up",
         motion_loop=True,
         episode_steps=2000,
+        stand_start_prob=0.0,
     ),
     "slope_down": IndependentTerrainSpec(
         key="slope_down",
@@ -61,6 +66,7 @@ INDEPENDENT_TERRAIN_SPECS = {
         terrain_type="slope_down",
         motion_loop=True,
         episode_steps=2000,
+        stand_start_prob=0.0,
     ),
 }
 
@@ -107,28 +113,50 @@ def default_train_args(key: str) -> list[str]:
         "--standalone-terrain-field",
         "--amp",
         "--amp-task-only",
-        # Keep the physical objective visible while AMP supplies the gait
-        # style.  This prevents an in-place leg swing from being optimal.
+        "--rough-terrain-height",
+        "0.05",
+        "--side-foot-pos-coef",
+        "0.50",
+        "--step-gap-coef",
+        "0.50",
+        "--swing-advance-coef",
+        "0.75",
+        "--symmetry-reward-coef",
+        "0.50",
+        "--forward-step-reward-coef",
+        "1.0",
+        # Preserve the retargeting heightfield's 5 x 2 m scale and origin.
+        # The old grid started at (-2, -10) with 3 m wide tiles, changing
+        # both the terrain under the reference and its lateral scale.
+        "--standalone-field-x-min",
+        "-5.5",
+        "--standalone-field-y-min",
+        "-11.0",
+        "--standalone-field-tile-width",
+        "2.0",
+        # Keep explicit reference pose, joint-velocity, foot-trajectory, and
+        # symmetry terms in the task reward. AMP alone did not prevent a
+        # straight-knee, long-stride velocity exploit in deployment playback.
         "--target-velocity",
         "0.862295",
         "--forward-velocity-tracking-sigma",
-        "0.20",
+        "0.35",
         "--forward-velocity-reward-coef",
-        "2.0",
+        "3.0",
         "--forward-progress-reward-coef",
-        "1.0",
+        "2.0",
         "--forward-velocity-deficit-penalty-coef",
-        "1.5",
+        "4.0",
         "--forward-velocity-excess-penalty-coef",
         "3.0",
         "--min-forward-progress-speed",
         "0.10",
         "--forward-progress-grace-steps",
-        "100",
+        "400",
         "--forward-progress-window-steps",
         "100",
         "--forward-progress-termination-penalty",
-        "2.0",
+        "4.0",
         "--fall-penalty",
         "10.0",
         "--terrain-penetration-tolerance",
@@ -136,23 +164,22 @@ def default_train_args(key: str) -> list[str]:
         "--terrain-penetration-penalty-coef",
         "20.0",
         "--foot-slip-velocity-threshold",
-        "0.04",
+        "0.08",
         "--foot-slip-penalty-coef",
-        "2.0",
+        "0.50",
         "--contact-reward-coef",
         "0.70",
         "--missed-contact-penalty-coef",
         "0.80",
         "--task-reward-lerp",
-        "0.50",
+        "0.75",
         "--amp-reward-coef",
-        "3.0",
+        "1.5",
         "--min-action-std",
         "0.05",
         "--motion-reset-prob",
-        "1.0",
-        # The downhill reference begins at the high end of its ramp; avoid a
-        # flat-ground stand reset that would start below the reference.
+        "0.50",
+        # All terrain starts are height-aligned, including downhill.
         "--stand-start-prob",
         "0.0",
         "--startup-action-ramp-steps",
@@ -184,7 +211,7 @@ def default_train_args(key: str) -> list[str]:
         "--save-interval",
         "500",
         "--log-root",
-        str(ROOT / "logs" / "independent_terrain" / spec.key),
+        str(LOG_ROOT / spec.key),
         "--log-group",
         spec.task_name,
         "--wandb-tags",

@@ -1266,6 +1266,18 @@ def course_terrain_reference_height_at(
     return result.astype(np.float32)
 
 
+def standalone_slope_datum(cfg: MoreTerrainCfg) -> tuple[float, float, float, float]:
+    """Return slope, world-Z intercept and calibrated reference spawn X/Z."""
+    kind = cfg.terrain_types[0]
+    slope = float(np.tan(np.deg2rad(cfg.slope_angle_deg)))
+    start = cfg.slope_center_x - cfg.slope_half_length
+    if kind == "slope_up":
+        return slope, cfg.slope_base_height - slope * start, cfg.standalone_slope_up_spawn_x, cfg.standalone_slope_up_spawn_z
+    if kind == "slope_down":
+        return -slope, cfg.slope_base_height + slope * (start + 2 * cfg.slope_half_length), cfg.standalone_slope_down_spawn_x, cfg.standalone_slope_down_spawn_z
+    raise ValueError(f"Expected an independent slope, got {kind!r}")
+
+
 def terrain_spawn_offset(
     kind: str,
     more: MoreTerrainCfg,
@@ -1406,6 +1418,41 @@ def terrain_spawn_offset(
     if kind == "flat":
         return np.asarray([0.0, more.flat_lane_y, 0.0], dtype=np.float32)
     raise ValueError(f"Unknown terrain kind: {kind!r}.")
+
+
+def rebase_reference_root_x_to_segment(
+    sampled_x: float,
+    reference_x: np.ndarray,
+    segment_start_x: float,
+    segment_end_x: float,
+    *,
+    margin: float = TERRAIN_REFERENCE_ROOT_MARGIN,
+) -> float:
+    """Map a sampled clip phase into the legal world-X interval of a segment.
+
+    A non-zero-stage reset must preserve phase progress without carrying the
+    clip's original world coordinate into a different terrain segment. The
+    mapping is monotone, bounded by the segment, and shared by CPU and Warp
+    reset paths (both perform reset-state assembly from NumPy before stepping).
+    """
+
+    values = np.asarray(reference_x, dtype=np.float32).reshape(-1)
+    if values.size < 2:
+        progress = 0.0
+    else:
+        first = float(values[0])
+        last = float(values[-1])
+        span = last - first
+        progress = 0.0 if abs(span) <= 1.0e-6 else (float(sampled_x) - first) / span
+    progress = float(np.clip(progress, 0.0, 1.0))
+    start = float(segment_start_x)
+    end = float(segment_end_x)
+    if end < start:
+        raise ValueError(f"segment end {end} precedes start {start}.")
+    usable_margin = min(max(float(margin), 0.0), 0.5 * max(end - start, 0.0))
+    low = start + usable_margin
+    high = end - usable_margin
+    return float(np.clip(low + progress * max(high - low, 0.0), low, high))
 
 
 def validate_terrain_types(values: Sequence[str]) -> tuple[str, ...]:

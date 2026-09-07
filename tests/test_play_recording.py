@@ -13,6 +13,7 @@ from scripts.play import (
     best_checkpoint_quality_warning,
     checkpoint_playback_contract_warning,
     checkpoint_recording_path,
+    checkpoint_start_state_warning,
     infer_stage,
     make_env_cfg,
     parse_args,
@@ -527,6 +528,25 @@ def test_playback_rejects_incompatible_recurrent_checkpoint() -> None:
                 }
             }
         )
+
+
+def test_playback_warns_when_checkpoint_never_trained_stationary_start() -> None:
+    warning = checkpoint_start_state_warning(
+        {"env_config": {"stand_start_prob": 0.0}},
+        SimpleNamespace(stand_start_prob=1.0),
+    )
+
+    assert warning is not None
+    assert "never exposed to the stationary deployment start" in warning
+
+
+def test_playback_start_warning_respects_reference_state_diagnostic() -> None:
+    warning = checkpoint_start_state_warning(
+        {"env_config": {"stand_start_prob": 0.0}},
+        SimpleNamespace(stand_start_prob=0.0),
+    )
+
+    assert warning is None
 
 
 def test_recording_frame_scheduler_preserves_one_second_duration_at_100hz() -> None:

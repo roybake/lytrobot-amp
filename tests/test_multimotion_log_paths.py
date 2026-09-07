@@ -30,8 +30,8 @@ class MultimotionLogPathTests(unittest.TestCase):
     def test_multimotion_defaults_use_group_and_no_fixed_run_name(self) -> None:
         args = default_train_args()
 
-        group_index = args.index("--log-group")
-        self.assertEqual(args[group_index + 1], "multimotion_0809_no_stairs")
+        self.assertNotIn("--log-group", args)
+        self.assertIn("no_stairs_amp_single", args[args.index("--log-root") + 1])
         self.assertNotIn("--run-name", args)
 
     def test_multimotion_defaults_reward_forward_course_progress(self) -> None:
@@ -48,10 +48,10 @@ class MultimotionLogPathTests(unittest.TestCase):
         )
         self.assertGreater(value("--forward-progress-reward-coef"), 0.0)
         self.assertGreater(value("--forward-velocity-deficit-penalty-coef"), 0.0)
-        self.assertLessEqual(value("--forward-velocity-tracking-sigma"), 0.20)
-        self.assertGreater(
-            value("--forward-velocity-excess-penalty-coef"),
+        self.assertAlmostEqual(value("--forward-velocity-tracking-sigma"), 0.35)
+        self.assertGreaterEqual(
             value("--forward-velocity-deficit-penalty-coef"),
+            value("--forward-velocity-excess-penalty-coef"),
         )
         self.assertGreater(value("--min-forward-progress-speed"), 0.0)
         self.assertGreater(value("--forward-progress-window-steps"), 0.0)
@@ -59,13 +59,10 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(value("--fall-penalty"), 10.0)
         self.assertEqual(value("--startup-action-ramp-steps"), 0.0)
         self.assertIn("--terminate-incomplete-motion-end", args)
-        self.assertGreater(value("--side-foot-pos-coef"), 0.0)
-        self.assertGreater(value("--step-gap-coef"), 0.0)
-        self.assertGreater(value("--swing-advance-coef"), 0.0)
         self.assertGreater(value("--foot-slip-penalty-coef"), 0.0)
         self.assertIn("--terrain-course-phase-sync", args)
         self.assertGreater(value("--terrain-course-phase-lookahead"), 0.0)
-        self.assertEqual(value("--motion-transition-blend-steps"), 30.0)
+        self.assertEqual(value("--motion-transition-blend-steps"), 0.0)
         self.assertGreater(value("--terrain-course-stage-reward"), 0.0)
         self.assertGreater(value("--terrain-course-random-start-prob"), 0.0)
         self.assertLess(value("--terrain-course-random-start-prob"), 1.0)
@@ -83,7 +80,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         ]
         self.assertEqual(
             names,
-            ["walk", "rough_walk"],
+            ["walk", "rough_walk", "slope_up", "slope_down"],
         )
 
     def test_random_stage_curriculum_preserves_full_route_warmup(self) -> None:
@@ -154,9 +151,7 @@ class MultimotionLogPathTests(unittest.TestCase):
             str(Path(__file__).resolve().parents[1] / "robot" / "MJCFmodelposition_0806.xml"),
         )
         self.assertEqual(value("--terrain-course-variants"), 6.0)
-        self.assertEqual(value("--terrain-course-run-in"), 2.90)
         self.assertEqual(value("--terrain-course-run-out"), 0.30)
-        self.assertEqual(value("--terrain-course-base-height"), 0.30)
         self.assertEqual(value("--rough-terrain-height"), ROUGH_TERRAIN_HEIGHT_M)
         self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
 

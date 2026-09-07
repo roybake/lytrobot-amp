@@ -10,6 +10,7 @@ from lytrobot_amp.training_defaults import (
     TRAINING_TARGET_SPEED_MPS,
 )
 from multimotion.retargeting.analyze_gait import analyze_reference
+from lytrobot_amp.env import locomotion_task_reward_contract
 from scripts.train_multimotion_no_stairs import default_train_args
 
 
@@ -51,16 +52,39 @@ def test_no_stairs_entrypoint_uses_terrain_aligned_references() -> None:
     assert _values(args, "--motion-loop") == ["true", "false", "false", "false"]
     assert _values(args, "--motion-reset-prob") == ["0.50"]
     assert "--serial-course-single-motion" not in args
-    assert "--use-reference-velocity" in args
-    assert _values(args, "--motion-transition-blend-steps") == ["30"]
+    assert "--no-use-reference-velocity" in args
+    assert _values(args, "--motion-transition-blend-steps") == ["0"]
     assert "--amp-task-only" in args
     # AMP constrains gait style while task reward keeps forward progress in
     # the PPO objective and prevents an in-place leg-swing local optimum.
-    assert float(_values(args, "--task-reward-lerp")[0]) == 0.50
+    assert float(_values(args, "--task-reward-lerp")[0]) == 0.70
     assert float(_values(args, "--amp-reward-coef")[0]) > 0.0
-    assert _values(args, "--terrain-course-random-start-prob") == ["0.8"]
+    assert _values(args, "--terrain-course-random-start-prob") == ["0.7"]
     assert _values(args, "--warp-nconmax") == ["128"]
     assert _values(args, "--warp-njmax") == ["512"]
+
+
+def test_amp_task_reward_rejects_standing_local_optimum() -> None:
+    common = dict(
+        target_velocity=TRAINING_TARGET_SPEED_MPS,
+        upright=1.0,
+        physical_height=1.0,
+        support=1.0,
+        forward_velocity_tracking_sigma=0.35,
+        forward_velocity_reward_coef=3.0,
+        forward_progress_reward_coef=1.75,
+        forward_velocity_deficit_penalty_coef=3.0,
+        forward_velocity_excess_penalty_coef=2.0,
+        contact_reward_coef=0.35,
+        foot_slip_penalty_coef=0.35,
+    )
+    standing = locomotion_task_reward_contract(forward_velocity=0.0, **common)
+    target = locomotion_task_reward_contract(
+        forward_velocity=TRAINING_TARGET_SPEED_MPS,
+        **common,
+    )
+    assert standing < 0.0
+    assert target > standing + 7.5
 
 
 @pytest.mark.skipif(

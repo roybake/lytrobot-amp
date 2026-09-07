@@ -8,11 +8,8 @@ import torch
 
 from lytrobot_amp.env import LytRobotEnvCfg
 from lytrobot_amp.training_defaults import (
-    MULTIMOTION_STAIR_STEP_DEPTH_M,
-    MULTIMOTION_STAIR_STEP_HEIGHT_M,
     ROUGH_TERRAIN_HEIGHT_M,
     SLOPE_ANGLE_DEG,
-    STAIR_STAGE2_STEP_HEIGHT_M,
     TRAINING_TARGET_SPEED_MPS,
 )
 from sensor_training.envs import (
@@ -27,8 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MOTION_NAMES = (
     "walk",
     "rough_walk",
-    "stair_up",
-    "stair_down",
+    "slope_up",
+    "slope_down",
 )
 
 
@@ -36,15 +33,18 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
     def test_defaults_keep_multimotion_group_without_skill_command(self) -> None:
         args = default_train_args()
 
-        self.assertEqual(args[args.index("--log-group") + 1], "multimotion")
-        self.assertEqual(args[args.index("--training-task") + 1], "multimotion")
+        self.assertNotIn("--log-group", args)
+        self.assertEqual(
+            args[args.index("--training-task") + 1],
+            "multimotion_no_stairs_amp_single",
+        )
         self.assertIn("--no-skill-conditioning", args)
         tags = args[args.index("--wandb-tags") + 1].split(",")
         self.assertIn("sensor-only", tags)
         self.assertIn("imu", tags)
         self.assertIn("tendon", tags)
-        self.assertIn("--use-reference-velocity", args)
-        self.assertNotIn("--no-use-reference-velocity", args)
+        self.assertIn("--no-use-reference-velocity", args)
+        self.assertNotIn("--use-reference-velocity", args)
         # The task definition is stage-neutral.  Stage 1/2 launchers append
         # the exact domain-randomization contract.
         self.assertNotIn("--domain-randomization", args)
@@ -68,8 +68,6 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             ROUGH_TERRAIN_HEIGHT_M,
         )
         self.assertEqual(value("--slope-angle-deg"), SLOPE_ANGLE_DEG)
-        self.assertEqual(value("--stair-step-height"), MULTIMOTION_STAIR_STEP_HEIGHT_M)
-        self.assertEqual(value("--stair-step-depth"), MULTIMOTION_STAIR_STEP_DEPTH_M)
         terrain_start = args.index("--terrain-types") + 1
         terrain_end = next(
             index
@@ -78,14 +76,14 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             args[terrain_start:terrain_end],
-            ["rough", "slope_up", "slope_down", "stairs"],
+            ["rough", "slope_up", "slope_down"],
         )
 
     def test_real_multimotion_env_exposes_only_current_56_sensor_values(self) -> None:
         motion_dir = REPO_ROOT / "robot" / "reference_data" / "multimotion"
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
-                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
+                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition_0806.xml"),
                 motion_files=tuple(
                     str(motion_dir / f"{name}_omniretarget.npz")
                     for name in MOTION_NAMES
@@ -93,12 +91,11 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 motion_names=MOTION_NAMES,
                 motion_loop=(True, False, False, False),
                 skill_conditioning=False,
-                use_reference_velocity=True,
+                use_reference_velocity=False,
                 terrain_types=(
                     "rough",
                     "slope_up",
                     "slope_down",
-                    "stairs",
                 ),
                 terrain_asset_dir=str(
                     REPO_ROOT / "robot" / "terrains" / "more_discolrl"
@@ -107,8 +104,6 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 terrain_course_variants=1,
                 rough_terrain_height=ROUGH_TERRAIN_HEIGHT_M,
                 slope_angle_deg=SLOPE_ANGLE_DEG,
-                stair_step_height=STAIR_STAGE2_STEP_HEIGHT_M,
-                stair_step_depth=MULTIMOTION_STAIR_STEP_DEPTH_M,
                 num_envs=1,
                 stand_start_prob=0.0,
                 motion_reset_prob=1.0,

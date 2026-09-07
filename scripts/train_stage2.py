@@ -45,7 +45,14 @@ def run_stage2() -> None:
     if stage1_checkpoint is not None:
         if any(arg == "--resume-checkpoint" or arg.startswith("--resume-checkpoint=") for arg in sys.argv):
             raise SystemExit("Use only one of --stage1-checkpoint/--stage1-model or --resume-checkpoint.")
-        sys.argv.extend(["--resume-checkpoint", stage1_checkpoint, "--resume-reset-progress"])
+        sys.argv.extend(
+            [
+                "--resume-checkpoint",
+                stage1_checkpoint,
+                "--resume-reset-progress",
+                "--resume-reset-optimizer",
+            ]
+        )
     elif not any(
         arg == "--resume-checkpoint" or arg.startswith("--resume-checkpoint=")
         for arg in sys.argv
@@ -61,7 +68,7 @@ def run_stage2() -> None:
         arg == "--training-task" or arg.startswith("--training-task=")
         for arg in sys.argv
     ):
-        sys.argv.extend(["--training-task", "walk"])
+        sys.argv.extend(["--training-task", "multimotion_no_stairs_amp_single"])
     domain_flags = (
         "--domain-randomization",
         "--no-domain-randomization",

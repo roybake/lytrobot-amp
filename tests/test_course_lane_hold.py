@@ -31,7 +31,9 @@ def test_lane_hold_launcher_enables_new_contract() -> None:
     assert parsed.training_task == TASK_NAME
     assert parsed.course_lane_hold is True
     assert parsed.serial_reference_state_init is True
-    assert parsed.motion_reset_prob == 0.50
+    assert parsed.motion_reset_prob == 0.0
+    assert parsed.stand_start_prob == 1.0
+    assert parsed.reset_noise_scale == 0.0
     assert parsed.action_residual_scale == 0.30
     assert parsed.course_lane_position_reward_coef == 2.0
     assert parsed.course_lane_velocity_reward_coef == 0.5

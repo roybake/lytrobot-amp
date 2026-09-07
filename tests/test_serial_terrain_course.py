@@ -386,7 +386,7 @@ def test_warp_amp_observe_matches_motion_feature_contract() -> None:
     env.qvel = torch.arange(20, dtype=torch.float32).repeat(2, 1)
     env.robot_qpos_adrs = torch.arange(7, 21, dtype=torch.long)
     env.robot_qvel_adrs = torch.arange(6, 20, dtype=torch.long)
-    env.more_terrain_cfg = SimpleNamespace(serial_course=False)
+    env.more_terrain_cfg = SimpleNamespace(serial_course=False, standalone_field=False)
     env.motion_ids = torch.zeros(2, dtype=torch.long)
     env.motion_stair_height_anchor = torch.zeros(1, dtype=torch.float32)
     env.motion_stair_height_scale = torch.ones(1, dtype=torch.float32)
@@ -731,7 +731,7 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
 
 
 def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None:
-    names = ("walk", "rough_walk")
+    names = ("walk", "rough_walk", "slope_up", "slope_down")
     paths = tuple(
         str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
     )
@@ -739,7 +739,7 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
         LytRobotEnvCfg(
             motion_files=paths,
             motion_names=names,
-            motion_loop=(True, False),
+            motion_loop=(True, False, False, False),
             terrain_types=("rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
             terrain_course_variants=1,
@@ -810,7 +810,7 @@ def test_serial_course_can_reset_from_natural_stand_for_deployed_start() -> None
 def test_opt_in_serial_reference_state_init_honors_motion_reset_probability() -> None:
     """AMP gait states train continuation without moving resets down-course."""
 
-    names = ("walk", "rough_walk")
+    names = ("walk", "rough_walk", "slope_up", "slope_down")
     paths = tuple(
         str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
     )
@@ -818,8 +818,8 @@ def test_opt_in_serial_reference_state_init_honors_motion_reset_probability() ->
         LytRobotEnvCfg(
             motion_files=paths,
             motion_names=names,
-            motion_loop=(True, True),
-            terrain_types=("flat", "rough", "slope_up", "slope_down"),
+            motion_loop=(True, False, False, False),
+            terrain_types=("rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
             serial_reference_state_init=True,
             terrain_course_variants=1,
@@ -838,13 +838,16 @@ def test_opt_in_serial_reference_state_init_honors_motion_reset_probability() ->
         assert np.all(
             np.asarray([data.qvel[0] for data in env.datas]) > 0.0
         )
-        # Sampled clip travel is rebased; every full-route episode still
-        # begins at the physical run-in spawn rather than several metres into
-        # the route.
+        # Sampled phase travel is rebased into the legal stage segment rather
+        # than being collapsed to a phase-zero entrance.
+        stage_end = env.course_stage_end_x[env.course_variant_ids, 0]
+        root_x = np.asarray([data.qpos[0] for data in env.datas])
+        assert np.all(root_x >= 0.30)
+        assert np.all(root_x <= stage_end - 0.30 + 1.0e-6)
         np.testing.assert_allclose(
-            [data.qpos[0] for data in env.datas],
-            0.30,
-            atol=1.0e-6,
+            [env._terrain_penetration_depth(data) for data in env.datas],
+            0.0,
+            atol=1.0e-9,
         )
 
         # Playback sets motion_reset_prob=0.  The exact same environment flag
@@ -867,7 +870,7 @@ def test_opt_in_serial_reference_state_init_honors_motion_reset_probability() ->
 def test_random_stage_resets_have_zero_robot_terrain_overlap() -> None:
     """Rough and downhill curriculum starts must not spawn inside geometry."""
 
-    names = ("walk", "rough_walk")
+    names = ("walk", "rough_walk", "slope_up", "slope_down")
     paths = tuple(
         str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
     )
@@ -875,8 +878,8 @@ def test_random_stage_resets_have_zero_robot_terrain_overlap() -> None:
         LytRobotEnvCfg(
             motion_files=paths,
             motion_names=names,
-            motion_loop=(True, False),
-            terrain_types=("flat", "rough", "slope_up", "slope_down"),
+            motion_loop=(True, False, False, False),
+            terrain_types=("rough", "slope_up", "slope_down"),
             serial_terrain_course=True,
             serial_reference_state_init=True,
             terrain_course_variants=1,
@@ -898,6 +901,31 @@ def test_random_stage_resets_have_zero_robot_terrain_overlap() -> None:
             for index in range(env.num_envs)
         }
         assert {"rough", "slope_up", "slope_down"}.issubset(scenarios)
+        for env_id, data in enumerate(env.datas):
+            variant = int(env.course_variant_ids[env_id])
+            stage = int(env.course_stage_ids[env_id])
+            stage_end = float(env.course_stage_end_x[variant, stage])
+            stage_start = 0.0 if stage == 0 else float(
+                env.course_stage_end_x[variant, stage - 1]
+            )
+            assert stage_start + 0.30 - 1.0e-6 <= data.qpos[0] <= stage_end - 0.30 + 1.0e-6
+            motion = env.motion.motions[int(env.motion_ids[env_id])]
+            frame = int(np.clip(np.floor(env.motion_phase[env_id]), 0, motion.frame_count - 1))
+            local_x = float(motion.reference_qpos[frame, 0])
+            reference_first = float(motion.reference_qpos[0, 0])
+            reference_last = float(motion.reference_qpos[-1, 0])
+            progress = 0.0 if abs(reference_last - reference_first) < 1.0e-6 else np.clip(
+                (local_x - reference_first) / (reference_last - reference_first), 0.0, 1.0
+            )
+            expected_x = stage_start + 0.30 + progress * max(stage_end - stage_start - 0.60, 0.0)
+            assert data.qpos[0] == pytest.approx(expected_x, abs=2.0e-5)
+            assert np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()
+            terrain_height = course_terrain_reference_height_at(
+                np.asarray([data.qpos[0]], dtype=np.float32),
+                env.more_terrain_cfg,
+                variant,
+            )[0]
+            assert data.qpos[2] > float(terrain_height) + 0.30
         np.testing.assert_allclose(
             [env._terrain_penetration_depth(data) for data in env.datas],
             0.0,

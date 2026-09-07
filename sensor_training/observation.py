@@ -91,13 +91,19 @@ class HistoryMotionReference:
         batch_size: int,
         rng: np.random.Generator,
         mirror_prob: float = 0.5,
+        motion_ids: np.ndarray | None = None,
     ) -> np.ndarray:
         if isinstance(self.source.reference_features, tuple):
             return self._sample_library_features(
                 batch_size,
                 rng,
                 mirror_prob=mirror_prob,
+                motion_ids=motion_ids,
             )
+        if motion_ids is not None:
+            ids = np.asarray(motion_ids, dtype=np.int32)
+            if ids.shape != (batch_size,) or np.any(ids != 0):
+                raise ValueError("Single-motion AMP references only accept motion_id=0.")
 
         current_phase = rng.uniform(0.0, float(self.source.frame_count), size=(batch_size, 1))
         frame_offsets = np.arange(
@@ -122,10 +128,19 @@ class HistoryMotionReference:
         rng: np.random.Generator,
         *,
         mirror_prob: float,
+        motion_ids: np.ndarray | None = None,
     ) -> np.ndarray:
         """Sample coherent histories from every clip in a MotionLibrary."""
 
-        motion_ids = self.source.sample_motion_ids(batch_size, rng)
+        motion_ids = (
+            self.source.sample_motion_ids(batch_size, rng)
+            if motion_ids is None
+            else np.asarray(motion_ids, dtype=np.int32)
+        )
+        if motion_ids.shape != (batch_size,):
+            raise ValueError(
+                f"Expected motion_ids shape {(batch_size,)}, got {motion_ids.shape}."
+            )
         output = np.empty(
             (batch_size, self.history_frame_count, self.source.feature_dim),
             dtype=np.float32,
@@ -168,3 +183,16 @@ class HistoryMotionReference:
             output[rows] = regular
 
         return output.reshape(batch_size, self.feature_dim).astype(np.float32)
+
+    def sample_features_for_motion_ids(
+        self,
+        motion_ids: np.ndarray,
+        rng: np.random.Generator,
+        mirror_prob: float = 0.5,
+    ) -> np.ndarray:
+        """Sample AMP histories from exactly the requested motion clips."""
+
+        ids = np.asarray(motion_ids, dtype=np.int32)
+        return self.sample_features(
+            int(ids.size), rng, mirror_prob=mirror_prob, motion_ids=ids
+        )

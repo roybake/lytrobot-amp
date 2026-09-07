@@ -54,7 +54,9 @@ def default_train_args() -> list[str]:
             "privileged,reference-conditioned,lane-hold,rough,slope-up,slope-down"
         ],
     )
-    _replace(args, "--motion-reset-prob", ["0.50"])
+    _replace(args, "--motion-reset-prob", ["0.0"])
+    _replace(args, "--stand-start-prob", ["1.0"])
+    _replace(args, "--reset-noise-scale", ["0.0"])
     _replace(args, "--action-residual-scale", ["0.30"])
     _remove(args, "--no-serial-reference-state-init")
     _remove(args, "--serial-reference-state-init")

@@ -43,6 +43,12 @@ class ModelExportTests(unittest.TestCase):
             "ppo_amp_config": {"actor_hidden_dims": [256, 128]},
             "env_config": {"target_velocity": 1.0},
             "common_joint_names": ["joint"],
+            "conditional_amp": {
+                "version": 1,
+                "condition_fields": ["motion_id"],
+                "condition_dim": 4,
+                "actor_input": False,
+            },
         }
 
     def test_save_exports_pair_and_removes_previous_pair(self) -> None:
@@ -74,6 +80,8 @@ class ModelExportTests(unittest.TestCase):
             self.assertEqual(metadata["iteration"], 1)
             self.assertEqual(metadata["obs_dim"], 7)
             self.assertEqual(metadata["action_dim"], 3)
+            self.assertEqual(metadata["conditional_amp"]["condition_dim"], 4)
+            self.assertFalse(metadata["conditional_amp"]["actor_input"])
 
             observation = np.random.default_rng(1).normal(size=(4, 7)).astype(np.float32)
             with torch.no_grad():

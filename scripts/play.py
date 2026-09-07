@@ -271,8 +271,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--episode-steps",
         type=int,
-        default=2_147_483_647,
-        help="Per-episode timeout used during playback; defaults to effectively unlimited.",
+        default=None,
+        help="Episode timeout; independent terrain tasks use the saved training horizon, others are unlimited.",
     )
     parser.add_argument(
         "--episode-timeout-jitter-steps",
@@ -479,7 +479,10 @@ def make_env_cfg(
     # Start every reset at the action's phase-zero state and leave the episode
     # alive until a real termination or a task-defined successful completion.
     cfg.motion_reset_prob = float(getattr(args, "motion_reset_prob", 0.0))
-    cfg.episode_steps = int(getattr(args, "episode_steps", 2_147_483_647))
+    episode_steps = getattr(args, "episode_steps", None)
+    cfg.episode_steps = int(episode_steps if episode_steps is not None else (
+        cfg.episode_steps if checkpoint_task.startswith("independent_") else 2_147_483_647
+    ))
     cfg.episode_timeout_jitter_steps = int(
         getattr(args, "episode_timeout_jitter_steps", 0)
     )
@@ -546,6 +549,27 @@ def checkpoint_playback_contract_warning(checkpoint: dict) -> str | None:
         "Historical no-stairs checkpoint uses a non-0806 robot XML; replaying "
         "its saved environment for compatibility. It is not compatible with "
         "the corrected Teacher training contract."
+    )
+
+
+def checkpoint_start_state_warning(
+    checkpoint: dict,
+    playback_cfg: LytRobotEnvCfg,
+) -> str | None:
+    """Warn when deployment asks for a start state absent from training."""
+
+    env_config = checkpoint.get("env_config", {})
+    if not isinstance(env_config, dict):
+        return None
+    trained_stand_probability = float(env_config.get("stand_start_prob", 0.0))
+    if trained_stand_probability > 0.0 or float(playback_cfg.stand_start_prob) <= 0.0:
+        return None
+    return (
+        "This checkpoint was trained with stand_start_prob=0 and was never "
+        "exposed to the stationary deployment start used by this playback. "
+        "It may fall without walking. For reference-state diagnosis only, use "
+        "--motion-reset-prob 1 --stand-start-prob 0; retrain with stand-start "
+        "samples before deployment."
     )
 
 
@@ -896,6 +920,9 @@ def main() -> None:
     validate_recurrent_sensor_architecture(checkpoint)
 
     env_cfg = make_env_cfg(args, checkpoint, stage)
+    start_state_warning = checkpoint_start_state_warning(checkpoint, env_cfg)
+    if start_state_warning is not None:
+        print(f"[WARN] {start_state_warning}")
     if env_cfg.serial_terrain_course and not (
         env_cfg.forward_velocity_reward_coef > 0.0
         or env_cfg.forward_progress_reward_coef > 0.0
