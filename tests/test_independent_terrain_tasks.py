@@ -135,7 +135,8 @@ def test_four_independent_launchers_have_disjoint_sensor_only_contracts() -> Non
         assert parsed.forward_progress_grace_steps >= (
             parsed.stand_start_phase_delay_steps + parsed.stand_start_transition_max_steps
         )
-        assert "independent_terrain_v3" in parsed.log_root
+        assert parsed.log_root.endswith(f"independent_terrain/{task_name.removeprefix('independent_')}")
+        assert "independent_terrain_v" not in parsed.log_root
         assert parsed.side_foot_pos_coef == 0.5
         assert parsed.step_gap_coef == 0.5
         assert parsed.swing_advance_coef == 0.75

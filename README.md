@@ -82,8 +82,8 @@ uv run python sensor_training/play.py \
 
 ### 4. 四个独立地形任务
 
-2026-09-05 起，新训练默认写入 `logs/independent_terrain_v2/`。下方旧 checkpoint
-路径可用于复查历史结果；新实验的 Stage 2 和回放请使用 v2 目录中的实际路径。
+独立地形训练现在只保留一套 canonical 配置，新训练和回放统一使用
+`logs/independent_terrain/<terrain>/`。历史 checkpoint 不会被任何正式 launcher 自动选用。
 本轮修复了独立坡面高度基准、下坡静止出生和起步检查时机，并调整了最佳模型选择。
 从头训练及验收说明见 [独立训练任务](docs/independent_training_tasks.md)。
 
@@ -98,11 +98,11 @@ Actor，不使用 Teacher action distillation；训练期 asymmetric critic 仍�
 uv run python scripts/train_flat_stage1.py
 # 平地训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_flat_stage2.py \
-  --stage1-checkpoint logs/independent_terrain/flat/stage1/09-02-15:24:59/model_final.pt
+  --stage1-checkpoint logs/independent_terrain/flat/stage1/<run>/model_final.pt
 
 # 平地测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/flat/stage1/09-07-10:12:43/model_best.onnx\
+  --checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.onnx \
   --stage stage1 --viewer --steps 0
 # 平地测试（Stage 2）
 uv run python sensor_training/play.py \
@@ -117,7 +117,7 @@ uv run python scripts/train_rough_stage2.py \
 
 # 不平路面测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v2/rough/stage1/09-05-19:59:10/model_best.onnx \
+  --checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.onnx \
   --stage stage1 --viewer --steps 0
 # 不平路面测试（Stage 2）
 uv run python sensor_training/play.py \

@@ -7,7 +7,7 @@
 
 ## 四个独立地形任务
 
-2026-09-07 修订（v4）：独立四地形任务统一采用固定目标速度 `0.862295 m/s`、
+当前唯一实现：独立四地形任务统一采用固定目标速度 `0.862295 m/s`、
 `sigma=0.35`、前向速度/进度系数 `3.0/2.0`、缺速/超速惩罚 `4.0/3.0`，
 `task_reward_lerp=0.75`，AMP 系数 `1.5`。任务奖励使用物理可观测的 anti-collapse
 合约，禁止 reference control 混入 Student；`amp_task_only` 保留为训练入口标记。
@@ -32,9 +32,9 @@
 四种地形在本次采样检查中均无穿透，但不能代替新策略训练与多 seed 回放。
 现有动作及 checkpoint 均未覆盖。
 
-2026-09-05 的初始化修订继续保留；新实验默认写入 `logs/independent_terrain_v3/`，任务 ID 和传感器
-Actor 输入维度不变。建议 Stage 1 从头训练；旧失败策略的续训不能验证新初始化分布。
-原有日志、模型和动作文件保持不变。上下坡高度目标和 AMP 高度现在按当前位置与
+新实验统一写入 `logs/independent_terrain/<terrain>/`，任务 ID 和传感器 Actor 输入维度不变。
+建议 Stage 1 从头训练；旧失败策略的续训不能验证新初始化分布。原有历史日志、模型和动作
+文件保持不变，但不再作为正式入口的默认路径。上下坡高度目标和 AMP 高度现在按当前位置与
 参考相位位置之间的坡面高差校正，避免循环片段结束后高度基准跳回原点。
 独立任务的 `model_best` 优先比较完成率，再比较终止率、足滑和奖励；这仍是训练
 分布上的指标，不能代替从静止起步的确定性回放验收。
@@ -71,68 +71,68 @@ AMP 一致性和下坡静止出生；尚未通过新训练证明四种地形均�
 uv run python scripts/train_flat_stage1.py
 # 平地训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_flat_stage2.py \
-  --stage1-checkpoint logs/independent_terrain_v3/flat/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt
 
 # 平地测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/flat/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/flat/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 平地测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/flat/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/flat/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 不平路面训练（Stage 1，无随机化）
 uv run python scripts/train_rough_stage1.py
 # 不平路面训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_rough_stage2.py \
-  --stage1-checkpoint logs/independent_terrain_v3/rough/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt
 
 # 不平路面测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/rough/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/rough/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 不平路面测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/rough/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/rough/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 上坡训练（Stage 1，无随机化）
 uv run python scripts/train_slope_up_stage1.py
 # 上坡训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_slope_up_stage2.py \
-  --stage1-checkpoint logs/independent_terrain_v3/slope_up/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt
 
 # 上坡测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/slope_up/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/slope_up/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 上坡测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/slope_up/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/slope_up/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 
 # 下坡训练（Stage 1，无随机化）
 uv run python scripts/train_slope_down_stage1.py
 # 下坡训练（Stage 2，加载 Stage 1 并开启随机化）
 uv run python scripts/train_slope_down_stage2.py \
-  --stage1-checkpoint logs/independent_terrain_v3/slope_down/stage1/<run>/model_best.pt
+  --stage1-checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt
 
 # 下坡测试（Stage 1）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/slope_down/stage1/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/slope_down/stage1/<run>/model_best.pt \
   --stage stage1 --viewer --steps 0
 # 下坡测试（Stage 2）
 uv run python sensor_training/play.py \
-  --checkpoint logs/independent_terrain_v3/slope_down/stage2/<run>/model_best.pt \
+  --checkpoint logs/independent_terrain/slope_down/stage2/<run>/model_best.pt \
   --stage stage2 --viewer --steps 0
 ```
 
 上面命令中的 `<run>` 要替换成实际运行目录名。如果只生成了最新 checkpoint，
 可以把测试命令里的 `model_best.pt` 换成同目录的 `model_final.pt`。
 测试命令默认会录屏；录像保持与仿真控制步一致的 1 倍时间速度，并统一保存到各自地形的
-`logs/independent_terrain_v3/<地形>/recording/`，例如下坡为
-`logs/independent_terrain_v3/slope_down/recording/`。如只想看画面、不保存录像，可追加
+`logs/independent_terrain/<地形>/recording/`，例如下坡为
+`logs/independent_terrain/slope_down/recording/`。如只想看画面、不保存录像，可追加
 `--no-record`。
 
 代码接口快速测试（不启动训练）：

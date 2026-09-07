@@ -10,7 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 MODEL_XML = ROOT / "robot" / "MJCFmodelposition.xml"
 TERRAIN_ASSET_DIR = ROOT / "robot" / "terrains" / "more_discolrl"
-LOG_ROOT = ROOT / "logs" / "independent_terrain_v3"
+# One canonical output tree.  Historical v2/v3 directories are not training
+# entry points and must not be selected by new runs or playback examples.
+LOG_ROOT = ROOT / "logs" / "independent_terrain"
 
 
 @dataclass(frozen=True)
