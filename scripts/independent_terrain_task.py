@@ -76,9 +76,14 @@ def get_spec(key: str) -> IndependentTerrainSpec:
 def default_train_args(key: str) -> list[str]:
     """Return a complete, non-distilled sensor-only AMP configuration.
 
-    Each task has exactly one reference clip and one terrain type.  There is
-    no serial course, skill label, reference-control blend, or Teacher action
+    Each task has exactly one reference clip and one terrain type. There is no
+    serial course, skill label, reference-control blend, or Teacher action
     target, so its checkpoint cannot accidentally become a four-terrain model.
+
+    The locomotion reward deliberately makes a stationary supported posture a
+    losing solution. With the deployable sensor controller, zero action holds
+    the currently measured tendon lengths, so standing is otherwise a very
+    easy local optimum compared with discovering a self-excited gait.
     """
 
     spec = get_spec(key)
@@ -107,18 +112,18 @@ def default_train_args(key: str) -> list[str]:
         "--standalone-terrain-field",
         "--amp",
         "--amp-task-only",
-        # Keep the physical objective visible while AMP supplies the gait
-        # style.  This prevents an in-place leg swing from being optimal.
+        # Keep task locomotion stronger than style imitation. At v_x=0 the
+        # supported/upright bonuses must not outweigh the speed deficit cost.
         "--target-velocity",
         "0.862295",
         "--forward-velocity-tracking-sigma",
-        "0.20",
+        "0.35",
         "--forward-velocity-reward-coef",
-        "2.0",
+        "3.0",
         "--forward-progress-reward-coef",
-        "1.0",
+        "2.0",
         "--forward-velocity-deficit-penalty-coef",
-        "1.5",
+        "4.0",
         "--forward-velocity-excess-penalty-coef",
         "3.0",
         "--min-forward-progress-speed",
@@ -128,31 +133,37 @@ def default_train_args(key: str) -> list[str]:
         "--forward-progress-window-steps",
         "100",
         "--forward-progress-termination-penalty",
-        "2.0",
+        "4.0",
         "--fall-penalty",
         "10.0",
         "--terrain-penetration-tolerance",
         "0.01",
         "--terrain-penetration-penalty-coef",
         "20.0",
+        # A strict slip cost suppresses the exploratory touchdowns required to
+        # discover gait. AMP still supplies gait style while Stage 1 learns to
+        # move; this bounded penalty retains pressure against persistent slip.
         "--foot-slip-velocity-threshold",
-        "0.04",
+        "0.08",
         "--foot-slip-penalty-coef",
-        "2.0",
+        "0.50",
         "--contact-reward-coef",
         "0.70",
         "--missed-contact-penalty-coef",
         "0.80",
+        "--alternating-step-reward-coef",
+        "1.0",
         "--task-reward-lerp",
-        "0.50",
+        "0.75",
         "--amp-reward-coef",
-        "3.0",
+        "1.5",
         "--min-action-std",
         "0.05",
+        # Half of resets expose moving expert states for gait recovery and half
+        # expose the exact phase-zero rest state used at deployment. A value of
+        # 1.0 never trains the sensor Actor to initiate walking from rest.
         "--motion-reset-prob",
-        "1.0",
-        # The downhill reference begins at the high end of its ramp; avoid a
-        # flat-ground stand reset that would start below the reference.
+        "0.50",
         "--stand-start-prob",
         "0.0",
         "--startup-action-ramp-steps",
