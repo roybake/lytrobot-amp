@@ -1,0 +1,43 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": false,
+  "terminal.integrated.defaultProfile.linux": "lytrobot-uv",
+  "terminal.integrated.profiles.linux": {
+    "lytrobot-uv": {
+      "path": "bash",
+      "args": [
+        "--rcfile",
+        "${workspaceFolder}/.vscode/terminal.bashrc"
+      ]
+    }
+  },
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/*.egg-info/**": true,
+    "**/logs/**": true,
+    "**/wandb/**": true,
+    "**/recording/**": true,
+    "**/runs/**": true,
+    "**/outputs/**": true,
+    "**/checkpoints/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/*.egg-info": true,
+    "**/logs": true,
+    "**/wandb": true,
+    "**/recording": true,
+    "**/runs": true,
+    "**/outputs": true,
+    "**/checkpoints": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.egg-info": true
+  }
+}
