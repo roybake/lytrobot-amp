@@ -22,6 +22,7 @@ from lytrobot_amp.motion import MotionLibrary, _repair_loop_root_translation_vel
 from lytrobot_amp.terrain import (
     MORE_TERRAIN_TYPES,
     MoreTerrainCfg,
+    SERIAL_ROUGH_TRANSITION_LENGTH,
     StairTerrainCfg,
     course_motion_sequence,
     course_stage_end_positions,
@@ -41,6 +42,8 @@ MOTION_DIR = ROOT / "robot" / "reference_data" / "multimotion"
 NAMES = (
     "walk",
     "rough_walk",
+    "slope_up",
+    "slope_down",
     "pit_walk",
     "gap_cross",
     "stair_up",
@@ -141,6 +144,30 @@ def test_course_random_start_probability_setters_validate_bounds() -> None:
             env.set_terrain_course_random_start_prob(1.01)
 
 
+def test_two_reference_course_reuses_rough_expert_for_slope_stages() -> None:
+    names = ("walk", "rough_walk")
+    env = LytRobotAmpEnv(
+        LytRobotEnvCfg(
+            motion_files=tuple(
+                str(MOTION_DIR / f"{name}_omniretarget.npz") for name in names
+            ),
+            motion_names=names,
+            motion_loop=(True, False),
+            terrain_types=("rough", "slope_up", "slope_down"),
+            serial_terrain_course=True,
+            terrain_course_variants=1,
+            num_envs=1,
+            domain_randomization=False,
+        )
+    )
+    try:
+        sequence = course_motion_sequence(env.more_terrain_cfg.normalized_course_orders[0])
+        expected = [0 if name == "walk" else 1 for name in sequence]
+        assert env.course_motion_sequences[0].tolist() == expected
+    finally:
+        env.close()
+
+
 def test_warp_partial_reset_uses_authoritative_per_world_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -186,7 +213,7 @@ def test_stair_reference_height_matches_compiled_hard_stair_rise() -> None:
         motion_paths(),
         model,
         motion_names=NAMES,
-        motion_loop=(True, False, False, False, False, False),
+        motion_loop=(True, False, False, False, False, False, False, False),
     )
     for name in ("stair_up", "stair_down"):
         motion = library.motions[NAMES.index(name)]
@@ -205,7 +232,7 @@ def test_hard_stair_down_start_is_not_misclassified_as_too_tall() -> None:
         LytRobotEnvCfg(
             motion_files=motion_paths(),
             motion_names=NAMES,
-            motion_loop=(True, False, False, False, False, False),
+            motion_loop=(True, False, False, False, False, False, False, False),
             terrain_types=MORE_TERRAIN_TYPES,
             serial_terrain_course=True,
             terrain_course_variants=8,
@@ -341,6 +368,42 @@ def test_each_lane_contains_all_terrains_in_its_own_order() -> None:
         assert np.all(heights >= more.course_base_height - 1.0e-6)
 
 
+def test_serial_rough_heightfield_is_flush_with_flat_course_seams() -> None:
+    """The nonzero source-map edge must not form a step onto rough terrain."""
+
+    more = MoreTerrainCfg(
+        enabled=True,
+        terrain_types=("rough",),
+        serial_course=True,
+        course_orders=(("rough",),),
+    )
+    model = load_model(ROOT / "robot" / "MJCFmodelposition.xml", None, more)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    segment = course_segments(more, 0)[0]
+
+    seam_x = np.asarray(
+        [
+            segment.start_x - 1.0e-3,
+            segment.start_x,
+            segment.end_x,
+            segment.end_x + 1.0e-3,
+        ]
+    )
+    seam_heights = terrain_height_from_model(
+        model, data, seam_x, np.zeros_like(seam_x)
+    )
+    np.testing.assert_allclose(seam_heights, more.course_base_height, atol=1.0e-6)
+
+    # The first part of the rough field can rise only through the smooth
+    # envelope; it cannot retain the old full-height edge protrusion.
+    probe_x = segment.start_x + 0.5 * SERIAL_ROUGH_TRANSITION_LENGTH
+    probe_height = terrain_height_from_model(model, data, probe_x, 0.0)
+    assert more.course_base_height <= probe_height < (
+        more.course_base_height + more.rough_height
+    )
+
+
 def test_three_robot_display_model_has_three_independent_robot_states() -> None:
     more, stairs = course_cfg()
     model = load_multi_robot_model(
@@ -358,7 +421,7 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
         LytRobotEnvCfg(
             motion_files=motion_paths(),
             motion_names=NAMES,
-            motion_loop=(True, False, False, False, False, False),
+            motion_loop=(True, False, False, False, False, False, False, False),
             terrain_types=MORE_TERRAIN_TYPES,
             serial_terrain_course=True,
             terrain_course_variants=3,

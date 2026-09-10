@@ -89,6 +89,11 @@ SWING_CLEARANCE = 0.003
 # already valid stair poses (which can lower a swing heel into the next tread).
 LEG_CLEARANCE = 0.0
 OUTPUT_FREQUENCY = 40.0
+# Slope contacts are solved sequentially.  Bound each correction to 8
+# degrees/frame so an optimizer cannot trade a toe-limit flip for a marginally
+# lower contact residual; at 40 Hz this still permits a natural foot roll.
+SLOPE_MAX_JOINT_STEP_RAD = np.deg2rad(8.0)
+SLOPE_MAX_ROOT_STEP_M = 0.060
 TURN_TIME_SCALE = 2.0
 TURN_RAMP_SECONDS = 0.75
 FOOT_GEOM_NAMES = ("foot_r", "toe_r", "foot_l", "toe_l")
@@ -364,7 +369,7 @@ def retarget_terrain_model(
             stair_down=task == "stair_down",
             stair_down_offset=STAIR_DOWN_OFFSET,
         )
-    elif kind in {"gap", "pit", "rough"}:
+    elif kind in {"gap", "pit", "rough", "slope_up", "slope_down"}:
         more = MoreTerrainCfg(enabled=True, terrain_types=(kind,))
         model = load_model(model_xml, None, more)
         offset = terrain_spawn_offset(kind, more, StairTerrainCfg())
@@ -381,6 +386,8 @@ def refine_contacts_and_collisions(
     roll_mode: np.ndarray,
     task: str,
     model_xml: Path,
+    *,
+    enforce_slope_continuity: bool = True,
 ) -> tuple[np.ndarray, dict[str, float | int | list[float]]]:
     """Full-model IK for leg clearance and ordered heel/sole/toe contact."""
 
@@ -429,7 +436,8 @@ def refine_contacts_and_collisions(
     roll_errors: list[float] = []
     heel_order_values: list[float] = []
     toe_order_values: list[float] = []
-    previous = np.concatenate(([refined[-1, 2]], refined[-1, joint_indices]))
+    is_slope = task in {"slope_up", "slope_down"} and enforce_slope_continuity
+    previous = np.concatenate(([refined[0, 2]], refined[0, joint_indices]))
 
     for frame in range(len(refined)):
         nominal_pose = refined[frame].copy()
@@ -465,6 +473,29 @@ def refine_contacts_and_collisions(
         )
         variable_lower = np.concatenate(([nominal_root - 0.05], joint_lower))
         variable_upper = np.concatenate(([nominal_root + 0.05], joint_upper))
+        if is_slope and frame > 0:
+            # Preserve C0 continuity in the final expert motion.  The local
+            # contact targets and the full STL non-penetration term remain in
+            # the objective, so this cannot be a blind pose smoother.
+            variable_lower[0] = max(
+                variable_lower[0], previous[0] - SLOPE_MAX_ROOT_STEP_M
+            )
+            variable_upper[0] = min(
+                variable_upper[0], previous[0] + SLOPE_MAX_ROOT_STEP_M
+            )
+            variable_lower[1:] = np.maximum(
+                variable_lower[1:], previous[1:] - SLOPE_MAX_JOINT_STEP_RAD
+            )
+            variable_upper[1:] = np.minimum(
+                variable_upper[1:], previous[1:] + SLOPE_MAX_JOINT_STEP_RAD
+            )
+        if np.any(variable_lower >= variable_upper):
+            invalid = np.flatnonzero(variable_lower >= variable_upper).tolist()
+            raise RuntimeError(
+                f"{task}: empty temporal IK bounds at frame {frame}, "
+                f"variables={invalid}, previous={previous[invalid]}, "
+                f"lower={variable_lower[invalid]}, upper={variable_upper[invalid]}."
+            )
 
         def residual(variables: np.ndarray) -> np.ndarray:
             pose = nominal_pose.copy()

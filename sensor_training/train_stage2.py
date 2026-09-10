@@ -48,10 +48,18 @@ if __name__ == "__main__":
         "--forward-velocity-deficit-penalty-coef": "4.0",
         "--forward-velocity-excess-penalty-coef": "4.0",
         "--save-interval": "500",
+        # Keep stage2 compatible with a deployable sensor-only stage1 policy:
+        # commands are residuals around measured tendon lengths, not around
+        # simulator reference controls.
+        "--reference-ctrl-blend": "0.0",
     }
     for name, value in defaults.items():
         if not _has_arg(name):
             sys.argv.extend([name, value])
+    if not (_has_arg("--use-reference-velocity") or _has_arg("--no-use-reference-velocity")):
+        # Keep the robustness phase locked to the same reference gait that
+        # stage1 learned; this is a reward target, not an Actor observation.
+        sys.argv.append("--use-reference-velocity")
     if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):
         sys.argv.append("--domain-randomization")
     if not (_has_arg("--wandb") or _has_arg("--no-wandb")):

@@ -94,6 +94,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         amp_rewards = torch.empty_like(rewards)
         dones = torch.empty_like(rewards)
         time_outs = torch.empty_like(rewards)
+        timeout_bootstrap_values = torch.zeros_like(rewards)
         successes = torch.empty_like(rewards)
         episode_starts = torch.empty_like(rewards)
         amp_features = torch.empty(
@@ -143,12 +144,32 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
 
             env_action = action if getattr(self.env, "is_torch_env", False) else action.cpu().numpy()
             next_obs, task_reward_value, done_value, info = self.env.step(env_action)
+            if "terminal_observation" in info:
+                terminal_ids = self._as_device_tensor(
+                    info["terminal_env_ids"]
+                ).to(dtype=torch.long)
+                terminal_obs = self._as_device_tensor(info["terminal_observation"])
+                terminal_context = self._as_device_tensor(
+                    info["terminal_privileged_context"]
+                )
+                with torch.no_grad():
+                    terminal_value = self.actor_critic.recurrent_action_and_value(
+                        terminal_obs,
+                        next_recurrent_state.index_select(0, terminal_ids),
+                        torch.zeros(len(terminal_ids), device=self.device),
+                        privileged_context=terminal_context,
+                    )[3]
+                timeout_bootstrap_values[step, terminal_ids] = terminal_value
             episode_step = self._as_device_tensor(info["episode_step"])
             episode_progress_sum += episode_step.sum()
             component_items = [
                 (key, value)
                 for key, value in info.items()
-                if key not in ("episode_step", "time_outs", "successes")
+                if key not in (
+                    "episode_step", "time_outs", "successes",
+                    "terminal_observation", "terminal_privileged_context",
+                    "terminal_env_ids",
+                )
             ]
             if not reward_component_keys:
                 reward_component_keys = tuple(key for key, _value in component_items)
@@ -258,6 +279,11 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         for step in reversed(range(num_steps)):
             terminal = torch.clamp(dones[step] - time_outs[step], min=0.0, max=1.0)
             next_values = next_value if step == num_steps - 1 else values[step + 1]
+            next_values = torch.where(
+                time_outs[step] > 0.0,
+                timeout_bootstrap_values[step],
+                next_values,
+            )
             next_non_terminal = 1.0 - terminal
             delta = (
                 rewards[step]
@@ -317,6 +343,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "amp_rewards": amp_rewards,
             "dones": dones,
             "time_outs": time_outs,
+            "timeout_bootstrap_values": timeout_bootstrap_values,
             "successes": successes,
             "episode_starts": episode_starts,
             "initial_recurrent_state": initial_recurrent_state,

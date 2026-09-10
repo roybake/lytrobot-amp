@@ -106,22 +106,6 @@ def _stability_gated_locomotion_terms(
     return stability, gated_track, gated_progress
 
 
-def _bounded_specific_cot_excess(
-    specific_cot: torch.Tensor,
-    limit: float,
-) -> torch.Tensor:
-    """Return a bounded relative CoT violation in ``[0, 1]``."""
-
-    safe_limit = max(float(limit), 1.0e-6)
-    finite = torch.nan_to_num(specific_cot, nan=1.0e6, posinf=1.0e6, neginf=0.0)
-    excess = torch.clamp_min(finite - safe_limit, 0.0)
-    return torch.clamp(
-        excess / torch.clamp_min(finite, safe_limit),
-        0.0,
-        1.0,
-    )
-
-
 def _forward_progress_guard(
     position_x: torch.Tensor,
     episode_step: torch.Tensor,
@@ -438,7 +422,7 @@ class LytRobotWarpAmpEnv:
         self.foot_x_min = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.foot_x_max = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.contact_balance_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
-        self.action_energy_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.action_activity_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.last_obs = torch.zeros((self.num_envs, self.obs_dim), dtype=torch.float32, device=self.device)
         self.stand_start = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.stand_start_transition_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
@@ -478,9 +462,19 @@ class LytRobotWarpAmpEnv:
         if not isinstance(self.motion, MotionLibrary):
             raise ValueError("serial terrain course requires a multi-motion library.")
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
+        # Two-reference compatibility: when no slope expert exists, both
+        # slope stages use the original rough-walk reference.  Four-reference
+        # layouts contain the requested clip names and bypass this fallback.
+        fallback_names = {"slope_up": "rough_walk", "slope_down": "rough_walk"}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
-            names = course_motion_sequence(order)
+            requested_names = course_motion_sequence(order)
+            names = [
+                name
+                if name in name_to_id
+                else fallback_names.get(name, name)
+                for name in requested_names
+            ]
             missing = [name for name in names if name not in name_to_id]
             if missing:
                 raise ValueError(
@@ -746,31 +740,9 @@ class LytRobotWarpAmpEnv:
         else:
             wp.capture_launch(self._forward_graph)
 
-    def _warp_decimated_step(self) -> tuple[torch.Tensor, torch.Tensor]:
-        mechanical_energy = torch.zeros(
-            self.num_envs,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        invalid_energy = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
+    def _warp_decimated_step(self) -> None:
         for _ in range(int(self.cfg.decimation)):
             self._warp_step()
-            actuator_power = torch.sum(
-                torch.abs(self.actuator_force * self.actuator_velocity),
-                dim=1,
-            )
-            invalid_energy |= ~torch.isfinite(actuator_power)
-            mechanical_energy += torch.nan_to_num(
-                actuator_power,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ) * float(self.cfg.timestep)
-        return mechanical_energy, invalid_energy
 
     def _init_domain_randomization(self) -> None:
         self.domain_randomization = bool(self.cfg.domain_randomization)
@@ -1429,7 +1401,7 @@ class LytRobotWarpAmpEnv:
         self.foot_x_max[ids] = side_x
         self.foot_stride_ema[ids] = 0.0
         self.contact_balance_ema[ids] = 0.0
-        self.action_energy_ema[ids] = 0.0
+        self.action_activity_ema[ids] = 0.0
         if self.actor_observation_enabled:
             assert targets is not None
             self.last_obs = self.observe(targets=targets)
@@ -1537,7 +1509,6 @@ class LytRobotWarpAmpEnv:
             raise ValueError(f"Expected action shape {(self.num_envs, self.action_dim)}, got {tuple(actions.shape)}")
 
         prev_action = self.last_action.clone()
-        start_x = self.qpos[:, 0].clone()
         commanded_action = self._apply_action_noise(torch.clamp(actions, -1.0, 1.0))
         commanded_action = commanded_action * self._startup_action_ramp()
         phase_scale = self._stand_start_progress()
@@ -1667,35 +1638,12 @@ class LytRobotWarpAmpEnv:
             if not self.domain_randomization or self.max_action_delay_ticks <= 0:
                 applied_action = commanded_action
                 self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
-                mechanical_energy, mechanical_energy_invalid = (
-                    self._warp_decimated_step()
-                )
+                self._warp_decimated_step()
             else:
-                mechanical_energy = torch.zeros(
-                    self.num_envs,
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                mechanical_energy_invalid = torch.zeros(
-                    self.num_envs,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
                 for _ in range(self.cfg.decimation):
                     applied_action = self._delayed_action(commanded_action)
                     self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
                     self._warp_step()
-                    actuator_power = torch.sum(
-                        torch.abs(self.actuator_force * self.actuator_velocity),
-                        dim=1,
-                    )
-                    mechanical_energy_invalid |= ~torch.isfinite(actuator_power)
-                    mechanical_energy += torch.nan_to_num(
-                        actuator_power,
-                        nan=0.0,
-                        posinf=0.0,
-                        neginf=0.0,
-                    ) * float(self.cfg.timestep)
 
         self.episode_step += 1
         foot_pos = self._foot_positions_local()
@@ -1718,66 +1666,6 @@ class LytRobotWarpAmpEnv:
             foot_world_vel,
             foot_geom_contact,
             foot_contact,
-        )
-        invalid_step = mechanical_energy_invalid | (
-            components["invalid_state"] > 0.5
-        )
-        rewards = torch.where(
-            mechanical_energy_invalid,
-            torch.full_like(rewards, -2.0),
-            rewards,
-        )
-        dones = dones | mechanical_energy_invalid
-        time_outs = time_outs & ~mechanical_energy_invalid
-        for key, value in components.items():
-            components[key] = torch.where(
-                mechanical_energy_invalid,
-                torch.zeros_like(value),
-                value,
-            )
-        components["invalid_state"] = invalid_step.to(torch.float32)
-        components["termination"] = torch.maximum(
-            components["termination"],
-            mechanical_energy_invalid.to(torch.float32),
-        )
-        mechanical_energy = torch.where(
-            invalid_step,
-            torch.zeros_like(mechanical_energy),
-            mechanical_energy,
-        )
-        actuator_power = mechanical_energy / max(self.dt, 1.0e-6)
-        forward_distance = torch.nan_to_num(
-            torch.clamp(self.qpos[:, 0] - start_x, min=0.0),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        cot_distance = torch.clamp(
-            forward_distance,
-            min=max(float(self.cfg.cot_min_forward_speed) * self.dt, 1.0e-6),
-        )
-        specific_cot = torch.nan_to_num(
-            mechanical_energy / (max(self.robot_mass, 1.0e-6) * cot_distance),
-            nan=1.0e6,
-            posinf=1.0e6,
-            neginf=1.0e6,
-        )
-        cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
-        specific_cot_excess = _bounded_specific_cot_excess(
-            specific_cot,
-            cot_limit,
-        )
-        if self.cfg.specific_cot_penalty_coef != 0.0:
-            rewards = rewards - (
-                float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
-            )
-        components.update(
-            {
-                "actuator_power": actuator_power,
-                "mechanical_energy": mechanical_energy,
-                "specific_cot": specific_cot,
-                "specific_cot_excess": specific_cot_excess,
-            }
         )
         if self.more_terrain_cfg.serial_course:
             rewards = rewards + (
@@ -1831,6 +1719,15 @@ class LytRobotWarpAmpEnv:
         reported_course_stage = self.course_stage_ids.clone()
         reported_course_start_stage = self.course_start_stage_ids.clone()
         done_ids_np = np.flatnonzero(dones.detach().cpu().numpy())
+        terminal_payload = None
+        terminal_observer = getattr(self, "terminal_observer", None)
+        if done_ids_np.size > 0 and callable(terminal_observer):
+            # The terminal history has to be read before reset; otherwise a
+            # time-limit bootstrap incorrectly evaluates the next episode.
+            terminal_ids = torch.as_tensor(
+                done_ids_np, dtype=torch.long, device=self.device
+            )
+            terminal_payload = terminal_observer(terminal_ids)
         if done_ids_np.size > 0:
             self.reset(done_ids_np)
         else:
@@ -1839,6 +1736,9 @@ class LytRobotWarpAmpEnv:
         info = {key: value for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.to(torch.float32)
+        if terminal_payload is not None:
+            info.update(terminal_payload)
+            info["terminal_env_ids"] = terminal_ids
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.to(torch.float32)
             info["course_suffix_complete"] = course_suffix_complete.to(torch.float32)
@@ -2239,11 +2139,11 @@ class LytRobotWarpAmpEnv:
         )
 
         if len(self.right_action_indices) > 0 and len(self.left_action_indices) > 0:
-            right_energy = torch.mean(action[:, self.right_action_indices].square(), dim=1)
-            left_energy = torch.mean(action[:, self.left_action_indices].square(), dim=1)
-            side_energy = torch.stack((right_energy, left_energy), dim=1)
-            self.action_energy_ema[:] = decay * self.action_energy_ema + (1.0 - decay) * side_energy
-            action_diff = self.action_energy_ema[:, 0] - self.action_energy_ema[:, 1]
+            right_activity = torch.mean(action[:, self.right_action_indices].square(), dim=1)
+            left_activity = torch.mean(action[:, self.left_action_indices].square(), dim=1)
+            side_activity = torch.stack((right_activity, left_activity), dim=1)
+            self.action_activity_ema[:] = decay * self.action_activity_ema + (1.0 - decay) * side_activity
+            action_diff = self.action_activity_ema[:, 0] - self.action_activity_ema[:, 1]
             action_balance = torch.exp(
                 -action_diff.square() / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2)
             )

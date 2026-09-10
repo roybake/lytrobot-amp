@@ -6,49 +6,16 @@ import numpy as np
 import torch
 
 from lytrobot_amp.env import (
-    _bounded_specific_cot_excess as bounded_numpy_cot_excess,
     _sanitize_reward_outputs as sanitize_numpy_reward_outputs,
     _stability_gated_locomotion_terms as gated_numpy_locomotion_terms,
 )
 from lytrobot_amp.env_warp import (
-    _bounded_specific_cot_excess as bounded_torch_cot_excess,
     _sanitize_reward_outputs as sanitize_torch_reward_outputs,
     _stability_gated_locomotion_terms as gated_torch_locomotion_terms,
 )
 
 
 class RewardNumericsTests(unittest.TestCase):
-    def test_specific_cot_penalty_is_zero_at_limit_and_bounded_above_it(self) -> None:
-        cot = np.asarray([0.4, 0.8, 1.6, 8.0, 1.0e6], dtype=np.float32)
-        expected = np.asarray([0.0, 0.0, 0.5, 0.9, 0.9999992], dtype=np.float32)
-
-        np.testing.assert_allclose(
-            bounded_numpy_cot_excess(cot, 0.8),
-            expected,
-            rtol=1.0e-6,
-            atol=1.0e-7,
-        )
-        torch.testing.assert_close(
-            bounded_torch_cot_excess(torch.from_numpy(cot), 0.8),
-            torch.from_numpy(expected),
-            rtol=1.0e-6,
-            atol=1.0e-7,
-        )
-
-    def test_specific_cot_penalty_handles_nonfinite_values(self) -> None:
-        numpy_values = bounded_numpy_cot_excess(
-            np.asarray([float("nan"), float("inf"), float("-inf")]),
-            0.8,
-        )
-        torch_values = bounded_torch_cot_excess(
-            torch.tensor([float("nan"), float("inf"), float("-inf")]),
-            0.8,
-        )
-
-        self.assertTrue(np.isfinite(numpy_values).all())
-        self.assertTrue(np.all((numpy_values >= 0.0) & (numpy_values <= 1.0)))
-        self.assertTrue(torch.isfinite(torch_values).all())
-        self.assertTrue(torch.all((torch_values >= 0.0) & (torch_values <= 1.0)))
 
     def test_warp_sanitizer_quarantines_only_invalid_environment(self) -> None:
         reward = torch.tensor([1.0, 2.0, float("nan")])

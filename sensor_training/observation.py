@@ -74,15 +74,17 @@ class HistoryMotionReference:
         return getattr(self.source, name)
 
     @staticmethod
-    def _interpolate_table(table: np.ndarray, phases: np.ndarray) -> np.ndarray:
+    def _interpolate_table(table: np.ndarray, phases: np.ndarray, *, loop: bool = True) -> np.ndarray:
         frame_count = table.shape[0]
         # Keep phase arithmetic in float64. A float32 value immediately below
         # frame_count can round up to frame_count (35200 for the current motion),
         # which must wrap to index zero instead of becoming an invalid index.
-        wrapped = np.remainder(np.asarray(phases, dtype=np.float64), float(frame_count))
+        phases = np.asarray(phases, dtype=np.float64)
+        wrapped = (np.remainder(phases, float(frame_count)) if loop
+                   else np.clip(phases, 0.0, float(frame_count - 1)))
         low_float = np.floor(wrapped)
         low = low_float.astype(np.int64) % frame_count
-        high = (low + 1) % frame_count
+        high = (low + 1) % frame_count if loop else np.minimum(low + 1, frame_count - 1)
         blend = (wrapped - low_float).astype(np.float32)[..., None]
         return ((1.0 - blend) * table[low] + blend * table[high]).astype(np.float32)
 
@@ -154,14 +156,17 @@ class HistoryMotionReference:
                 float(self.source.frequencies[motion_id]) * self.policy_dt
             )
             phases = current_phase + frame_offsets * reference_stride
+            loop = bool(getattr(self.source, "motion_loop", np.ones(len(self.source.frame_counts), dtype=bool))[motion_id])
             regular = self._interpolate_table(
                 self.source.reference_features[motion_id],
                 phases,
+                loop=loop,
             )
             if np.any(mirror_mask[rows]):
                 mirrored = self._interpolate_table(
                     self.source.mirrored_reference_features[motion_id],
                     phases,
+                    loop=loop,
                 )
                 local_mirror = mirror_mask[rows]
                 regular[local_mirror] = mirrored[local_mirror]

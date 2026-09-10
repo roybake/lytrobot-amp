@@ -33,6 +33,8 @@ CLIPS = (
     "turn_left",
     "turn_right",
     "rough_walk",
+    "slope_up",
+    "slope_down",
     "pit_walk",
     "gap_cross",
     "stair_up",
@@ -121,6 +123,8 @@ def clip_metrics(model: mujoco.MjModel, motion_path: Path) -> dict[str, object]:
         "unsupported_gap_contact_frames": metadata.get(
             "unsupported_gap_contact_frames", 0
         ),
+        "maximum_joint_step_rad": metadata.get("maximum_joint_step_rad"),
+        "maximum_root_step_m": metadata.get("maximum_root_step_m"),
     }
 
 
@@ -142,8 +146,9 @@ def main() -> None:
     failures: list[str] = []
     warnings: list[str] = []
     for clip, metrics in clips.items():
-        if metrics["frequency_hz"] != 40.0:
-            failures.append(f"{clip}: expected 40 Hz")
+        expected_frequency = 120.0 if clip in {"slope_up", "slope_down"} else 40.0
+        if metrics["frequency_hz"] != expected_frequency:
+            failures.append(f"{clip}: expected {expected_frequency:g} Hz")
         if metrics["penetration_frames"] != 0:
             failures.append(
                 f"{clip}: {metrics['penetration_frames']} cross-leg penetration frames"
@@ -177,6 +182,16 @@ def main() -> None:
                 f"{locomotion}: forward speed {speed:.3f} m/s does not match "
                 f"{TRAINING_TARGET_SPEED_MPS:.3f} m/s"
             )
+    for slope in ("slope_up", "slope_down"):
+        metrics = clips[slope]
+        if metrics["maximum_joint_step_rad"] is None:
+            failures.append(f"{slope}: missing continuity audit")
+        elif float(metrics["maximum_joint_step_rad"]) > 0.36:
+            failures.append(f"{slope}: joint discontinuity exceeds 0.36 rad/frame")
+        if metrics["maximum_root_step_m"] is None:
+            failures.append(f"{slope}: missing root continuity audit")
+        elif float(metrics["maximum_root_step_m"]) > 0.07:
+            failures.append(f"{slope}: root discontinuity exceeds 0.07 m/frame")
     if TRAINING_TARGET_SPEED_MPS < MIN_WALKING_SPEED_MPS:
         warnings.append(
             "Native reference speed "
@@ -196,6 +211,8 @@ def main() -> None:
             "locomotion_target_speed_mps": TRAINING_TARGET_SPEED_MPS,
             "locomotion_speed_tolerance_mps": 0.02,
             "locomotion_minimum_speed_mps": MIN_WALKING_SPEED_MPS,
+            "slope_maximum_joint_step_rad": 0.36,
+            "slope_maximum_root_step_m": 0.07,
             "training_speed_meets_acceptance_minimum": (
                 TRAINING_TARGET_SPEED_MPS >= MIN_WALKING_SPEED_MPS
             ),

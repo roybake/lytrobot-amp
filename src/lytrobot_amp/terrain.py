@@ -45,6 +45,11 @@ COURSE_TERRAIN_LENGTHS = {
 MORE_XML_TERRAIN_RGBA = (0.5, 0.5, 0.5, 1.0)
 MORE_MATTE_TERRAIN_MATERIAL = "more_matte_terrain"
 MORE_TERRAIN_CHECKER_TEXTURE = "more_terrain_checker"
+# The source rough heightmap has non-zero samples at both X edges.  A serial
+# course places it directly against a flat platform, so those samples otherwise
+# form a small but abrupt lip at each seam.  Reserve this much of the existing
+# rough segment for a smooth fade from/to the common course datum.
+SERIAL_ROUGH_TRANSITION_LENGTH = 0.30
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,16 @@ class MoreTerrainCfg:
     rough_lane_y: float = 6.0
     pit_lane_y: float = 9.0
     gap_lane_y: float = 12.0
+    # Standalone lanes are used by the reference-data visualizer and contact
+    # IK tools.  Serial courses create their ramps from ``course_segments``.
+    slope_up_lane_y: float = 15.0
+    slope_down_lane_y: float = 18.0
+    # Keep a 0.35 m support margin at each end of the 3.10 m reference.  A
+    # walking cycle begins with the rear foot slightly behind the root; ending
+    # the physical ramp at the root trajectory would make that foot sample the
+    # flat floor and inject a false contact discontinuity.
+    slope_start_x: float = -0.35
+    slope_half_length: float = 1.90
     lane_width: float = 2.0
 
     rough_center_x: float = 2.0
@@ -242,9 +257,10 @@ def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
         elif kind == "rough":
             result.append("rough_walk")
         elif kind in {"slope_up", "slope_down"}:
-            # The assessment policy has no terrain/skill command.  Reusing the
-            # unrolled walking reference leaves adaptation to IMU+tendon input.
-            result.append("rough_walk")
+            # Each slope has its own OmniRetarget + full-foot contact-IK
+            # expert.  Sensor-only deployment still receives no terrain label;
+            # this selection is training-side supervision only.
+            result.append(kind)
         elif kind == "pit":
             result.append("pit_walk")
         else:
@@ -467,6 +483,57 @@ def more_boxes(cfg: MoreTerrainCfg) -> list[tuple[str, np.ndarray, np.ndarray]]:
             )
         )
     return boxes
+
+
+def standalone_slope_ramps(
+    cfg: MoreTerrainCfg,
+) -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
+    """Return standalone 6-degree ramps for slope reference generation.
+
+    The top surface of an up ramp rises from the global floor; a down ramp
+    starts at the same height and descends to it.  This is deliberately the
+    same box construction used by the serial assessment course, so contact IK
+    and preview playback see the exact slope angle used in training.
+    """
+
+    _validate_more(cfg)
+    if cfg.serial_course:
+        return []
+    angle = np.deg2rad(float(cfg.slope_angle_deg))
+    thickness = max(float(cfg.course_base_height), 0.05)
+    slope_length = 2.0 * float(cfg.slope_half_length)
+    rise = slope_length * np.tan(angle)
+    half_size = np.asarray(
+        [0.5 * slope_length / np.cos(angle), 0.5 * cfg.lane_width, 0.5 * thickness],
+        dtype=np.float64,
+    )
+    result: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    for kind, lane_y in (
+        ("slope_up", cfg.slope_up_lane_y),
+        ("slope_down", cfg.slope_down_lane_y),
+    ):
+        if kind not in cfg.terrain_types:
+            continue
+        signed_angle = -angle if kind == "slope_up" else angle
+        center = np.asarray(
+            [
+                cfg.slope_start_x + cfg.slope_half_length,
+                lane_y,
+                0.5 * rise - 0.5 * thickness * np.cos(angle),
+            ],
+            dtype=np.float64,
+        )
+        quat = np.asarray(
+            [
+                np.cos(0.5 * signed_angle),
+                0.0,
+                np.sin(0.5 * signed_angle),
+                0.0,
+            ],
+            dtype=np.float64,
+        )
+        result.append((f"more_{kind}", center, half_size, quat))
+    return result
 
 
 def serial_course_boxes(
@@ -741,6 +808,9 @@ def _attach_terrain(
         if serial_course and ({"slope_up", "slope_down"} & set(more.terrain_types)):
             for name, center, half_size, quat in serial_course_ramps(more):
                 _add_ramp(spec, name, center, half_size, quat, terrain_material)
+        elif {"slope_up", "slope_down"} & set(more.terrain_types):
+            for name, center, half_size, quat in standalone_slope_ramps(more):
+                _add_ramp(spec, name, center, half_size, quat, terrain_material)
 
         if "rough" in more.terrain_types:
             asset_dir = (
@@ -804,6 +874,50 @@ def _attach_terrain(
                 geom.conaffinity = 1
 
 
+def _taper_serial_rough_heightfield_edges(model: mujoco.MjModel) -> None:
+    """Fade the serial rough heightfield to the flat-course datum at both ends.
+
+    MuJoCo stores heightfields as mutable, normalized samples on the compiled
+    model.  Applying the envelope here keeps the copied MoRE asset intact and
+    affects only the serial course, where rough terrain is physically joined to
+    flat platforms.  The cubic smoothstep has zero slope at both ends, avoiding
+    a replacement step at the end of the transition zone.
+    """
+
+    hfield_id = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_HFIELD,
+        "course_rough_hfield",
+    )
+    if hfield_id < 0:
+        return
+    row_count = int(model.hfield_nrow[hfield_id])
+    column_count = int(model.hfield_ncol[hfield_id])
+    if row_count < 1 or column_count < 2:
+        return
+
+    # Hfield columns run along its local X direction.  The samples include both
+    # endpoints, hence ``column_count - 1`` spatial intervals.
+    length = 2.0 * float(model.hfield_size[hfield_id, 0])
+    cell_length = length / float(column_count - 1)
+    transition_columns = min(
+        column_count // 2,
+        max(1, int(np.ceil(SERIAL_ROUGH_TRANSITION_LENGTH / cell_length))),
+    )
+    normalized_distance = np.linspace(0.0, 1.0, transition_columns + 1)
+    smoothstep = normalized_distance**2 * (3.0 - 2.0 * normalized_distance)
+    envelope = np.ones(column_count, dtype=model.hfield_data.dtype)
+    envelope[: transition_columns + 1] = smoothstep
+    envelope[-(transition_columns + 1) :] = smoothstep[::-1]
+
+    offset = int(model.hfield_adr[hfield_id])
+    sample_count = row_count * column_count
+    samples = model.hfield_data[offset : offset + sample_count].reshape(
+        row_count, column_count
+    )
+    samples *= envelope[np.newaxis, :]
+
+
 def load_model(
     model_xml: str | Path,
     stairs: StairTerrainCfg | None = None,
@@ -819,7 +933,10 @@ def load_model(
 
     spec = mujoco.MjSpec.from_file(str(model_path))
     _attach_terrain(spec, stairs, more)
-    return spec.compile()
+    model = spec.compile()
+    if more is not None and more.serial_course and "rough" in more.terrain_types:
+        _taper_serial_rough_heightfield_edges(model)
+    return model
 
 
 def load_multi_robot_model(
@@ -845,6 +962,8 @@ def load_multi_robot_model(
         scene.attach(robot, prefix=f"robot_{index}_", frame=frame)
     _attach_terrain(scene, stairs, more)
     model = scene.compile()
+    if more is not None and more.serial_course and "rough" in more.terrain_types:
+        _taper_serial_rough_heightfield_edges(model)
     # Attaching full robot specs also attaches one copy of their scene lights.
     # Keep a single MoRE-strength key light so multi-robot terrain playback is
     # not overexposed by N identical lights.
@@ -973,6 +1092,10 @@ def terrain_spawn_offset(
         return np.asarray(
             [more.rough_spawn_x, more.rough_lane_y, 0.0], dtype=np.float32
         )
+    if kind == "slope_up":
+        return np.asarray([0.0, more.slope_up_lane_y, 0.0], dtype=np.float32)
+    if kind == "slope_down":
+        return np.asarray([0.0, more.slope_down_lane_y, 0.0], dtype=np.float32)
     if kind == "stairs":
         x = stairs.descent_start + stair_down_offset if stair_down else 0.0
         return np.asarray([x, stairs.center_y, 0.0], dtype=np.float32)

@@ -13,7 +13,7 @@ from scripts import play, train, train_multimotion
 def test_recorded_launcher_and_all_effective_arguments(monkeypatch):
     recorded = run.recorded_config()
     argv = run.relocate(recorded["argv"][1:])
-    assert train_multimotion.default_train_args() + ["--max-iterations", "30000"] == argv
+    assert "stairs" in argv
     monkeypatch.setattr(sys, "argv", ["train.py", *argv])
     actual = vars(train.parse_args())
     # The historical main resolves this tri-state after parsing.
@@ -22,6 +22,14 @@ def test_recorded_launcher_and_all_effective_arguments(monkeypatch):
     assert actual == run.relocate(recorded["args"])
     assert Path(train.__file__).resolve().is_relative_to(run.ROOT)
     assert Path(sys.modules["lytrobot_amp.env"].__file__).resolve().is_relative_to(run.ROOT)
+
+
+def test_recovery_training_uses_current_no_stair_defaults():
+    argv = run.training_argv([])
+    assert train_multimotion.default_train_args() + ["--max-iterations", "30000"] == argv[:-4]
+    assert "stairs" not in argv
+    assert "stair_up" not in argv
+    assert "stair_down" not in argv
 
 
 def test_playback_uses_historical_assets_without_mutating_metadata(monkeypatch):

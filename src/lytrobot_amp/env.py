@@ -114,29 +114,6 @@ def _stability_gated_locomotion_terms(
     return stability, gated_track, gated_progress
 
 
-def _bounded_specific_cot_excess(
-    specific_cot: float | np.ndarray,
-    limit: float,
-) -> float | np.ndarray:
-    """Return a bounded relative CoT violation in ``[0, 1]``.
-
-    Normalizing the raw excess by the tiny acceptance limit makes nearly every
-    early-training transition hit the same large penalty.  A negative per-step
-    reward then teaches the policy to end the episode as quickly as possible.
-    Normalizing by the measured CoT preserves zero penalty at or below the
-    limit and caps the configured penalty coefficient's actual contribution.
-    """
-
-    values = np.asarray(specific_cot, dtype=np.float32)
-    safe_limit = max(float(limit), 1.0e-6)
-    finite = np.nan_to_num(values, nan=1.0e6, posinf=1.0e6, neginf=0.0)
-    excess = np.maximum(finite - safe_limit, 0.0)
-    bounded = np.clip(excess / np.maximum(finite, safe_limit), 0.0, 1.0)
-    if np.ndim(specific_cot) == 0:
-        return float(bounded)
-    return bounded
-
-
 def _forward_progress_guard(
     position_x: np.ndarray,
     episode_step: np.ndarray,
@@ -258,9 +235,6 @@ class LytRobotEnvCfg:
     forward_progress_termination_penalty: float = 2.0
     fall_penalty: float = 2.0
     terminate_incomplete_motion_end: bool = False
-    specific_cot_limit: float = 0.8
-    specific_cot_penalty_coef: float = 0.0
-    cot_min_forward_speed: float = 0.10
     reset_noise_scale: float = 0.01
     motion_reset_prob: float = 0.5
     action_residual_scale: float = 0.5
@@ -528,7 +502,7 @@ class LytRobotAmpEnv:
         self.foot_x_min = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.foot_x_max = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.contact_balance_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
-        self.action_energy_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.action_activity_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.last_obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         self.stand_start = np.zeros(self.num_envs, dtype=bool)
         self.stand_start_transition_steps = np.ones(self.num_envs, dtype=np.int32)
@@ -567,9 +541,19 @@ class LytRobotAmpEnv:
         if not isinstance(self.motion, MotionLibrary):
             raise ValueError("serial terrain course requires a multi-motion library.")
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
+        # The original two-reference curriculum deliberately has no dedicated
+        # slope clips.  Preserve it by using its rough-walk expert on either
+        # slope; four-reference training resolves the exact names directly.
+        fallback_names = {"slope_up": "rough_walk", "slope_down": "rough_walk"}
         rows: list[list[int]] = []
         for order in self.more_terrain_cfg.normalized_course_orders:
-            names = course_motion_sequence(order)
+            requested_names = course_motion_sequence(order)
+            names = [
+                name
+                if name in name_to_id
+                else fallback_names.get(name, name)
+                for name in requested_names
+            ]
             missing = [name for name in names if name not in name_to_id]
             if missing:
                 raise ValueError(
@@ -1203,7 +1187,7 @@ class LytRobotAmpEnv:
             self.foot_x_max[int(env_id)] = side_x
             self.foot_stride_ema[int(env_id)] = 0.0
             self.contact_balance_ema[int(env_id)] = 0.0
-            self.action_energy_ema[int(env_id)] = 0.0
+            self.action_activity_ema[int(env_id)] = 0.0
             self.episode_step[int(env_id)] = 0
             self.episode_timeout_step[int(env_id)] = self._sample_timeout_step()
             self.forward_progress_anchor_x[int(env_id)] = float(data.qpos[0])
@@ -1317,10 +1301,6 @@ class LytRobotAmpEnv:
             "forward_progress": [],
             "forward_velocity_deficit": [],
             "forward_velocity_excess": [],
-            "actuator_power": [],
-            "mechanical_energy": [],
-            "specific_cot": [],
-            "specific_cot_excess": [],
             "termination": [],
             "root_orientation": [],
             "height": [],
@@ -1464,9 +1444,6 @@ class LytRobotAmpEnv:
                 reference_targets.tendon_ctrl[env_id], env_id
             )
             base_ctrl = self._reference_base_ctrl(transitioned_reference_ctrl, data)
-            start_x = float(data.qpos[0])
-            mechanical_energy = 0.0
-            mechanical_energy_invalid = False
             data.xfrc_applied[:] = 0.0
             data.xfrc_applied[self.pelvis_body_id] = self.push_force[env_id]
             applied_action = commanded_action
@@ -1474,14 +1451,6 @@ class LytRobotAmpEnv:
                 applied_action = self._delayed_action(env_id, commanded_action)
                 data.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl, env_id=env_id)
                 mujoco.mj_step(self.model, data)
-                substep_energy = float(
-                    np.sum(np.abs(data.actuator_force * data.actuator_velocity))
-                    * float(self.cfg.timestep)
-                )
-                if np.isfinite(substep_energy):
-                    mechanical_energy += substep_energy
-                else:
-                    mechanical_energy_invalid = True
 
             self.episode_step[env_id] += 1
             foot_pos = self._foot_positions_local(data)
@@ -1507,53 +1476,15 @@ class LytRobotAmpEnv:
                 foot_geom_contact,
                 foot_contact,
             )
-            invalid_step = bool(
-                mechanical_energy_invalid
-                or reward_parts.get("invalid_state", 0.0) > 0.5
-            )
+            invalid_step = bool(reward_parts.get("invalid_state", 0.0) > 0.5)
             if invalid_step:
                 reward = -2.0
                 done = True
                 timed_out = False
-                mechanical_energy = 0.0
                 reward_parts = {key: 0.0 for key in reward_parts}
                 reward_parts["invalid_state"] = 1.0
                 reward_parts["termination"] = 1.0
             rewards[env_id] = reward
-            forward_distance = max(
-                float(np.nan_to_num(float(data.qpos[0]) - start_x, nan=0.0)),
-                0.0,
-            )
-            cot_distance = max(
-                forward_distance,
-                float(self.cfg.cot_min_forward_speed) * self.dt,
-                1.0e-6,
-            )
-            specific_cot = float(
-                np.nan_to_num(
-                    mechanical_energy
-                    / max(self.robot_mass * cot_distance, 1.0e-6),
-                    nan=1.0e6,
-                    posinf=1.0e6,
-                    neginf=1.0e6,
-                )
-            )
-            cot_limit = max(float(self.cfg.specific_cot_limit), 1.0e-6)
-            specific_cot_excess = float(
-                _bounded_specific_cot_excess(specific_cot, cot_limit)
-            )
-            if self.cfg.specific_cot_penalty_coef != 0.0:
-                rewards[env_id] -= (
-                    float(self.cfg.specific_cot_penalty_coef) * specific_cot_excess
-                )
-            reward_parts.update(
-                {
-                    "actuator_power": mechanical_energy / max(self.dt, 1.0e-6),
-                    "mechanical_energy": mechanical_energy,
-                    "specific_cot": specific_cot,
-                    "specific_cot_excess": specific_cot_excess,
-                }
-            )
             if self.more_terrain_cfg.serial_course:
                 rewards[env_id] += (
                     float(self.cfg.terrain_course_completion_reward)
@@ -1614,6 +1545,12 @@ class LytRobotAmpEnv:
         reported_course_stage = self.course_stage_ids.copy()
         reported_course_start_stage = self.course_start_stage_ids.copy()
         done_ids = np.nonzero(dones)[0].astype(np.int32)
+        terminal_payload = None
+        terminal_observer = getattr(self, "terminal_observer", None)
+        if len(done_ids) > 0 and callable(terminal_observer):
+            # Capture the terminal state before autoreset so recurrent
+            # trainers can bootstrap time-limit transitions correctly.
+            terminal_payload = terminal_observer(done_ids)
         if len(done_ids) > 0:
             self.reset(done_ids)
         else:
@@ -1622,6 +1559,9 @@ class LytRobotAmpEnv:
         info = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.astype(np.float32)
+        if terminal_payload is not None:
+            info.update(terminal_payload)
+            info["terminal_env_ids"] = done_ids
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.astype(np.float32)
             info["course_suffix_complete"] = course_suffix_complete.astype(np.float32)
@@ -2027,15 +1967,15 @@ class LytRobotAmpEnv:
         )
 
         if len(self.right_action_indices) > 0 and len(self.left_action_indices) > 0:
-            side_energy = np.asarray(
+            side_activity = np.asarray(
                 [
                     np.mean(np.square(action[self.right_action_indices])),
                     np.mean(np.square(action[self.left_action_indices])),
                 ],
                 dtype=np.float32,
             )
-            self.action_energy_ema[env_id] = decay * self.action_energy_ema[env_id] + (1.0 - decay) * side_energy
-            action_diff = float(self.action_energy_ema[env_id, 0] - self.action_energy_ema[env_id, 1])
+            self.action_activity_ema[env_id] = decay * self.action_activity_ema[env_id] + (1.0 - decay) * side_activity
+            action_diff = float(self.action_activity_ema[env_id, 0] - self.action_activity_ema[env_id, 1])
             action_balance = float(
                 np.exp(-(action_diff**2) / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2))
             )

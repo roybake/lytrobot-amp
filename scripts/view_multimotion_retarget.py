@@ -41,6 +41,8 @@ CLIP_ORDER = (
     "turn_left",
     "turn_right",
     "rough_walk",
+    "slope_up",
+    "slope_down",
     "pit_walk",
     "gap_cross",
     "stair_up",
@@ -109,6 +111,22 @@ CLIP_SPECS = {
         filename="rough_walk_omniretarget.npz",
         azimuth=105.0,
         distance=2.55,
+    ),
+    "slope_up": ClipSpec(
+        key="slope_up",
+        title="SLOPE WALK UP",
+        subtitle="OmniRetarget + STL contact IK  |  6 deg  |  heel > sole > toe",
+        filename="slope_up_omniretarget.npz",
+        azimuth=105.0,
+        distance=2.65,
+    ),
+    "slope_down": ClipSpec(
+        key="slope_down",
+        title="SLOPE WALK DOWN",
+        subtitle="OmniRetarget + STL contact IK  |  -6 deg  |  heel > sole > toe",
+        filename="slope_down_omniretarget.npz",
+        azimuth=105.0,
+        distance=2.65,
     ),
     "pit_walk": ClipSpec(
         key="pit_walk",
@@ -185,7 +203,7 @@ def reference_more_terrains() -> MoreTerrainCfg:
 
     return MoreTerrainCfg(
         enabled=True,
-        terrain_types=("gap", "pit", "rough", "stairs"),
+        terrain_types=("gap", "pit", "rough", "slope_up", "slope_down", "stairs"),
     )
 
 

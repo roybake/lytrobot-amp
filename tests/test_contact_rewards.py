@@ -81,7 +81,7 @@ class ContactRewardTests(unittest.TestCase):
         self.env.foot_x_max = np.asarray([[0.05, 0.05]], dtype=np.float32)
         self.env.foot_stride_ema = np.zeros((1, 2), dtype=np.float32)
         self.env.contact_balance_ema = np.zeros((1, 2), dtype=np.float32)
-        self.env.action_energy_ema = np.zeros((1, 2), dtype=np.float32)
+        self.env.action_activity_ema = np.zeros((1, 2), dtype=np.float32)
         self.env.right_action_indices = np.asarray([], dtype=np.int32)
         self.env.left_action_indices = np.asarray([], dtype=np.int32)
         foot_pos = np.asarray(

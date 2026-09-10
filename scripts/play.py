@@ -198,6 +198,7 @@ def make_env_cfg(
         cfg.terrain_course_random_assignment = False
         # Playback is a strict full-route evaluation, never a curriculum reset.
         cfg.terrain_course_random_start_prob = 0.0
+    if use_serial_course:
         cfg.stand_start_prob = 0.0
     if args.stand_start_prob is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
@@ -466,16 +467,6 @@ def main() -> None:
     stage = infer_stage(args.checkpoint, checkpoint, args.stage)
 
     env_cfg = make_env_cfg(args, checkpoint, stage)
-    if env_cfg.serial_terrain_course and not (
-        env_cfg.forward_velocity_reward_coef > 0.0
-        or env_cfg.forward_progress_reward_coef > 0.0
-        or env_cfg.forward_velocity_deficit_penalty_coef > 0.0
-    ):
-        print(
-            "[WARN] This checkpoint was trained without an explicit forward-course "
-            "objective and may stand in place. It must be fine-tuned or retrained "
-            "with the corrected multimotion defaults."
-        )
     env = LytRobotAmpEnv(env_cfg)
     sensor_architecture = checkpoint.get("sensor_policy_architecture", {})
     recurrent_sensor_policy = bool(sensor_architecture.get("recurrent", False))
@@ -502,6 +493,7 @@ def main() -> None:
                 gate_hidden_dims=tuple(sensor_architecture["gate_hidden_dims"]),
                 expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),
                 residual_scale=float(sensor_architecture["residual_scale"]),
+                privileged_context_dim=int(sensor_architecture.get("privileged_context_dim", 0)),
             ).to(args.device)
             recurrent_state = policy.initial_state(env.num_envs)
         else:

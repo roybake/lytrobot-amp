@@ -38,8 +38,9 @@ def recorded_config() -> dict:
 
 
 def training_argv(extra: list[str]) -> list[str]:
-    # The log records the fully expanded launcher arguments, including overrides.
-    args = relocate(recorded_config()["argv"][1:])
+    from scripts import train_multimotion
+
+    args = [*train_multimotion.default_train_args(), "--max-iterations", "30000"]
     return [*args, *extra, "--log-root", str(ROOT / "logs"),
             "--log-group", LOG_GROUP]
 

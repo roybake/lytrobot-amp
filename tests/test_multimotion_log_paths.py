@@ -18,15 +18,9 @@ from scripts.train_multimotion import (
     PPO_MINIBATCHES,
     ROLLOUT_STEPS,
     default_train_args,
+    split_reference_set_args,
 )
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
-    TRAINING_TARGET_SPEED_MPS,
-)
+from lytrobot_amp.benchmark import MAX_ROUGH_HEIGHT_DIFFERENCE_M, MAX_SLOPE_DEG
 
 
 class MultimotionLogPathTests(unittest.TestCase):
@@ -34,37 +28,27 @@ class MultimotionLogPathTests(unittest.TestCase):
         args = default_train_args()
 
         group_index = args.index("--log-group")
-        self.assertEqual(args[group_index + 1], "multimotion")
+        self.assertEqual(args[group_index + 1], "multimotion_four_ref")
         self.assertNotIn("--run-name", args)
 
-    def test_multimotion_defaults_reward_forward_course_progress(self) -> None:
+    def test_multimotion_defaults_keep_flat_rewards_and_course_bonuses(self) -> None:
         args = default_train_args()
 
         def value(option: str) -> float:
             return float(args[args.index(option) + 1])
 
-        self.assertGreater(value("--forward-velocity-reward-coef"), 0.0)
-        self.assertAlmostEqual(
-            value("--target-velocity"),
-            TRAINING_TARGET_SPEED_MPS,
-            places=6,
-        )
-        self.assertGreater(value("--forward-progress-reward-coef"), 0.0)
-        self.assertGreater(value("--forward-velocity-deficit-penalty-coef"), 0.0)
-        self.assertLessEqual(value("--forward-velocity-tracking-sigma"), 0.20)
-        self.assertGreater(
-            value("--forward-velocity-excess-penalty-coef"),
-            value("--forward-velocity-deficit-penalty-coef"),
-        )
-        self.assertGreater(value("--min-forward-progress-speed"), 0.0)
-        self.assertGreater(value("--forward-progress-window-steps"), 0.0)
-        self.assertGreaterEqual(value("--min-forward-progress-speed"), 0.10)
-        self.assertEqual(value("--fall-penalty"), 10.0)
+        self.assertNotIn("--use-reference-velocity", args)
+        self.assertNotIn("--target-velocity", args)
+        self.assertNotIn("--forward-velocity-reward-coef", args)
+        self.assertNotIn("--forward-progress-reward-coef", args)
+        self.assertNotIn("--forward-velocity-deficit-penalty-coef", args)
+        self.assertNotIn("--fall-penalty", args)
+        self.assertNotIn("--terminate-incomplete-motion-end", args)
+        self.assertNotIn("--side-foot-pos-coef", args)
+        self.assertNotIn("--step-gap-coef", args)
+        self.assertNotIn("--swing-advance-coef", args)
+        self.assertNotIn("--symmetry-reward-coef", args)
         self.assertEqual(value("--startup-action-ramp-steps"), 0.0)
-        self.assertIn("--terminate-incomplete-motion-end", args)
-        self.assertGreater(value("--side-foot-pos-coef"), 0.0)
-        self.assertGreater(value("--step-gap-coef"), 0.0)
-        self.assertGreater(value("--swing-advance-coef"), 0.0)
         self.assertEqual(value("--motion-transition-blend-steps"), 15.0)
         self.assertGreater(value("--terrain-course-stage-reward"), 0.0)
         self.assertGreater(value("--terrain-course-random-start-prob"), 0.0)
@@ -81,10 +65,42 @@ class MultimotionLogPathTests(unittest.TestCase):
         names = args[
             args.index("--motion-names") + 1 : args.index("--motion-weights")
         ]
+        weights = args[
+            args.index("--motion-weights") + 1 : args.index("--motion-loop")
+        ]
+        loops = args[
+            args.index("--motion-loop") + 1 : args.index("--skill-conditioning")
+        ]
         self.assertEqual(
             names,
-            ["walk", "rough_walk", "stair_up", "stair_down"],
+            ["walk", "rough_walk", "slope_up", "slope_down"],
         )
+        self.assertEqual(weights, ["0.35", "0.25", "0.20", "0.20"])
+        self.assertEqual(loops, ["true", "false", "false", "false"])
+
+    def test_two_reference_defaults_preserve_the_original_pair(self) -> None:
+        args = default_train_args("two")
+
+        names = args[
+            args.index("--motion-names") + 1 : args.index("--motion-weights")
+        ]
+        weights = args[
+            args.index("--motion-weights") + 1 : args.index("--motion-loop")
+        ]
+        loops = args[
+            args.index("--motion-loop") + 1 : args.index("--skill-conditioning")
+        ]
+        self.assertEqual(names, ["walk", "rough_walk"])
+        self.assertEqual(weights, ["0.50", "0.50"])
+        self.assertEqual(loops, ["true", "false"])
+        self.assertEqual(args[args.index("--log-group") + 1], "multimotion_two_ref")
+
+    def test_reference_set_selector_is_removed_before_train_parser(self) -> None:
+        reference_set, remaining = split_reference_set_args(
+            ["--reference-set", "two", "--num-envs", "128"]
+        )
+        self.assertEqual(reference_set, "two")
+        self.assertEqual(remaining, ["--num-envs", "128"])
 
     def test_random_stage_curriculum_preserves_full_route_warmup(self) -> None:
         target = 0.80
@@ -139,7 +155,7 @@ class MultimotionLogPathTests(unittest.TestCase):
         self.assertEqual(integer("--warp-nconmax"), 32)
         self.assertEqual(integer("--warp-njmax"), 128)
 
-    def test_multimotion_defaults_cover_acceptance_terrain_and_energy_limits(self) -> None:
+    def test_multimotion_defaults_keep_rough_and_slope_terrain(self) -> None:
         args = default_train_args()
 
         def value(option: str) -> float:
@@ -148,13 +164,9 @@ class MultimotionLogPathTests(unittest.TestCase):
         start = args.index("--terrain-types") + 1
         end = next(index for index in range(start, len(args)) if args[index].startswith("--"))
         terrains = set(args[start:end])
-        self.assertEqual(terrains, {"rough", "slope_up", "slope_down", "stairs"})
+        self.assertEqual(terrains, {"rough", "slope_up", "slope_down"})
         self.assertEqual(value("--rough-terrain-height"), MAX_ROUGH_HEIGHT_DIFFERENCE_M)
         self.assertEqual(value("--slope-angle-deg"), MAX_SLOPE_DEG)
-        self.assertEqual(value("--stair-step-height"), STAIR_HEIGHT_RANGE_M[1])
-        self.assertEqual(value("--stair-step-depth"), STAIR_TREAD_RANGE_M[0])
-        self.assertEqual(value("--specific-cot-limit"), MAX_SPECIFIC_COT_J_PER_KG_M)
-        self.assertGreater(value("--specific-cot-penalty-coef"), 0.0)
 
     def test_multimotion_group_creates_timestamp_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

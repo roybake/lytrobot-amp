@@ -12,14 +12,13 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from scripts.train_multimotion import default_train_args as base_multimotion_args
+from scripts.train_multimotion import (
+    default_train_args as base_multimotion_args,
+    split_reference_set_args,
+)
 from lytrobot_amp.benchmark import (
     MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
-    TRAINING_TARGET_SPEED_MPS,
-    STAIR_HEIGHT_RANGE_M,
-    STAIR_TREAD_RANGE_M,
 )
 
 
@@ -38,8 +37,8 @@ def _replace_option_values(
     args[start:end] = [option, *values]
 
 
-def default_train_args() -> list[str]:
-    args = base_multimotion_args()
+def default_train_args(reference_set: str = "four") -> list[str]:
+    args = base_multimotion_args(reference_set)
     _replace_option_values(
         args,
         "--rough-terrain-height",
@@ -47,30 +46,9 @@ def default_train_args() -> list[str]:
     )
     _replace_option_values(
         args,
-        "--stair-step-height",
-        [f"{STAIR_HEIGHT_RANGE_M[1]:.2f}"],
-    )
-    _replace_option_values(
-        args,
-        "--stair-step-depth",
-        [f"{STAIR_TREAD_RANGE_M[0]:.2f}"],
-    )
-    _replace_option_values(
-        args,
-        "--target-velocity",
-        [f"{TRAINING_TARGET_SPEED_MPS:.6f}"],
-    )
-    _replace_option_values(
-        args,
         "--slope-angle-deg",
         [f"{MAX_SLOPE_DEG:.1f}"],
     )
-    _replace_option_values(
-        args,
-        "--specific-cot-limit",
-        [f"{MAX_SPECIFIC_COT_J_PER_KG_M:.2f}"],
-    )
-    _replace_option_values(args, "--specific-cot-penalty-coef", ["2.0"])
     # The deployed control path must not receive the simulator-selected motion
     # reference.  With zero blend, actions remain 14 tendon target corrections
     # around measured tendon lengths and terrain adaptation comes from the GRU.
@@ -92,7 +70,7 @@ def default_train_args() -> list[str]:
     args[tag_index] = (
         "lytrobot,bpo,amp,multimotion,imu,tendon,recurrent,gru,implicit-terrain,"
         "asymmetric-critic,residual-moe,sensor-only,"
-        "more,serial-course,random-order,flat,rough,slope-up,slope-down,stairs,"
+        "more,serial-course,random-order,flat,rough,slope-up,slope-down,"
         "acceptance,sim2real,adaptive-dr"
     )
     # SensorHistoryEnv never exposes the skill one-hot, and persisting this as
@@ -102,7 +80,12 @@ def default_train_args() -> list[str]:
 
 
 def main() -> None:
-    sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
+    reference_set, user_args = split_reference_set_args(sys.argv[1:])
+    sys.argv = [
+        str(HERE / "train.py"),
+        *default_train_args(reference_set),
+        *user_args,
+    ]
     from sensor_training.train import main as train_main
 
     train_main()

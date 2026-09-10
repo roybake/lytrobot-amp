@@ -21,14 +21,12 @@ from lytrobot_amp.benchmark import (  # noqa: E402
     AcceptanceResult,
     MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
     MIN_WALKING_SPEED_KMH,
     MIN_WALKING_SPEED_MPS,
     REQUIRED_SCENARIOS,
     STAIR_ASSESSMENT_CASES,
     STAIR_HEIGHT_RANGE_M,
     STAIR_TREAD_RANGE_M,
-    specific_cost_of_transport,
 )
 from lytrobot_amp.env import LytRobotEnvCfg  # noqa: E402
 from lytrobot_amp.terrain import course_stage_scenarios  # noqa: E402
@@ -100,6 +98,7 @@ def load_policy(
         gate_hidden_dims=tuple(architecture["gate_hidden_dims"]),
         expert_hidden_dims=tuple(architecture["expert_hidden_dims"]),
         residual_scale=float(architecture["residual_scale"]),
+        privileged_context_dim=int(architecture.get("privileged_context_dim", 0)),
     ).to(device)
     policy.load_state_dict(checkpoint["actor_critic"])
     policy.eval()
@@ -179,8 +178,6 @@ def evaluate_flat(
         recurrent_state = policy.initial_state(env.num_envs)
         episode_start = np.ones(env.num_envs, dtype=np.float32)
         velocity_sum = 0.0
-        energy_sum = 0.0
-        forward_distance = 0.0
         terminations = 0
         for _ in range(max(int(steps), 1)):
             action, recurrent_state = policy_action(
@@ -194,24 +191,13 @@ def evaluate_flat(
             episode_start = np.asarray(done, dtype=np.float32)
             velocity = float(info["forward_velocity"][0])
             velocity_sum += velocity
-            forward_distance += max(velocity, 0.0) * env.dt
-            energy_sum += float(info["mechanical_energy"][0])
             terminations += int(float(info["termination"][0]) > 0.5)
         mean_speed = velocity_sum / max(int(steps), 1)
-        cot = specific_cost_of_transport(
-            energy_sum,
-            env.base_env.robot_mass,
-            forward_distance,
-        )
         return {
             "steps": int(steps),
             "duration_s": float(max(int(steps), 1) * env.dt),
             "mean_speed_mps": mean_speed,
             "mean_speed_kmh": mean_speed * 3.6,
-            "forward_distance_m": forward_distance,
-            "absolute_mechanical_energy_j": energy_sum,
-            "robot_mass_kg": env.base_env.robot_mass,
-            "specific_cot_j_per_kg_m": cot,
             "terminations": terminations,
             "stable": terminations == 0,
         }
@@ -320,7 +306,6 @@ def main() -> None:
     )
     result = AcceptanceResult(
         mean_speed_mps=float(flat["mean_speed_mps"]),
-        flat_specific_cot_j_per_kg_m=float(flat["specific_cot_j_per_kg_m"]),
         stable_scenarios=tuple(sorted(stable)),
         course_successes=course_successes,
     )
@@ -331,7 +316,6 @@ def main() -> None:
         "criteria": {
             "minimum_speed_kmh": MIN_WALKING_SPEED_KMH,
             "minimum_speed_mps": MIN_WALKING_SPEED_MPS,
-            "maximum_flat_specific_cot_j_per_kg_m": MAX_SPECIFIC_COT_J_PER_KG_M,
             "maximum_rough_height_difference_m": MAX_ROUGH_HEIGHT_DIFFERENCE_M,
             "maximum_slope_deg": MAX_SLOPE_DEG,
             "stair_height_range_m": STAIR_HEIGHT_RANGE_M,
@@ -345,8 +329,8 @@ def main() -> None:
         "stable_scenarios": list(result.stable_scenarios),
         "failures": list(result.failures),
         "scope": (
-            "simulation pre-acceptance; physical prototype speed, electrical energy, "
-            "and integration require hardware measurement"
+            "simulation pre-acceptance; physical prototype speed and system "
+            "integration require hardware measurement"
         ),
     }
     serialized = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)

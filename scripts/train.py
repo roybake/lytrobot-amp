@@ -225,9 +225,6 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Terminate a non-looping serial-course stage that ends before its spatial boundary.",
     )
-    parser.add_argument("--specific-cot-limit", type=float, default=0.8)
-    parser.add_argument("--specific-cot-penalty-coef", type=float, default=0.0)
-    parser.add_argument("--cot-min-forward-speed", type=float, default=0.10)
     parser.add_argument("--reset-noise-scale", type=float, default=0.01)
     parser.add_argument("--motion-reset-prob", type=float, default=0.5)
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
@@ -955,28 +952,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
-    if args.serial_terrain_course and not (
-        args.forward_velocity_reward_coef > 0.0
-        or args.forward_progress_reward_coef > 0.0
-        or args.forward_velocity_deficit_penalty_coef > 0.0
-    ):
-        raise ValueError(
-            "Serial-course training requires a forward locomotion objective; "
-            "set --forward-velocity-reward-coef, --forward-progress-reward-coef, "
-            "or --forward-velocity-deficit-penalty-coef above zero."
-        )
     if args.min_forward_progress_speed < 0.0:
         raise ValueError("--min-forward-progress-speed must be non-negative.")
-    if args.serial_terrain_course and args.min_forward_progress_speed <= 0.0:
-        raise ValueError(
-            "Serial-course training requires --min-forward-progress-speed above zero "
-            "so standing still is a terminal failure."
-        )
-    if args.serial_terrain_course and not args.terminate_incomplete_motion_end:
-        raise ValueError(
-            "Serial-course training requires --terminate-incomplete-motion-end "
-            "so a policy cannot freeze on a finished reference frame."
-        )
     if not 0.0 <= args.terrain_course_random_start_prob <= 1.0:
         raise ValueError("--terrain-course-random-start-prob must be in [0, 1].")
     if args.terrain_course_random_start_warmup_iterations < 0:
@@ -1108,9 +1085,6 @@ def main() -> None:
         forward_progress_termination_penalty=args.forward_progress_termination_penalty,
         fall_penalty=args.fall_penalty,
         terminate_incomplete_motion_end=bool(args.terminate_incomplete_motion_end),
-        specific_cot_limit=args.specific_cot_limit,
-        specific_cot_penalty_coef=args.specific_cot_penalty_coef,
-        cot_min_forward_speed=args.cot_min_forward_speed,
         reset_noise_scale=args.reset_noise_scale,
         motion_reset_prob=args.motion_reset_prob,
         action_residual_scale=args.action_residual_scale,

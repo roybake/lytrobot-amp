@@ -9,7 +9,6 @@ from lytrobot_amp.benchmark import (
     AcceptanceResult,
     MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
-    MAX_SPECIFIC_COT_J_PER_KG_M,
     MIN_WALKING_SPEED_MPS,
     ORIGINAL_RETARGETED_WALK_SPEED_MPS,
     REQUIRED_SCENARIOS,
@@ -17,7 +16,6 @@ from lytrobot_amp.benchmark import (
     STAIR_HEIGHT_RANGE_M,
     STAIR_TREAD_RANGE_M,
     TRAINING_TARGET_SPEED_MPS,
-    specific_cost_of_transport,
 )
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.terrain import (
@@ -40,7 +38,6 @@ def test_acceptance_constants_match_contract() -> None:
     assert np.isclose(ORIGINAL_RETARGETED_WALK_SPEED_MPS, 0.8622949262039437)
     assert TRAINING_TARGET_SPEED_MPS == ORIGINAL_RETARGETED_WALK_SPEED_MPS
     assert TRAINING_TARGET_SPEED_MPS < MIN_WALKING_SPEED_MPS
-    assert MAX_SPECIFIC_COT_J_PER_KG_M == 0.8
     assert MAX_ROUGH_HEIGHT_DIFFERENCE_M == 0.05
     assert MAX_SLOPE_DEG == 6.0
     assert STAIR_HEIGHT_RANGE_M == (0.13, 0.20)
@@ -54,18 +51,15 @@ def test_acceptance_constants_match_contract() -> None:
     assert len(REQUIRED_SCENARIOS) == 6
 
 
-def test_specific_cot_and_acceptance_result_are_fail_closed() -> None:
-    assert specific_cost_of_transport(8.0, 10.0, 1.0) == 0.8
-    assert np.isinf(specific_cost_of_transport(0.0, 10.0, 0.0))
+def test_acceptance_result_is_fail_closed() -> None:
     passed = AcceptanceResult(
         mean_speed_mps=MIN_WALKING_SPEED_MPS,
-        flat_specific_cot_j_per_kg_m=MAX_SPECIFIC_COT_J_PER_KG_M,
         stable_scenarios=REQUIRED_SCENARIOS,
         course_successes=1,
     )
     assert passed.passed
-    assert not AcceptanceResult(0.0, 1.0, (), 0).passed
-    assert not AcceptanceResult(float("nan"), float("nan"), REQUIRED_SCENARIOS, 1).passed
+    assert not AcceptanceResult(0.0, (), 0).passed
+    assert not AcceptanceResult(float("nan"), REQUIRED_SCENARIOS, 1).passed
 
 
 def test_slope_pair_stays_adjacent_in_randomized_courses() -> None:
@@ -179,36 +173,3 @@ def test_all_stair_assessment_boundaries_build_exact_geometry() -> None:
             if "stair_up_" in name
         ]
         np.testing.assert_allclose(np.diff(up_tops), height)
-
-
-def test_cpu_step_reports_finite_mechanical_energy_and_cot() -> None:
-    env = LytRobotAmpEnv(
-        LytRobotEnvCfg(
-            model_xml=str(ROOT / "robot" / "MJCFmodelposition.xml"),
-            motion_file=str(ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"),
-            num_envs=1,
-            reset_noise_scale=0.0,
-            motion_reset_prob=1.0,
-            stand_start_prob=0.0,
-            domain_randomization=False,
-            episode_timeout_jitter_steps=0,
-            specific_cot_limit=MAX_SPECIFIC_COT_J_PER_KG_M,
-            specific_cot_penalty_coef=2.0,
-        )
-    )
-    try:
-        _observation, reward, _done, info = env.step(
-            np.zeros((1, env.action_dim), dtype=np.float32)
-        )
-        for key in (
-            "actuator_power",
-            "mechanical_energy",
-            "specific_cot",
-            "specific_cot_excess",
-        ):
-            assert key in info
-            assert np.isfinite(info[key]).all()
-            assert np.all(info[key] >= 0.0)
-        assert np.isfinite(reward).all()
-    finally:
-        env.close()

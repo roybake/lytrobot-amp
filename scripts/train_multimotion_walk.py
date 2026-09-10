@@ -11,7 +11,10 @@ REPO_ROOT = HERE.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.train_multimotion import default_train_args as multimotion_train_args
+from scripts.train_multimotion import (
+    default_train_args as multimotion_train_args,
+    split_reference_set_args,
+)
 
 
 def _replace_option_values(
@@ -26,16 +29,23 @@ def _replace_option_values(
     args[start:end] = [option, *values]
 
 
-def default_train_args() -> list[str]:
-    """Keep the four straight-terrain skills in the layout but sample only walk."""
+def _option_values(args: list[str], option: str) -> list[str]:
+    start = args.index(option) + 1
+    end = start
+    while end < len(args) and not args[end].startswith("--"):
+        end += 1
+    return args[start:end]
 
-    args = multimotion_train_args()
+
+def default_train_args(reference_set: str = "four") -> list[str]:
+    """Keep the straight-terrain skills in the layout but sample only walk."""
+
+    args = multimotion_train_args(reference_set)
     _replace_option_values(
         args,
         "--motion-weights",
-        ["1.0", "0.0", "0.0", "0.0"],
+        ["1.0", *("0.0" for _ in _option_values(args, "--motion-files")[1:])],
     )
-    _replace_option_values(args, "--specific-cot-penalty-coef", ["0.0"])
     _replace_option_values(args, "--episode-steps", ["1000"])
     _replace_option_values(args, "--log-group", ["multimotion_walk_warmup"])
     _replace_option_values(
@@ -48,7 +58,12 @@ def default_train_args() -> list[str]:
 
 
 def main() -> None:
-    sys.argv = [str(HERE / "train.py"), *default_train_args(), *sys.argv[1:]]
+    reference_set, user_args = split_reference_set_args(sys.argv[1:])
+    sys.argv = [
+        str(HERE / "train.py"),
+        *default_train_args(reference_set),
+        *user_args,
+    ]
     from train import main as train_main
 
     train_main()

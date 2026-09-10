@@ -30,7 +30,7 @@ OmniRetarget 源码快照来自 `amazon-far/holosoma` 提交 `79d728c2c40e7f9ce8
 ## 重定向复现
 
 ```bash
-cd /home/yeah/code/LYTrobot_amp
+cd /home/yeah/code/LYTrobot_amp_recovered_20260806
 
 # 1. ASF/AMC -> Z-up 人体关键点、接触标签和动作片段
 uv run --project squat_training/retargeting \
@@ -48,11 +48,11 @@ done
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_references.py
 
-# 4. 生成 rough、pit、gap 地形接触 IK 数据
+# 4. 生成 rough、pit、gap 及独立 6°上下坡的接触 IK 数据
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_terrain_references.py
 
-# 5. 自动验收：腿部无负几何距离、转身峰值 <= 50 deg/s、
+# 5. 自动验收：腿部无负几何距离、坡道连续帧无突变、转身峰值 <= 50 deg/s、
 #    支撑期满足脚跟 -> 全脚掌 -> 脚趾
 uv run python multimotion/retargeting/validate_references.py
 ```
@@ -65,6 +65,14 @@ uv run python multimotion/retargeting/validate_references.py
 
 ```bash
 MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py
+```
+
+上下坡预览（生成后可单独检查脚底接触点）：
+
+```bash
+MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
+  --clips slope_up slope_down \
+  --output recording/reference/omniretarget_slope_heel_sole_toe.mp4
 ```
 
 默认输出：
@@ -99,18 +107,16 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
 
 源文件与许可证已复制到 `robot/terrains/more_discolrl/`，来源为本机
 `/home/yeah/code/unitreeG1/MORE/MoRE-discoRL`。`src/lytrobot_amp/terrain.py`
-地形实现支持 gap、pit、rough、6°上/下坡和 stairs；当前训练入口只把 rough、
-6°上/下坡和 stairs 拼入 LYT 连续串联路线。gap、pit 数据与实现仍保留用于离线参考
+地形实现支持 gap、pit、rough、6°上/下坡和 stairs；当前训练入口只把 rough
+和 6°上/下坡拼入 LYT 连续串联路线。gap、pit 和 stairs 数据与实现仍保留用于离线参考
 验证，不参与当前多动作训练。
-正式训练把 rough 最大高度差限制为 0.05 m，并使用 3 级、台阶高 0.20 m、
-踏面 0.22 m 的最难考核楼梯；原始 CMU 楼梯参考数据仍来自 0.13 m 高、
-0.58 m 深的重定向标定。环境会把参考骨盆升降幅度缩放到实际台阶总高度，并使用
-相对参考高度的摔倒边界；踏面长度差异仍由策略通过观测和残差动作适应。
+正式训练把 rough 最大高度差限制为 0.05 m，并使用 6° 上/下坡。楼梯参考数据和
+3 级阶梯几何参数仍保留给专项课程或离线验证，当前默认入口不拼入楼梯段。
 
-每条完整状态路线只包含 rough、6°上/下坡和 stairs，地形沿前进方向首尾拼接。由于所有
+每条完整状态路线只包含 rough 和 6°上/下坡，地形沿前进方向首尾拼接。由于所有
 Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8 条随机排列
 （可用 `--terrain-course-variants` 修改），每个 episode 随机选择其中一条。机器人
-按走路及所选路线的地形动作连续推进；楼梯段自动展开为上楼和下楼，
+按走路及所选路线的地形动作连续推进；
 只有完成整条路线才记作成功结束。每种排列都包含全部地形，不会退化成单地形通道。
 为避免策略永远只看到入口动作，默认先用 5000 轮只训练从 stage 0 出发的完整路线，
 再用 10000 轮把随机非零 stage reset 的概率线性提高到 80%；跨过 stage 边界时给予
@@ -143,7 +149,12 @@ uv run python sensor_training/play.py \
 下面的 `scripts/train_multimotion.py` 是完整仿真状态观测版本，不满足严格的
 “仅 IMU + 肌腱长度”部署要求。
 
-第一阶段：
+第一阶段（选择一种参考布局并始终保持一致）：
+
+- 原始两参考：`--reference-set two`，即 `walk + rough_walk`；坡地沿用 rough 专家。
+- 四参考：`--reference-set four`，即新增独立的 `slope_up`、`slope_down` 专家；这是默认值。
+
+两种布局的策略输入维度不同，不能把其中一种 checkpoint 用作另一种的 resume checkpoint。
 
 ```bash
 uv run python scripts/train_multimotion_walk.py \
@@ -163,11 +174,10 @@ uv run python scripts/train_multimotion.py \
 transition；PPO 划分为 8 个 12,288 样本 minibatch，AMP 使用 4096 样本并更新 2 次。
 8 条随机路线平均各分配 512 个环境。随机阶段课程前 5000 轮保持为 0，随后 10000 轮
 线性升至 0.8；训练日志的 `startp` / `terrain_course_random_start_probability` 可用于
-核对当前课程进度。`task_invalid_state` 正常应持续为 0；出现非零时不要把能耗尖峰误判
-为真实策略能耗，应先排查仿真状态。
+核对当前课程进度。`task_invalid_state` 正常应持续为 0；出现非零应先排查仿真状态。
 
 第一条命令保留完整多动作策略的观测维度和 14 维动作接口，但环境与 AMP 专家采样只
-使用平地 walk；同时暂不施加 CoT 惩罚，先学习立即纠偏和持续不摔倒。选择
+使用平地 walk，先学习立即纠偏和持续不摔倒。选择
 `mean_episode_length` 持续接近 `1000`、`termination_fraction` 接近 0 且速度没有明显
 超过参考值的 checkpoint，再执行第二条命令进入完整串联路线。不要从旧的
 `1.4 m/s` checkpoint 继续训练。旧八动作或六动作 checkpoint 的技能 one-hot 和当前
@@ -216,7 +226,7 @@ uv run python scripts/train_multimotion.py \
 显示：
 
 ```bash
-cd /home/yeah/code/LYTrobot_amp
+cd /home/yeah/code/LYTrobot_amp_recovered_20260806
 uv run python scripts/play.py \
   --checkpoint logs/multimotion/07-30-11:52:12/model_26000.pt \
   --stage multimotion \
@@ -237,11 +247,11 @@ uv run python scripts/play.py \
 - 前进速度与进度奖励乘以根部姿态/高度稳定度，倾倒前冲不再获得完整正奖励；
 - 速度跟踪带宽收紧到 `0.20 m/s`，超速惩罚系数提高到 `3.0`，抑制超过参考速度后继续前冲；
 - 摔倒终止额外扣 `10`，确保高速前冲后立即倒地的回报低于持续稳定行走；
-- 完整评测 episode 从走路开始，依次通过随机排列的 rough、6°上/下坡和 stairs 全部地形；
-- AMP 判别器从四个直线地形重定向片段的共享归一化混合分布采样；
+- 完整评测 episode 从走路开始，依次通过随机排列的 rough 和 6°上/下坡全部地形；
+- AMP 判别器从当前直线地形重定向片段的共享归一化混合分布采样；
 - PPO/BPO 强化学习奖励继续跟踪根姿态、线/角速度、关节、足端与接触；
 - 动作片段结束后自动切换下一路段，完成整条串联路线后才成功重置；
-- 台阶和地面均参与足端接触奖励与摩擦领域随机化。
+- 地面、rough 和坡面均参与足端接触奖励与摩擦领域随机化。
 
 快速验证：
 

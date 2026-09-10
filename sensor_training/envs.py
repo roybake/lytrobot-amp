@@ -90,6 +90,7 @@ class SensorHistoryEnv:
         self._allocate_histories()
         self._build_privileged_context_tables()
         self._fill_history(self._all_env_ids())
+        self.base_env.terminal_observer = self._terminal_observation
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_env, name)
@@ -371,6 +372,20 @@ class SensorHistoryEnv:
             ids = np.asarray(env_ids, dtype=np.int64)
         self._fill_history(ids)
         return self.observe()
+
+    def _terminal_observation(self, ids):
+        """Build the next sensor history before autoreset, including squat phase."""
+        actor_history, amp_history = self._actor_history, self._amp_history
+        try:
+            self._append_history()
+            observation = self.observe()[ids]
+            context = self.privileged_observe()[ids]
+            return {
+                "terminal_observation": observation.clone() if self.is_torch_env else observation.copy(),
+                "terminal_privileged_context": context.clone() if self.is_torch_env else context.copy(),
+            }
+        finally:
+            self._actor_history, self._amp_history = actor_history, amp_history
 
     def step(self, action: np.ndarray | torch.Tensor):
         _base_obs, reward, done, info = self.base_env.step(action)

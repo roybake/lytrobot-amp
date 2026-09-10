@@ -71,6 +71,29 @@ class _DummySensorEnv:
         return observation, reward, done, info
 
 
+class _TimeoutSensorEnv(_DummySensorEnv):
+    """Autoresets one environment and supplies its pre-reset sensor state."""
+
+    def step(self, action):
+        self.step_count += 1
+        observation = torch.full((self.num_envs, self.obs_dim), -3.0)
+        reward = torch.ones(self.num_envs)
+        done = torch.tensor([1.0, 0.0], dtype=torch.float32)
+        info = {
+            "episode_step": torch.full((self.num_envs,), float(self.step_count)),
+            "time_outs": torch.tensor([1.0, 0.0]),
+            "successes": torch.zeros(self.num_envs),
+            "termination": torch.zeros(self.num_envs),
+            # These deliberately differ from the reset observation above.
+            "terminal_observation": torch.full((1, self.obs_dim), 2.0),
+            "terminal_privileged_context": torch.full(
+                (1, self.privileged_context_dim), 0.25
+            ),
+            "terminal_env_ids": torch.tensor([0]),
+        }
+        return observation, reward, done, info
+
+
 class RecurrentSensorPolicyTests(unittest.TestCase):
     def _policy(self) -> SensorActorCritic:
         torch.manual_seed(7)
@@ -177,6 +200,44 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             (3, 2, env.privileged_context_dim),
         )
 
+    def test_timeout_bootstrap_uses_pre_reset_terminal_sensor_state(self) -> None:
+        env = _TimeoutSensorEnv()
+        cfg = SensorPPOAMPConfig(
+            num_steps=1,
+            update_epochs=1,
+            num_minibatches=1,
+            amp_enabled=False,
+            recurrent_hidden_dim=8,
+            num_experts=2,
+            actor_hidden_dims=(8,),
+            critic_hidden_dims=(8,),
+            gate_hidden_dims=(8,),
+            expert_hidden_dims=(8,),
+        )
+        trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
+        initial_obs = torch.zeros(1, env.obs_dim)
+        initial_context = torch.zeros(1, env.privileged_context_dim)
+        with torch.no_grad():
+            terminal_hidden = trainer.actor_critic.recurrent_action_and_value(
+                initial_obs,
+                trainer.actor_critic.initial_state(1),
+                torch.ones(1),
+                privileged_context=initial_context,
+            )[5]
+            expected_terminal_value = trainer.actor_critic.recurrent_action_and_value(
+                torch.full((1, env.obs_dim), 2.0),
+                terminal_hidden,
+                torch.zeros(1),
+                privileged_context=torch.full((1, env.privileged_context_dim), 0.25),
+            )[3]
+        rollout = trainer.collect_rollout()
+
+        torch.testing.assert_close(
+            rollout["timeout_bootstrap_values"][0, :1],
+            expected_terminal_value,
+        )
+        self.assertEqual(float(rollout["timeout_bootstrap_values"][0, 1]), 0.0)
+
     def test_privileged_context_trains_estimator_and_critic_but_not_actor_input(self) -> None:
         policy = SensorActorCritic(
             obs_dim=18,
@@ -268,3 +329,35 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_acceptance_loader_restores_privileged_critic_architecture():
+    from scripts.evaluate_acceptance import load_policy
+
+    env = _DummySensorEnv()
+    cfg = SensorPPOAMPConfig(
+        actor_hidden_dims=(8,), critic_hidden_dims=(8,),
+        recurrent_hidden_dim=8, num_experts=2,
+        gate_hidden_dims=(8,), expert_hidden_dims=(8,),
+    )
+    trainer = SensorHistoryPPOAMPTrainer(env, cfg, 'cpu', '/tmp')
+    checkpoint = {
+        'sensor_observation': env.observation_metadata,
+        'sensor_policy_architecture': {
+            'recurrent': True, 'sensor_frame_dim': env.sensor_frame_dim,
+            'recurrent_hidden_dim': cfg.recurrent_hidden_dim, 'num_experts': cfg.num_experts,
+            'gate_hidden_dims': cfg.gate_hidden_dims, 'expert_hidden_dims': cfg.expert_hidden_dims,
+            'residual_scale': cfg.residual_scale, 'privileged_context_dim': env.privileged_context_dim,
+        },
+        'ppo_amp_config': {'actor_hidden_dims': cfg.actor_hidden_dims, 'critic_hidden_dims': cfg.critic_hidden_dims},
+        'actor_critic': trainer.actor_critic.state_dict(),
+    }
+    policy = load_policy(checkpoint, env, torch.device('cpu'))
+    assert policy.privileged_context_dim == env.privileged_context_dim
+    obs = torch.randn(env.num_envs, env.obs_dim)
+    hidden = policy.initial_state(env.num_envs)
+    starts = torch.ones(env.num_envs)
+    torch.testing.assert_close(
+        policy.act_inference_recurrent(obs, hidden, starts)[0],
+        trainer.actor_critic.act_inference_recurrent(obs, hidden, starts)[0],
+    )
