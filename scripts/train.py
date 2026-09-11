@@ -197,7 +197,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=24)
     parser.add_argument("--episode-steps", type=int, default=1000)
     parser.add_argument("--episode-timeout-jitter-steps", type=int, default=240)
-    parser.add_argument("--decimation", type=int, default=4)
+    parser.add_argument(
+        "--decimation",
+        type=int,
+        default=2,
+        help=(
+            "Physics steps per policy action (physics timestep: 5 ms). "
+            "Default 2 = 100 Hz control; use 4 for 50 Hz compatibility."
+        ),
+    )
     parser.add_argument("--solver-iterations", type=int, default=10)
     parser.add_argument("--solver-ls-iterations", type=int, default=20)
     parser.add_argument("--warp-nconmax", type=int, default=32)

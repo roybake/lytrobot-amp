@@ -214,7 +214,10 @@ class LytRobotEnvCfg:
     num_envs: int = 4096
     seed: int = 42
     randomize_episode_seed: bool = False
-    decimation: int = 4
+    # The simulator advances at 200 Hz (5 ms).  Hold each policy action for
+    # two physics steps by default, yielding a 100 Hz control loop.  Keep
+    # ``decimation=4`` available for existing 50 Hz policies/checkpoints.
+    decimation: int = 2
     timestep: float = 0.005
     solver_iterations: int = 10
     solver_ls_iterations: int = 20
@@ -1400,8 +1403,18 @@ class LytRobotAmpEnv:
                     self.motion_ids[advance] = self.course_motion_sequences[
                         self.course_variant_ids[advance], self.course_stage_ids[advance]
                     ]
-                looping = self.motion.motion_loop[self.motion_ids]
-                retry_loop = motion_complete & looping & ~reached_stage_end & ~at_last_stage
+                # A terrain clip describes one traversal of its segment, but
+                # it must not turn into a frozen terminal pose when the robot
+                # falls short of that segment's physical boundary.  Repeat the
+                # current clip until the boundary gate permits a stage change.
+                # ``terminate_incomplete_motion_end`` deliberately retains its
+                # diagnostic/reset behaviour instead of retrying.
+                retry_loop = (
+                    motion_complete
+                    & ~advance
+                    & ~course_suffix_complete
+                    & ~incomplete_motion_end_candidate
+                )
                 self.motion_phase = np.where(
                     advance,
                     0.0,

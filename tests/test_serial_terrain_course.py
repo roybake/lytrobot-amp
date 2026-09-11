@@ -506,6 +506,29 @@ def test_environment_assigns_three_robots_to_three_randomized_courses() -> None:
         np.testing.assert_array_equal(done, [0.0, 0.0, 0.0])
         np.testing.assert_array_equal(info["course_complete"], [0.0, 0.0, 0.0])
 
+        # A non-looping terrain reference must restart when its clip ends
+        # before the robot reaches the corresponding spatial boundary.  The
+        # alternative is a permanently clamped final pose (standing in place).
+        env.cfg.terminate_incomplete_motion_end = False
+        env.course_stage_ids[:] = 1
+        env.motion_ids[:] = env.course_motion_sequences[
+            env.course_variant_ids, env.course_stage_ids
+        ]
+        for env_id, data in enumerate(env.datas):
+            data.qpos[0] = (
+                env.course_stage_end_x[env.course_variant_ids[env_id], 1] - 1.0
+            )
+            mujoco.mj_forward(env.model, data)
+        env.motion_phase[:] = env.motion.frame_counts[env.motion_ids] - 0.1
+        _, _, done, info = env.step(
+            np.zeros((env.num_envs, env.action_dim), dtype=np.float32)
+        )
+        np.testing.assert_array_equal(env.course_stage_ids, [1, 1, 1])
+        np.testing.assert_array_equal(done, [0.0, 0.0, 0.0])
+        np.testing.assert_array_equal(info["incomplete_motion_end"], [0.0, 0.0, 0.0])
+        assert np.all(env.motion_phase < env.motion.frequencies[env.motion_ids] * env.dt)
+
+        env.cfg.terminate_incomplete_motion_end = True
         last_stage = env.course_motion_sequences.shape[1] - 1
         env.course_stage_ids[:] = last_stage
         env.motion_ids[:] = env.course_motion_sequences[
