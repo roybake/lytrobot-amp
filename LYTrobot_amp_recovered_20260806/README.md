@@ -36,6 +36,10 @@ wandb login
 
 机器人模型为 `robot/MJCFmodelposition.xml`，参考步态为 `robot/reference_data/walk1.npz` 或 `walk1_mjcf.npz`。
 
+控制回路默认 100 Hz（5 ms 物理步长、`--decimation 2`）。为复现已有的 50 Hz
+策略或继续其训练，可显式传入 `--decimation 4`；回放程序会优先采用 checkpoint
+中保存的训练配置。
+
 ## 任务一：Stage1 基础稳定行走
 
 Stage1 关闭领域随机化，先让机器人学会稳定站立和周期性向前行走。默认 1024 个环境、30000 iterations，权重保存到 `logs/stage1/<run>/`。
@@ -128,7 +132,7 @@ uv run python scripts/train_stage2.py \
 
 ```bash
 uv run python scripts/play.py \
-  --checkpoint logs/stage2/<run>/model_final.onnx \
+  --checkpoint logs/stage2/09-10-15:43:15/model_3500.onnx \
   --device cuda \
   --viewer \
   --steps 0 \
@@ -158,7 +162,7 @@ uv run python scripts/play.py \
 uv run python sensor_training/train_stage1.py
 
 uv run python sensor_training/play.py \
-  --checkpoint logs/sensor_policy/stage1/09-09-15:44:13/model_5000.onnx\
+  --checkpoint logs/sensor_policy/stage1/09-09-15:44:13/model_final.onnx\
   --device cuda \
   --viewer \
   --steps 0
@@ -171,7 +175,7 @@ uv run python sensor_training/train_stage2.py \
   --stage1-checkpoint logs/sensor_policy/stage1/<run>/model_final.pt
 
 uv run python sensor_training/play.py \
-  --checkpoint logs/sensor_policy/stage2/<run>/model_final.pt \
+  --checkpoint logs/stage2/09-10-15:43:15/model_final.onnx \
   --device cuda \
   --viewer \
   --steps 0
@@ -264,7 +268,7 @@ uv run python scripts/train_multimotion.py \
 
 ```bash
 uv run python scripts/play.py \
-  --checkpoint logs/multimotion_four_ref/09-10-12:37:53/model_1500.onnx\
+  --checkpoint logs/multimotion_four_ref/09-10-12:37:53/model_4500.onnx\
   --stage multimotion \
   --device cuda \
   --viewer \

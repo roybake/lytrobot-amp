@@ -23,11 +23,6 @@ if __name__ == "__main__":
         sys.argv.extend(["--device", "cuda"])
     if not _has_arg("--sim-backend"):
         sys.argv.extend(["--sim-backend", "warp"])
-    if not (_has_arg("--use-reference-velocity") or _has_arg("--no-use-reference-velocity")):
-        # The target speed and pelvis angular velocity come from the walking
-        # clip.  They remain reward-only teacher signals, never Actor inputs.
-        sys.argv.append("--use-reference-velocity")
-
     # Keep sensor stage1 on the same reward/training defaults as
     # scripts/train_stage1.py.  The previous foot-dominant symmetry shaping
     # produced a high per-step reward while forward motion, posture, and
@@ -42,7 +37,8 @@ if __name__ == "__main__":
         "--save-interval": "500",
         # A sensor-only policy must also be sensor-only in the physical
         # control path.  Do not let the reference clip provide an unobserved
-        # gait phase through the actuator baseline.
+        # gait phase through the actuator baseline.  This affects only the
+        # actuator baseline, not the stage1 task-reward target.
         "--reference-ctrl-blend": "0.0",
     }
     for name, value in stage1_defaults.items():

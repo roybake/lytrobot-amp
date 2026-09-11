@@ -1592,8 +1592,17 @@ class LytRobotWarpAmpEnv:
                 self.course_variant_ids, self.course_stage_ids
             ]
             self.motion_ids[:] = torch.where(advance, next_motion_ids, self.motion_ids)
-            looping = self.motion_loop[self.motion_ids]
-            retry_loop = motion_complete & looping & ~reached_stage_end & ~at_last_stage
+            # Keep replaying an unfinished terrain clip.  Otherwise a
+            # non-looping reference is clamped to its final (standing) frame
+            # while the robot is still before the physical stage boundary.
+            # Preserve terminate_incomplete_motion_end as the opt-in reset
+            # path used for diagnostics/curriculum enforcement.
+            retry_loop = (
+                motion_complete
+                & ~advance
+                & ~course_suffix_complete
+                & ~incomplete_motion_end_candidate
+            )
             self.motion_phase[:] = torch.where(
                 advance,
                 torch.zeros_like(next_phase),
