@@ -230,7 +230,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--device", default="cuda", choices=("cuda",))
+    parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--sim-backend", default="warp", choices=("warp", "cpu"))
     parser.add_argument("--torch-threads", type=int, default=0)
 
@@ -575,8 +575,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def select_device(device_arg: str) -> str:
+    if device_arg == "cpu":
+        return "cpu"
     if device_arg != "cuda":
-        raise RuntimeError("Training only supports --device cuda.")
+        raise RuntimeError(f"Unsupported training device: {device_arg}.")
     if not torch.cuda.is_available():
         raise RuntimeError("Training requires CUDA, but torch.cuda.is_available() is false.")
     return "cuda"

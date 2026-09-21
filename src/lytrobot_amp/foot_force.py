@@ -44,20 +44,46 @@ class CpuFootForceSensor:
         self.anchors = self._derive_anchors()
 
     def _derive_anchors(self):
+        """Build all anchors in the parent foot-body frame.
+
+        The articulated toe geom is deliberately not treated as though its
+        ``geom_pos`` were expressed in the foot body.  The stable plantar
+        frame is the body owning the foot geom; the heel/forefoot anchors are
+        derived from that body's support geom.  Runtime toe contacts are still
+        transformed from world coordinates into this same frame.
+        """
         anchors = []
         for side, geoms in enumerate(self.side_geoms):
-            body = self.geom_body[geoms[0]]
+            foot_geom = geoms[0]
+            body = self.geom_body[foot_geom]
             points = []
-            for g in geoms:
-                # geom_pos and geom_size are model geometry, not magic world constants.
-                p = np.asarray(self.model.geom_pos[g], dtype=np.float32)
-                size = np.asarray(self.model.geom_size[g], dtype=np.float32)
-                points.extend(((p[0]-size[0], p[1]), (p[0]+size[0], p[1])))
+            # geom_aabb is expressed in the geom frame and is meaningful for
+            # meshes, unlike geom_size (which is not an XYZ half extent).
+            centre = np.asarray(self.model.geom_aabb[foot_geom, :3], dtype=np.float32)
+            half = np.asarray(self.model.geom_aabb[foot_geom, 3:], dtype=np.float32)
+            geom_rot = np.asarray(self.model.geom_quat[foot_geom], dtype=np.float64)
+            rotation = np.empty(9, dtype=np.float64)
+            mujoco.mju_quat2Mat(rotation, geom_rot)
+            rotation = rotation.reshape(3, 3).astype(np.float32)
+            geom_pos = np.asarray(self.model.geom_pos[foot_geom], dtype=np.float32)
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    for sz in (-1.0, 1.0):
+                        point_geom = centre + np.asarray((sx * half[0], sy * half[1], sz * half[2]), np.float32)
+                        point_foot = geom_pos + rotation @ point_geom
+                        points.append(point_foot[:2])
             xy = np.asarray(points, dtype=np.float32)
             xmin, xmax = float(xy[:, 0].min()), float(xy[:, 0].max())
-            ymid = float(xy[:, 1].mean()); spread = max(float(np.ptp(xy[:, 1])) * .35, .015)
+            ymin, ymax = float(xy[:, 1].min()), float(xy[:, 1].max())
+            ymid = .5 * (ymin + ymax); spread = max((ymax-ymin) * .32, .015)
             heel_x = xmin + .18 * (xmax-xmin); fore_x = xmin + .78 * (xmax-xmin)
-            anchors.append(np.asarray(((heel_x, ymid), (fore_x, ymid + spread), (fore_x, ymid - spread)), np.float32))
+            # Left medial points toward world centre (-local Y); right medial
+            # points toward world centre (+local Y).  Public semantics remain
+            # mirrored even though the MJCF geom ordering is right-first.
+            medial_sign = -1.0 if side == 0 else 1.0
+            anchors.append(np.asarray(((heel_x, ymid),
+                                       (fore_x, ymid + medial_sign * spread),
+                                       (fore_x, ymid - medial_sign * spread)), np.float32))
         return anchors
 
     def raw(self, data: mujoco.MjData) -> np.ndarray:
@@ -82,3 +108,50 @@ class CpuFootForceSensor:
 
     def normalized(self, data: mujoco.MjData) -> np.ndarray:
         return np.nan_to_num(np.clip(self.raw(data) / self.force_ref, 0, self.config.force_clip) / self.config.force_clip).astype(np.float32)
+
+
+class FootForceSensorDynamics:
+    """Stateful gain/bias/noise/filter/delay model for six force channels."""
+
+    def __init__(self, num_envs: int, config: FootForceSensorConfig, *, seed: int = 0,
+                 torch_device=None):
+        self.num_envs, self.config = int(num_envs), config
+        self.rng = np.random.default_rng(seed)
+        gain = self.rng.uniform(1.0-config.gain_randomization,
+                                1.0+config.gain_randomization, (num_envs, 6)).astype(np.float32)
+        bias = self.rng.uniform(-config.bias_randomization,
+                                config.bias_randomization, (num_envs, 6)).astype(np.float32)
+        self._torch = torch_device is not None
+        if self._torch:
+            import torch
+            self.gain = torch.as_tensor(gain, device=torch_device)
+            self.bias = torch.as_tensor(bias, device=torch_device)
+            self.filtered = torch.zeros((num_envs, 6), device=torch_device)
+            self.delay = torch.zeros((num_envs, config.delay_steps + 1, 6), device=torch_device)
+        else:
+            self.gain, self.bias = gain, bias
+            self.filtered = np.zeros((num_envs, 6), np.float32)
+            self.delay = np.zeros((num_envs, config.delay_steps + 1, 6), np.float32)
+        self.cursor = 0
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.filtered[ids] = 0
+        self.delay[ids] = 0
+
+    def apply(self, force):
+        cfg = self.config
+        value = force * self.gain + self.bias
+        if cfg.noise_std:
+            if self._torch:
+                import torch
+                value = value + torch.randn_like(value) * cfg.noise_std
+            else:
+                value = value + self.rng.normal(0, cfg.noise_std, value.shape).astype(np.float32)
+        value = value.clip(min=0) if self._torch else np.clip(value, 0, None)
+        self.filtered = cfg.lowpass_alpha * value + (1.0-cfg.lowpass_alpha) * self.filtered
+        self.delay[:, self.cursor] = self.filtered
+        read = (self.cursor + 1) % self.delay.shape[1]
+        result = self.delay[:, read].clone() if self._torch else self.delay[:, read].copy()
+        self.cursor = read
+        return result

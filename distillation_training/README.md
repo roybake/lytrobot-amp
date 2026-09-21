@@ -9,8 +9,11 @@ uv run python distillation_training/train_teacher.py
 uv run python distillation_training/train_student_bc.py --teacher-checkpoint <path>
 uv run python distillation_training/train_student_dagger.py --teacher-checkpoint <path> --student-checkpoint <path>
 uv run python distillation_training/train_student_rl.py --teacher-checkpoint <path> --student-checkpoint <path>
-uv run python distillation_training/play.py --checkpoint <path> --oracle-privileged
+uv run python distillation_training/play.py --checkpoint <path>
+uv run python distillation_training/play.py --checkpoint <path> --teacher-checkpoint <teacher.pt> --oracle-privileged
 ```
+
+Student BC、DAgger、RL 默认均为 `--num-envs 1024 --num-steps 96`，优化器以完整 environment sequence 做 0.96 s truncated BPTT，不把 timestep flatten。GPU/Warp 是默认执行路径；CPU 仅用于 CPU force 验收或显式 smoke 回退。
 
 ## 推荐：自动编排
 

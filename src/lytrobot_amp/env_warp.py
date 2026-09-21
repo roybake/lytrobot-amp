@@ -2298,7 +2298,7 @@ class LytRobotWarpAmpEnv:
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
         }
-        if self.cfg.deepmimic_reward:
+        if bool(getattr(self.cfg, "deepmimic_reward", False)):
             components.update({
                 f"deepmimic_{name}": value
                 for name, value in _dm_terms.items()
