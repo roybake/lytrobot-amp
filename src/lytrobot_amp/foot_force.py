@@ -55,6 +55,9 @@ class CpuFootForceSensor:
         self.side_geoms = (list(map(int, contact_geom_ids[2:])), list(map(int, contact_geom_ids[:2])))
         self.geom_side = {g: side for side, geoms in enumerate(self.side_geoms) for g in geoms}
         self.geom_body = {g: int(model.geom_bodyid[g]) for g in self.geom_side}
+        # Anchors for each side are defined in the body frame that owns the
+        # fixed foot geom (the first geom), never in the articulated toe body.
+        self.side_body = tuple(self.geom_body[geoms[0]] for geoms in self.side_geoms)
         self.mass = max(float(np.sum(model.body_mass)), 1e-6)
         self.force_ref = max(self.mass * abs(float(model.opt.gravity[2])) / 2.0, 1e-6)
         self.anchors = self._derive_anchors()
@@ -113,7 +116,9 @@ class CpuFootForceSensor:
             mujoco.mj_contactForce(self.model, data, i, cf)
             normal = max(float(cf[0]), 0.0)
             if normal == 0.0: continue
-            body = self.geom_body[foot]
+            # A toe contact is still expressed in the stable parent foot
+            # plantar frame, which is also the frame used by ``anchors``.
+            body = self.side_body[side]
             rot = np.asarray(data.xmat[body], np.float32).reshape(3, 3)
             local = rot.T @ (np.asarray(c.pos, np.float32) - np.asarray(data.xpos[body], np.float32))
             d2 = np.sum((self.anchors[side] - local[:2]) ** 2, axis=1)
@@ -135,15 +140,16 @@ class FootForceSensorDynamics:
         self.rng = np.random.default_rng(seed)
         self._torch = torch_device is not None
         self._torch_device = torch_device
-        gain, bias = self._sample_calibration(self.num_envs)
         if self._torch:
             import torch
-            self.gain = torch.as_tensor(gain, device=torch_device)
-            self.bias = torch.as_tensor(bias, device=torch_device)
+            self._torch_rng = torch.Generator(device=torch_device)
+            self._torch_rng.manual_seed(int(seed))
+            self.gain, self.bias = self._sample_calibration_torch(self.num_envs)
             self.filtered = torch.zeros((num_envs, 6), device=torch_device)
             self.delay = torch.zeros((num_envs, config.delay_steps + 1, 6), device=torch_device)
             self.cursor = torch.zeros(num_envs, dtype=torch.long, device=torch_device)
         else:
+            gain, bias = self._sample_calibration(self.num_envs)
             self.gain, self.bias = gain, bias
             self.filtered = np.zeros((num_envs, 6), np.float32)
             self.delay = np.zeros((num_envs, config.delay_steps + 1, 6), np.float32)
@@ -157,6 +163,19 @@ class FootForceSensorDynamics:
         bias = self.rng.uniform(
             -cfg.bias_randomization, cfg.bias_randomization, (count, 6)
         ).astype(np.float32)
+        return gain, bias
+
+    def _sample_calibration_torch(self, count):
+        import torch
+        cfg = self.config
+        gain = torch.ones((count, 6), dtype=torch.float32, device=self._torch_device)
+        bias = torch.zeros((count, 6), dtype=torch.float32, device=self._torch_device)
+        if cfg.gain_randomization:
+            gain.uniform_(1.0-cfg.gain_randomization, 1.0+cfg.gain_randomization,
+                          generator=self._torch_rng)
+        if cfg.bias_randomization:
+            bias.uniform_(-cfg.bias_randomization, cfg.bias_randomization,
+                          generator=self._torch_rng)
         return gain, bias
 
     def _ids(self, env_ids=None):
@@ -177,12 +196,12 @@ class FootForceSensorDynamics:
         self.filtered[ids] = 0
         self.delay[ids] = 0
         self.cursor[ids] = 0
-        gain, bias = self._sample_calibration(len(ids))
         if self._torch:
-            import torch
-            self.gain[ids] = torch.as_tensor(gain, device=self._torch_device)
-            self.bias[ids] = torch.as_tensor(bias, device=self._torch_device)
+            gain, bias = self._sample_calibration_torch(len(ids))
+            self.gain[ids] = gain
+            self.bias[ids] = bias
         else:
+            gain, bias = self._sample_calibration(len(ids))
             self.gain[ids] = gain
             self.bias[ids] = bias
 

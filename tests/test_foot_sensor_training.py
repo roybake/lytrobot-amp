@@ -43,11 +43,19 @@ def test_force_channel_order_is_stable_left_then_right():
       "right_heel_force","right_forefoot_medial_force","right_forefoot_lateral_force")
 
 
-def test_repeated_observation_reads_do_not_advance_filter_or_delay():
+def test_repeated_observe_does_not_advance_filter_or_delay():
     env=FootForceEnv.__new__(FootForceEnv)
+    env.base_env=SimpleNamespace(num_envs=2)
     env._force_sensor_output=np.arange(12,dtype=np.float32).reshape(2,6)
-    first=env._read_foot_force_sensor().copy();second=env._read_foot_force_sensor().copy()
-    np.testing.assert_array_equal(first,second)
+    env._actor_history=np.zeros((2,1,62),np.float32)
+    env.force_dynamics=FootForceSensorDynamics(2,FootForceSensorConfig(delay_steps=2))
+    env.force_dynamics.apply(np.ones((2,6),np.float32))
+    filtered=env.force_dynamics.filtered.copy();delay=env.force_dynamics.delay.copy();cursor=env.force_dynamics.cursor.copy()
+    observations=[env.observe().copy() for _ in range(3)]
+    np.testing.assert_array_equal(observations[0],observations[1]);np.testing.assert_array_equal(observations[1],observations[2])
+    np.testing.assert_array_equal(env.force_dynamics.filtered,filtered)
+    np.testing.assert_array_equal(env.force_dynamics.delay,delay)
+    np.testing.assert_array_equal(env.force_dynamics.cursor,cursor)
 
 
 def test_partial_autoreset_clears_only_selected_environment_state():
@@ -69,7 +77,8 @@ def test_noise_is_applied_and_output_remains_nonnegative():
 def _fake_cpu_sensor():
     sensor=CpuFootForceSensor.__new__(CpuFootForceSensor)
     sensor.config=FootForceSensorConfig(distribution_sigma=.02)
-    sensor.terrain_geom_ids={0};sensor.geom_side={10:0,20:1};sensor.geom_body={10:1,20:2}
+    sensor.terrain_geom_ids={0};sensor.geom_side={10:0,11:0,20:1,21:1}
+    sensor.geom_body={10:1,11:3,20:2,21:4};sensor.side_body=(1,2)
     sensor.anchors=np.asarray([
       [[0,0],[1,-.1],[1,.1]],[[0,0],[1,.1],[1,-.1]]],np.float32)
     return sensor
@@ -77,8 +86,8 @@ def _fake_cpu_sensor():
 
 def _fake_data(contacts):
     return SimpleNamespace(ncon=len(contacts),contact=contacts,
-      xmat=np.asarray([np.eye(3),np.eye(3),np.eye(3)],np.float32).reshape(3,9),
-      xpos=np.zeros((3,3),np.float32))
+      xmat=np.asarray([np.eye(3) for _ in range(5)],np.float32).reshape(5,9),
+      xpos=np.zeros((5,3),np.float32))
 
 
 def test_cpu_force_no_contact_is_zero():
@@ -96,3 +105,29 @@ def test_cpu_support_force_is_nonnegative_and_left_right_mapping_is_stable(monke
     assert np.all(force>=0) and np.isclose(force[:3].sum(),120) and np.isclose(force[3:].sum(),80)
     assert force[0]>force[1] and force[0]>force[2]
     assert force[4]>force[3] and force[4]>force[5]
+
+
+def test_toe_contact_is_transformed_into_parent_foot_frame(monkeypatch):
+    def contact_force(_model,_data,_index,result):
+        result[:]=0;result[0]=100.0
+    monkeypatch.setattr(mujoco,"mj_contactForce",contact_force)
+    sensor=_fake_cpu_sensor();sensor.model=object()
+    # In the fixed left-foot frame this is exactly the medial forefoot anchor.
+    contact=SimpleNamespace(geom1=0,geom2=11,pos=np.asarray([1.,-.1,0.],np.float32))
+    data=_fake_data([contact])
+    # Give the toe body an intentionally unrelated translated/rotated frame.
+    data.xpos[3]=np.asarray([1.,-.1,0.],np.float32)
+    data.xmat[3]=np.asarray([[0.,-1.,0.],[1.,0.,0.],[0.,0.,1.]],np.float32).reshape(-1)
+    toe_force=sensor.raw(data)
+    assert toe_force[1]>99.0 and toe_force[1]>toe_force[0] and toe_force[1]>toe_force[2]
+
+    # Foot and toe geoms at the same world-space foot-frame point must produce
+    # identical Gaussian weights, matching the Warp fixed-body transform.
+    data.contact=[SimpleNamespace(geom1=0,geom2=10,pos=contact.pos)]
+    foot_force=sensor.raw(data)
+    foot_rotation=data.xmat[sensor.side_body[0]].reshape(3,3)
+    warp_equivalent_local=foot_rotation.T@(contact.pos-data.xpos[sensor.side_body[0]])
+    d2=np.sum((sensor.anchors[0]-warp_equivalent_local[:2])**2,axis=1)
+    expected=np.exp(-d2/(2*sensor.config.distribution_sigma**2));expected/=expected.sum()
+    np.testing.assert_allclose(toe_force[:3]/toe_force[:3].sum(),expected,rtol=1e-6,atol=1e-6)
+    np.testing.assert_allclose(foot_force,toe_force,rtol=1e-6,atol=1e-6)

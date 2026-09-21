@@ -19,7 +19,13 @@ class FootForceEnv(SensorHistoryEnv):
         if bool(getattr(base_env, "is_torch_env", False)):
             import warp as wp
             self._force_anchor=torch.as_tensor(np.asarray(self.force_sensor.anchors),device=base_env.device)
-            self._force_body=torch.as_tensor([self.force_sensor.geom_body[g[0]] for g in self.force_sensor.side_geoms],device=base_env.device)
+            # Body ids are immutable Python integers; keeping them off CUDA
+            # avoids an int(cuda_tensor) synchronization on every policy tick.
+            self._force_body=self.force_sensor.side_body
+            self._force_side_geoms=tuple(
+                torch.as_tensor(geoms,dtype=torch.long,device=base_env.device)
+                for geoms in self.force_sensor.side_geoms
+            )
             count=int(base_env.contact_geom.shape[0]);wp_device=base_env.wp_data.contact.geom.device
             self._force_contact_ids=wp.array(np.arange(count,dtype=np.int32),dtype=wp.int32,device=wp_device)
             self._force_decoded=wp.zeros(count,dtype=wp.spatial_vector,device=wp_device)
@@ -119,9 +125,9 @@ class FootForceEnv(SensorHistoryEnv):
         good=valid
         # Transform contact positions to the foot body frame and use precisely
         # the same geometry-derived Gaussian anchors as the CPU adapter.
-        for side, geoms in enumerate(((int(b.contact_geom_id_values[2]),int(b.contact_geom_id_values[3])),(int(b.contact_geom_id_values[0]),int(b.contact_geom_id_values[1])))):
-            matched=good & ((terrain1 & torch.isin(g2,torch.tensor(geoms,device=b.device))) | (terrain2 & torch.isin(g1,torch.tensor(geoms,device=b.device))))
-            body=int(self._force_body[side]); rel=b.contact_pos-b.xpos[world,body]
+        for side, geoms in enumerate(self._force_side_geoms):
+            matched=good & ((terrain1 & torch.isin(g2,geoms)) | (terrain2 & torch.isin(g1,geoms)))
+            body=self._force_body[side]; rel=b.contact_pos-b.xpos[world,body]
             local=torch.einsum('nij,nj->ni',b.xmat[world,body].transpose(1,2),rel)[:,:2]
             d2=((local[:,None,:]-self._force_anchor[side][None])**2).sum(-1)
             weights=torch.softmax(-d2/(2*max(self.foot_force_config.distribution_sigma,1e-5)**2),dim=1)
@@ -169,24 +175,23 @@ class FootForceEnv(SensorHistoryEnv):
             self._update_foot_force_sensor()
         if len(done_ids)>0:
             # The base environment has already autoreset these worlds.  Clear
-            # every stateful sensor component before reading their reset pose.
+            # only their stateful sensor components.  Do not advance dynamics
+            # a second time in the same policy tick.
             self.force_dynamics.reset(done_ids)
-            self._update_foot_force_sensor(done_ids)
+            self._force_sensor_output[done_ids]=0
+            self._last_force_raw[done_ids]=0
+            self._last_force_normalized[done_ids]=0
         self._append_history()
         if len(done_ids)>0:self._fill_history(done_ids)
         force=self._last_force_normalized
         left=force[:,:3].sum(1);right=force[:,3:].sum(1);eps=1e-5
         for index,name in enumerate(FOOT_FORCE_NAMES):info[f'foot_force/{name.removesuffix("_force")}']=force[:,index]
-        def scalar(value):return float(value.detach().float().mean().cpu()) if torch.is_tensor(value) else float(np.mean(value))
         cast=lambda value:value.float() if torch.is_tensor(value) else value.astype(np.float32)
         info.update({'foot_force/left_total':left,'foot_force/right_total':right,
           'foot_force/left_contact_fraction':cast(left>eps),'foot_force/right_contact_fraction':cast(right>eps),
           'foot_force/double_support_fraction':cast((left>eps)&(right>eps)),'foot_force/flight_fraction':cast((left<=eps)&(right<=eps)),
+          'foot_force/nonzero_fraction':cast(force>eps).mean(1),
           'foot_force/saturation_fraction':cast(force>=1.-1e-6).mean(1)})
-        finite=bool(torch.isfinite(force).all()) if torch.is_tensor(force) else bool(np.isfinite(force).all())
-        if not finite: print('[WARN] foot force contains NaN/Inf')
-        elif scalar((force.abs() if torch.is_tensor(force) else np.abs(force)).sum(1)<eps)>.99: print('[WARN] foot force is zero for nearly every environment')
-        elif scalar(info['foot_force/saturation_fraction'])>.99: print('[WARN] foot force is saturated for nearly every channel')
         return self.observe(),reward,done,info
 
 
@@ -261,6 +266,10 @@ class _PhaseObservationMixin:
             stand_start_phase_delay_steps=int(cfg.stand_start_phase_delay_steps),
             stand_start_transition_steps=int(cfg.stand_start_transition_min_steps),
             torch_device=base_env.device if bool(getattr(base_env,"is_torch_env",False)) else None)
+        self._phase_assertion_step=0
+        self._phase_assertion_interval=(
+            1 if not bool(getattr(base_env,"is_torch_env",False)) or base_env.num_envs<=32 else 100
+        )
 
     @property
     def sensor_frame_dim(self):return self._phase_base_dim+2
@@ -296,13 +305,15 @@ class _PhaseObservationMixin:
         # Under the fixed reset/startup schedule the simulator reference and
         # controller clock must remain the same state, even though the default
         # sensor-stability task reward is phase independent.
-        if self.is_torch_env:
-            error=torch.remainder(self.phase_clock.phase-self.base_env.motion_phase+self.phase_clock.config.frame_count/2,self.phase_clock.config.frame_count)-self.phase_clock.config.frame_count/2
-            aligned=bool((error.abs()<2e-4).all())
-        else:
-            error=np.mod(self.phase_clock.phase-self.base_env.motion_phase+self.phase_clock.config.frame_count/2,self.phase_clock.config.frame_count)-self.phase_clock.config.frame_count/2
-            aligned=bool(np.all(np.abs(error)<2e-4))
-        if not aligned:raise RuntimeError("deployable phase clock diverged from simulator reward phase")
+        self._phase_assertion_step+=1
+        if self._phase_assertion_step % self._phase_assertion_interval==0:
+            if self.is_torch_env:
+                error=torch.remainder(self.phase_clock.phase-self.base_env.motion_phase+self.phase_clock.config.frame_count/2,self.phase_clock.config.frame_count)-self.phase_clock.config.frame_count/2
+                aligned=bool((error.abs()<2e-4).all())
+            else:
+                error=np.mod(self.phase_clock.phase-self.base_env.motion_phase+self.phase_clock.config.frame_count/2,self.phase_clock.config.frame_count)-self.phase_clock.config.frame_count/2
+                aligned=bool(np.all(np.abs(error)<2e-4))
+            if not aligned:raise RuntimeError("deployable phase clock diverged from simulator reward phase")
         return observation,reward,done,info
 
 

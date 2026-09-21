@@ -15,14 +15,14 @@ phase 是控制器内部固定 reset 时钟，不是完整 gait command：`φ₀
 
 ```bash
 # 24-step：分别量化 Δphase 与 Δforce（每轮 4096*24=98304）
-uv run python foot_sensor_training/train_no_force_stage1.py
-uv run python foot_sensor_training/train_phase_stage1.py
-uv run python foot_sensor_training/train_stage1.py
-uv run python foot_sensor_training/train_phase_force_stage1.py
+uv run python foot_sensor_training/train_no_force_stage1.py --device cuda --sim-backend warp
+uv run python foot_sensor_training/train_phase_stage1.py --device cuda --sim-backend warp
+uv run python foot_sensor_training/train_stage1.py --device cuda --sim-backend warp
+uv run python foot_sensor_training/train_phase_force_stage1.py --device cuda --sim-backend warp
 
 # 96-step：量化 ΔBPTT（每轮 1024*96=98304）
-uv run python foot_sensor_training/train_phase_stage1.py --num-envs 1024 --num-steps 96
-uv run python foot_sensor_training/train_phase_force_stage1.py --num-envs 1024 --num-steps 96
+uv run python foot_sensor_training/train_phase_stage1.py --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
+uv run python foot_sensor_training/train_phase_force_stage1.py --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
 ```
 
 6 路足力顺序固定为 left heel/forefoot medial/forefoot lateral，再到对应 right 三路。CPU 使用 `mj_contactForce`，Warp 使用 `mujoco_warp.contact_force`。传感器 dynamics 每个 policy tick 只更新一次，observation/logging 只读缓存；autoreset 按 env 清 filter/delay。`delay_steps=N` 的精确定义为 `output_t=filtered_(t-N)`。

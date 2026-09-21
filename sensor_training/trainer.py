@@ -554,6 +554,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             key: float(component_values[index])
             for index, key in enumerate(reward_component_keys)
         }
+        # This runs once per rollout after the existing summary transfer, so
+        # force acceptance checks add no per-policy-tick CUDA synchronization.
+        force_nonzero = reward_components.get("foot_force/nonzero_fraction")
+        force_saturation = reward_components.get("foot_force/saturation_fraction")
+        if self.env.is_torch_env and force_nonzero is not None and force_nonzero <= 0.0:
+            raise RuntimeError("Warp foot force stayed zero for the full rollout")
+        if self.env.is_torch_env and force_saturation is not None and force_saturation > 0.95:
+            raise RuntimeError(
+                f"Warp foot force saturation exceeded 0.95 ({force_saturation:.4f})"
+            )
 
         return {
             "obs": obs,

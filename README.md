@@ -36,11 +36,14 @@ cd /home/yeah/code/LYTrobot_amp_recovered_20260806
 先训练和评估 teacher；确认其 checkpoint 已稳定后，一键依次启动 BC、DAgger、Student RL，并在运行目录写入 `pipeline.json`：
 
 ```bash
-uv run python distillation_training/train_teacher.py
+uv run python distillation_training/train_teacher.py --device cuda --sim-backend warp
 
 uv run python distillation_training/train_pipeline.py \
   --teacher-checkpoint logs/distillation/teacher/<run>/teacher.pt \
-  --run-dir logs/distillation/<run>
+  --run-dir logs/distillation/<run> \
+  --device cuda --sim-backend warp \
+  --max-validation-action-mse <chosen_threshold> \
+  --max-validation-kl <chosen_threshold>
 ```
 
 只做可观测性诊断（BC）可使用：
@@ -49,6 +52,8 @@ uv run python distillation_training/train_pipeline.py \
 uv run python distillation_training/train_pipeline.py \
   --teacher-checkpoint <teacher.pt> \
   --run-dir logs/distillation/<run> \
+  --device cuda --sim-backend warp \
+  --max-validation-normalized-action-mse <chosen_threshold> \
   --skip-dagger --skip-rl
 ```
 
@@ -57,7 +62,7 @@ uv run python distillation_training/train_pipeline.py \
 ### B. 无蒸馏的 62D 足底力 ablation
 
 ```bash
-uv run python foot_sensor_training/train_stage1.py
+uv run python foot_sensor_training/train_stage1.py --device cuda --sim-backend warp
 uv run python foot_sensor_training/play.py --checkpoint <checkpoint.pt>
 ```
 
@@ -79,7 +84,7 @@ uv sync
 wandb login
 ```
 
-机器人模型为 `robot/MJCFmodelposition.xml`，参考步态为 `robot/reference_data/walk1.npz` 或 `walk1_mjcf.npz`。
+机器人模型为 `robot/MJCFmodelposition.xml`；本轮正式 Teacher、Student 与 AMP 训练统一使用 `robot/reference_data/walk1_mjcf.npz`。
 
 控制回路默认 100 Hz（5 ms 物理步长、`--decimation 2`）。传感器策略的所有训练入口
 强制使用该频率，传入其他 decimation 会在启动前报错；回放程序仍会优先采用 checkpoint

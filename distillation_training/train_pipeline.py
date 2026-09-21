@@ -26,19 +26,29 @@ def main() -> None:
     p.add_argument('--skip-rl', action='store_true')
     p.add_argument('--num-envs',type=int,default=1024);p.add_argument('--max-iterations',type=int,default=1000)
     p.add_argument('--device',choices=('cpu','cuda'),default='cuda');p.add_argument('--sim-backend',choices=('cpu','warp'),default='warp')
+    p.add_argument('--max-validation-action-mse',type=float)
+    p.add_argument('--max-validation-normalized-action-mse',type=float)
+    p.add_argument('--max-validation-kl',type=float)
     a=p.parse_args(); teacher=Path(a.teacher_checkpoint).resolve()
     if not teacher.is_file(): p.error(f'teacher checkpoint does not exist: {teacher}')
     out=(ROOT/a.run_dir).resolve(); out.mkdir(parents=True,exist_ok=True)
     bc=out/'student_bc.pt'; dagger=out/'student_dagger.pt'; final=out/'student_rl.pt'
     validate_checkpoint(teacher,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--no-wandb']
-    run(['uv','run','python','distillation_training/train_student_bc.py','--teacher-checkpoint',str(teacher),'--output',str(bc),*common]);validate_checkpoint(bc,'student')
+    manual=a.max_validation_action_mse is not None and a.max_validation_kl is not None
+    relative=a.max_validation_normalized_action_mse is not None
+    if not (manual or relative):p.error('automatic pipeline requires explicit BC manual thresholds or --max-validation-normalized-action-mse')
+    gate=[]
+    if a.max_validation_action_mse is not None:gate+=['--max-validation-action-mse',str(a.max_validation_action_mse)]
+    if a.max_validation_normalized_action_mse is not None:gate+=['--max-validation-normalized-action-mse',str(a.max_validation_normalized_action_mse)]
+    if a.max_validation_kl is not None:gate+=['--max-validation-kl',str(a.max_validation_kl)]
+    run(['uv','run','python','distillation_training/train_student_bc.py','--teacher-checkpoint',str(teacher),'--output',str(bc),*gate,*common]);validate_checkpoint(bc,'student')
     if not torch.load(bc,map_location='cpu',weights_only=False)['validation']['passed']: raise RuntimeError('BC validation gate failed')
     current=bc
     if not a.skip_dagger:
         run(['uv','run','python','distillation_training/train_student_dagger.py','--teacher-checkpoint',str(teacher),'--student-checkpoint',str(current),'--output',str(dagger),*common]);validate_checkpoint(dagger,'student')
         current=dagger
     if not a.skip_rl:
-        run(['uv','run','python','distillation_training/train_student_rl.py','--teacher-checkpoint',str(teacher),'--student-checkpoint',str(current),'--output',str(final),*common]);validate_checkpoint(final,'student')
+        run(['uv','run','python','distillation_training/train_student_rl.py','--teacher-checkpoint',str(teacher),'--student-checkpoint',str(current),'--output',str(final),'--amp',*common]);validate_checkpoint(final,'student')
         current=final
     (out/'pipeline.json').write_text(json.dumps({'teacher_checkpoint':str(teacher),'bc_checkpoint':str(bc),'dagger_checkpoint':str(dagger),'final_checkpoint':str(final),'skip_dagger':a.skip_dagger,'skip_rl':a.skip_rl},indent=2)+'\n')
     print(f'[PIPELINE] manifest: {out / "pipeline.json"}')
