@@ -1,8 +1,10 @@
-"""64D deployable frame plus training-only, interpretable 20D target."""
+"""Variant-aware deployable frames plus one training-only 20D target."""
 import torch, numpy as np
-from foot_sensor_training.envs import PhaseFootForceEnv
+from foot_sensor_training.envs import PhaseFootForceEnv,PhaseNoForceEnv
 from .config import PRIVILEGED_FIELDS
-class DistillationEnv(PhaseFootForceEnv):
+
+
+class _DistillationPrivilegedMixin:
     @property
     def privileged_schema(self): return {"fields":PRIVILEGED_FIELDS,"dim":20,"actor_input":False,"reference_fields":False}
     def privileged_vector(self):
@@ -20,12 +22,48 @@ class DistillationEnv(PhaseFootForceEnv):
         rate=np.stack([d.actuator_velocity[b.position_actuator_ids] for d in b.datas]).clip(-10,10)/10
         return np.concatenate((vel,gravity,rate),1).astype(np.float32)
 
-class DistillationCpuEnv(DistillationEnv):
+    def _terminal_observation(self,ids):
+        payload=super()._terminal_observation(ids)
+        privileged=self.privileged_vector()[ids]
+        payload["terminal_privileged_vector"]=(
+            privileged.clone() if self.is_torch_env else privileged.copy()
+        )
+        return payload
+
+
+class DistillationForceEnv(_DistillationPrivilegedMixin,PhaseFootForceEnv):
+    pass
+
+
+class DistillationNoForceEnv(_DistillationPrivilegedMixin,PhaseNoForceEnv):
+    pass
+
+
+class DistillationForceCpuEnv(DistillationForceEnv):
     def __init__(self,cfg):
         from lytrobot_amp.env import LytRobotAmpEnv
         super().__init__(LytRobotAmpEnv(cfg))
 
-class DistillationWarpEnv(DistillationEnv):
+
+class DistillationForceWarpEnv(DistillationForceEnv):
     def __init__(self,cfg,device='cuda'):
         from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
         super().__init__(LytRobotWarpAmpEnv(cfg,device=device))
+
+
+class DistillationNoForceCpuEnv(DistillationNoForceEnv):
+    def __init__(self,cfg):
+        from lytrobot_amp.env import LytRobotAmpEnv
+        super().__init__(LytRobotAmpEnv(cfg))
+
+
+class DistillationNoForceWarpEnv(DistillationNoForceEnv):
+    def __init__(self,cfg,device='cuda'):
+        from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+        super().__init__(LytRobotWarpAmpEnv(cfg,device=device))
+
+
+# Historical names remain Route B aliases.
+DistillationEnv=DistillationForceEnv
+DistillationCpuEnv=DistillationForceCpuEnv
+DistillationWarpEnv=DistillationForceWarpEnv

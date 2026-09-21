@@ -26,9 +26,8 @@ def _replay(actor,estimator,rows,hidden):
 
 
 def test_nonzero_rollout_initial_hidden_replays_exact_log_probability():
-    torch.manual_seed(4);actor=SharedActor().eval();estimator=HistoryEstimator().eval()
+    torch.manual_seed(4);actor=SharedActor(64).eval();estimator=HistoryEstimator(64).eval()
     initial=torch.randn(3,128);rows=_rollout(actor,estimator,initial)
     old=torch.stack([row[-1] for row in rows])
     torch.testing.assert_close(_replay(actor,estimator,rows,initial.clone()),old,rtol=1e-5,atol=1e-6)
     assert not torch.allclose(_replay(actor,estimator,rows,torch.zeros_like(initial)),old)
-

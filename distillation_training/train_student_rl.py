@@ -8,13 +8,15 @@ if str(root) not in sys.path: sys.path.insert(0,str(root))
 
 from distillation_training.amp import AMPTrainingModule,add_amp_args,config_from_args
 from distillation_training.networks import SharedActor,HistoryEstimator,TeacherCritic
-from distillation_training.runtime import add_runtime_args,make_env,tensor,env_step,validate_checkpoint,sensor_metadata
+from distillation_training.returns import compute_gae_with_time_limit_bootstrap
+from distillation_training.runtime import (add_runtime_args,dimension_metadata,inherit_checkpoint_variant,
+  make_env,selected_variant,tensor,env_step,validate_checkpoint,sensor_metadata)
 from distillation_training.trainer_student import distillation_losses
 from distillation_training.config import PRIVILEGED_FIELDS
 
 
 def _checkpoint_payload(a,actor,estimator,critic,optimizer,amp,env,iteration,global_step,grad):
-    meta=sensor_metadata(env)
+    spec=selected_variant(a);meta=sensor_metadata(env,spec)
     return {'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),
       'critic':critic.state_dict(),'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),
       'discriminator':amp.discriminator.state_dict(),'discriminator_optimizer':amp.optimizer.state_dict(),
@@ -26,7 +28,8 @@ def _checkpoint_payload(a,actor,estimator,critic,optimizer,amp,env,iteration,glo
       'recurrent_sequence_update':True,'rollout_initial_hidden_saved':True,'rl_finetune_stage':'A',
       'frozen_modules':['sensor_encoder','privileged_encoder','actor_head'],
       'trainable_modules':['history_estimator','critic','log_std'],
-      'amp_discriminator_frozen':bool(a.freeze_amp_discriminator),'gradient_norm':grad}
+      'amp_discriminator_frozen':bool(a.freeze_amp_discriminator),'gradient_norm':grad,
+      **dimension_metadata(spec)}
 
 
 def _emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,diagnostics):
@@ -41,12 +44,13 @@ def main():
     p.add_argument('--lambda-p',type=float,default=.5);p.add_argument('--lambda-kl',type=float,default=.5)
     add_amp_args(p);a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
     teacher=validate_checkpoint(a.teacher_checkpoint,'teacher');student=validate_checkpoint(a.student_checkpoint,'student')
-    actor=SharedActor().to(device);actor.load_state_dict(student['shared_actor'])
+    spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student))
+    actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(student['shared_actor'])
     for name,parameter in actor.named_parameters():parameter.requires_grad=(name=='log_std')
-    teacher_actor=SharedActor().to(device);teacher_actor.load_state_dict(teacher['shared_actor']);teacher_actor.eval()
+    teacher_actor=SharedActor(spec.sensor_dim).to(device);teacher_actor.load_state_dict(teacher['shared_actor']);teacher_actor.eval()
     for parameter in teacher_actor.parameters():parameter.requires_grad=False
-    estimator=HistoryEstimator().to(device);estimator.load_state_dict(student['history_estimator'])
-    critic=TeacherCritic().to(device)
+    estimator=HistoryEstimator(spec.sensor_dim).to(device);estimator.load_state_dict(student['history_estimator'])
+    critic=TeacherCritic(spec.sensor_dim).to(device)
     if student.get('rl_finetune_stage') and student.get('critic') is not None:critic.load_state_dict(student['critic'])
     optimizer=torch.optim.Adam([actor.log_std,*estimator.parameters(),*critic.parameters()],lr=a.learning_rate)
     if student.get('rl_finetune_stage') and student.get('optimizer') is not None:optimizer.load_state_dict(student['optimizer'])
@@ -71,20 +75,28 @@ def main():
                 teacher_mean=teacher_actor.mean(obs,truth);amp_feature=tensor(env.amp_observe(),device)
                 amp_reward=amp.policy_reward(amp_feature)
             nxt,task_reward,done,info=env_step(env,action);reward=amp.combine_reward(task_reward,amp_reward)
+            time_out=tensor(info.get('time_outs',torch.zeros_like(done)),device)
+            timeout_bootstrap=torch.zeros(n,device=device)
+            if 'terminal_observation' in info:
+                terminal_ids=torch.as_tensor(info['terminal_env_ids'],device=device,dtype=torch.long)
+                terminal_obs=tensor(info['terminal_observation'],device)
+                terminal_privileged=tensor(info['terminal_privileged_vector'],device)
+                with torch.no_grad():terminal_value,_=critic(terminal_obs,terminal_privileged)
+                timeout_bootstrap[terminal_ids]=terminal_value
             rows.append({'obs':obs,'previous_action':pa,'previous_tendon':pt,'episode_start':start,
               'truth':truth,'teacher_mean':teacher_mean,'action':action,'old_logp':logp,'value':value,
-              'reward':reward,'done':done,'task_reward':task_reward,'amp_reward':amp_reward,'amp_feature':amp_feature})
+              'reward':reward,'done':done,'time_out':time_out,'timeout_bootstrap':timeout_bootstrap,
+              'task_reward':task_reward,'amp_reward':amp_reward,'amp_feature':amp_feature})
             for key in force_metrics:
                 info_key=f'foot_force/{key}'
                 if info_key in info:force_metrics[key].append(tensor(info[info_key],device))
             pt=torch.where(done[:,None]>0,nxt[:,42:56],obs[:,42:56]);pa=torch.where(done[:,None]>0,torch.zeros_like(action),action)
             start=done;obs=nxt;global_step+=n
         with torch.no_grad():next_value,_=critic(obs,tensor(env.privileged_vector(),device))
-        adv=[];gae=torch.zeros(n,device=device)
-        for row in reversed(rows):
-            delta=row['reward']+.99*(1-row['done'])*next_value-row['value']
-            gae=delta+.99*.95*(1-row['done'])*gae;adv.append(gae);next_value=row['value']
-        adv=torch.stack(list(reversed(adv)));ret=adv+torch.stack([row['value'] for row in rows])
+        adv,ret=compute_gae_with_time_limit_bootstrap(
+          torch.stack([row['reward'] for row in rows]),torch.stack([row['value'] for row in rows]),
+          torch.stack([row['done'] for row in rows]),torch.stack([row['time_out'] for row in rows]),
+          torch.stack([row['timeout_bootstrap'] for row in rows]),next_value,.99,.95)
         adv=(adv-adv.mean())/(adv.std()+1e-8);h=initial_hidden;logps=[];values=[];entropies=[];aux=[];step_losses=[]
         anneal=max(0.,1.-iteration/max(a.max_iterations,1))
         for row in rows:
@@ -98,10 +110,17 @@ def main():
         value_loss=.5*(torch.stack(values)-ret).square().mean();privileged_loss=torch.stack([x['privileged'] for x in step_losses]).mean()
         action_kl=torch.stack([x['kl'] for x in step_losses]).mean();teacher_mse=torch.stack([x['action_mse'] for x in step_losses]).mean()
         estimator_loss=torch.stack(aux).mean();entropy=torch.stack(entropies).mean();loss=policy+value_loss+estimator_loss-.002*entropy
-        finite_values=torch.stack((loss,policy,value_loss,privileged_loss,action_kl,teacher_mse,estimator_loss))
-        if not bool(finite_values.isfinite().all()):
+        rollout_rewards=torch.stack([row['reward'] for row in rows])
+        finite_values=torch.stack((loss,policy,value_loss,entropy,privileged_loss,action_kl,teacher_mse,estimator_loss))
+        finite=(finite_values.isfinite().all() & rollout_rewards.isfinite().all()
+          & actor.log_std.exp().isfinite().all() & h.isfinite().all())
+        if not bool(finite):
             emergency=_emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,
-              {'losses':finite_values.detach().cpu(),'action_std':actor.log_std.exp().detach().cpu()})
+              {'sensor_variant':spec.name,'losses':finite_values.detach().cpu(),
+               'reward_min':rollout_rewards.nan_to_num().min().detach().cpu(),
+               'reward_max':rollout_rewards.nan_to_num().max().detach().cpu(),
+               'hidden_norm':h.nan_to_num().norm(dim=1).mean().detach().cpu(),
+               'action_std':actor.log_std.exp().detach().cpu()})
             raise RuntimeError(f'Student RL loss became NaN/Inf at iteration {iteration}; saved {emergency}')
         optimizer.zero_grad(set_to_none=True);loss.backward()
         grad=torch.nn.utils.clip_grad_norm_([*actor.parameters(),*estimator.parameters(),*critic.parameters()],1)
@@ -116,10 +135,10 @@ def main():
             raise RuntimeError(f'{exc}; emergency checkpoint: {emergency}') from exc
         zero=torch.zeros((),device=device)
         force_means={key:(torch.stack(values).mean() if values else zero) for key,values in force_metrics.items()}
-        if a.sim_backend=='warp' and float(force_means['nonzero_fraction'])<=0:
+        if spec.use_foot_force and a.sim_backend=='warp' and float(force_means['nonzero_fraction'])<=0:
             emergency=_emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,{'force_metrics':{k:v.detach().cpu() for k,v in force_means.items()}})
             raise RuntimeError(f'Warp foot force stayed zero for the full rollout; saved {emergency}')
-        if a.sim_backend=='warp' and float(force_means['saturation_fraction'])>.95:
+        if spec.use_foot_force and a.sim_backend=='warp' and float(force_means['saturation_fraction'])>.95:
             emergency=_emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,{'force_metrics':{k:v.detach().cpu() for k,v in force_means.items()}})
             raise RuntimeError(f'Warp foot force saturation exceeded 0.95; saved {emergency}')
         last_metrics={'student_rl/task_reward':torch.stack([row['task_reward'] for row in rows]).mean(),

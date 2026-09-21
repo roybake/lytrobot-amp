@@ -12,7 +12,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
-from distillation_training.runtime import validate_checkpoint
+from distillation_training.runtime import checkpoint_variant,validate_checkpoint
 
 def run(command: list[str]) -> None:
     print("[PIPELINE]", " ".join(command), flush=True)
@@ -33,7 +33,7 @@ def main() -> None:
     if not teacher.is_file(): p.error(f'teacher checkpoint does not exist: {teacher}')
     out=(ROOT/a.run_dir).resolve(); out.mkdir(parents=True,exist_ok=True)
     bc=out/'student_bc.pt'; dagger=out/'student_dagger.pt'; final=out/'student_rl.pt'
-    validate_checkpoint(teacher,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--no-wandb']
+    teacher_payload=validate_checkpoint(teacher,'teacher');variant=checkpoint_variant(teacher_payload,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--no-wandb']
     manual=a.max_validation_action_mse is not None and a.max_validation_kl is not None
     relative=a.max_validation_normalized_action_mse is not None
     if not (manual or relative):p.error('automatic pipeline requires explicit BC manual thresholds or --max-validation-normalized-action-mse')
@@ -50,6 +50,6 @@ def main() -> None:
     if not a.skip_rl:
         run(['uv','run','python','distillation_training/train_student_rl.py','--teacher-checkpoint',str(teacher),'--student-checkpoint',str(current),'--output',str(final),'--amp',*common]);validate_checkpoint(final,'student')
         current=final
-    (out/'pipeline.json').write_text(json.dumps({'teacher_checkpoint':str(teacher),'bc_checkpoint':str(bc),'dagger_checkpoint':str(dagger),'final_checkpoint':str(final),'skip_dagger':a.skip_dagger,'skip_rl':a.skip_rl},indent=2)+'\n')
+    (out/'pipeline.json').write_text(json.dumps({'sensor_variant':variant.name,'sensor_dim':variant.sensor_dim,'estimator_input_dim':variant.estimator_input_dim,'teacher_checkpoint':str(teacher),'bc_checkpoint':str(bc),'dagger_checkpoint':str(dagger),'final_checkpoint':str(final),'skip_dagger':a.skip_dagger,'skip_rl':a.skip_rl},indent=2)+'\n')
     print(f'[PIPELINE] manifest: {out / "pipeline.json"}')
 if __name__=='__main__': main()

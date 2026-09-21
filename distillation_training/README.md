@@ -1,20 +1,57 @@
-# 64D phase-enabled Teacher → Student 蒸馏
+# 58D/64D variant-aware Teacher → Student 蒸馏
 
-Teacher 与 Student 看到相同的 64D 部署输入：`IMU 42 + tendon 14 + foot force 6 + phase sin/cos 2`。Teacher 额外得到训练期 20D truth：body root linear velocity 3、projected gravity 3、true tendon velocity 14。phase 是 controller-known input，既不放进 privileged target，也不由 estimator 蒸馏。
+同一套蒸馏代码支持两条可部署路线：
 
-Student estimator 输入为 `sensor 64 + previous action 14 + causal tendon velocity 14 = 92D`，GRU hidden 保持 128D。部署 recurrent state 仍为 `hidden 128 + previous tendon 14 = 142D`；phase 由外部 `DeployablePhaseClock` 维护。BC/DAgger/RL 默认完整 96-step BPTT，沿 env 维采样，不 flatten 时间维。
+| variant | Actor observation（固定顺序） | estimator input |
+|---|---|---:|
+| `phase_no_force` | IMU `[0:42]`、tendon `[42:56]`、phase sin/cos `[56:58]` | 58+14+14 = 86D |
+| `phase_force` | IMU `[0:42]`、tendon `[42:56]`、6D plantar force `[56:62]`、phase sin/cos `[62:64]` | 64+14+14 = 92D |
+
+两条路线只相差 6D 足底力。SharedActor 的输入层由 variant 决定，其余 SensorEncoder 128、PrivilegedEncoder 64、ActorHead 256/128、14D action 完全相同。HistoryEstimator 都使用 GRU hidden 128 和 96-step BPTT。部署 recurrent state 都是 `hidden 128 + previous tendon 14 = 142D`，不随 sensor variant 改变。
+
+Teacher 的 training-only privileged vector 对两条路线完全相同：body-frame root linear velocity 3、projected gravity 3、true tendon velocity 14，共 20D。它不含 contact、foot force truth、phase truth、reference state 或 terrain label。无足底 Teacher 的 actor 输入严格为 58D sensor + 20D privileged；有足底 Teacher 为 64D sensor + 20D privileged。Critic 可使用相同的 20D training-only truth。
+
+Teacher 和 Student RL 共用 `AMPTrainingModule`、expert motion、AMP reward、discriminator、gradient penalty 和 optimizer。AMP feature 只用于 discriminator/reward，不进入 actor observation 或 ONNX。Student RL 优先恢复 Student checkpoint 中的 discriminator，否则使用 Teacher checkpoint；默认继续训练，`--freeze-amp-discriminator` 仅供诊断。
+
+## 正式命令
+
+Teacher 显式选择 variant；BC、DAgger、Student RL 从 checkpoint 自动继承并验证 variant，禁止 silent mismatch。
 
 ```bash
-uv run python distillation_training/train_teacher.py --device cuda --sim-backend warp
-uv run python distillation_training/train_student_bc.py --teacher-checkpoint <teacher.pt> --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --max-validation-action-mse <chosen_threshold> --max-validation-kl <chosen_threshold>
-uv run python distillation_training/train_student_dagger.py --teacher-checkpoint <teacher.pt> --student-checkpoint <student_bc.pt> --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
-uv run python distillation_training/train_student_rl.py --teacher-checkpoint <teacher.pt> --student-checkpoint <student_dagger.pt> --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --amp
-uv run python distillation_training/play.py --checkpoint <student_rl.pt> --teacher-checkpoint <teacher.pt> --oracle-privileged
-uv run python distillation_training/play.py --checkpoint <student_rl.pt> --export-onnx student.onnx
+# Route A: no force
+uv run python distillation_training/train_teacher.py --sensor-variant phase_no_force --device cuda --sim-backend warp
+uv run python distillation_training/train_student_bc.py --teacher-checkpoint teacher_no_force.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --max-validation-normalized-action-mse <threshold>
+uv run python distillation_training/train_student_dagger.py --teacher-checkpoint teacher_no_force.pt --student-checkpoint student_no_force_bc.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
+uv run python distillation_training/train_student_rl.py --teacher-checkpoint teacher_no_force.pt --student-checkpoint student_no_force_dagger.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --amp
+
+# Route B: force
+uv run python distillation_training/train_teacher.py --sensor-variant phase_force --device cuda --sim-backend warp
+uv run python distillation_training/train_student_bc.py --teacher-checkpoint teacher_force.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --max-validation-normalized-action-mse <threshold>
+uv run python distillation_training/train_student_dagger.py --teacher-checkpoint teacher_force.pt --student-checkpoint student_force_bc.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
+uv run python distillation_training/train_student_rl.py --teacher-checkpoint teacher_force.pt --student-checkpoint student_force_dagger.pt --device cuda --sim-backend warp --num-envs 1024 --num-steps 96 --amp
 ```
 
-Student RL stage A 只训练 HistoryEstimator、critic 与 `log_std`，冻结 SensorEncoder、PrivilegedEncoder、ActorHead。rollout 起点的非零 hidden 会被 detach/clone 保存，并用作 PPO sequence replay 的初始状态。导出的 ONNX 输入严格为 `observation(64), previous_action(14), recurrent_state(142), episode_start`，metadata 包含 64/92/128/142 schema 和完整 phase clock 参数。
+显存不足时优先把 `--num-envs` 从 1024 降到 512/256，保持 `--num-steps 96`。BC 正式输出必须通过 manual gate（action MSE + KL）或 relative normalized-action-MSE gate；只有短 smoke 可用 `--allow-unvalidated-output`，其 checkpoint 明确记录 `validation.status=unresolved`。
 
-Teacher 和 Student RL 共用 `AMPTrainingModule`：默认 reward 为 `0.5 * task + 0.6 * AMP`，gradient penalty 与参考采样实现一致。Student 优先从 Student RL checkpoint 恢复 discriminator/optimizer，否则从 Teacher checkpoint 加载；默认继续训练 discriminator，`--freeze-amp-discriminator` 仅用于诊断。AMP feature 只供 discriminator/reward 使用，不进入 actor 或 ONNX。
+Teacher 和 Student RL 的 time-limit transition 使用 autoreset 前 `terminal_observation` 与 `terminal_privileged_vector` 计算 critic bootstrap；fall 仍是真 terminal，不 bootstrap。两者调用相同的 `returns.py` GAE 实现。
 
-BC/DAgger replay 默认直接保留在 CUDA，sequence 始终为 `[N,96,...]`，训练时转为 `[96,N,...]`。BC 不再使用无限阈值：必须显式配置 action-MSE+KL manual gate，或配置 `--max-validation-normalized-action-mse` relative gate；否则 checkpoint 的 `validation.status` 为 `unresolved`，pipeline 不会进入 DAgger。两轮 smoke 可显式传 `--allow-unvalidated-output`。
+## Oracle、ONNX 与 GPU smoke
+
+```bash
+uv run python distillation_training/play.py --checkpoint student.pt --teacher-checkpoint teacher.pt --oracle-privileged --device cuda --sim-backend warp
+uv run python distillation_training/play.py --checkpoint student.pt --export-onnx student.onnx
+uv run python scripts/smoke_distillation_gpu.py
+```
+
+ONNX 自动从 checkpoint 选择 observation 58D 或 64D；两者输入还包括 previous action 14D、recurrent state 142D、episode start。metadata 记录 sensor variant、58/64、86/92、hidden 128、state 142、phase clock，并明确 privileged/AMP/reference tendon 不进入 actor。
+
+## Paired ablation
+
+用相同 seed（推荐 42、43、44）分别训练 `phase_no_force` 与 `phase_force`，其余 reward、AMP、phase、reset、action、网络容量、BPTT、motion 和优化参数保持一致。记录 episode length、fall rate、forward speed、task reward、AMP reward、gait quality、action smoothness、Student/Teacher KL 与 privileged estimator MAE。
+
+| Policy | Force | Phase | BPTT | Distillation | AMP | Score |
+|---|---|---:|---:|---:|---:|---:|
+| Direct-58 | No | Yes | 96 | No | Yes | |
+| Direct-64 | Yes | Yes | 96 | No | Yes | |
+| Student-58 | No | Yes | 96 | Yes | Yes | |
+| Student-64 | Yes | Yes | 96 | Yes | Yes | |

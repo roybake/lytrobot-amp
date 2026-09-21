@@ -4,7 +4,8 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 if str(root) not in sys.path: sys.path.insert(0,str(root))
 from distillation_training.networks import SharedActor,HistoryEstimator
-from distillation_training.runtime import add_runtime_args,make_env,tensor,env_step,validate_checkpoint,sensor_metadata
+from distillation_training.runtime import (add_runtime_args,dimension_metadata,inherit_checkpoint_variant,
+  make_env,tensor,env_step,validate_checkpoint,sensor_metadata)
 from distillation_training.trainer_student import BoundedReplay,sequence_losses
 from distillation_training.config import PRIVILEGED_FIELDS
 
@@ -44,13 +45,14 @@ def main():
     p.add_argument('--allow-unvalidated-output',action='store_true')
     p.add_argument('--max-buffer',type=int,default=4096);p.add_argument('--updates-per-iteration',type=int,default=2)
     a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
-    ck=validate_checkpoint(a.teacher_checkpoint,'teacher');actor=SharedActor().to(device);actor.load_state_dict(ck['shared_actor']);actor.eval()
+    ck=validate_checkpoint(a.teacher_checkpoint,'teacher');spec=inherit_checkpoint_variant(a,('teacher',ck))
+    actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(ck['shared_actor']);actor.eval()
     for parameter in actor.parameters():parameter.requires_grad=False
-    estimator=HistoryEstimator().to(device);optimizer=torch.optim.Adam(estimator.parameters(),lr=a.learning_rate)
+    estimator=HistoryEstimator(spec.sensor_dim).to(device);optimizer=torch.optim.Adam(estimator.parameters(),lr=a.learning_rate)
     env,cfg=make_env(a);replay=BoundedReplay(a.max_buffer,storage_device=device);global_step=0
     for iteration in range(1,a.max_iterations+1):
         collected,force_health=collect(env,actor,a.num_steps,device);train,val=split(collected)
-        if a.sim_backend=='warp' and (float(force_health['nonzero_fraction'])<=0.0 or float(force_health['saturation_fraction'])>.95):
+        if spec.use_foot_force and a.sim_backend=='warp' and (float(force_health['nonzero_fraction'])<=0.0 or float(force_health['saturation_fraction'])>.95):
             emergency=Path(a.output).with_suffix('.emergency.pt');emergency.parent.mkdir(parents=True,exist_ok=True)
             torch.save({'stage':'bc','iteration':iteration,'history_estimator':estimator.state_dict(),
               'force_metrics':{k:v.detach().cpu() for k,v in force_health.items()}},emergency)
@@ -94,13 +96,14 @@ def main():
         'max_normalized_action_mse':a.max_validation_normalized_action_mse,'max_kl':a.max_validation_kl}})
     torch.save({'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),
       'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),
-      'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env),
+      'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env,spec),
+      'phase_clock':env.observation_metadata['phase_clock'],
       'privileged_schema':{'fields':list(PRIVILEGED_FIELDS),'dim':20},'validation':validation,
       'iteration':a.max_iterations,'global_step':global_step,'bptt_steps':a.num_steps,
       'replay_format':'bounded device-resident ReplaySequence[N,96,...]',
       'replay_storage_device':str(device),'replay_transfer_strategy':'device_resident_no_per_batch_transfer',
       'bc_sequence_starts_from_env_reset':True,
-      'bc_updates_per_iteration':a.updates_per_iteration},out)
+      'bc_updates_per_iteration':a.updates_per_iteration,**dimension_metadata(spec)},out)
     env.close();print(out.resolve())
     if a.require_validation_thresholds and not passed and not a.allow_unvalidated_output:raise SystemExit(2)
     return out
