@@ -18,6 +18,27 @@ from .networks import RecurrentSensorActorExport, SensorActorCritic
 from .ppo_config import SensorPPOAMPConfig
 
 
+def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
+    """Compare actor layouts while allowing a stand-to-walk schedule change.
+
+    Checkpoint metadata passes through JSON, which turns tuples into lists.
+    The three schedule values alter command *values* but not actor dimensions
+    or field order; fine-tuning must be able to change them.
+    """
+    saved_normalized = json.loads(json.dumps(saved))
+    current_normalized = json.loads(json.dumps(current))
+    for metadata in (saved_normalized, current_normalized):
+        gait = metadata.get("gait_command")
+        if isinstance(gait, dict):
+            for key in (
+                "stand_start_phase_delay_steps",
+                "stand_start_transition_min_steps",
+                "stand_start_transition_max_steps",
+            ):
+                gait.pop(key, None)
+    return saved_normalized == current_normalized
+
+
 class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
     def __init__(
         self,
@@ -33,6 +54,23 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.device = torch.device(device)
         self.log_dir = Path(log_dir)
         self.rng = np.random.default_rng(cfg.seed + 1000)
+        if env.obs_dim % env.sensor_frame_dim != 0:
+            raise ValueError(
+                "Sensor observation dimension must contain an integer number of frames."
+            )
+        self.actor_history_frames = env.obs_dim // env.sensor_frame_dim
+        context_weights = env.privileged_context_metadata.get("loss_weights")
+        if context_weights is None:
+            context_weights = (1.0,) * env.privileged_context_dim
+        if len(context_weights) != env.privileged_context_dim:
+            raise ValueError(
+                "Privileged-context loss weights must match the context dimension."
+            )
+        self.privileged_context_loss_weights = torch.as_tensor(
+            context_weights,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         self.actor_critic = SensorActorCritic(
             obs_dim=env.obs_dim,
@@ -43,7 +81,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             min_action_std=cfg.min_action_std,
             max_action_std=cfg.max_action_std,
             sensor_frame_dim=env.sensor_frame_dim,
+            actor_history_frames=self.actor_history_frames,
             recurrent_hidden_dim=cfg.recurrent_hidden_dim,
+            use_moe=cfg.use_moe,
             num_experts=cfg.num_experts,
             gate_hidden_dims=cfg.gate_hidden_dims,
             expert_hidden_dims=cfg.expert_hidden_dims,
@@ -58,7 +98,53 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.discriminator_optimizer = torch.optim.Adam(
             self.discriminator.parameters(), lr=cfg.discriminator_learning_rate
         )
-
+        self._compiled_evaluate_sequence = None
+        self._compiled_rollout_action_and_value = None
+        self._compiled_rollout_amp_reward = None
+        self._policy_compile_failed = False
+        self._rollout_compile_failed = False
+        if self.device.type == "cuda":
+            # RTX 30-series cards support TF32 tensor cores.  This only
+            # affects float32 matmul precision and substantially improves the
+            # MLP-heavy recurrent update; it does not alter tensor shapes or
+            # the rollout/BPTT semantics.
+            torch.set_float32_matmul_precision("high")
+            enabled_compilers: list[str] = []
+            if bool(cfg.compile_rollout):
+                self._compiled_rollout_action_and_value = torch.compile(
+                    self.actor_critic.rollout_action_and_value,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,
+                )
+                if cfg.amp_enabled:
+                    self._compiled_rollout_amp_reward = torch.compile(
+                        self.discriminator.reward,
+                        mode="reduce-overhead",
+                        fullgraph=True,
+                        dynamic=False,
+                    )
+                enabled_compilers.append("rollout")
+            if bool(cfg.compile_policy_update):
+                # Compile a bounded BPTT chunk, not the entire rollout
+                # window.  This remains opt-in because recurrent backward
+                # graph compilation is expensive on mid-range CUDA GPUs.
+                self._compiled_evaluate_sequence = torch.compile(
+                    self.actor_critic.evaluate_sequence,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,
+                )
+                enabled_compilers.append(
+                    f"policy-step({int(cfg.compile_policy_chunk_steps)})"
+                )
+            if enabled_compilers:
+                print(
+                    "[INFO] compilation enabled for "
+                    f"{', '.join(enabled_compilers)}; "
+                    "the first matching call will compile a bounded graph "
+                    "(the policy backward graph can take a few minutes once)."
+                )
         self.obs = env.reset()
         self.recurrent_state = self.actor_critic.initial_state(env.num_envs)
         self.episode_starts = torch.ones(
@@ -74,6 +160,133 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.completed_episode_lengths: deque[int] = deque(maxlen=window)
         self.completed_episode_successes: deque[float] = deque(maxlen=window)
         self.loaded_domain_randomization_scale: float | None = None
+
+    def _evaluate_policy_sequence(
+        self,
+        obs: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        episode_starts: torch.Tensor,
+        actions: torch.Tensor,
+        privileged_contexts: torch.Tensor,
+    ):
+        """Evaluate a recurrent minibatch, falling back safely if compilation fails."""
+
+        compiled = self._compiled_evaluate_sequence
+        if compiled is None:
+            return self.actor_critic.evaluate_sequence(
+               obs,
+               initial_hidden,
+               episode_starts,
+               actions,
+               privileged_contexts,
+           )
+        try:
+            chunk_steps = max(1, int(self.cfg.compile_policy_chunk_steps))
+            if obs.shape[0] <= chunk_steps:
+                return tuple(
+                    value.clone()
+                    for value in compiled(
+                        obs,
+                        initial_hidden,
+                        episode_starts,
+                        actions,
+                        privileged_contexts,
+                    )
+                )
+
+            hidden = initial_hidden
+            chunks: list[tuple[torch.Tensor, ...]] = []
+            for start in range(0, obs.shape[0], chunk_steps):
+                end = min(start + chunk_steps, obs.shape[0])
+                chunk = tuple(
+                    value.clone()
+                    for value in compiled(
+                        obs[start:end],
+                        hidden,
+                        episode_starts[start:end],
+                        actions[start:end],
+                        privileged_contexts[start:end],
+                    )
+                )
+                hidden = chunk[4]
+                chunks.append(chunk)
+            return (
+                torch.cat([chunk[0] for chunk in chunks]),
+                torch.cat([chunk[1] for chunk in chunks]),
+                torch.cat([chunk[2] for chunk in chunks]),
+                torch.cat([chunk[3] for chunk in chunks]),
+                hidden,
+                torch.cat([chunk[5] for chunk in chunks]),
+                torch.cat([chunk[6] for chunk in chunks]),
+                torch.cat([chunk[7] for chunk in chunks]),
+            )
+        except Exception as exc:
+            if not self._policy_compile_failed:
+                print(
+                    "[WARN] recurrent policy compilation failed; "
+                    f"falling back to eager updates: {type(exc).__name__}: {exc}"
+                )
+            self._policy_compile_failed = True
+            self._compiled_evaluate_sequence = None
+            return self.actor_critic.evaluate_sequence(
+                obs,
+                initial_hidden,
+                episode_starts,
+                actions,
+                privileged_contexts,
+            )
+
+    def _rollout_action_and_value(
+        self,
+        obs: torch.Tensor,
+        hidden_state: torch.Tensor,
+        episode_start: torch.Tensor,
+        privileged_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Use the cached one-step rollout graph, with an eager fallback."""
+
+        compiled = self._compiled_rollout_action_and_value
+        if compiled is None:
+            return self.actor_critic.rollout_action_and_value(
+                obs, hidden_state, episode_start, privileged_context
+            )
+        try:
+            # reduce-overhead replays CUDA graphs with reusable output
+            # buffers.  These tensors survive an AMP graph invocation and an
+            # environment step, so detach them from that reusable storage.
+            return tuple(
+                value.clone()
+                for value in compiled(obs, hidden_state, episode_start, privileged_context)
+            )
+        except Exception as exc:
+            if not self._rollout_compile_failed:
+                print(
+                    "[WARN] recurrent rollout compilation failed; "
+                    f"falling back to eager rollout: {type(exc).__name__}: {exc}"
+                )
+            self._rollout_compile_failed = True
+            self._compiled_rollout_action_and_value = None
+            return self.actor_critic.rollout_action_and_value(
+                obs, hidden_state, episode_start, privileged_context
+            )
+
+    def _rollout_amp_reward(self, amp_obs: torch.Tensor) -> torch.Tensor:
+        """Use the cached discriminator-reward graph, with an eager fallback."""
+
+        compiled = self._compiled_rollout_amp_reward
+        if compiled is None:
+            return self.discriminator.reward(amp_obs)
+        try:
+            return compiled(amp_obs).clone()
+        except Exception as exc:
+            if not self._rollout_compile_failed:
+                print(
+                    "[WARN] AMP rollout compilation failed; "
+                    f"falling back to eager rollout: {type(exc).__name__}: {exc}"
+                )
+            self._rollout_compile_failed = True
+            self._compiled_rollout_amp_reward = None
+            return self.discriminator.reward(amp_obs)
 
     def reset_training_env(self) -> None:
         super().reset_training_env()
@@ -124,20 +337,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 (
                     action,
                     log_prob,
-                    _entropy,
                     value,
-                    _median_value,
                     next_recurrent_state,
-                    _gate_weights,
-                    _residual,
-                ) = self.actor_critic.recurrent_action_and_value(
+                ) = self._rollout_action_and_value(
                     obs_tensor,
                     self.recurrent_state,
                     current_episode_starts,
-                    privileged_context=privileged_context,
+                    privileged_context,
                 )
                 amp_reward = (
-                    self.discriminator.reward(amp_tensor)
+                    self._rollout_amp_reward(amp_tensor)
                     if self.cfg.amp_enabled
                     else torch.zeros(num_envs, device=self.device)
                 )
@@ -207,6 +416,21 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             )
             success = self._as_device_tensor(info.get("successes", time_out))
             amp_reward = torch.nan_to_num(amp_reward, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.cfg.amp_enabled and self.cfg.amp_startup_gate:
+                gait_progress = self._as_device_tensor(
+                    info.get("gait_progress", np.ones(num_envs, dtype=np.float32))
+                )
+                amp_gate = torch.clamp(
+                    torch.nan_to_num(
+                        gait_progress,
+                        nan=0.0,
+                        posinf=1.0,
+                        neginf=0.0,
+                    ),
+                    0.0,
+                    1.0,
+                )
+                amp_reward = amp_reward * amp_gate
             total_reward = self.cfg.task_reward_lerp * task_reward
             if self.cfg.amp_enabled:
                 total_reward += (
@@ -356,6 +580,18 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "nonfinite_task_reward_count": nonfinite_task_reward_count,
         }
 
+    def _actor_auxiliary_loss(
+        self,
+        obs: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        episode_starts: torch.Tensor,
+        env_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Extension point for isolated trainers; direct training adds nothing."""
+
+        del obs, initial_hidden, episode_starts, env_indices
+        return None
+
     def update_policy(
         self,
         rollout: dict[str, torch.Tensor | np.ndarray],
@@ -370,6 +606,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = rollout["episode_starts"]
         initial_hidden = rollout["initial_recurrent_state"]
         privileged_contexts = rollout["privileged_contexts"]
+        advantages = rollout["advantages"]
         assert all(torch.is_tensor(value) for value in (
             obs,
             actions,
@@ -379,8 +616,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             episode_starts,
             initial_hidden,
             privileged_contexts,
+            advantages,
         ))
-
         finite_envs = (
             torch.isfinite(obs).all(dim=(0, 2))
             & torch.isfinite(actions).all(dim=(0, 2))
@@ -389,6 +626,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             & torch.isfinite(old_values).all(dim=0)
             & torch.isfinite(initial_hidden).all(dim=1)
             & torch.isfinite(privileged_contexts).all(dim=(0, 2))
+            & torch.isfinite(advantages).all(dim=0)
         )
         dropped_sample_count = int(
             ((~finite_envs).sum() * obs.shape[0]).detach().cpu()
@@ -401,7 +639,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         episode_starts = episode_starts[:, finite_envs]
         initial_hidden = initial_hidden[finite_envs]
         privileged_contexts = privileged_contexts[:, finite_envs]
-
+        advantages = advantages[:, finite_envs]
         env_batch_size = obs.shape[1]
         minibatches = max(1, min(self.cfg.num_minibatches, env_batch_size))
         metric_names = (
@@ -456,7 +694,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     gate_weights,
                     residual,
                     context_prediction,
-                ) = self.actor_critic.evaluate_sequence(
+                ) = self._evaluate_policy_sequence(
                     obs[:, mb],
                     initial_hidden[mb],
                     episode_starts[:, mb],
@@ -478,17 +716,35 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 )
                 ratio = log_ratio.exp()
 
-                with torch.no_grad():
+                if self.cfg.deepmimic_ppo:
+                    # MimicKit PPO: min(A*r, A*clip(r,1-eps,1+eps)).
+                    mb_advantage = advantages[:, mb]
+                    normalized_advantage = (
+                        (mb_advantage - mb_advantage.mean())
+                        / mb_advantage.std(unbiased=False).clamp_min(1.0e-6)
+                    ).clamp(-4.0, 4.0)
+                    policy_loss = -torch.minimum(
+                        normalized_advantage * ratio,
+                        normalized_advantage * ratio.clamp(
+                            1.0 - ratio_eps, 1.0 + ratio_eps
+                        ),
+                    ).mean()
                     median_advantage = mb_returns - median_value
-                    target_ratio = 1.0 + ratio_eps * torch.tanh(
-                        median_advantage / (2.0 * bpo_lambda)
-                    )
-                    policy_weight = (
-                        (mb_returns - new_value).abs()
-                        + float(max(self.cfg.bpo_tv_coef, 0.0))
-                    )
-                ratio_error = (target_ratio - ratio).abs()
-                policy_loss = (ratio_error * policy_weight).mean()
+                    target_ratio = torch.ones_like(ratio)
+                    policy_weight = torch.ones_like(ratio)
+                    ratio_error = (ratio - 1.0).abs()
+                else:
+                    with torch.no_grad():
+                        median_advantage = mb_returns - median_value
+                        target_ratio = 1.0 + ratio_eps * torch.tanh(
+                            median_advantage / (2.0 * bpo_lambda)
+                        )
+                        policy_weight = (
+                            (mb_returns - new_value).abs()
+                            + float(max(self.cfg.bpo_tv_coef, 0.0))
+                        )
+                    ratio_error = (target_ratio - ratio).abs()
+                    policy_loss = (ratio_error * policy_weight).mean()
 
                 value_clip = float(max(self.cfg.value_clip_coef, 0.0))
                 value_pred_clipped = (
@@ -508,14 +764,17 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     value_losses_clipped,
                 ).mean()
                 median_value_loss = (
-                    bpo_lambda
-                    * self._bpo_soft_abs(
-                        (mb_returns.detach() - median_value) / bpo_lambda
-                    )
-                ).mean()
+                    policy_loss.new_zeros(()) if self.cfg.deepmimic_ppo else
+                    (
+                        bpo_lambda
+                        * self._bpo_soft_abs(
+                            (mb_returns.detach() - median_value) / bpo_lambda
+                        )
+                    ).mean()
+                )
                 entropy_loss = entropy.mean()
 
-                if gate_weights.shape[0] > 1:
+                if self.cfg.use_moe and gate_weights.shape[0] > 1:
                     valid_transition = 1.0 - episode_starts[1:, mb]
                     gate_delta = (gate_weights[1:] - gate_weights[:-1]).square().mean(dim=-1)
                     gate_change_loss = (
@@ -524,14 +783,33 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     )
                 else:
                     gate_change_loss = gate_weights.new_zeros(())
-                mean_expert_load = gate_weights.mean(dim=(0, 1))
-                expert_load_balance_loss = (
-                    self.cfg.num_experts * mean_expert_load.square().sum() - 1.0
-                )
-                residual_l2_loss = residual.square().mean()
-                privileged_context_loss = F.smooth_l1_loss(
+                if self.cfg.use_moe:
+                    mean_expert_load = gate_weights.mean(dim=(0, 1))
+                    expert_load_balance_loss = (
+                        self.cfg.num_experts * mean_expert_load.square().sum() - 1.0
+                    )
+                    residual_l2_loss = residual.square().mean()
+                else:
+                    expert_load_balance_loss = policy_loss.new_zeros(())
+                    residual_l2_loss = policy_loss.new_zeros(())
+                context_loss_elements = F.smooth_l1_loss(
                     context_prediction,
                     privileged_contexts[:, mb],
+                    reduction="none",
+                )
+                privileged_context_loss = (
+                    context_loss_elements
+                    * self.privileged_context_loss_weights.reshape(1, 1, -1)
+                ).sum() / (
+                    self.privileged_context_loss_weights.sum()
+                    * context_loss_elements.shape[0]
+                    * context_loss_elements.shape[1]
+                )
+                auxiliary_actor_loss = self._actor_auxiliary_loss(
+                    obs[:, mb],
+                    initial_hidden[mb],
+                    episode_starts[:, mb],
+                    mb,
                 )
 
                 loss = (
@@ -545,6 +823,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     + self.cfg.privileged_context_loss_coef
                     * privileged_context_loss
                 )
+                if auxiliary_actor_loss is not None:
+                    loss = loss + auxiliary_actor_loss
                 stepped = self._optimizer_step_if_finite(
                     loss,
                     self.actor_critic,
@@ -627,11 +907,27 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "training must start in a new run instead of resuming that checkpoint."
             )
         saved_context_dim = int(architecture.get("privileged_context_dim", 0))
+        # Old recurrent sensor checkpoints predate this switch and use MoE.
+        saved_use_moe = bool(architecture.get("use_moe", True))
+        if saved_use_moe != self.cfg.use_moe:
+            raise ValueError(
+                "Checkpoint MoE architecture does not match this run: "
+                f"saved use_moe={saved_use_moe}, current={self.cfg.use_moe}."
+            )
         if saved_context_dim != self.env.privileged_context_dim:
             raise ValueError(
                 "Checkpoint has no compatible implicit-terrain estimator: "
                 f"saved privileged_context_dim={saved_context_dim}, "
                 f"current={self.env.privileged_context_dim}. Start a new run."
+            )
+        saved_history_frames = int(architecture.get("actor_history_frames", 1))
+        if saved_history_frames != self.actor_history_frames:
+            raise ValueError(
+                "Checkpoint Actor sensor-history input is incompatible: "
+                f"saved actor_history_frames={saved_history_frames}, "
+                f"current={self.actor_history_frames}. Older checkpoints read only "
+                "the latest frame and cannot be resumed into the multi-frame GRU; "
+                "start a new run."
             )
         saved_metadata = checkpoint.get("sensor_observation")
         if saved_metadata is None:
@@ -639,7 +935,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "Checkpoint has no sensor_observation metadata; use a checkpoint produced by sensor_training."
             )
         current_metadata = self.env.observation_metadata
-        if saved_metadata != current_metadata:
+        if not _sensor_metadata_compatible(saved_metadata, current_metadata):
             raise ValueError(
                 "Checkpoint sensor observation layout does not match the current sensor_training layout."
             )
@@ -653,9 +949,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         checkpoint.update({
             "sensor_observation": self.env.observation_metadata,
             "sensor_policy_architecture": {
-                "name": "proprioceptive_gru_context_residual_moe",
+                "name": (
+                    "proprioceptive_history_gru_context_residual_moe"
+                    if self.cfg.use_moe
+                    else "proprioceptive_history_gru_context"
+                ),
                 "recurrent": True,
+                "use_moe": self.cfg.use_moe,
                 "sensor_frame_dim": self.env.sensor_frame_dim,
+                "actor_history_frames": self.actor_history_frames,
+                "recurrent_input_dim": self.actor_critic.recurrent_input_dim,
                 "recurrent_hidden_dim": self.cfg.recurrent_hidden_dim,
                 "num_experts": self.cfg.num_experts,
                 "gate_hidden_dims": list(self.cfg.gate_hidden_dims),

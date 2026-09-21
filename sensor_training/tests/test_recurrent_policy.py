@@ -94,6 +94,16 @@ class _TimeoutSensorEnv(_DummySensorEnv):
         return observation, reward, done, info
 
 
+class _GaitGateSensorEnv(_DummySensorEnv):
+    def step(self, action):
+        observation, reward, done, info = super().step(action)
+        info["gait_progress"] = torch.full(
+            (self.num_envs,),
+            min(max((self.step_count - 1) * 0.5, 0.0), 1.0),
+        )
+        return observation, reward, done, info
+
+
 class RecurrentSensorPolicyTests(unittest.TestCase):
     def _policy(self) -> SensorActorCritic:
         torch.manual_seed(7)
@@ -101,7 +111,9 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             obs_dim=18,
             action_dim=4,
             sensor_frame_dim=3,
+            actor_history_frames=6,
             recurrent_hidden_dim=8,
+            use_moe=True,
             num_experts=3,
             actor_hidden_dims=(8,),
             critic_hidden_dims=(8,),
@@ -110,17 +122,18 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             residual_scale=0.25,
         )
 
-    def test_recurrent_encoder_uses_only_latest_sensor_frame(self) -> None:
+    def test_recurrent_encoder_uses_older_sensor_frames(self) -> None:
         policy = self._policy()
         first = torch.randn(2, 18)
-        second = torch.randn(2, 18)
-        second[:, -3:] = first[:, -3:]
+        second = first.clone()
+        second[:, :3] += 1.0
         hidden = torch.randn(2, 8)
 
         first_next = policy._next_hidden(first, hidden, torch.zeros(2))
         second_next = policy._next_hidden(second, hidden, torch.zeros(2))
 
-        torch.testing.assert_close(first_next, second_next)
+        self.assertFalse(torch.allclose(first_next, second_next))
+        self.assertEqual(policy.recurrent.input_size, 18)
 
     def test_episode_start_clears_hidden_state_before_gru_step(self) -> None:
         policy = self._policy()
@@ -164,6 +177,24 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(policy.recurrent.weight_hh.grad).all())
         self.assertGreater(float(policy.recurrent.weight_hh.grad.abs().sum()), 0.0)
 
+    def test_rollout_hot_path_matches_full_recurrent_evaluation(self) -> None:
+        policy = self._policy()
+        observations = torch.randn(3, 18)
+        hidden = policy.initial_state(3)
+        starts = torch.tensor([1.0, 0.0, 0.0])
+
+        torch.manual_seed(29)
+        rollout_action, rollout_log_prob, rollout_value, rollout_hidden = (
+            policy.rollout_action_and_value(observations, hidden, starts)
+        )
+        torch.manual_seed(29)
+        full = policy.recurrent_action_and_value(observations, hidden, starts)
+
+        torch.testing.assert_close(rollout_action, full[0])
+        torch.testing.assert_close(rollout_log_prob, full[1])
+        torch.testing.assert_close(rollout_value, full[3])
+        torch.testing.assert_close(rollout_hidden, full[5])
+
     def test_trainer_preserves_reset_masks_and_updates_sequences(self) -> None:
         env = _DummySensorEnv()
         cfg = SensorPPOAMPConfig(
@@ -199,6 +230,72 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
             tuple(rollout["privileged_contexts"].shape),
             (3, 2, env.privileged_context_dim),
         )
+
+    def test_direct_amp_reward_fades_in_with_startup_speed(self) -> None:
+        for gate_enabled, expected in (
+            (True, [0.0, 0.5, 1.0]),
+            (False, [1.0, 1.0, 1.0]),
+        ):
+            with self.subTest(gate_enabled=gate_enabled):
+                env = _GaitGateSensorEnv()
+                cfg = SensorPPOAMPConfig(
+                    num_steps=3,
+                    amp_enabled=True,
+                    amp_startup_gate=gate_enabled,
+                    recurrent_hidden_dim=8,
+                    actor_hidden_dims=(8,),
+                    critic_hidden_dims=(8,),
+                    discriminator_hidden_dims=(8,),
+                )
+                trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
+                trainer._rollout_amp_reward = lambda _features: torch.ones(
+                    env.num_envs
+                )
+                rollout = trainer.collect_rollout()
+                torch.testing.assert_close(
+                    rollout["amp_rewards"][:, 0],
+                    torch.tensor(expected),
+                )
+
+    def test_compiled_chunks_preserve_full_bptt_evaluation(self) -> None:
+        """Chunk boundaries must not alter recurrent outputs or hidden state."""
+
+        env = _DummySensorEnv()
+        cfg = SensorPPOAMPConfig(
+            num_steps=5,
+            update_epochs=1,
+            num_minibatches=1,
+            amp_enabled=False,
+            compile_policy_chunk_steps=2,
+            recurrent_hidden_dim=8,
+            num_experts=2,
+            actor_hidden_dims=(8,),
+            critic_hidden_dims=(8,),
+            gate_hidden_dims=(8,),
+            expert_hidden_dims=(8,),
+        )
+        trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
+        torch.manual_seed(17)
+        observations = torch.randn(5, env.num_envs, env.obs_dim)
+        actions = torch.randn(5, env.num_envs, env.action_dim)
+        starts = torch.zeros(5, env.num_envs)
+        starts[0] = 1.0
+        starts[3, 0] = 1.0
+        contexts = torch.randn(5, env.num_envs, env.privileged_context_dim)
+        initial_hidden = trainer.actor_critic.initial_state(env.num_envs)
+
+        expected = trainer.actor_critic.evaluate_sequence(
+            observations, initial_hidden, starts, actions, contexts
+        )
+        # Use the eager callable as a deterministic test double for the
+        # compiled chunk callable; CUDA integration chooses torch.compile.
+        trainer._compiled_evaluate_sequence = trainer.actor_critic.evaluate_sequence
+        actual = trainer._evaluate_policy_sequence(
+            observations, initial_hidden, starts, actions, contexts
+        )
+
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor)
 
     def test_timeout_bootstrap_uses_pre_reset_terminal_sensor_state(self) -> None:
         env = _TimeoutSensorEnv()
@@ -337,7 +434,7 @@ def test_acceptance_loader_restores_privileged_critic_architecture():
     env = _DummySensorEnv()
     cfg = SensorPPOAMPConfig(
         actor_hidden_dims=(8,), critic_hidden_dims=(8,),
-        recurrent_hidden_dim=8, num_experts=2,
+        recurrent_hidden_dim=8, use_moe=True, num_experts=2,
         gate_hidden_dims=(8,), expert_hidden_dims=(8,),
     )
     trainer = SensorHistoryPPOAMPTrainer(env, cfg, 'cpu', '/tmp')
@@ -345,7 +442,9 @@ def test_acceptance_loader_restores_privileged_critic_architecture():
         'sensor_observation': env.observation_metadata,
         'sensor_policy_architecture': {
             'recurrent': True, 'sensor_frame_dim': env.sensor_frame_dim,
-            'recurrent_hidden_dim': cfg.recurrent_hidden_dim, 'num_experts': cfg.num_experts,
+            'actor_history_frames': env.obs_dim // env.sensor_frame_dim,
+            'recurrent_hidden_dim': cfg.recurrent_hidden_dim, 'use_moe': cfg.use_moe,
+            'num_experts': cfg.num_experts,
             'gate_hidden_dims': cfg.gate_hidden_dims, 'expert_hidden_dims': cfg.expert_hidden_dims,
             'residual_scale': cfg.residual_scale, 'privileged_context_dim': env.privileged_context_dim,
         },

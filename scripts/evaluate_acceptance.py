@@ -93,7 +93,9 @@ def load_policy(
         min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
         max_action_std=float(ppo_cfg.get("max_action_std", 0.8)),
         sensor_frame_dim=int(architecture["sensor_frame_dim"]),
+        actor_history_frames=int(architecture.get("actor_history_frames", 1)),
         recurrent_hidden_dim=int(architecture["recurrent_hidden_dim"]),
+        use_moe=bool(architecture.get("use_moe", True)),
         num_experts=int(architecture["num_experts"]),
         gate_hidden_dims=tuple(architecture["gate_hidden_dims"]),
         expert_hidden_dims=tuple(architecture["expert_hidden_dims"]),
@@ -179,6 +181,24 @@ def evaluate_flat(
         episode_start = np.ones(env.num_envs, dtype=np.float32)
         velocity_sum = 0.0
         terminations = 0
+        knee_indices = np.asarray(
+            [
+                index
+                for index, name in enumerate(env.base_motion.common_joint_names)
+                if "knee" in name
+            ],
+            dtype=np.int64,
+        )
+        if len(knee_indices) != 2:
+            raise ValueError(
+                f"Natural-gait evaluation requires two knee joints; found {len(knee_indices)}."
+            )
+        knee_qpos_adrs = env.base_motion.robot_qpos_adrs[knee_indices]
+        knee_flexion_sum = np.zeros(2, dtype=np.float64)
+        knee_track_sum = 0.0
+        locked_knee_samples = 0
+        gait_samples = 0
+        knee_target = max(float(env.cfg.sensor_knee_flexion_target), 1.0e-6)
         for _ in range(max(int(steps), 1)):
             action, recurrent_state = policy_action(
                 policy,
@@ -192,7 +212,22 @@ def evaluate_flat(
             velocity = float(info["forward_velocity"][0])
             velocity_sum += velocity
             terminations += int(float(info["termination"][0]) > 0.5)
+            if float(done[0]) <= 0.5:
+                knee_flexion = np.maximum(
+                    -np.asarray(env.base_env.datas[0].qpos[knee_qpos_adrs]),
+                    0.0,
+                )
+                knee_track = float(
+                    np.clip(np.min(knee_flexion) / knee_target, 0.0, 1.0)
+                )
+                knee_flexion_sum += knee_flexion
+                knee_track_sum += knee_track
+                locked_knee_samples += int(knee_track < 0.60)
+                gait_samples += 1
         mean_speed = velocity_sum / max(int(steps), 1)
+        mean_knee_flexion = knee_flexion_sum / max(gait_samples, 1)
+        mean_knee_track = knee_track_sum / max(gait_samples, 1)
+        locked_knee_fraction = locked_knee_samples / max(gait_samples, 1)
         return {
             "steps": int(steps),
             "duration_s": float(max(int(steps), 1) * env.dt),
@@ -200,6 +235,13 @@ def evaluate_flat(
             "mean_speed_kmh": mean_speed * 3.6,
             "terminations": terminations,
             "stable": terminations == 0,
+            "mean_right_knee_flexion_rad": float(mean_knee_flexion[0]),
+            "mean_left_knee_flexion_rad": float(mean_knee_flexion[1]),
+            "mean_knee_flexion_track": float(mean_knee_track),
+            "locked_knee_fraction": float(locked_knee_fraction),
+            "natural_knee_gait": bool(
+                mean_knee_track >= 0.90 and locked_knee_fraction <= 0.10
+            ),
         }
     finally:
         env.close()
@@ -309,8 +351,15 @@ def main() -> None:
         stable_scenarios=tuple(sorted(stable)),
         course_successes=course_successes,
     )
+    natural_gait_passed = bool(flat["natural_knee_gait"])
+    failures = list(result.failures)
+    if not natural_gait_passed:
+        failures.append(
+            "locked-knee gait exceeds the natural-walking limit "
+            f"({float(flat['locked_knee_fraction']):.1%} locked samples)"
+        )
     report = {
-        "passed": result.passed,
+        "passed": bool(result.passed and natural_gait_passed),
         "checkpoint": str(checkpoint_path),
         "sensor_input": checkpoint["sensor_observation"],
         "criteria": {
@@ -322,12 +371,14 @@ def main() -> None:
             "stair_tread_range_m": STAIR_TREAD_RANGE_M,
             "stair_assessment_cases": STAIR_ASSESSMENT_CASES,
             "required_scenarios": REQUIRED_SCENARIOS,
+            "minimum_mean_knee_flexion_track": 0.90,
+            "maximum_locked_knee_fraction": 0.10,
         },
         "flat": flat,
         "course": worst_case_course,
         "course_cases": course_cases,
         "stable_scenarios": list(result.stable_scenarios),
-        "failures": list(result.failures),
+        "failures": failures,
         "scope": (
             "simulation pre-acceptance; physical prototype speed and system "
             "integration require hardware measurement"
@@ -341,7 +392,7 @@ def main() -> None:
         else checkpoint_path.parent / "acceptance_report.json"
     )
     output.write_text(serialized + "\n", encoding="utf-8")
-    if not result.passed:
+    if not report["passed"]:
         raise SystemExit(1)
 
 

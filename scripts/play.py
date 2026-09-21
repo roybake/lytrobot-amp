@@ -103,9 +103,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play/evaluate a LYT BPO-AMP checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
-    parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
+    parser.add_argument(
+        "--motion-file", default=None,
+        help="Playback reference; defaults to the one saved in the checkpoint.",
+    )
     parser.add_argument("--steps", type=int, default=1000, help="Number of policy steps to run. Use 0 for no limit.")
-    parser.add_argument("--target-velocity", type=float, default=1.0)
+    parser.add_argument("--target-velocity", type=float, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--seed",
@@ -114,6 +117,14 @@ def parse_args() -> argparse.Namespace:
         help="Playback RNG seed. Omit it to randomize each run; set it to reproduce one play test.",
     )
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--training-aligned",
+        action="store_true",
+        help=(
+            "Preserve reset noise and per-episode RNG behavior saved in the checkpoint. "
+            "Use for distributional evaluation; the default viewer mode is deterministic."
+        ),
+    )
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument(
         "--num-robots",
@@ -128,6 +139,15 @@ def parse_args() -> argparse.Namespace:
         help="Use randomized all-terrain serial courses (enabled by default for multimotion).",
     )
     parser.add_argument(
+        "--terrain-test",
+        choices=("rough", "slope-up", "slope-down"),
+        default=None,
+        help=(
+            "Run one independent sensor-policy route: flat→rough, flat→uphill, "
+            "or downhill→flat. Each route has continuous terrain seams."
+        ),
+    )
+    parser.add_argument(
         "--stage",
         default="auto",
         choices=("auto", "stage1", "stage2", "multimotion"),
@@ -135,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--stand-start-prob", type=float, default=None)
+    parser.add_argument("--stand-start-motion-phase", type=float, default=None)
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=None)
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=None)
     parser.add_argument("--stand-start-transition-max-steps", type=int, default=None)
@@ -158,22 +179,33 @@ def make_env_cfg(
     checkpoint: dict,
     stage: str | None = None,
 ) -> LytRobotEnvCfg:
+    checkpoint_env_cfg = checkpoint.get("env_config", {})
+    saved_motion_file = (
+        checkpoint_env_cfg.get("motion_file")
+        if isinstance(checkpoint_env_cfg, dict) else None
+    )
+    motion_file = args.motion_file or saved_motion_file or str(
+        REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
+    )
     cfg = LytRobotEnvCfg(
         model_xml=args.model_xml,
-        motion_file=args.motion_file,
+        motion_file=motion_file,
         num_envs=1,
-        target_velocity=args.target_velocity,
+        target_velocity=(
+            float(args.target_velocity)
+            if args.target_velocity is not None
+            else float(checkpoint.get("env_config", {}).get("target_velocity", 1.0))
+        ),
         reset_noise_scale=0.0,
         stand_start_prob=0.0,
     )
-    checkpoint_env_cfg = checkpoint.get("env_config", {})
     if isinstance(checkpoint_env_cfg, dict):
         valid_fields = {field.name for field in fields(LytRobotEnvCfg)}
         for key, value in checkpoint_env_cfg.items():
             if key in valid_fields and key not in {"model_xml", "motion_file", "num_envs", "seed", "target_velocity"}:
                 setattr(cfg, key, value)
     cfg.model_xml = args.model_xml
-    cfg.motion_file = args.motion_file
+    cfg.motion_file = motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
     if robot_count is None:
@@ -182,8 +214,10 @@ def make_env_cfg(
         raise ValueError("--num-robots must be positive.")
     cfg.num_envs = int(robot_count)
     cfg.seed = int(args.seed)
-    cfg.target_velocity = args.target_velocity
-    cfg.reset_noise_scale = 0.0
+    if args.target_velocity is not None:
+        cfg.target_velocity = float(args.target_velocity)
+    if not getattr(args, "training_aligned", False):
+        cfg.reset_noise_scale = 0.0
     use_serial_course = (
         resolved_stage == "multimotion"
         if args.serial_terrain_course is None
@@ -193,6 +227,21 @@ def make_env_cfg(
     # was trained with a serial course.  Previously the copied checkpoint
     # value stayed True because only the enabling branch assigned this field.
     cfg.serial_terrain_course = use_serial_course
+    terrain_test = getattr(args, "terrain_test", None)
+    if terrain_test is not None:
+        terrain = terrain_test.replace("-", "_")
+        cfg.terrain_types = (terrain,)
+        cfg.serial_terrain_course = True
+        # These are deployment tests, so the flat portions are the MJCF's
+        # default MuJoCo floor (z=0), not the raised training-course datum.
+        cfg.terrain_course_base_height = 0.0
+        # Leave enough native floor for a stable gait to settle, while keeping
+        # a short recording able to show the requested terrain transition.
+        cfg.terrain_course_run_in = 0.75
+        cfg.terrain_course_variants = max(int(robot_count), 1)
+        cfg.terrain_course_random_assignment = False
+        cfg.terrain_course_random_start_prob = 0.0
+        cfg.stand_start_prob = 0.0
     if use_serial_course:
         cfg.terrain_course_variants = max(int(robot_count), 1)
         cfg.terrain_course_random_assignment = False
@@ -202,6 +251,9 @@ def make_env_cfg(
         cfg.stand_start_prob = 0.0
     if args.stand_start_prob is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
+    stand_start_motion_phase = getattr(args, "stand_start_motion_phase", None)
+    if stand_start_motion_phase is not None:
+        cfg.stand_start_motion_phase = float(stand_start_motion_phase)
     if args.stand_start_phase_delay_steps is not None:
         cfg.stand_start_phase_delay_steps = int(args.stand_start_phase_delay_steps)
     if args.stand_start_transition_min_steps is not None:
@@ -214,7 +266,7 @@ def make_env_cfg(
         cfg.domain_randomization = bool(args.domain_randomization)
     if args.episode_random_seed is not None:
         cfg.randomize_episode_seed = bool(args.episode_random_seed)
-    elif getattr(args, "seed_was_provided", False):
+    elif getattr(args, "seed_was_provided", False) and not getattr(args, "training_aligned", False):
         cfg.randomize_episode_seed = False
     return cfg
 
@@ -488,7 +540,9 @@ def main() -> None:
                 min_action_std=float(ppo_cfg.get("min_action_std", 0.05)),
                 max_action_std=float(ppo_cfg.get("max_action_std", 0.80)),
                 sensor_frame_dim=int(sensor_architecture["sensor_frame_dim"]),
+                actor_history_frames=int(sensor_architecture.get("actor_history_frames", 1)),
                 recurrent_hidden_dim=int(sensor_architecture["recurrent_hidden_dim"]),
+                use_moe=bool(sensor_architecture.get("use_moe", True)),
                 num_experts=int(sensor_architecture["num_experts"]),
                 gate_hidden_dims=tuple(sensor_architecture["gate_hidden_dims"]),
                 expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),

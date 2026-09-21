@@ -14,6 +14,8 @@ from .env import (
     _stair_root_height_transform,
     scaled_randomization_range,
 )
+from .gait_constraints import natural_gait_bonus, sensor_gait_scores
+from .mimickit_deepmimic import deepmimic_reward
 from .motion import (
     CONTACT_GEOM_NAMES,
     MotionLibrary,
@@ -232,13 +234,23 @@ class LytRobotWarpAmpEnv:
         self.position_action_dim = int(len(self.position_actuator_ids_np))
         self.action_dim = self.position_action_dim
         self.ctrl_dim = int(self.model.nu)
+        motion_files = cfg.motion_files or (cfg.motion_file,)
+        preserve_stair_world_xy = bool(
+            cfg.stair_terrain
+            and len(motion_files) == 1
+            and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+        )
+        self.continuous_stair_phase_curriculum = bool(
+            preserve_stair_world_xy and not cfg.stair_fixed_start
+        )
         self.motion = load_motion_library(
-            cfg.motion_files or (cfg.motion_file,),
+            motion_files,
             self.model,
             actuator_ids=self.position_actuator_ids_np,
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
+            zero_root_xy=not preserve_stair_world_xy,
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -246,7 +258,9 @@ class LytRobotWarpAmpEnv:
         motion_names = (
             self.motion.motion_names
             if isinstance(self.motion, MotionLibrary)
-            else (Path(cfg.motion_file).stem,)
+            # A one-element ``--motion-files`` list is represented by a
+            # MotionReference, so task detection must use that selected path.
+            else (Path(motion_files[0]).stem,)
         )
         self.stair_motion_mask_np = np.asarray(
             ["stair" in name.lower() for name in motion_names], dtype=bool
@@ -265,6 +279,9 @@ class LytRobotWarpAmpEnv:
         self.motion_stair_height_scale_np = np.ones(
             self.motion_count, dtype=np.float32
         )
+        self.motion_stair_distance_np = np.zeros(
+            self.motion_count, dtype=np.float32
+        )
         for motion_id, motion_reference in enumerate(motion_references):
             if not self.stair_motion_mask_np[motion_id]:
                 continue
@@ -274,8 +291,20 @@ class LytRobotWarpAmpEnv:
                 step_count=self.stair_cfg.step_count,
                 descending=bool(self.stair_down_motion_mask_np[motion_id]),
             )
+            if (
+                self.continuous_stair_phase_curriculum
+                or self.cfg.stair_fixed_start
+            ) and not self.more_terrain_cfg.serial_course:
+                # Specialist references are already solved for their compiled
+                # 0.13 m stairs; do not invalidate down-stair foot contacts by
+                # applying a second pelvis-only height scale at runtime.
+                scale = 1.0
             self.motion_stair_height_anchor_np[motion_id] = anchor
             self.motion_stair_height_scale_np[motion_id] = scale
+            self.motion_stair_distance_np[motion_id] = float(
+                motion_reference.reference_qpos[-1, 0]
+                - motion_reference.reference_qpos[0, 0]
+            )
         self.nominal_root_height = float(self.motion.model_qpos0[2])
         self.motion_terrain_kinds = tuple(
             terrain_kind_from_motion(name) for name in motion_names
@@ -356,6 +385,10 @@ class LytRobotWarpAmpEnv:
         self.contact_geom_id_values = tuple(int(geom_id) for geom_id in contact_geom_ids_np)
         self.right_contact_geom_ids = self.contact_geom_ids[:2]
         self.left_contact_geom_ids = self.contact_geom_ids[2:]
+        self.sensor_foot_body_ids = tuple(
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in ("foot_r", "foot_l")
+        )
         self._build_stand_reference()
 
         self.joint_reward_weights = torch.as_tensor(
@@ -367,6 +400,18 @@ class LytRobotWarpAmpEnv:
                     joint_id
                     for joint_id, name in enumerate(self.motion.common_joint_names)
                     if "ankle" in name or "subtalar" in name or "mtp" in name
+                ],
+                dtype=np.int64,
+            ),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.knee_joint_indices = torch.as_tensor(
+            np.asarray(
+                [
+                    joint_id
+                    for joint_id, name in enumerate(self.motion.common_joint_names)
+                    if "knee" in name
                 ],
                 dtype=np.int64,
             ),
@@ -389,6 +434,15 @@ class LytRobotWarpAmpEnv:
             self.num_envs, dtype=torch.float32, device=self.device
         )
         self.forward_progress_anchor_step = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.stair_start_x = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.stair_start_y = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.stair_terminal_hold_elapsed = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
         self.motion_phase = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -423,6 +477,22 @@ class LytRobotWarpAmpEnv:
         self.foot_x_max = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.contact_balance_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.action_activity_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.sensor_last_foot_contact = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
+        self.sensor_foot_roll_stage = torch.zeros((self.num_envs, 2), dtype=torch.long, device=self.device)
+        self.sensor_toe_only_steps = torch.zeros((self.num_envs, 2), dtype=torch.long, device=self.device)
+        self.sensor_last_touchdown_side = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.sensor_liftoff_x = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.sensor_had_liftoff = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
+        self.sensor_stride_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.sensor_stride_seen = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
+        self.sensor_contact_duty_ema = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.sensor_single_support_ema = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.sensor_time_since_touchdown = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.sensor_step_interval_ema = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.sensor_touchdown_seen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.sensor_cadence_seen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.sensor_swing_steps = torch.zeros((self.num_envs, 2), dtype=torch.long, device=self.device)
+        self.sensor_prev_foot_world = torch.zeros((self.num_envs, 2, 3), dtype=torch.float32, device=self.device)
         self.last_obs = torch.zeros((self.num_envs, self.obs_dim), dtype=torch.float32, device=self.device)
         self.stand_start = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.stand_start_transition_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
@@ -599,7 +669,7 @@ class LytRobotWarpAmpEnv:
             (
                 self.motion.motion_loop
                 if isinstance(self.motion, MotionLibrary)
-                else np.asarray([True])
+                else np.asarray([self.motion.source_loop])
             ),
             dtype=torch.bool,
             device=self.device,
@@ -611,6 +681,10 @@ class LytRobotWarpAmpEnv:
         )
         self.motion_stair_height_scale = tensor(
             self.motion_stair_height_scale_np
+        )
+        self.motion_stair_distance = tensor(self.motion_stair_distance_np)
+        self.motion_stair_mask = torch.as_tensor(
+            self.stair_motion_mask_np, dtype=torch.bool, device=self.device
         )
 
     def _build_stand_reference(self) -> None:
@@ -693,9 +767,16 @@ class LytRobotWarpAmpEnv:
         self.wp_body_subtreemass = wp.to_torch(self.wp_model.body_subtreemass)
         self.wp_geom_friction = wp.to_torch(self.wp_model.geom_friction)
         self.wp_gravity = wp.to_torch(self.wp_model.opt.gravity)
-        self.contact_geom = wp.to_torch(self.wp_data.contact.geom).long()
-        self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid).long()
-        self.contact_dim = wp.to_torch(self.wp_data.contact.dim).long()
+        # Keep live Warp views.  Casting to int64 here copies the int32
+        # buffers once, freezing contact identities/counts for every step.
+        self.contact_geom = wp.to_torch(self.wp_data.contact.geom)
+        self.contact_pos = wp.to_torch(self.wp_data.contact.pos)
+        self.contact_worldid = wp.to_torch(self.wp_data.contact.worldid)
+        self.contact_dim = wp.to_torch(self.wp_data.contact.dim)
+        self.contact_nacon = wp.to_torch(self.wp_data.nacon)
+        self.contact_slot_ids = torch.arange(
+            self.contact_dim.numel(), dtype=torch.long, device=self.device
+        )
         self._warp_reset_mask = torch.zeros(
             self.num_envs,
             dtype=torch.bool,
@@ -1214,8 +1295,8 @@ class LytRobotWarpAmpEnv:
         g1 = self.contact_geom[:, 0]
         g2 = self.contact_geom[:, 1]
         world = self.contact_worldid
-        valid = (self.contact_dim > 0) & (world >= 0) & (world < self.num_envs)
-        safe_world = torch.clamp(world, 0, self.num_envs - 1)
+        valid = self._valid_contact_slots()
+        safe_world = torch.clamp(world, 0, self.num_envs - 1).long()
 
         g1_terrain = torch.isin(g1, self.terrain_geom_ids)
         g2_terrain = torch.isin(g2, self.terrain_geom_ids)
@@ -1235,6 +1316,59 @@ class LytRobotWarpAmpEnv:
 
     def _foot_contacts(self) -> torch.Tensor:
         return self._side_contacts_from_geom(self._foot_geom_contacts())
+
+    def _valid_contact_slots(self) -> torch.Tensor:
+        """Ignore stale contacts beyond Warp's current active prefix."""
+
+        return (
+            (self.contact_slot_ids < self.contact_nacon[0])
+            & (self.contact_dim > 0)
+            & (self.contact_worldid >= 0)
+            & (self.contact_worldid < self.num_envs)
+        )
+
+    def _sensor_foot_roll_contacts(self) -> torch.Tensor:
+        """Classify real floor contacts by heel, sole and toe position."""
+
+        zones = torch.zeros((self.num_envs, 2, 3), dtype=torch.float32, device=self.device)
+        g1, g2 = self.contact_geom[:, 0], self.contact_geom[:, 1]
+        world = self.contact_worldid
+        valid = self._valid_contact_slots()
+        safe_world = world.clamp(0, self.num_envs - 1).long()
+        terrain1 = torch.isin(g1, self.terrain_geom_ids)
+        terrain2 = torch.isin(g2, self.terrain_geom_ids)
+        for side, (foot_geom, toe_geom) in enumerate(
+            ((self.contact_geom_id_values[0], self.contact_geom_id_values[1]),
+             (self.contact_geom_id_values[2], self.contact_geom_id_values[3]))
+        ):
+            foot_contact = valid & ((terrain1 & (g2 == foot_geom)) | (terrain2 & (g1 == foot_geom)))
+            toe_contact = valid & ((terrain1 & (g2 == toe_geom)) | (terrain2 & (g1 == toe_geom)))
+            body_id = self.sensor_foot_body_ids[side]
+            # Foot-local X separates the posterior heel from the central sole.
+            # The toe is its own articulated geom.  These boundaries are
+            # inside the observed foot mesh contact span (-0.026..0.12 m).
+            local_x = torch.sum(
+                (self.contact_pos - self.xpos[safe_world, body_id])
+                * self.xmat[safe_world, body_id, :, 0],
+                dim=1,
+            )
+            for zone, matched in enumerate(
+                (foot_contact & (local_x <= 0.0),
+                 foot_contact & (local_x > 0.0),
+                 toe_contact)
+            ):
+                zones[:, side, zone].scatter_reduce_(
+                    0, safe_world, matched.float(), reduce="amax", include_self=True
+                )
+        # Warp's convex mesh narrowphase often retains only the posterior
+        # foot contact while the articulated toe also contacts the floor.
+        # Two loaded endpoints imply support through the intervening sole;
+        # this recovers the reference roll without treating a toe-only strike
+        # as a complete heel/sole/toe sequence.
+        zones[:, :, 1] = torch.maximum(
+            zones[:, :, 1], torch.minimum(zones[:, :, 0], zones[:, :, 2])
+        )
+        return zones > 0.5
 
     def reset(self, env_ids: np.ndarray | list[int] | torch.Tensor | None = None) -> torch.Tensor:
         if env_ids is None:
@@ -1280,6 +1414,19 @@ class LytRobotWarpAmpEnv:
         else:
             sampled_motion_ids = np.zeros(len(ids_np), dtype=np.int32)
             states = self.motion.sample_states(len(ids_np), self.rng)
+        if self.continuous_stair_phase_curriculum:
+            reference = (
+                self.motion.motions[0]
+                if isinstance(self.motion, MotionLibrary)
+                else self.motion
+            )
+            landing_frames = np.arange(
+                0, max(reference.frame_count - 1, 1), 32, dtype=np.int32
+            )
+            sampled_frames = self.rng.choice(landing_frames, size=len(ids_np))
+            states.qpos[:] = reference.reference_qpos[sampled_frames]
+            states.qvel[:] = 0.0
+            states.indices[:] = sampled_frames
         use_stand_start = (
             np.zeros(len(ids_np), dtype=bool)
             if serial_course
@@ -1295,6 +1442,25 @@ class LytRobotWarpAmpEnv:
                 < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
             )
         )
+        stair_fixed_start = (
+            np.zeros(len(ids_np), dtype=bool)
+            if serial_course
+            else self.stair_motion_mask_np[sampled_motion_ids]
+            & bool(self.cfg.stair_fixed_start)
+            & ~use_stand_start
+        )
+        use_motion_reset |= stair_fixed_start
+        if np.any(stair_fixed_start):
+            for row in np.flatnonzero(stair_fixed_start):
+                motion_id = int(sampled_motion_ids[row])
+                reference = (
+                    self.motion.motions[motion_id]
+                    if isinstance(self.motion, MotionLibrary)
+                    else self.motion
+                )
+                states.qpos[row] = reference.reference_qpos[0]
+                states.qvel[row] = reference.reference_qvel[0]
+                states.indices[row] = 0
         # Mass, inertia, friction, and gravity live on the single shared Warp
         # model.  They are opt-in because one draw would otherwise change all
         # worlds at once and destroy the within-batch dynamics distribution.
@@ -1319,9 +1485,27 @@ class LytRobotWarpAmpEnv:
         qpos = np.repeat(self.motion.model_qpos0[None, :], len(ids_np), axis=0).astype(np.float32)
         qvel = np.zeros((len(ids_np), self.model.nv), dtype=np.float32)
         phase = np.zeros(len(ids_np), dtype=np.float32)
+        phase[use_stand_start] = float(self.cfg.stand_start_motion_phase)
         qpos[use_motion_reset] = states.qpos[use_motion_reset]
         qvel[use_motion_reset] = states.qvel[use_motion_reset]
         phase[use_motion_reset] = states.indices[use_motion_reset].astype(np.float32)
+        reset_frame_counts = np.asarray(
+            self.motion.frame_counts
+            if isinstance(self.motion, MotionLibrary)
+            else [self.motion.frame_count],
+            dtype=np.int32,
+        )[sampled_motion_ids]
+        reset_looping = np.asarray(
+            self.motion.motion_loop
+            if isinstance(self.motion, MotionLibrary)
+            else [self.motion.source_loop],
+            dtype=bool,
+        )[sampled_motion_ids]
+        phase = np.where(
+            reset_looping,
+            np.mod(phase, reset_frame_counts),
+            np.clip(phase, 0.0, reset_frame_counts - 1.0),
+        ).astype(np.float32)
         reset_motion_ids = sampled_motion_ids[use_motion_reset]
         reset_height_anchor = self.motion_stair_height_anchor_np[reset_motion_ids]
         reset_height_scale = self.motion_stair_height_scale_np[reset_motion_ids]
@@ -1374,6 +1558,9 @@ class LytRobotWarpAmpEnv:
         self.episode_timeout_step[ids] = self._sample_timeout_steps(len(ids_np))
         self.forward_progress_anchor_x[ids] = self.qpos[ids, 0]
         self.forward_progress_anchor_step[ids] = 0
+        self.stair_start_x[ids] = self.qpos[ids, 0]
+        self.stair_start_y[ids] = self.qpos[ids, 1]
+        self.stair_terminal_hold_elapsed[ids] = 0
         targets = self._targets_at_current_phase() if self.actor_observation_enabled else None
         reset_targets = (
             {key: value[ids] for key, value in targets.items()}
@@ -1402,6 +1589,22 @@ class LytRobotWarpAmpEnv:
         self.foot_stride_ema[ids] = 0.0
         self.contact_balance_ema[ids] = 0.0
         self.action_activity_ema[ids] = 0.0
+        self.sensor_last_foot_contact[ids] = False
+        self.sensor_foot_roll_stage[ids] = 0
+        self.sensor_toe_only_steps[ids] = 0
+        self.sensor_last_touchdown_side[ids] = -1
+        self.sensor_liftoff_x[ids] = self.geom_xpos[ids][:, self.contact_geom_ids[[0, 2]], 0]
+        self.sensor_had_liftoff[ids] = False
+        self.sensor_stride_ema[ids] = 0.0
+        self.sensor_stride_seen[ids] = False
+        self.sensor_contact_duty_ema[ids] = 0.0
+        self.sensor_single_support_ema[ids] = 0.0
+        self.sensor_time_since_touchdown[ids] = 0.0
+        self.sensor_step_interval_ema[ids] = 0.0
+        self.sensor_touchdown_seen[ids] = False
+        self.sensor_cadence_seen[ids] = False
+        self.sensor_swing_steps[ids] = 0
+        self.sensor_prev_foot_world[ids] = self.geom_xpos[ids][:, self.contact_geom_ids[[0, 2]]]
         if self.actor_observation_enabled:
             assert targets is not None
             self.last_obs = self.observe(targets=targets)
@@ -1526,6 +1729,12 @@ class LytRobotWarpAmpEnv:
         incomplete_motion_required_x = torch.full_like(
             self.qpos[:, 0], float("inf")
         )
+        stair_motion = self.motion_stair_mask[self.motion_ids]
+        stair_distance_error = torch.zeros_like(self.qpos[:, 0])
+        stair_distance_success = torch.zeros_like(course_complete)
+        stair_distance_failure = torch.zeros_like(course_complete)
+        stair_lateral_error = torch.zeros_like(self.qpos[:, 0])
+        stair_lateral_failure = torch.zeros_like(course_complete)
         if self.more_terrain_cfg.serial_course:
             motion_complete = next_phase >= frame_counts - 1.0
             active_looping = self.motion_loop[self.motion_ids].clone()
@@ -1655,27 +1864,41 @@ class LytRobotWarpAmpEnv:
                     self._warp_step()
 
         self.episode_step += 1
-        foot_pos = self._foot_positions_local()
-        foot_vel = (foot_pos - self.last_foot_pos) / max(self.dt, 1.0e-6)
-        foot_world_pos = self._foot_positions_world()
-        foot_world_vel = (foot_world_pos - self.last_foot_world_pos) / max(self.dt, 1.0e-6)
-        foot_geom_contact = self._foot_geom_contacts()
-        foot_contact = self._side_contacts_from_geom(foot_geom_contact)
-        rewards, dones, time_outs, components = self._compute_reward_done(
-            commanded_action,
-            prev_action,
-            (
-                targets["root_lin_vel"][:, 0]
-                if self.cfg.use_reference_velocity
-                else float(self.cfg.target_velocity) * phase_scale
-            ),
-            targets,
-            foot_pos,
-            foot_vel,
-            foot_world_vel,
-            foot_geom_contact,
-            foot_contact,
+        target_forward_velocity = (
+            targets["root_lin_vel"][:, 0]
+            if self.cfg.use_reference_velocity
+            else float(self.cfg.target_velocity) * phase_scale
         )
+        sensor_reward_fast_path = bool(self.cfg.sensor_stability_reward)
+        if sensor_reward_fast_path:
+            # SensorHistoryEnv replaces the reference-tracking reward.  Skip
+            # pose, foot, contact and symmetry terms that it would discard.
+            rewards, dones, time_outs, components = self._compute_sensor_reward_done(
+                commanded_action,
+                prev_action,
+                target_forward_velocity,
+                targets,
+            )
+            foot_pos = None
+            foot_world_pos = None
+        else:
+            foot_pos = self._foot_positions_local()
+            foot_vel = (foot_pos - self.last_foot_pos) / max(self.dt, 1.0e-6)
+            foot_world_pos = self._foot_positions_world()
+            foot_world_vel = (foot_world_pos - self.last_foot_world_pos) / max(self.dt, 1.0e-6)
+            foot_geom_contact = self._foot_geom_contacts()
+            foot_contact = self._side_contacts_from_geom(foot_geom_contact)
+            rewards, dones, time_outs, components = self._compute_reward_done(
+                commanded_action,
+                prev_action,
+                target_forward_velocity,
+                targets,
+                foot_pos,
+                foot_vel,
+                foot_world_vel,
+                foot_geom_contact,
+                foot_contact,
+            )
         if self.more_terrain_cfg.serial_course:
             rewards = rewards + (
                 float(self.cfg.terrain_course_completion_reward)
@@ -1713,28 +1936,105 @@ class LytRobotWarpAmpEnv:
         components["forward_progress_window_speed"] = progress_speed
         components["insufficient_progress"] = insufficient_progress.to(torch.float32)
         components["incomplete_motion_end"] = incomplete_motion_end.to(torch.float32)
+        # Non-looping stair references define a fixed root-X displacement.  A
+        # terminal frame that stops short of that displacement is a failed
+        # stair traversal, even if the robot remains upright.
+        if self.more_terrain_cfg.serial_course:
+            stair_active = torch.zeros_like(stair_motion)
+            stair_terminal = torch.zeros_like(motion_complete)
+            self.stair_terminal_hold_elapsed.zero_()
+        else:
+            stair_active = stair_motion
+            hold_steps = (
+                max(int(self.cfg.stair_terminal_hold_steps), 0)
+                if self.cfg.stair_fixed_start
+                else 0
+            )
+            completed_stair = stair_active & motion_complete
+            if hold_steps > 0:
+                self.stair_terminal_hold_elapsed[:] = torch.where(
+                    completed_stair,
+                    torch.clamp(
+                        self.stair_terminal_hold_elapsed + 1,
+                        max=hold_steps,
+                    ),
+                    torch.zeros_like(self.stair_terminal_hold_elapsed),
+                )
+                stair_terminal = completed_stair & (
+                    self.stair_terminal_hold_elapsed >= hold_steps
+                )
+            else:
+                self.stair_terminal_hold_elapsed.zero_()
+                stair_terminal = completed_stair
+        expected_stair_distance = self.motion_stair_distance[self.motion_ids]
+        stair_distance_error = torch.where(
+            stair_terminal,
+            torch.abs(
+                (self.qpos[:, 0] - self.stair_start_x) - expected_stair_distance
+            ),
+            torch.zeros_like(self.qpos[:, 0]),
+        )
+        stair_distance_success = stair_terminal & (
+            stair_distance_error <= max(float(self.cfg.stair_distance_tolerance), 0.0)
+        )
+        stair_distance_failure = stair_terminal & ~stair_distance_success
+        rewards = rewards - (
+            max(float(self.cfg.stair_distance_failure_penalty), 0.0)
+            * stair_distance_failure.to(torch.float32)
+        )
+        stair_lateral_error = torch.where(
+            stair_active,
+            torch.abs(self.qpos[:, 1] - self.stair_start_y),
+            torch.zeros_like(self.qpos[:, 0]),
+        )
+        stair_lateral_failure = stair_active & (
+            stair_lateral_error > max(float(self.cfg.stair_lateral_tolerance), 0.0)
+        )
+        rewards = rewards - (
+            max(float(self.cfg.stair_lateral_failure_penalty), 0.0)
+            * stair_lateral_failure.to(torch.float32)
+        )
         successful_motion_end = (
             course_suffix_complete
             if self.more_terrain_cfg.serial_course
-            else motion_complete
+            else (
+                (motion_complete & ~stair_active)
+                | (stair_terminal & ~stair_distance_failure)
+            )
         )
-        dones = dones | successful_motion_end | forward_progress_failure
+        dones = (
+            dones
+            | successful_motion_end
+            | stair_distance_failure
+            | stair_lateral_failure
+            | forward_progress_failure
+        )
         time_outs = time_outs | successful_motion_end
         episode_steps = self.episode_step.clone()
+        reported_stair_terminal_hold_elapsed = (
+            self.stair_terminal_hold_elapsed.clone()
+        )
         self.last_action[:] = commanded_action
-        self.last_foot_pos[:] = foot_pos
-        self.last_foot_world_pos[:] = foot_world_pos
+        if foot_pos is not None and foot_world_pos is not None:
+            self.last_foot_pos[:] = foot_pos
+            self.last_foot_world_pos[:] = foot_world_pos
 
         reported_course_stage = self.course_stage_ids.clone()
         reported_course_start_stage = self.course_start_stage_ids.clone()
-        done_ids_np = np.flatnonzero(dones.detach().cpu().numpy())
+        # Only time-limit transitions need a pre-reset value bootstrap.  Falls
+        # are true terminals, so constructing their terminal sensor history
+        # and evaluating the critic is wasted work.  Reuse the single host
+        # transfer needed by the current CPU reset path for both masks.
+        terminal_masks_np = torch.stack((dones, time_outs)).detach().cpu().numpy()
+        done_ids_np = np.flatnonzero(terminal_masks_np[0])
+        bootstrap_ids_np = np.flatnonzero(terminal_masks_np[1])
         terminal_payload = None
         terminal_observer = getattr(self, "terminal_observer", None)
-        if done_ids_np.size > 0 and callable(terminal_observer):
+        if bootstrap_ids_np.size > 0 and callable(terminal_observer):
             # The terminal history has to be read before reset; otherwise a
             # time-limit bootstrap incorrectly evaluates the next episode.
             terminal_ids = torch.as_tensor(
-                done_ids_np, dtype=torch.long, device=self.device
+                bootstrap_ids_np, dtype=torch.long, device=self.device
             )
             terminal_payload = terminal_observer(terminal_ids)
         if done_ids_np.size > 0:
@@ -1748,6 +2048,14 @@ class LytRobotWarpAmpEnv:
         if terminal_payload is not None:
             info.update(terminal_payload)
             info["terminal_env_ids"] = terminal_ids
+        info["stair_distance_error"] = stair_distance_error
+        info["stair_distance_success"] = stair_distance_success.to(torch.float32)
+        info["stair_distance_failure"] = stair_distance_failure.to(torch.float32)
+        info["stair_lateral_error"] = stair_lateral_error
+        info["stair_lateral_failure"] = stair_lateral_failure.to(torch.float32)
+        info["stair_terminal_hold_elapsed"] = reported_stair_terminal_hold_elapsed.to(
+            torch.float32
+        )
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.to(torch.float32)
             info["course_suffix_complete"] = course_suffix_complete.to(torch.float32)
@@ -1755,6 +2063,257 @@ class LytRobotWarpAmpEnv:
             info["course_start_stage"] = reported_course_start_stage.to(torch.float32)
             info["successes"] = course_complete.to(torch.float32)
         return self.last_obs, rewards, dones.to(torch.float32), info
+
+    def _compute_sensor_reward_done(
+        self,
+        action: torch.Tensor,
+        prev_action: torch.Tensor,
+        target_forward_velocity: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute only terms consumed by the sensor-stability objective."""
+
+        root_height = self.qpos[:, 2]
+        up_z = self.xmat[:, self.pelvis_body_id, 2, 2]
+        # These stability terms must not depend on the unobserved reference
+        # phase.  The pelvis up axis is available from IMU history, while root
+        # clearance is used only by the training reward/termination path.
+        upright_span = max(1.0 - float(self.cfg.min_upright_z), 1.0e-6)
+        sensor_upright = torch.clamp(
+            (up_z - float(self.cfg.min_upright_z)) / upright_span,
+            0.0,
+            1.0,
+        )
+        terrain_height = (
+            float(self.more_terrain_cfg.course_base_height)
+            if self.more_terrain_cfg.serial_course
+            else 0.0
+        )
+        root_clearance = root_height - terrain_height
+        clearance_span = max(
+            self.nominal_root_height - float(self.cfg.fall_height),
+            1.0e-6,
+        )
+        sensor_height = torch.clamp(
+            (root_clearance - float(self.cfg.fall_height)) / clearance_span,
+            0.0,
+            1.0,
+        )
+        pelvis_tilt = torch.acos(torch.clamp(up_z, -1.0, 1.0))
+        sensor_posture_track = torch.exp(
+            -(pelvis_tilt / max(float(getattr(self.cfg, "sensor_upright_sigma", 0.12)), 1.0e-6)).square()
+        )
+        sensor_gait_height_track = torch.exp(
+            -((root_clearance - float(getattr(self.cfg, "sensor_gait_height_target", 0.845)))
+              / max(float(getattr(self.cfg, "sensor_gait_height_sigma", 0.07)), 1.0e-6)).square()
+        )
+        # Preserve the existing metric keys for log/CSV compatibility; in the
+        # sensor fast path they now carry phase-independent stability scores.
+        root_orientation = sensor_upright
+        height = sensor_height
+
+        forward_velocity = self.qvel[:, 0]
+        forward_velocity_error = forward_velocity - target_forward_velocity
+        forward_velocity_track = torch.exp(
+            -forward_velocity_error.square()
+            / (max(float(self.cfg.forward_velocity_tracking_sigma), 1.0e-6) ** 2)
+        )
+        target_velocity_scale = max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+        gait_progress = torch.clamp(
+            torch.abs(target_forward_velocity) / target_velocity_scale,
+            0.0,
+            1.0,
+        )
+        forward_progress = torch.clamp(forward_velocity / target_velocity_scale, -1.0, 1.0)
+        forward_velocity_deficit = torch.clamp(
+            (target_forward_velocity - forward_velocity) / target_velocity_scale,
+            0.0,
+            2.0,
+        )
+        forward_velocity_excess = torch.clamp(
+            (forward_velocity - target_forward_velocity) / target_velocity_scale,
+            0.0,
+            2.0,
+        )
+        knee_target = max(float(self.cfg.sensor_knee_flexion_target), 1.0e-6)
+        if len(self.knee_joint_indices) > 0:
+            knee_flexion = torch.clamp(
+                -self.qpos[:, self.robot_qpos_adrs][:, self.knee_joint_indices],
+                min=0.0,
+            )
+            knee_flexion_track = torch.clamp(
+                torch.amin(knee_flexion, dim=1) / knee_target,
+                0.0,
+                1.0,
+            )
+        else:
+            knee_flexion_track = torch.ones_like(root_height)
+        gait_scores = {}
+        if any(
+            float(getattr(self.cfg, name, 0.0)) > 0.0
+            for name in (
+                "sensor_mirror_reward_coef",
+                "sensor_natural_gait_reward_coef",
+                "sensor_stride_reward_coef",
+                "sensor_foot_roll_reward_coef",
+                "sensor_alternation_reward_coef",
+                "sensor_hop_penalty_coef",
+                "sensor_tiptoe_penalty_coef",
+                "sensor_stance_slip_penalty_coef",
+                "sensor_sync_forward_penalty_coef",
+            )
+        ):
+            zones = self._sensor_foot_roll_contacts()
+            all_foot_world = self.geom_xpos[:, self.contact_geom_ids]
+            foot_world = all_foot_world[:, [0, 2]]
+            foot_x = foot_world[:, :, 0]
+            foot_height = torch.stack(
+                (torch.amin(all_foot_world[:, 0:2, 2], dim=1),
+                 torch.amin(all_foot_world[:, 2:4, 2], dim=1)),
+                dim=1,
+            )
+            stance_speed = torch.linalg.vector_norm(
+                (foot_world[:, :, :2] - self.sensor_prev_foot_world[:, :, :2])
+                / max(self.dt, 1.0e-6),
+                dim=2,
+            )
+            foot_forward_speed = (
+                foot_world[:, :, 0] - self.sensor_prev_foot_world[:, :, 0]
+            ) / max(self.dt, 1.0e-6)
+            self.sensor_prev_foot_world.copy_(foot_world)
+            foot_local = self._foot_positions_local()
+            gait_scores = sensor_gait_scores(
+                self, zones, foot_x, foot_local[:, 0, 1] + foot_local[:, 2, 1],
+                stance_speed, foot_forward_speed, foot_height
+            )
+        (
+            locomotion_stability,
+            stable_forward_velocity_track,
+            stable_forward_progress,
+        ) = _stability_gated_locomotion_terms(
+            forward_velocity_track,
+            forward_progress,
+            sensor_upright,
+            sensor_height,
+        )
+
+        position_action = torch.clamp(action, -1.0, 1.0)
+        prev_position_action = torch.clamp(prev_action, -1.0, 1.0)
+        ctrl_penalty = torch.mean(position_action.square(), dim=1)
+        action_rate = torch.mean((position_action - prev_position_action).square(), dim=1)
+        if self.has_distal_action:
+            distal_action = torch.mean(
+                position_action[:, self.distal_position_action_mask].square(), dim=1
+            )
+            distal_action_rate = torch.mean(
+                (
+                    position_action[:, self.distal_position_action_mask]
+                    - prev_position_action[:, self.distal_position_action_mask]
+                ).square(),
+                dim=1,
+            )
+        else:
+            distal_action = ctrl_penalty
+            distal_action_rate = action_rate
+
+        bad_state = ~(
+            torch.isfinite(self.qpos).all(dim=1)
+            & torch.isfinite(self.qvel).all(dim=1)
+            & torch.isfinite(self.ctrl).all(dim=1)
+        )
+        fallen = (
+            (root_clearance < float(self.cfg.fall_height))
+            | (root_clearance > float(self.cfg.max_height))
+            | (up_z < self.cfg.min_upright_z)
+        )
+
+        # Match sensor_stability_task_reward before its fall/stall overrides.
+        stability = torch.clamp(
+            torch.minimum(sensor_posture_track, sensor_gait_height_track),
+            0.0,
+            1.0,
+        )
+        quality_terms = torch.stack(
+            tuple(torch.clamp(gait_scores.get(name, torch.full_like(root_height, 0.5)), 0.05, 1.0)
+                  for name in (
+                      "sensor_stride_length", "sensor_step_cadence",
+                      "sensor_swing_clearance", "sensor_foot_roll",
+                      "sensor_alternation", "sensor_mirror",
+                  )),
+            dim=1,
+        )
+        gait_quality = 6.0 / torch.sum(1.0 / quality_terms, dim=1)
+        speed_track = torch.clamp(forward_velocity_track, 0.0, 1.0)
+        reward = 0.50 * stability + stability * (
+            1.50 * speed_track
+            + 0.50 * torch.clamp(forward_progress, 0.0, 1.0)
+            - 2.50 * torch.clamp(forward_velocity_deficit, 0.0, 2.0)
+            - float(getattr(self.cfg, "sensor_velocity_excess_penalty_coef", 0.0))
+            * torch.clamp(forward_velocity_excess, 0.0, 2.0)
+            + float(getattr(self.cfg, "sensor_natural_gait_reward_coef", 0.0))
+            * gait_progress
+            * speed_track
+            * gait_quality
+            + float(self.cfg.sensor_knee_gait_reward_coef)
+            * gait_progress
+            * (knee_flexion_track - 1.0)
+            + gait_progress * (
+                - float(getattr(self.cfg, "sensor_hop_penalty_coef", 0.0))
+                * gait_scores.get("sensor_hop", 0.0)
+                - float(getattr(self.cfg, "sensor_tiptoe_penalty_coef", 0.0))
+                * (gait_scores.get("sensor_tiptoe", 0.0)
+                   + gait_scores.get("sensor_roll_violation", 0.0))
+                - float(getattr(self.cfg, "sensor_stance_slip_penalty_coef", 0.0))
+                * gait_scores.get("sensor_stance_slip", 0.0)
+                - float(getattr(self.cfg, "sensor_sync_forward_penalty_coef", 0.0))
+                * gait_scores.get("sensor_synchronous_forward", 0.0)
+            )
+        ) - 0.04 * ctrl_penalty - 0.10 * action_rate - 0.03 * distal_action - 0.12 * distal_action_rate
+        components = {
+            "root_height_value": root_height,
+            "reference_root_height_value": targets["root_height"],
+            "sensor_root_clearance": root_clearance,
+            "forward_velocity": forward_velocity,
+            "forward_velocity_error": forward_velocity_error,
+            "forward_velocity_track": forward_velocity_track,
+            "forward_progress": forward_progress,
+            "locomotion_stability": locomotion_stability,
+            "stable_forward_velocity_track": stable_forward_velocity_track,
+            "stable_forward_progress": stable_forward_progress,
+            "forward_velocity_deficit": forward_velocity_deficit,
+            "forward_velocity_excess": forward_velocity_excess,
+            "root_orientation": root_orientation,
+            "height": height,
+            "sensor_upright": sensor_upright,
+            "sensor_height": sensor_height,
+            "sensor_posture_track": sensor_posture_track,
+            "sensor_gait_height_track": sensor_gait_height_track,
+            "sensor_gait_quality": gait_quality,
+            "gait_progress": gait_progress,
+            "knee_flexion_track": knee_flexion_track,
+            "knee_extension": 1.0 - knee_flexion_track,
+            **gait_scores,
+            "ctrl_penalty": ctrl_penalty,
+            "action_rate": action_rate,
+            "distal_action": distal_action,
+            "distal_action_rate": distal_action_rate,
+        }
+        if self.cfg.deepmimic_reward:
+            components.update({
+                f"deepmimic_{name}": value
+                for name, value in _dm_terms.items()
+            })
+        reward, bad_state, components = _sanitize_reward_outputs(
+            reward,
+            bad_state,
+            fallen,
+            components,
+            fall_penalty=self.cfg.fall_penalty,
+        )
+        timed_out = self.episode_step >= self.episode_timeout_step
+        dones = bad_state | fallen | timed_out
+        components["termination"] = (bad_state | fallen).to(torch.float32)
+        return reward, dones, timed_out, components
 
     def _compute_reward_done(
         self,
@@ -1791,6 +2350,11 @@ class LytRobotWarpAmpEnv:
             / (max(float(self.cfg.forward_velocity_tracking_sigma), 1.0e-6) ** 2)
         )
         target_velocity_scale = max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+        gait_progress = torch.clamp(
+            torch.abs(target_forward_velocity) / target_velocity_scale,
+            0.0,
+            1.0,
+        )
         forward_progress = torch.clamp(forward_velocity / target_velocity_scale, -1.0, 1.0)
         forward_velocity_deficit = torch.clamp(
             (target_forward_velocity - forward_velocity) / target_velocity_scale,
@@ -1804,6 +2368,27 @@ class LytRobotWarpAmpEnv:
         )
 
         height = torch.exp(-((root_height - targets["root_height"]).square()) / (0.09**2))
+        upright_span = max(1.0 - float(self.cfg.min_upright_z), 1.0e-6)
+        sensor_upright = torch.clamp(
+            (up_z - float(self.cfg.min_upright_z)) / upright_span,
+            0.0,
+            1.0,
+        )
+        terrain_height = (
+            float(self.more_terrain_cfg.course_base_height)
+            if self.more_terrain_cfg.serial_course
+            else 0.0
+        )
+        root_clearance = root_height - terrain_height
+        clearance_span = max(
+            self.nominal_root_height - float(self.cfg.fall_height),
+            1.0e-6,
+        )
+        sensor_height = torch.clamp(
+            (root_clearance - float(self.cfg.fall_height)) / clearance_span,
+            0.0,
+            1.0,
+        )
         (
             locomotion_stability,
             stable_forward_velocity_track,
@@ -1816,6 +2401,52 @@ class LytRobotWarpAmpEnv:
         )
         joint_pos = self.qpos[:, self.robot_qpos_adrs]
         joint_vel = self.qvel[:, self.robot_qvel_adrs]
+        knee_target = max(float(self.cfg.sensor_knee_flexion_target), 1.0e-6)
+        if len(self.knee_joint_indices) > 0:
+            knee_flexion_track = torch.clamp(
+                torch.amin(
+                    torch.clamp(-joint_pos[:, self.knee_joint_indices], min=0.0),
+                    dim=1,
+                )
+                / knee_target,
+                0.0,
+                1.0,
+            )
+        else:
+            knee_flexion_track = torch.ones_like(root_height)
+        gait_scores = {}
+        if any(
+            float(getattr(self.cfg, name, 0.0)) > 0.0
+            for name in (
+                "sensor_natural_gait_reward_coef", "sensor_knee_gait_reward_coef",
+                "sensor_hop_penalty_coef", "sensor_tiptoe_penalty_coef",
+                "sensor_stance_slip_penalty_coef", "sensor_sync_forward_penalty_coef",
+            )
+        ):
+            zones = self._sensor_foot_roll_contacts()
+            all_foot_world = self.geom_xpos[:, self.contact_geom_ids]
+            foot_world = all_foot_world[:, [0, 2]]
+            foot_height = torch.stack((
+                torch.amin(all_foot_world[:, 0:2, 2], dim=1),
+                torch.amin(all_foot_world[:, 2:4, 2], dim=1),
+            ), dim=1)
+            foot_velocity = (foot_world - self.sensor_prev_foot_world) / max(self.dt, 1.0e-6)
+            self.sensor_prev_foot_world.copy_(foot_world)
+            foot_local = self._foot_positions_local()
+            gait_scores = sensor_gait_scores(
+                self, zones, foot_world[:, :, 0],
+                foot_local[:, 0, 1] + foot_local[:, 2, 1],
+                torch.linalg.vector_norm(foot_velocity[:, :, :2], dim=2),
+                foot_velocity[:, :, 0], foot_height,
+            )
+            quality_names = (
+                "sensor_stride_length", "sensor_step_cadence", "sensor_swing_clearance",
+                "sensor_foot_roll", "sensor_alternation", "sensor_mirror",
+            )
+            gait_scores["sensor_gait_quality"] = len(quality_names) / sum(
+                1.0 / torch.clamp(gait_scores[name], 0.05, 1.0)
+                for name in quality_names
+            )
         weight_sum = torch.sum(self.joint_reward_weights).clamp_min(1.0e-6)
         pose_error = torch.sum((joint_pos - targets["joint_pos"]).square() * self.joint_reward_weights, dim=1) / weight_sum
         vel_error = torch.sum((joint_vel - targets["joint_vel"]).square() * self.joint_reward_weights, dim=1) / weight_sum
@@ -1916,6 +2547,28 @@ class LytRobotWarpAmpEnv:
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
             - self.cfg.missed_contact_penalty_coef * missed_contact
         )
+        if self.cfg.deepmimic_reward:
+            reward, _dm_terms = deepmimic_reward(
+                root_height=root_height,
+                root_quat=root_quat,
+                root_lin_vel=self.qvel[:, :3],
+                root_ang_vel=self.qvel[:, 3:6],
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                key_pos_root_local=foot_pos,
+                target_root_height=targets["root_height"],
+                target_root_quat=ref_root_quat,
+                target_root_lin_vel=targets["root_lin_vel"],
+                target_root_ang_vel=targets["root_ang_vel"],
+                target_joint_pos=targets["joint_pos"],
+                target_joint_vel=targets["joint_vel"],
+                target_key_pos_root_local=targets["foot_pos"],
+            )
+        if gait_scores:
+            reward = reward + natural_gait_bonus(
+                gait_scores, gait_progress, forward_velocity_track,
+                locomotion_stability, knee_flexion_track, self.cfg,
+            )
 
         bad_state = ~(
             torch.isfinite(self.qpos).all(dim=1)
@@ -1936,6 +2589,7 @@ class LytRobotWarpAmpEnv:
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": targets["root_height"],
+            "sensor_root_clearance": root_clearance,
             "root_vel": root_vel,
             "forward_velocity": forward_velocity,
             "forward_velocity_error": forward_velocity_error,
@@ -1948,6 +2602,12 @@ class LytRobotWarpAmpEnv:
             "forward_velocity_excess": forward_velocity_excess,
             "root_orientation": root_orientation,
             "height": height,
+            "sensor_upright": sensor_upright,
+            "sensor_height": sensor_height,
+            "gait_progress": gait_progress,
+            "knee_flexion_track": knee_flexion_track,
+            "knee_extension": 1.0 - knee_flexion_track,
+            **gait_scores,
             "pose_track": pose_track,
             "vel_track": vel_track,
             "foot_pos": foot_pos_track,

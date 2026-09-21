@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from dataclasses import dataclass
+import itertools
 import math
 from pathlib import Path
 import shutil
@@ -25,6 +26,10 @@ from lytrobot_amp.motion import MotionReference
 from lytrobot_amp.terrain import (
     MoreTerrainCfg,
     StairTerrainCfg,
+    STAIR_TRAINING_STEP_COUNT,
+    STAIR_TRAINING_STEP_HEIGHT_M,
+    STAIR_TRAINING_TOP_LENGTH_M,
+    STAIR_TRAINING_TREAD_WIDTH_M,
     load_model,
     terrain_kind_from_motion,
     terrain_spawn_offset,
@@ -45,6 +50,7 @@ CLIP_ORDER = (
     "slope_down",
     "pit_walk",
     "gap_cross",
+    "stair_up_down",
     "stair_up",
     "stair_down",
 )
@@ -147,15 +153,23 @@ CLIP_SPECS = {
     "stair_up": ClipSpec(
         key="stair_up",
         title="STAIRS WALK UP",
-        subtitle="CMU 114_07  |  feet on 3 calibrated steps",
+        subtitle="CMU 114_07  |  feet on 5 calibrated steps",
         filename="stair_up_omniretarget.npz",
         azimuth=90.0,
         distance=2.65,
     ),
+    "stair_up_down": ClipSpec(
+        key="stair_up_down",
+        title="CONTINUOUS STAIRS UP / DOWN",
+        subtitle="OmniRetarget + full-body IK  |  5 x 0.13 m  |  step-to gait",
+        filename="stair_up_down_omniretarget.npz",
+        azimuth=90.0,
+        distance=2.85,
+    ),
     "stair_down": ClipSpec(
         key="stair_down",
         title="STAIRS WALK DOWN",
-        subtitle="CMU 114_07  |  feet on 3 calibrated steps",
+        subtitle="CMU 114_07  |  feet on 5 calibrated steps",
         filename="stair_down_omniretarget.npz",
         azimuth=90.0,
         distance=2.65,
@@ -171,6 +185,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-xml", default=str(MODEL_XML))
     parser.add_argument("--motion-dir", default=str(MOTION_DIR))
     parser.add_argument("--viewer", action="store_true", help="Also open the interactive MuJoCo viewer.")
+    parser.add_argument(
+        "--viewer-loop", action="store_true",
+        help="Replay selected clips until the MuJoCo window is closed (requires --viewer --no-record).",
+    )
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--contact-sheet", action=argparse.BooleanOptionalAction, default=True)
@@ -190,11 +208,12 @@ def reference_stairs() -> StairTerrainCfg:
 
     return StairTerrainCfg(
         enabled=True,
-        step_height=0.13,
-        step_depth=0.58,
-        step_count=3,
+        step_height=STAIR_TRAINING_STEP_HEIGHT_M,
+        step_depth=STAIR_TRAINING_TREAD_WIDTH_M,
+        step_count=STAIR_TRAINING_STEP_COUNT,
         width=2.0,
         start_x=-0.95,
+        top_length=STAIR_TRAINING_TOP_LENGTH_M,
     )
 
 
@@ -495,6 +514,8 @@ def main() -> None:
         raise ValueError("--fps and --speed must be positive.")
     if args.walk_cycles < 1:
         raise ValueError("--walk-cycles must be at least one.")
+    if args.viewer_loop and (not args.viewer or args.record):
+        raise ValueError("--viewer-loop requires --viewer --no-record.")
 
     stairs = reference_stairs()
     more = reference_more_terrains()
@@ -538,7 +559,7 @@ def main() -> None:
 
     try:
         with viewer_context as viewer:
-            for segment in segments:
+            for segment in (itertools.cycle(segments) if args.viewer_loop else segments):
                 print(
                     f"[{segment.spec.title}] {segment.motion.frame_count} source frames, "
                     f"{segment.motion.frequency:g} Hz"

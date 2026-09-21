@@ -21,6 +21,10 @@ sys.path[:0] = [str(SRC_ROOT), str(LEGACY_RETARGET)]
 from lytrobot_amp.terrain import (  # noqa: E402
     MoreTerrainCfg,
     StairTerrainCfg,
+    STAIR_TRAINING_STEP_COUNT,
+    STAIR_TRAINING_STEP_HEIGHT_M,
+    STAIR_TRAINING_TOP_LENGTH_M,
+    STAIR_TRAINING_TREAD_WIDTH_M,
     load_model,
     terrain_geom_ids,
     terrain_height_from_model,
@@ -72,12 +76,19 @@ CONTACT_JOINT_QPOS = np.asarray(
     [10, 12, 13, 14, 18, 20, 21, 22],
     dtype=np.int64,
 )
+# Stair swing clearance needs hip flexion as well as distal-leg correction;
+# otherwise a 0.20 m riser cannot be cleared within the clinical knee limit.
+STAIR_CONTACT_JOINT_QPOS = np.asarray(
+    [7, 10, 12, 13, 14, 15, 18, 20, 21, 22],
+    dtype=np.int64,
+)
 TRAIN_STAIR_CFG = StairTerrainCfg(
     enabled=True,
-    step_height=0.13,
-    step_depth=0.58,
-    step_count=3,
+    step_height=STAIR_TRAINING_STEP_HEIGHT_M,
+    step_depth=STAIR_TRAINING_TREAD_WIDTH_M,
+    step_count=STAIR_TRAINING_STEP_COUNT,
     start_x=-0.95,
+    top_length=STAIR_TRAINING_TOP_LENGTH_M,
 )
 STAIR_DOWN_OFFSET = 0.25
 CONTACT_CLEARANCE = 0.0015
@@ -388,6 +399,7 @@ def refine_contacts_and_collisions(
     model_xml: Path,
     *,
     enforce_slope_continuity: bool = True,
+    lock_root_height: bool = False,
 ) -> tuple[np.ndarray, dict[str, float | int | list[float]]]:
     """Full-model IK for leg clearance and ordered heel/sole/toe contact."""
 
@@ -398,7 +410,8 @@ def refine_contacts_and_collisions(
         (geom_for_body(model, left), geom_for_body(model, right))
         for left, right in COLLISION_BODY_PAIRS
     ]
-    joint_indices = CONTACT_JOINT_QPOS
+    is_stair = task in {"stair_up", "stair_down"}
+    joint_indices = STAIR_CONTACT_JOINT_QPOS if is_stair else CONTACT_JOINT_QPOS
     by_address = {
         int(model.jnt_qposadr[joint_id]): joint_id for joint_id in range(model.njnt)
     }
@@ -407,6 +420,11 @@ def refine_contacts_and_collisions(
     joint_upper = np.asarray([model.jnt_range[joint_id, 1] for joint_id in joint_ids])
     refined = np.asarray(qpos, dtype=np.float64).copy()
     fromto = np.zeros(6, dtype=np.float64)
+    terrain_ids = terrain_geom_ids(model) if is_stair else np.empty(0, dtype=np.int32)
+    foot_geom_ids = np.asarray(
+        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in FOOT_GEOM_NAMES],
+        dtype=np.int32,
+    )
 
     def collision_distance(pose: np.ndarray) -> float:
         evaluated = pose.copy()
@@ -467,12 +485,19 @@ def refine_contacts_and_collisions(
             support_constraints.append((support_slice, targets, lower_side))
             root_offsets.extend(targets - nominal_clearance[support_slice])
 
-        nominal_root = float(nominal_pose[2] + np.mean(root_offsets))
+        nominal_root = float(
+            nominal_pose[2]
+            if lock_root_height
+            else nominal_pose[2] + np.mean(root_offsets)
+        )
         nominal_variables = np.concatenate(
             ([nominal_root], nominal_pose[joint_indices])
         )
-        variable_lower = np.concatenate(([nominal_root - 0.05], joint_lower))
-        variable_upper = np.concatenate(([nominal_root + 0.05], joint_upper))
+        root_span = 0.25 if is_stair else 0.05
+        if lock_root_height:
+            root_span = 1.0e-8
+        variable_lower = np.concatenate(([nominal_root - root_span], joint_lower))
+        variable_upper = np.concatenate(([nominal_root + root_span], joint_upper))
         if is_slope and frame > 0:
             # Preserve C0 continuity in the final expert motion.  The local
             # contact targets and the full STL non-penetration term remain in
@@ -526,11 +551,36 @@ def refine_contacts_and_collisions(
                 current_clearance - 0.25 * CONTACT_CLEARANCE,
                 0.0,
             )
+            if is_stair:
+                geometry_distances = np.asarray(
+                    [
+                        min(
+                            mujoco.mj_geomDistance(
+                                model,
+                                data,
+                                int(terrain_id),
+                                int(foot_geom_id),
+                                0.25,
+                                fromto,
+                            )
+                            for terrain_id in terrain_ids
+                        )
+                        for foot_geom_id in foot_geom_ids
+                    ],
+                    dtype=np.float64,
+                )
+                geometry_penetration = np.minimum(
+                    geometry_distances - 0.25 * CONTACT_CLEARANCE,
+                    0.0,
+                )
+            else:
+                geometry_penetration = np.empty(0, dtype=np.float64)
             return np.concatenate(
                 (
                     30.0 * support_error,
-                    4.0 * support_x_error,
+                    (100.0 if is_stair else 4.0) * support_x_error,
                     18.0 * ground_penetration,
+                    500.0 * geometry_penetration,
                     [0.18 * (variables[0] - nominal_root)],
                     0.035 * (variables[1:] - nominal_variables[1:]),
                     [0.03 * (variables[0] - previous[0])],
@@ -542,7 +592,7 @@ def refine_contacts_and_collisions(
             residual,
             np.clip(nominal_variables, variable_lower, variable_upper),
             bounds=(variable_lower, variable_upper),
-            max_nfev=60,
+            max_nfev=100 if is_stair else 60,
             ftol=1.0e-7,
             xtol=1.0e-7,
             gtol=1.0e-7,
@@ -681,6 +731,75 @@ def refine_contacts_and_collisions(
     }
 
 
+def lift_stair_foot_clearance(
+    qpos: np.ndarray,
+    task: str,
+    model_xml: Path,
+    *,
+    clearance: float = CONTACT_CLEARANCE,
+    smoothing_radius: int = 2,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Raise the pelvis by the minimum smooth amount that removes foot-STL overlap."""
+
+    if task not in {"stair_up", "stair_down"}:
+        return np.asarray(qpos, dtype=np.float64).copy(), {}
+    model, pose_offset, _ = retarget_terrain_model(task, model_xml)
+    data = mujoco.MjData(model)
+    terrain_ids = terrain_geom_ids(model)
+    foot_ids = np.asarray(
+        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in FOOT_GEOM_NAMES],
+        dtype=np.int32,
+    )
+    fromto = np.zeros(6, dtype=np.float64)
+    result = np.asarray(qpos, dtype=np.float64).copy()
+    required = np.zeros(len(result), dtype=np.float64)
+
+    def minimum_distance(pose: np.ndarray) -> float:
+        evaluated = pose.copy()
+        evaluated[:3] += pose_offset
+        data.qpos[:] = evaluated
+        mujoco.mj_forward(model, data)
+        return float(
+            min(
+                mujoco.mj_geomDistance(
+                    model,
+                    data,
+                    int(terrain_id),
+                    int(foot_id),
+                    0.30,
+                    fromto,
+                )
+                for terrain_id in terrain_ids
+                for foot_id in foot_ids
+            )
+        )
+
+    before = np.asarray([minimum_distance(pose) for pose in result])
+    required[:] = np.maximum(float(clearance) - before, 0.0)
+    if smoothing_radius > 0:
+        padded = np.pad(required, smoothing_radius, mode="edge")
+        smooth_safe = np.asarray(
+            [
+                np.max(padded[index : index + 2 * smoothing_radius + 1])
+                for index in range(len(required))
+            ],
+            dtype=np.float64,
+        )
+    else:
+        smooth_safe = required
+    result[:, 2] += smooth_safe
+    after = np.asarray([minimum_distance(pose) for pose in result])
+    residual = np.maximum(float(clearance) - after, 0.0)
+    result[:, 2] += residual
+    final = np.asarray([minimum_distance(pose) for pose in result])
+    return result, {
+        "minimum_foot_terrain_geometry_distance_before_lift": float(before.min()),
+        "maximum_root_clearance_lift_m": float((smooth_safe + residual).max()),
+        "minimum_foot_terrain_geometry_distance_after_lift": float(final.min()),
+        "foot_terrain_penetration_frames_after_lift": int(np.count_nonzero(final < -1.0e-6)),
+    }
+
+
 def velocities(
     model: mujoco.MjModel, qpos: np.ndarray, frequency: float, loop: bool
 ) -> np.ndarray:
@@ -812,6 +931,119 @@ def align_stair_contacts(
     }
 
 
+def align_stair_footfalls(
+    qpos: np.ndarray,
+    contact: np.ndarray,
+    task: str,
+    model_xml: Path,
+    planned_events: list[tuple[int, int]] | None = None,
+) -> dict[str, object]:
+    """Place each touchdown on one successive stair tread centre.
+
+    The source clips provide five usable touchdown events.  Height-only IK can
+    select a nearby tread and skip a riser, so smoothly shift the floating root
+    between touchdown anchors while leaving the OmniRetarget joint motion
+    intact.
+    """
+
+    if task not in {"stair_up", "stair_down"}:
+        return {}
+    model = mujoco.MjModel.from_xml_path(str(model_xml))
+    data = mujoco.MjData(model)
+    _, landmark_body_ids, landmark_points = sole_landmarks(model)
+    count = TRAIN_STAIR_CFG.step_count
+    if planned_events is None:
+        events = [
+            (frame, side)
+            for frame in range(1, len(contact))
+            for side in range(2)
+            if contact[frame, side] > 0.5 and contact[frame - 1, side] <= 0.5
+        ]
+        events.sort()
+        selected = events[:count]
+    else:
+        selected = [(int(frame), int(side)) for frame, side in planned_events]
+    if len(selected) != count:
+        raise ValueError(f"{task}: expected {count} touchdown events, got {len(selected)}.")
+    if task == "stair_up":
+        start_x = TRAIN_STAIR_CFG.ascent_start
+        world_offset = 0.0
+    else:
+        start_x = TRAIN_STAIR_CFG.descent_start
+        world_offset = TRAIN_STAIR_CFG.descent_start + STAIR_DOWN_OFFSET
+    targets = start_x + (np.arange(count, dtype=np.float64) + 0.5) * TRAIN_STAIR_CFG.step_depth
+    frames = np.asarray([frame for frame, _ in selected], dtype=np.int64)
+    corrections = np.empty(count, dtype=np.float64)
+    for index, (frame, side) in enumerate(selected):
+        data.qpos[:] = qpos[frame]
+        data.qpos[0] += world_offset
+        mujoco.mj_forward(model, data)
+        landmarks = landmark_positions(data, landmark_body_ids, landmark_points)
+        foot_center_x = float(np.mean(landmarks[2 * side : 2 * side + 2, 0]))
+        corrections[index] = targets[index] - foot_center_x
+    anchors = np.concatenate(([0], frames, [len(qpos) - 1]))
+    anchor_corrections = np.concatenate(([corrections[0]], corrections, [corrections[-1]]))
+    qpos[:, 0] += np.interp(np.arange(len(qpos)), anchors, anchor_corrections)
+    return {
+        "stair_footfall_frames": frames.tolist(),
+        "stair_footfall_sides": [int(side) for _, side in selected],
+        "stair_footfall_target_x": targets.tolist(),
+    }
+
+
+def filter_unrealizable_stair_supports(
+    qpos: np.ndarray,
+    contact: np.ndarray,
+    roll_mode: np.ndarray,
+    task: str,
+    model_xml: Path,
+    *,
+    max_tread_height_span: float = 0.035,
+    max_roll_error: float = 0.035,
+) -> np.ndarray:
+    """Drop contact labels that cannot fit on one narrow stair tread.
+
+    A 0.32 m tread is intentionally narrower than the complete foot.  The
+    human contact labels occasionally mark a heel/toe pair straddling two
+    risers as fully planted; asking IK to satisfy both heights creates a
+    physically impossible roll target and an unnatural reference.  Such a
+    frame is treated as swing/partial support, allowing the controller to use
+    the valid part of the foot without being rewarded for penetrating the next
+    step.  The qpos itself is never edited by this filter.
+    """
+
+    if task not in {"stair_up", "stair_down"}:
+        return np.asarray(contact, dtype=np.float32).copy()
+    model, pose_offset, _ = retarget_terrain_model(task, model_xml)
+    data = mujoco.MjData(model)
+    _, landmark_body_ids, landmark_points = sole_landmarks(model)
+    filtered = np.asarray(contact, dtype=np.float32).copy()
+    for frame, pose in enumerate(np.asarray(qpos, dtype=np.float64)):
+        data.qpos[:] = pose
+        data.qpos[:3] += pose_offset
+        mujoco.mj_forward(model, data)
+        landmarks = landmark_positions(data, landmark_body_ids, landmark_points)
+        foot_xy = np.asarray(landmarks[:, :2], dtype=np.float64)
+        ground = terrain_height_from_model(
+            model, data, foot_xy[:, 0], foot_xy[:, 1]
+        )
+        clearance = np.asarray(landmarks[:, 2], dtype=np.float64) - ground
+        for side in (0, 1):
+            if filtered[frame, side] <= 0.5:
+                continue
+            indices = slice(2 * side, 2 * side + 2)
+            roll_delta = float(clearance[2 * side + 1] - clearance[2 * side])
+            mode = int(roll_mode[frame, side])
+            ordering_invalid = (
+                (mode == ROLL_HEEL and roll_delta < -0.002)
+                or (mode == ROLL_TOE and roll_delta > 0.002)
+                or (mode not in {ROLL_HEEL, ROLL_TOE} and abs(roll_delta) > float(max_roll_error))
+            )
+            if np.ptp(ground[indices]) > float(max_tread_height_span) or ordering_invalid:
+                filtered[frame, side] = 0.0
+    return filtered
+
+
 def build(
     raw_path: Path,
     output: Path,
@@ -886,6 +1118,15 @@ def build(
     roll_mode = roll_mode[nearest]
     frequency = OUTPUT_FREQUENCY
     clip_joint_limits(model, qpos)
+    clearance_alignment: dict[str, float | int] = {}
+    footfall_alignment = align_stair_footfalls(qpos, contact, task, model_xml)
+    planned_footfalls = list(
+        zip(
+            footfall_alignment.get("stair_footfall_frames", []),
+            footfall_alignment.get("stair_footfall_sides", []),
+            strict=True,
+        )
+    )
     terrain_alignment = align_stair_contacts(qpos, contact, task, model_xml)
     qpos, refinement = refine_contacts_and_collisions(
         qpos,
@@ -895,6 +1136,87 @@ def build(
         task,
         model_xml,
     )
+    if task in {"stair_up", "stair_down"}:
+        # Narrow-tread filtering and IK can expose a second invalid roll after
+        # the root height is adjusted; converge for a few cheap passes.
+        for _ in range(3):
+            filtered_contact = filter_unrealizable_stair_supports(
+                qpos,
+                contact,
+                roll_mode,
+                task,
+                model_xml,
+            )
+            if np.array_equal(filtered_contact, contact):
+                break
+            contact = filtered_contact
+            # Re-run contact IK using only realizable support labels so the
+            # stored qpos, foot_contact and metadata describe the same task.
+            footfall_alignment = align_stair_footfalls(
+                qpos,
+                contact,
+                task,
+                model_xml,
+                planned_events=planned_footfalls,
+            )
+            terrain_alignment = align_stair_contacts(qpos, contact, task, model_xml)
+            qpos, refinement = refine_contacts_and_collisions(
+                qpos,
+                contact,
+                roll_phase,
+                roll_mode,
+                task,
+                model_xml,
+            )
+        # Contact refinement changes lower-body angles and can move a landing
+        # several centimetres along X.  Make the final saved reference—not an
+        # intermediate IK iterate—the one whose five touchdown centres occupy
+        # five consecutive treads, then restore only vertical clearance.
+        # Alternate exact touchdown alignment with full-STL IK so both the
+        # spatial footfall contract and collision-free swing motion converge.
+        for _ in range(2):
+            footfall_alignment = align_stair_footfalls(
+                qpos,
+                contact,
+                task,
+                model_xml,
+                planned_events=planned_footfalls,
+            )
+            terrain_alignment = align_stair_contacts(qpos, contact, task, model_xml)
+            qpos, refinement = refine_contacts_and_collisions(
+                qpos,
+                contact,
+                roll_phase,
+                roll_mode,
+                task,
+                model_xml,
+            )
+        footfall_alignment = align_stair_footfalls(
+            qpos,
+            contact,
+            task,
+            model_xml,
+            planned_events=planned_footfalls,
+        )
+        terrain_alignment = align_stair_contacts(qpos, contact, task, model_xml)
+        qpos, clearance_alignment = lift_stair_foot_clearance(qpos, task, model_xml)
+        qpos, refinement = refine_contacts_and_collisions(
+            qpos,
+            contact,
+            roll_phase,
+            roll_mode,
+            task,
+            model_xml,
+            lock_root_height=True,
+        )
+        footfall_alignment = align_stair_footfalls(
+            qpos,
+            contact,
+            task,
+            model_xml,
+            planned_events=planned_footfalls,
+        )
+        qpos, clearance_alignment = lift_stair_foot_clearance(qpos, task, model_xml)
     clip_joint_limits(model, qpos)
     retargeted_forward_speed = forward_speed(qpos, frequency, loop)
     if task == "walk":
@@ -930,6 +1252,8 @@ def build(
         "controlled_turn_peak_yaw_rate_rad_s": controlled_turn_peak_rate,
         "demonstrated_turn_degrees": demonstrated_turn_degrees if is_turn else None,
         "contact_sequence": "heel -> full sole -> toe",
+        **footfall_alignment,
+        **clearance_alignment,
         **refinement,
         **terrain_alignment,
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train multimotion using only IMU and tendon-length actor observations."""
+"""Train multimotion from IMU, tendon-length and applied-action history."""
 
 from __future__ import annotations
 
@@ -20,6 +20,12 @@ from lytrobot_amp.benchmark import (
     MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
 )
+from sensor_training.training_defaults import (
+    DEFAULT_SENSOR_DECIMATION,
+    cli_int,
+    recurrent_rollout_shape,
+    validate_sensor_decimation,
+)
 
 
 def _replace_option_values(
@@ -37,8 +43,14 @@ def _replace_option_values(
     args[start:end] = [option, *values]
 
 
-def default_train_args(reference_set: str = "four") -> list[str]:
+def default_train_args(
+    reference_set: str = "four",
+    *,
+    decimation: int = DEFAULT_SENSOR_DECIMATION,
+) -> list[str]:
+    decimation = validate_sensor_decimation(decimation)
     args = base_multimotion_args(reference_set)
+    num_steps, num_envs = recurrent_rollout_shape(decimation)
     _replace_option_values(
         args,
         "--rough-terrain-height",
@@ -54,8 +66,12 @@ def default_train_args(reference_set: str = "four") -> list[str]:
     # around measured tendon lengths and terrain adaptation comes from the GRU.
     _replace_option_values(args, "--reference-ctrl-blend", ["0.0"])
     _replace_option_values(args, "--motion-transition-blend-steps", ["0"])
+    _replace_option_values(args, "--decimation", [str(decimation)])
+    _replace_option_values(args, "--num-envs", [str(num_envs)])
+    _replace_option_values(args, "--num-steps", [str(num_steps)])
     args.extend(
         [
+            "--use-moe",
             "--domain-randomization",
             "--dr-curriculum-mode",
             "adaptive",
@@ -81,9 +97,12 @@ def default_train_args(reference_set: str = "four") -> list[str]:
 
 def main() -> None:
     reference_set, user_args = split_reference_set_args(sys.argv[1:])
+    decimation = validate_sensor_decimation(
+        cli_int(user_args, "--decimation", DEFAULT_SENSOR_DECIMATION)
+    )
     sys.argv = [
         str(HERE / "train.py"),
-        *default_train_args(reference_set),
+        *default_train_args(reference_set, decimation=decimation),
         *user_args,
     ]
     from sensor_training.train import main as train_main

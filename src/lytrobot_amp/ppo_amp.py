@@ -45,7 +45,14 @@ class PPOAMPConfig:
     min_learning_rate: float = 1.0e-5
     max_learning_rate: float = 3.0e-4
     kl_adapt_factor: float = 1.5
+    # SensorHistoryPPOAMPTrainer can compile its fixed-shape recurrent update.
+    # The ordinary feed-forward trainer leaves this disabled.
+    compile_policy_update: bool = False
+    compile_rollout: bool = False
+    compile_policy_chunk_steps: int = 1
     amp_enabled: bool = True
+    lcp_weight: float = 0.0
+    deepmimic_ppo: bool = False
     amp_reward_coef: float = 1.20
     task_reward_lerp: float = 0.50
     amp_discriminator_updates: int = 1
@@ -877,11 +884,11 @@ class PPOAMPTrainer:
 
     @staticmethod
     def _remove_stale_models(directory: Path, current_stem: str) -> None:
-        """Keep only the newest successfully written PT/ONNX model pair."""
+        """Keep the newest pair plus the independently selected best pair."""
 
         for suffix in (".pt", ".onnx"):
             for candidate in directory.glob(f"model_*{suffix}"):
-                if candidate.stem != current_stem:
+                if candidate.stem not in {current_stem, "model_best"}:
                     candidate.unlink(missing_ok=True)
 
     def _save_checkpoint_pair(self, path: str | Path, checkpoint: dict) -> tuple[Path, Path]:

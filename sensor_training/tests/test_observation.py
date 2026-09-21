@@ -11,6 +11,7 @@ from sensor_training.envs import (
     SensorHistoryCpuAmpEnv,
     _normalized_terrain_context,
 )
+from sensor_training.gait_command import DeployableGaitCommandGenerator
 from sensor_training.observation import HistoryMotionReference, resolve_imu_sensor_layout
 from lytrobot_amp.env import LytRobotEnvCfg
 
@@ -122,11 +123,13 @@ class SensorObservationTests(unittest.TestCase):
         self.assertTrue(np.all(features[0::2] < 100.0))
         self.assertTrue(np.all(features[1::2] >= 100.0))
 
-    def test_actor_observation_contains_only_imu_and_tendon_history(self) -> None:
+    def test_actor_observation_contains_deployable_sensor_and_action_history(self) -> None:
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
                 model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
-                motion_file=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"),
+                motion_file=str(
+                    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+                ),
                 num_envs=1,
                 target_velocity=1.0,
                 forward_velocity_tracking_sigma=0.5,
@@ -134,23 +137,39 @@ class SensorObservationTests(unittest.TestCase):
                 forward_progress_reward_coef=2.0,
                 forward_velocity_deficit_penalty_coef=4.0,
                 forward_velocity_excess_penalty_coef=4.0,
-                stand_start_prob=0.0,
-                motion_reset_prob=0.0,
+                stand_start_prob=1.0,
+                motion_reset_prob=1.0,
+                stand_start_motion_phase=15.0,
+                stand_start_phase_delay_steps=0,
+                stand_start_transition_min_steps=10,
+                stand_start_transition_max_steps=10,
                 reset_noise_scale=0.0,
+                startup_action_ramp_steps=10,
+                reference_ctrl_blend=1.0,
+                action_residual_scale=0.5,
             )
         )
         try:
             observation = env.reset()
-            self.assertEqual(env.sensor_frame_dim, 56)
-            self.assertEqual(env.obs_dim, 336)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertTrue(bool(env.base_env.stand_start[0]))
+            self.assertEqual(float(env.base_env.motion_phase[0]), 15.0)
+            np.testing.assert_allclose(
+                env.base_env.datas[0].qpos,
+                env.base_env.motion.model_qpos0,
+                atol=1.0e-7,
+            )
+            self.assertEqual(env.gait_command_dim, 46)
+            self.assertEqual(env.sensor_frame_dim, 116)
+            self.assertEqual(env.obs_dim, 696)
+            self.assertEqual(observation.shape, (1, 696))
             self.assertEqual(
                 env.observation_metadata["actor_input_fields"],
-                ("imu", "tendon_length"),
+                ("imu", "tendon_length", "previous_action", "gait_command"),
             )
-            self.assertEqual(env.observation_metadata["command_fields"], ())
-            self.assertEqual(env.observation_metadata["command_dim"], 0)
-            self.assertTrue(env.observation_metadata["strict_sensor_only"])
+            self.assertEqual(env.observation_metadata["command_dim"], 46)
+            self.assertFalse(env.observation_metadata["strict_sensor_only"])
+            self.assertTrue(env.observation_metadata["hardware_sensor_only"])
+            self.assertTrue(env.observation_metadata["deployable_command_only"])
             self.assertFalse(
                 env.observation_metadata["privileged_training_context"][
                     "actor_input"
@@ -164,21 +183,104 @@ class SensorObservationTests(unittest.TestCase):
             observation_before_command_change = observation.copy()
             env.base_env.cfg.target_velocity = 3.0
             np.testing.assert_allclose(env.observe(), observation_before_command_change)
-            action = np.zeros((1, env.action_dim), dtype=np.float32)
-            _observation, _reward, _done, info = env.step(action)
+            command_generator = DeployableGaitCommandGenerator.from_metadata(
+                env.observation_metadata
+            )
+            wrapped_generator = DeployableGaitCommandGenerator.from_metadata(
+                {"sensor_observation": env.observation_metadata}
+            )
+            np.testing.assert_allclose(
+                wrapped_generator.command(),
+                command_generator.command(),
+                atol=1.0e-7,
+            )
+            np.testing.assert_allclose(
+                observation.reshape(1, 6, 116)[0, -1, -46:],
+                command_generator.command(),
+                atol=1.0e-6,
+            )
+            action = np.linspace(-0.5, 0.5, env.action_dim, dtype=np.float32)[None, :]
+            first_action_scale = command_generator.action_scale
+            first_tendon_target = command_generator.tendon_control_target(action[0])
+            observation, _reward, _done, info = env.step(action)
+            np.testing.assert_allclose(
+                env.base_env.datas[0].ctrl[env.base_env.position_actuator_ids],
+                first_tendon_target,
+                atol=1.0e-6,
+            )
+            frames = observation.reshape(1, 6, 116)[0]
+            action_history = frames[:, 56:70]
+            np.testing.assert_allclose(
+                action_history[-1], first_action_scale * action[0], atol=1.0e-6
+            )
+            np.testing.assert_allclose(action_history[-2], 0.0, atol=1.0e-6)
+            command_generator.advance()
+            np.testing.assert_allclose(
+                frames[-1, -46:],
+                command_generator.command(target_velocity=3.0),
+                atol=1.0e-5,
+            )
+            next_action = -action
+            second_action_scale = command_generator.action_scale
+            second_tendon_target = command_generator.tendon_control_target(next_action[0])
+            observation, _reward, _done, _info = env.step(next_action)
+            np.testing.assert_allclose(
+                env.base_env.datas[0].ctrl[env.base_env.position_actuator_ids],
+                second_tendon_target,
+                atol=1.0e-6,
+            )
+            action_history = observation.reshape(1, 6, 116)[0, :, 56:70]
+            np.testing.assert_allclose(
+                action_history[-2], first_action_scale * action[0], atol=1.0e-6
+            )
+            np.testing.assert_allclose(
+                action_history[-1], second_action_scale * next_action[0], atol=1.0e-6
+            )
+            commanded_velocity = 3.0 * float(info["gait_progress"][0])
             expected_deficit = np.clip(
-                (3.0 - float(info["forward_velocity"][0])) / 3.0,
+                (commanded_velocity - float(info["forward_velocity"][0])) / 3.0,
                 0.0,
                 2.0,
             )
             self.assertAlmostEqual(float(info["forward_velocity_deficit"][0]), expected_deficit, places=5)
             expected_excess = np.clip(
-                (float(info["forward_velocity"][0]) - 3.0) / 3.0,
+                (float(info["forward_velocity"][0]) - commanded_velocity) / 3.0,
                 0.0,
                 2.0,
             )
             self.assertAlmostEqual(float(info["forward_velocity_excess"][0]), expected_excess, places=5)
             self.assertIn("termination", info)
+        finally:
+            env.close()
+
+    def test_random_phase_reset_uses_the_matching_reference_state(self) -> None:
+        env = SensorHistoryCpuAmpEnv(
+            LytRobotEnvCfg(
+                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
+                motion_file=str(
+                    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+                ),
+                num_envs=4,
+                stand_start_prob=0.0,
+                motion_reset_prob=1.0,
+                reset_noise_scale=0.0,
+                domain_randomization=False,
+            )
+        )
+        try:
+            env.reset()
+            self.assertFalse(np.any(env.base_env.stand_start))
+            for env_id, phase in enumerate(env.base_env.motion_phase.astype(np.int64)):
+                np.testing.assert_allclose(
+                    env.base_env.datas[env_id].qpos,
+                    env.base_env.motion.reference_qpos[phase],
+                    atol=1.0e-7,
+                )
+                np.testing.assert_allclose(
+                    env.base_env.datas[env_id].qvel,
+                    env.base_env.motion.reference_qvel[phase],
+                    atol=1.0e-7,
+                )
         finally:
             env.close()
 

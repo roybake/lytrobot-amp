@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import torch
 
 from lytrobot_amp import __version__
-from lytrobot_amp.env import LytRobotEnvCfg
+from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
 
 try:
@@ -56,6 +57,8 @@ TRAIN_LOG_PROGRESS_RE = re.compile(r"\[TRAIN\]\s+iter=(\d+)\s+step=(\d+)")
 
 WANDB_EPISODE_TOTAL_REWARD_KEY = "episode/total_reward"
 WANDB_EPISODE_LENGTH_KEY = "episode/length"
+# Enabled only by sensor_training/train_distill.py before main() is called.
+DISTILLATION_CLI_ENABLED = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,15 +103,54 @@ def parse_args() -> argparse.Namespace:
         default=str(REPO_ROOT / "robot" / "terrains" / "more_discolrl"),
     )
     parser.add_argument("--stair-terrain", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--stair-step-height", type=float, default=0.08)
-    parser.add_argument("--stair-step-depth", type=float, default=0.30)
+    parser.add_argument(
+        "--stair-step-height", type=float, default=0.13,
+        help="楼梯立板高度（专项课程固定为 0.13 m）。",
+    )
+    parser.add_argument(
+        "--stair-step-depth", type=float, default=0.32,
+        help="前进方向踏步宽度（专项课程固定为 0.32 m）。",
+    )
+    parser.add_argument(
+        "--stair-tread-width",
+        dest="stair_step_depth",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="--stair-step-depth 的语义别名（前进方向踏步宽度）。",
+    )
     parser.add_argument("--stair-step-count", type=int, default=5)
     parser.add_argument("--stair-width", type=float, default=2.0)
     parser.add_argument("--stair-run-in", type=float, default=1.5)
-    parser.add_argument("--stair-top-length", type=float, default=1.2)
+    parser.add_argument("--stair-top-length", type=float, default=0.64)
     parser.add_argument("--stair-run-out", type=float, default=1.5)
-    parser.add_argument("--stair-start-x", type=float, default=-1.5)
-    parser.add_argument("--stair-down-offset", type=float, default=0.0)
+    parser.add_argument("--stair-start-x", type=float, default=-0.95)
+    parser.add_argument("--stair-down-offset", type=float, default=0.25)
+    parser.add_argument(
+        "--stair-fixed-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="每个楼梯专项 episode 固定从参考动作第 0 帧开始。",
+    )
+    parser.add_argument(
+        "--stair-distance-tolerance", type=float, default=0.05,
+        help="楼梯参考根轨迹末端距离容差（米）。",
+    )
+    parser.add_argument(
+        "--stair-distance-failure-penalty", type=float, default=5.0,
+        help="未达到固定楼梯距离时的终止惩罚。",
+    )
+    parser.add_argument(
+        "--stair-lateral-tolerance", type=float, default=0.30,
+        help="楼梯中心线横向偏差上限（米），用于阻止绕开台阶。",
+    )
+    parser.add_argument(
+        "--stair-lateral-failure-penalty", type=float, default=5.0,
+        help="横向绕开楼梯时的终止惩罚。",
+    )
+    parser.add_argument(
+        "--stair-terminal-hold-steps", type=int, default=30,
+        help="专项楼梯参考末帧的稳定保持控制步数。",
+    )
     parser.add_argument("--flat-lane-y", type=float, default=3.0)
     parser.add_argument("--rough-lane-y", type=float, default=6.0)
     parser.add_argument("--pit-lane-y", type=float, default=9.0)
@@ -189,7 +231,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda", choices=("cuda",))
-    parser.add_argument("--sim-backend", default="warp", choices=("warp",))
+    parser.add_argument("--sim-backend", default="warp", choices=("warp", "cpu"))
     parser.add_argument("--torch-threads", type=int, default=0)
 
     parser.add_argument("--num-envs", type=int, default=4096)
@@ -227,6 +269,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-progress-window-steps", type=int, default=50)
     parser.add_argument("--forward-progress-termination-penalty", type=float, default=2.0)
     parser.add_argument("--fall-penalty", type=float, default=2.0)
+    parser.add_argument(
+        "--sensor-stability-reward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the phase-independent stability/velocity task reward in the "
+            "sensor-only environment."
+        ),
+    )
+    parser.add_argument("--sensor-fall-penalty", type=float, default=25.0)
+    parser.add_argument("--sensor-knee-flexion-target", type=float, default=0.25)
+    parser.add_argument("--sensor-knee-gait-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-natural-gait-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-gait-height-target", type=float, default=0.845)
+    parser.add_argument("--sensor-gait-height-sigma", type=float, default=0.07)
+    parser.add_argument("--sensor-upright-sigma", type=float, default=0.12)
+    parser.add_argument("--sensor-mirror-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-stride-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-foot-roll-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-alternation-reward-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-hop-penalty-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-tiptoe-penalty-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-stance-slip-penalty-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-sync-forward-penalty-coef", type=float, default=0.0)
+    parser.add_argument("--sensor-velocity-excess-penalty-coef", type=float, default=0.0)
     parser.add_argument(
         "--terminate-incomplete-motion-end",
         action=argparse.BooleanOptionalAction,
@@ -266,6 +333,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symmetry-action-weight", type=float, default=0.15)
     parser.add_argument("--startup-action-ramp-steps", type=int, default=20)
     parser.add_argument("--stand-start-prob", type=float, default=0.5)
+    parser.add_argument(
+        "--stand-start-motion-phase",
+        type=float,
+        default=0.0,
+        help=(
+            "Reference frame used when blending from the standing reset into motion; "
+            "choose a double-support frame for deployable walking starts."
+        ),
+    )
     parser.add_argument("--stand-start-phase-delay-steps", type=int, default=25)
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=80)
     parser.add_argument("--stand-start-transition-max-steps", type=int, default=160)
@@ -349,6 +425,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate", type=float, default=None)
     parser.add_argument("--max-learning-rate", type=float, default=None)
     parser.add_argument("--kl-adapt-factor", type=float, default=None)
+    parser.add_argument(
+        "--use-moe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable residual MoE for the serial multi-terrain sensor curriculum.",
+    )
+    parser.add_argument(
+        "--compile-policy-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Compile the fixed-shape recurrent policy backward update with "
+            "torch.compile. Enabled by default; first compilation can take a few minutes."
+        ),
+    )
+    parser.add_argument(
+        "--compile-rollout",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Compile the no-grad recurrent rollout and AMP reward graphs. "
+            "Enabled by default for the sensor trainer."
+        ),
+    )
+    parser.add_argument(
+        "--compile-policy-chunk-steps",
+        type=int,
+        default=None,
+        help=(
+            "BPTT steps per compiled recurrent-policy graph. "
+            "The sensor-policy default 16 compiles and caches a bounded recurrent chunk, avoiding "
+            "both per-step Python calls and an entire rollout unroll."
+        ),
+    )
     parser.add_argument("--disc-learning-rate", type=float, default=3.0e-5)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--minibatches", type=int, default=4)
@@ -360,10 +470,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-mirror-ref-prob", type=float, default=0.50)
     parser.add_argument("--amp-reward-coef", type=float, default=1.20)
     parser.add_argument("--task-reward-lerp", type=float, default=0.50)
+    if DISTILLATION_CLI_ENABLED:
+        parser.add_argument(
+            "--teacher-checkpoint",
+            required=True,
+            help=(
+                "Privileged full-state Teacher checkpoint used only by the "
+                "dedicated sensor-distillation entry point."
+            ),
+        )
+        parser.add_argument("--teacher-action-loss-coef", type=float, default=0.0)
+        parser.add_argument("--teacher-action-loss-final-coef", type=float, default=0.0)
+        parser.add_argument("--teacher-action-loss-decay-iterations", type=int, default=0)
+        parser.add_argument(
+            "--distillation-reset-schedule",
+            action="store_true",
+            help="Restart the Teacher-action loss schedule after loading a Student checkpoint.",
+        )
     parser.add_argument("--min-action-std", type=float, default=0.05)
     parser.add_argument("--max-action-std", type=float, default=0.60)
     parser.add_argument("--episode-metric-window", type=int, default=4096)
     parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument(
+        "--save-best-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preserve model_best.pt/.onnx when rollout stability improves.",
+    )
+    parser.add_argument(
+        "--best-checkpoint-min-completed",
+        type=int,
+        default=32,
+        help="Minimum completed episodes before model_best can be updated.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--resource-log-interval", type=int, default=50)
     parser.add_argument("--wandb-log-interval", type=int, default=10)
@@ -387,6 +526,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--deepmimic-reward", action="store_true", help="Use five-term DeepMimic tracking reward instead of the task reward.")
+    parser.add_argument("--lcp-weight", type=float, default=0.0, help="Sensor-actor Lipschitz penalty weight (sensor stair trainer only).")
+    parser.add_argument("--deepmimic-ppo", action="store_true", help="Use clipped PPO objective in the recurrent sensor trainer.")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-watch", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -441,8 +583,10 @@ def select_device(device_arg: str) -> str:
 
 
 def select_sim_backend(backend_arg: str, device: str) -> str:
+    if backend_arg == "cpu":
+        return "cpu"
     if backend_arg != "warp":
-        raise RuntimeError("Training only supports --sim-backend warp.")
+        raise RuntimeError(f"Unsupported simulation backend: {backend_arg}.")
     if device != "cuda":
         raise RuntimeError("--sim-backend warp requires --device cuda.")
     if LytRobotWarpAmpEnv is None:
@@ -894,6 +1038,33 @@ class TrainingRunLogger:
         self._log_file.close()
 
 
+def load_best_checkpoint_quality(
+    metrics_csv_path: Path,
+    *,
+    min_completed: int,
+) -> tuple[float, float]:
+    """Recover the best stable rollout score when a run is resumed."""
+
+    if not metrics_csv_path.is_file():
+        return (-1.0, -1.0)
+    best = (-1.0, -1.0)
+    try:
+        with metrics_csv_path.open(newline="", encoding="utf-8") as file:
+            for row in csv.DictReader(file):
+                completed = float(row.get("completed_episode_count", "0") or 0.0)
+                success = float(row.get("rollout_episode_success_rate", "nan"))
+                length = float(row.get("mean_episode_length", "nan"))
+                if (
+                    completed >= max(int(min_completed), 1)
+                    and np.isfinite(success)
+                    and np.isfinite(length)
+                ):
+                    best = max(best, (success, length))
+    except (OSError, ValueError):
+        return best
+    return best
+
+
 def raise_keyboard_interrupt(_signum, _frame) -> None:
     raise KeyboardInterrupt
 
@@ -960,6 +1131,21 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
+    if args.deepmimic_ppo and not hasattr(PPOAMPTrainer, "_evaluate_policy_sequence"):
+        raise ValueError("--deepmimic-ppo requires the recurrent sensor training entry point.")
+    if args.deepmimic_ppo and (not args.deepmimic_reward or args.amp):
+        raise ValueError("--deepmimic-ppo requires --deepmimic-reward and --no-amp.")
+    teacher_checkpoint = getattr(args, "teacher_checkpoint", None)
+    teacher_action_loss_coef = float(getattr(args, "teacher_action_loss_coef", 0.0))
+    teacher_action_loss_final_coef = float(
+        getattr(args, "teacher_action_loss_final_coef", 0.0)
+    )
+    teacher_action_loss_decay_iterations = int(
+        getattr(args, "teacher_action_loss_decay_iterations", 0)
+    )
+    distillation_reset_schedule = bool(
+        getattr(args, "distillation_reset_schedule", False)
+    )
     if args.min_forward_progress_speed < 0.0:
         raise ValueError("--min-forward-progress-speed must be non-negative.")
     if not 0.0 <= args.terrain_course_random_start_prob <= 1.0:
@@ -974,6 +1160,11 @@ def main() -> None:
         )
     if args.terrain_course_stage_reward < 0.0:
         raise ValueError("--terrain-course-stage-reward must be non-negative.")
+    if args.use_moe and not args.serial_terrain_course:
+        raise ValueError(
+            "--use-moe is reserved for the serial terrain course; use "
+            "sensor_training/train_multimotion.py."
+        )
     if args.min_forward_progress_speed > 0.0 and args.forward_progress_window_steps <= 0:
         raise ValueError(
             "--forward-progress-window-steps must be positive when the forward-progress guard is enabled."
@@ -982,6 +1173,51 @@ def main() -> None:
         raise ValueError("--forward-progress-grace-steps must be non-negative.")
     if args.fall_penalty < 0.0:
         raise ValueError("--fall-penalty must be non-negative.")
+    if args.stair_distance_tolerance < 0.0:
+        raise ValueError("--stair-distance-tolerance must be non-negative.")
+    if args.lcp_weight < 0.0:
+        raise ValueError("--lcp-weight must be non-negative.")
+    if args.stair_distance_failure_penalty < 0.0:
+        raise ValueError("--stair-distance-failure-penalty must be non-negative.")
+    if args.stair_lateral_tolerance < 0.0:
+        raise ValueError("--stair-lateral-tolerance must be non-negative.")
+    if args.stair_lateral_failure_penalty < 0.0:
+        raise ValueError("--stair-lateral-failure-penalty must be non-negative.")
+    if args.stair_terminal_hold_steps < 0:
+        raise ValueError("--stair-terminal-hold-steps must be non-negative.")
+    if args.sensor_knee_flexion_target <= 0.0:
+        raise ValueError("--sensor-knee-flexion-target must be positive.")
+    if args.sensor_knee_gait_reward_coef < 0.0:
+        raise ValueError("--sensor-knee-gait-reward-coef must be non-negative.")
+    if args.sensor_natural_gait_reward_coef < 0.0:
+        raise ValueError("--sensor-natural-gait-reward-coef must be non-negative.")
+    if args.sensor_gait_height_sigma <= 0.0:
+        raise ValueError("--sensor-gait-height-sigma must be positive.")
+    if args.sensor_upright_sigma <= 0.0:
+        raise ValueError("--sensor-upright-sigma must be positive.")
+    for name in (
+        "sensor_mirror_reward_coef",
+        "sensor_stride_reward_coef",
+        "sensor_foot_roll_reward_coef",
+        "sensor_alternation_reward_coef",
+        "sensor_hop_penalty_coef",
+        "sensor_tiptoe_penalty_coef",
+        "sensor_stance_slip_penalty_coef",
+        "sensor_sync_forward_penalty_coef",
+        "sensor_velocity_excess_penalty_coef",
+    ):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative.")
+    if teacher_action_loss_coef < 0.0 or teacher_action_loss_final_coef < 0.0:
+        raise ValueError("Teacher action-loss coefficients must be non-negative.")
+    if teacher_action_loss_decay_iterations < 0:
+        raise ValueError("--teacher-action-loss-decay-iterations must be non-negative.")
+    if args.compile_policy_chunk_steps is not None and args.compile_policy_chunk_steps < 1:
+        raise ValueError("--compile-policy-chunk-steps must be positive.")
+    if teacher_checkpoint is None and (
+        teacher_action_loss_coef > 0.0 or teacher_action_loss_final_coef > 0.0
+    ):
+        raise ValueError("Teacher action loss requires --teacher-checkpoint.")
     if args.motion_files is not None:
         clip_count = len(args.motion_files)
         for option, values in (
@@ -998,6 +1234,9 @@ def main() -> None:
     # simulator. Long runs commonly replace numbered snapshots with
     # model_final.pt during graceful shutdown.
     args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint)
+    teacher_checkpoint = resolve_resume_checkpoint(teacher_checkpoint)
+    if DISTILLATION_CLI_ENABLED:
+        args.teacher_checkpoint = teacher_checkpoint
     if args.domain_randomization is None:
         args.domain_randomization = args.stage == "stage2"
     if args.max_iterations is None:
@@ -1041,6 +1280,7 @@ def main() -> None:
         motion_loop=tuple(value == "true" for value in (args.motion_loop or ())),
         skill_conditioning=bool(args.skill_conditioning),
         use_reference_velocity=bool(args.use_reference_velocity),
+        deepmimic_reward=bool(args.deepmimic_reward),
         terrain_types=tuple(args.terrain_types or ()),
         terrain_asset_dir=args.terrain_asset_dir,
         stair_terrain=bool(args.stair_terrain),
@@ -1053,6 +1293,12 @@ def main() -> None:
         stair_run_out=args.stair_run_out,
         stair_start_x=args.stair_start_x,
         stair_down_offset=args.stair_down_offset,
+        stair_fixed_start=bool(args.stair_fixed_start),
+        stair_distance_tolerance=args.stair_distance_tolerance,
+        stair_distance_failure_penalty=args.stair_distance_failure_penalty,
+        stair_lateral_tolerance=args.stair_lateral_tolerance,
+        stair_lateral_failure_penalty=args.stair_lateral_failure_penalty,
+        stair_terminal_hold_steps=args.stair_terminal_hold_steps,
         flat_lane_y=args.flat_lane_y,
         rough_lane_y=args.rough_lane_y,
         pit_lane_y=args.pit_lane_y,
@@ -1092,6 +1338,23 @@ def main() -> None:
         forward_progress_window_steps=args.forward_progress_window_steps,
         forward_progress_termination_penalty=args.forward_progress_termination_penalty,
         fall_penalty=args.fall_penalty,
+        sensor_stability_reward=bool(args.sensor_stability_reward),
+        sensor_fall_penalty=args.sensor_fall_penalty,
+        sensor_knee_flexion_target=args.sensor_knee_flexion_target,
+        sensor_knee_gait_reward_coef=args.sensor_knee_gait_reward_coef,
+        sensor_natural_gait_reward_coef=args.sensor_natural_gait_reward_coef,
+        sensor_gait_height_target=args.sensor_gait_height_target,
+        sensor_gait_height_sigma=args.sensor_gait_height_sigma,
+        sensor_upright_sigma=args.sensor_upright_sigma,
+        sensor_mirror_reward_coef=args.sensor_mirror_reward_coef,
+        sensor_stride_reward_coef=args.sensor_stride_reward_coef,
+        sensor_foot_roll_reward_coef=args.sensor_foot_roll_reward_coef,
+        sensor_alternation_reward_coef=args.sensor_alternation_reward_coef,
+        sensor_hop_penalty_coef=args.sensor_hop_penalty_coef,
+        sensor_tiptoe_penalty_coef=args.sensor_tiptoe_penalty_coef,
+        sensor_stance_slip_penalty_coef=args.sensor_stance_slip_penalty_coef,
+        sensor_sync_forward_penalty_coef=args.sensor_sync_forward_penalty_coef,
+        sensor_velocity_excess_penalty_coef=args.sensor_velocity_excess_penalty_coef,
         terminate_incomplete_motion_end=bool(args.terminate_incomplete_motion_end),
         reset_noise_scale=args.reset_noise_scale,
         motion_reset_prob=args.motion_reset_prob,
@@ -1121,6 +1384,7 @@ def main() -> None:
         symmetry_action_weight=args.symmetry_action_weight,
         startup_action_ramp_steps=args.startup_action_ramp_steps,
         stand_start_prob=args.stand_start_prob,
+        stand_start_motion_phase=args.stand_start_motion_phase,
         stand_start_phase_delay_steps=args.stand_start_phase_delay_steps,
         stand_start_transition_min_steps=args.stand_start_transition_min_steps,
         stand_start_transition_max_steps=args.stand_start_transition_max_steps,
@@ -1154,6 +1418,12 @@ def main() -> None:
         action_delay_max_ms=args.action_delay_max_ms,
     )
     ppo_defaults = PPOAMPConfig()
+    supports_distillation = hasattr(ppo_defaults, "teacher_checkpoint")
+    if teacher_checkpoint is not None and not supports_distillation:
+        raise ValueError(
+            "Teacher distillation is isolated from ordinary training; use "
+            "sensor_training/train_distill_stage1.py or train_distill_stage2.py."
+        )
     ppo_cfg = PPOAMPConfig(
         seed=args.seed,
         learning_rate=args.learning_rate,
@@ -1180,13 +1450,41 @@ def main() -> None:
             args.max_learning_rate if args.max_learning_rate is not None else ppo_defaults.max_learning_rate
         ),
         kl_adapt_factor=args.kl_adapt_factor if args.kl_adapt_factor is not None else ppo_defaults.kl_adapt_factor,
+        compile_policy_update=(
+            args.compile_policy_update
+            if args.compile_policy_update is not None
+            else ppo_defaults.compile_policy_update
+        ),
+        compile_rollout=(
+            args.compile_rollout
+            if args.compile_rollout is not None
+            else ppo_defaults.compile_rollout
+        ),
+        compile_policy_chunk_steps=(
+            args.compile_policy_chunk_steps
+            if args.compile_policy_chunk_steps is not None
+            else ppo_defaults.compile_policy_chunk_steps
+        ),
         discriminator_learning_rate=args.disc_learning_rate,
         num_steps=args.num_steps,
         update_epochs=args.epochs,
         num_minibatches=args.minibatches,
         amp_enabled=args.amp,
+        lcp_weight=args.lcp_weight,
+        deepmimic_ppo=args.deepmimic_ppo,
         amp_reward_coef=args.amp_reward_coef,
         task_reward_lerp=args.task_reward_lerp,
+        **(
+            {
+                "teacher_checkpoint": teacher_checkpoint,
+                "teacher_action_loss_coef": teacher_action_loss_coef,
+                "teacher_action_loss_final_coef": teacher_action_loss_final_coef,
+                "teacher_action_loss_decay_iterations": teacher_action_loss_decay_iterations,
+                "distillation_reset_schedule": distillation_reset_schedule,
+            }
+            if supports_distillation
+            else {}
+        ),
         amp_discriminator_updates=args.amp_disc_updates,
         amp_minibatch_size=args.amp_minibatch_size,
         amp_grad_penalty_coef=args.amp_grad_penalty_coef,
@@ -1197,13 +1495,19 @@ def main() -> None:
         max_action_std=args.max_action_std,
         episode_metric_window=args.episode_metric_window,
     )
+    if args.use_moe:
+        if not hasattr(ppo_cfg, "use_moe"):
+            raise ValueError("--use-moe is only available for the recurrent sensor policy.")
+        ppo_cfg.use_moe = True
     save_config(log_dir, args, env_cfg, ppo_cfg)
 
     run = maybe_init_wandb(args, log_dir)
     metrics_csv_path = log_dir / "metrics.csv"
-    assert sim_backend == "warp"
-    assert LytRobotWarpAmpEnv is not None
-    env = LytRobotWarpAmpEnv(env_cfg, device=device)
+    if sim_backend == "warp":
+        assert LytRobotWarpAmpEnv is not None
+        env = LytRobotWarpAmpEnv(env_cfg, device=device)
+    else:
+        env = LytRobotAmpEnv(env_cfg)
     trainer = PPOAMPTrainer(env, ppo_cfg, device=device, log_dir=log_dir)
 
     # Optional: useful for debugging gradients, but expensive during long GPU/Warp runs.
@@ -1336,6 +1640,10 @@ def main() -> None:
     last_dr_window_success = float("nan")
     last_dr_window_depth_success = float("nan")
     last_dr_window_termination = float("nan")
+    best_checkpoint_quality = load_best_checkpoint_quality(
+        metrics_csv_path,
+        min_completed=args.best_checkpoint_min_completed,
+    )
     try:
         for iteration in range(start_iteration, args.max_iterations):
             current_course_random_start_prob = (
@@ -1531,6 +1839,41 @@ def main() -> None:
                 ckpt_path = log_dir / f"model_{ckpt_step}.pt"
                 saved_pt, saved_onnx = trainer.save(ckpt_path, iteration=iteration)
                 run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
+                checkpoint_quality = (
+                    float(metrics.get("rollout_episode_success_rate", -1.0)),
+                    float(metrics.get("mean_episode_length", -1.0)),
+                )
+                completed_episodes = float(metrics.get("completed_episode_count", 0.0))
+                knee_flexion_track = float(
+                    metrics.get("task_knee_flexion_track", float("nan"))
+                )
+                natural_gait_ok = (
+                    args.sensor_knee_gait_reward_coef <= 0.0
+                    or (
+                        np.isfinite(knee_flexion_track)
+                        and knee_flexion_track >= 0.90
+                    )
+                )
+                if (
+                    args.save_best_checkpoint
+                    and completed_episodes >= max(int(args.best_checkpoint_min_completed), 1)
+                    and all(np.isfinite(value) for value in checkpoint_quality)
+                    and natural_gait_ok
+                    and checkpoint_quality > best_checkpoint_quality
+                ):
+                    best_path = log_dir / "model_best.pt"
+                    shutil.copy2(saved_pt, best_path)
+                    shutil.copy2(saved_onnx, best_path.with_suffix(".onnx"))
+                    best_checkpoint_quality = checkpoint_quality
+                    run_logger.emit(
+                        "[BEST] "
+                        f"iter={iteration:05d} rollout_success={checkpoint_quality[0]:.3f} "
+                        f"episode_length={checkpoint_quality[1]:.1f} "
+                        f"knee_flexion_track={knee_flexion_track:.3f} "
+                        f"saved {best_path}",
+                        iteration=iteration,
+                        force=True,
+                    )
             if args.iteration_sleep_ms > 0.0:
                 torch.cuda.synchronize()
                 time.sleep(args.iteration_sleep_ms / 1000.0)

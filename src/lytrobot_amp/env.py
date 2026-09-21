@@ -8,6 +8,7 @@ import secrets
 
 import mujoco
 import numpy as np
+import torch
 
 from .motion import (
     CONTACT_GEOM_NAMES,
@@ -17,6 +18,8 @@ from .motion import (
     load_motion_library,
     resolve_contact_geom_ids,
 )
+from .gait_constraints import natural_gait_bonus, sensor_gait_scores_numpy
+from .mimickit_deepmimic import deepmimic_reward
 from .terrain import (
     MoreTerrainCfg,
     StairTerrainCfg,
@@ -49,7 +52,7 @@ def _stair_root_height_transform(
     step_count: int,
     descending: bool,
 ) -> tuple[float, float]:
-    """Return anchor/scale mapping a stair clip to the compiled stair rise."""
+    """Return anchor/scale mapping a generic stair clip to the compiled rise."""
 
     start = float(motion.reference_root_height[0])
     end = float(motion.reference_root_height[-1])
@@ -61,8 +64,6 @@ def _stair_root_height_transform(
             "matched to non-zero stair geometry."
         )
     scale = desired_rise / reference_rise if desired_rise > 0.0 else 1.0
-    # Scaling about the low end preserves the robot's pelvis clearance at the
-    # course datum while moving the high end onto the actual stair top.
     anchor = end if descending else start
     return anchor, scale
 
@@ -182,18 +183,37 @@ class LytRobotEnvCfg:
     motion_loop: tuple[bool, ...] = ()
     skill_conditioning: bool = True
     use_reference_velocity: bool = False
+    deepmimic_reward: bool = False
     terrain_types: tuple[str, ...] = ()
     terrain_asset_dir: str = ""
     stair_terrain: bool = False
-    stair_step_height: float = 0.08
-    stair_step_depth: float = 0.30
+    # Stair-specialist defaults: 0.13 m riser and 0.32 m tread width.
+    # ``stair_width`` below is lateral clearance, not the forward tread width.
+    stair_step_height: float = 0.13
+    stair_step_depth: float = 0.32
     stair_step_count: int = 5
     stair_width: float = 2.0
     stair_run_in: float = 1.5
-    stair_top_length: float = 1.2
+    stair_top_length: float = 0.64
     stair_run_out: float = 1.5
-    stair_start_x: float = -1.5
-    stair_down_offset: float = 0.0
+    stair_start_x: float = -0.95
+    stair_down_offset: float = 0.25
+    # Specialist stair entry points start every episode at reference frame 0;
+    # general multi-motion training can leave this disabled and sample starts.
+    stair_fixed_start: bool = False
+    # A stair clip is successful only when its fixed root-X displacement is
+    # reached at the final reference frame.  This prevents a policy from
+    # receiving success while stopping on an intermediate tread.
+    stair_distance_tolerance: float = 0.05
+    stair_distance_failure_penalty: float = 5.0
+    # A wide open floor exists beside the standalone stair mesh.  Fail an
+    # episode that leaves this center corridor so reaching the final X value
+    # by walking around the staircase cannot count as success.
+    stair_lateral_tolerance: float = 0.30
+    stair_lateral_failure_penalty: float = 5.0
+    # Hold the final fixed reference pose before declaring stair success.  The
+    # hold applies only to the dedicated fixed-start specialist.
+    stair_terminal_hold_steps: int = 30
     flat_lane_y: float = 3.0
     rough_lane_y: float = 6.0
     pit_lane_y: float = 9.0
@@ -206,6 +226,8 @@ class LytRobotEnvCfg:
     terrain_course_variants: int = 8
     terrain_course_lane_spacing: float = 3.0
     terrain_course_base_height: float = 0.30
+    terrain_course_run_in: float = 2.90
+    terrain_course_run_out: float = 0.30
     terrain_course_random_assignment: bool = True
     terrain_course_completion_reward: float = 25.0
     terrain_course_stage_reward: float = 0.0
@@ -237,6 +259,31 @@ class LytRobotEnvCfg:
     forward_progress_window_steps: int = 50
     forward_progress_termination_penalty: float = 2.0
     fall_penalty: float = 2.0
+    # Sensor-only actors do not observe the reference motion phase used by the
+    # full-state imitation reward.  Enable a phase-independent task reward in
+    # the sensor wrapper instead of asking the deployable actor to optimize an
+    # unobserved target.
+    sensor_stability_reward: bool = False
+    sensor_fall_penalty: float = 25.0
+    # Phase-independent anti-locking constraint for the sensor policy.  The
+    # OmniRetarget walking clip keeps both knees flexed by at least 0.286 rad;
+    # 0.25 rad leaves a small dynamics margin while excluding the straight-leg
+    # shortcut seen in sensor-only PPO runs.
+    sensor_knee_flexion_target: float = 0.25
+    sensor_knee_gait_reward_coef: float = 0.0
+    sensor_natural_gait_reward_coef: float = 0.0
+    sensor_gait_height_target: float = 0.845
+    sensor_gait_height_sigma: float = 0.07
+    sensor_upright_sigma: float = 0.12
+    sensor_mirror_reward_coef: float = 0.0
+    sensor_stride_reward_coef: float = 0.0
+    sensor_foot_roll_reward_coef: float = 0.0
+    sensor_alternation_reward_coef: float = 0.0
+    sensor_hop_penalty_coef: float = 0.0
+    sensor_tiptoe_penalty_coef: float = 0.0
+    sensor_stance_slip_penalty_coef: float = 0.0
+    sensor_sync_forward_penalty_coef: float = 0.0
+    sensor_velocity_excess_penalty_coef: float = 0.0
     terminate_incomplete_motion_end: bool = False
     reset_noise_scale: float = 0.01
     motion_reset_prob: float = 0.5
@@ -269,6 +316,11 @@ class LytRobotEnvCfg:
     symmetry_action_weight: float = 0.15
     startup_action_ramp_steps: int = 20
     stand_start_prob: float = 0.5
+    # Reference frame used while a stand-start episode begins.  Sensor gait
+    # policies choose a natural double-support frame instead of frame zero so
+    # the first blended walking target does not immediately request a swing
+    # leg.  The robot still resets to its measured/model standing pose.
+    stand_start_motion_phase: float = 0.0
     stand_start_phase_delay_steps: int = 25
     stand_start_transition_min_steps: int = 80
     stand_start_transition_max_steps: int = 160
@@ -346,6 +398,8 @@ class LytRobotAmpEnv:
             course_orders=course_orders,
             course_lane_spacing=cfg.terrain_course_lane_spacing,
             course_base_height=cfg.terrain_course_base_height,
+            course_run_in=cfg.terrain_course_run_in,
+            course_run_out=cfg.terrain_course_run_out,
             flat_lane_y=cfg.flat_lane_y,
             rough_lane_y=cfg.rough_lane_y,
             pit_lane_y=cfg.pit_lane_y,
@@ -371,6 +425,17 @@ class LytRobotAmpEnv:
         self.action_dim = self.position_action_dim
         self.ctrl_dim = int(self.model.nu)
         motion_files = cfg.motion_files or (cfg.motion_file,)
+        # This one-piece up/platform/down reference was contact-solved in the
+        # actual stair world frame.  Zeroing its initial XY shifts the feet
+        # off their calibrated treads while leaving the terrain unchanged.
+        preserve_stair_world_xy = bool(
+            cfg.stair_terrain
+            and len(motion_files) == 1
+            and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+        )
+        self.continuous_stair_phase_curriculum = bool(
+            preserve_stair_world_xy and not cfg.stair_fixed_start
+        )
         self.motion = load_motion_library(
             motion_files,
             self.model,
@@ -378,6 +443,7 @@ class LytRobotAmpEnv:
             motion_weights=cfg.motion_weights or None,
             motion_names=cfg.motion_names or None,
             motion_loop=cfg.motion_loop or None,
+            zero_root_xy=not preserve_stair_world_xy,
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -385,7 +451,11 @@ class LytRobotAmpEnv:
         motion_names = (
             self.motion.motion_names
             if isinstance(self.motion, MotionLibrary)
-            else (Path(cfg.motion_file).stem,)
+            # ``--motion-files`` may contain exactly one clip.  In that case
+            # ``load_motion_library`` returns MotionReference (not a library),
+            # so identify the task from the actual selected file rather than
+            # the unrelated legacy ``motion_file`` default.
+            else (Path(motion_files[0]).stem,)
         )
         self.stair_motion_mask = np.asarray(
             ["stair" in name.lower() for name in motion_names], dtype=bool
@@ -400,6 +470,7 @@ class LytRobotAmpEnv:
         )
         self.motion_stair_height_anchor = np.zeros(self.motion_count, dtype=np.float32)
         self.motion_stair_height_scale = np.ones(self.motion_count, dtype=np.float32)
+        self.motion_stair_distance = np.zeros(self.motion_count, dtype=np.float32)
         for motion_id, motion_reference in enumerate(motion_references):
             if not self.stair_motion_mask[motion_id]:
                 continue
@@ -409,8 +480,20 @@ class LytRobotAmpEnv:
                 step_count=self.stair_cfg.step_count,
                 descending=bool(self.stair_down_motion_mask[motion_id]),
             )
+            if (
+                self.continuous_stair_phase_curriculum
+                or self.cfg.stair_fixed_start
+            ) and not self.more_terrain_cfg.serial_course:
+                # The specialist NPZ was contact-IK'd against this exact fixed
+                # 0.13 m geometry.  Scaling only its floating pelvis after IK
+                # would lift the down-stair reset out of support.
+                scale = 1.0
             self.motion_stair_height_anchor[motion_id] = anchor
             self.motion_stair_height_scale[motion_id] = scale
+            self.motion_stair_distance[motion_id] = float(
+                motion_reference.reference_qpos[-1, 0]
+                - motion_reference.reference_qpos[0, 0]
+            )
         self.nominal_root_height = float(self.motion.model_qpos0[2])
         self.motion_terrain_kinds = tuple(
             terrain_kind_from_motion(name) for name in motion_names
@@ -480,6 +563,14 @@ class LytRobotAmpEnv:
             ],
             dtype=np.int32,
         )
+        self.knee_joint_indices = np.asarray(
+            [
+                joint_id
+                for joint_id, name in enumerate(self.motion.common_joint_names)
+                if "knee" in name
+            ],
+            dtype=np.int32,
+        )
         self.right_action_indices, self.left_action_indices = self._build_side_action_indices()
 
         self.datas = [mujoco.MjData(self.model) for _ in range(self.num_envs)]
@@ -487,6 +578,9 @@ class LytRobotAmpEnv:
         self.episode_timeout_step = np.full(self.num_envs, int(cfg.episode_steps), dtype=np.int32)
         self.forward_progress_anchor_x = np.zeros(self.num_envs, dtype=np.float32)
         self.forward_progress_anchor_step = np.zeros(self.num_envs, dtype=np.int32)
+        self.stair_start_x = np.zeros(self.num_envs, dtype=np.float32)
+        self.stair_start_y = np.zeros(self.num_envs, dtype=np.float32)
+        self.stair_terminal_hold_elapsed = np.zeros(self.num_envs, dtype=np.int32)
         self.motion_phase = np.zeros(self.num_envs, dtype=np.float32)
         self.motion_ids = np.zeros(self.num_envs, dtype=np.int32)
         self.course_variant_ids = np.zeros(self.num_envs, dtype=np.int32)
@@ -506,6 +600,25 @@ class LytRobotAmpEnv:
         self.foot_x_max = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.contact_balance_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
         self.action_activity_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.sensor_foot_body_ids = tuple(
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in ("foot_r", "foot_l")
+        )
+        self.sensor_last_foot_contact = np.zeros((self.num_envs, 2), dtype=bool)
+        self.sensor_foot_roll_stage = np.zeros((self.num_envs, 2), dtype=np.int32)
+        self.sensor_toe_only_steps = np.zeros((self.num_envs, 2), dtype=np.int32)
+        self.sensor_last_touchdown_side = np.full(self.num_envs, -1, dtype=np.int32)
+        self.sensor_liftoff_x = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.sensor_had_liftoff = np.zeros((self.num_envs, 2), dtype=bool)
+        self.sensor_stride_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.sensor_stride_seen = np.zeros((self.num_envs, 2), dtype=bool)
+        self.sensor_contact_duty_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.sensor_single_support_ema = np.zeros(self.num_envs, dtype=np.float32)
+        self.sensor_time_since_touchdown = np.zeros(self.num_envs, dtype=np.float32)
+        self.sensor_step_interval_ema = np.zeros(self.num_envs, dtype=np.float32)
+        self.sensor_touchdown_seen = np.zeros(self.num_envs, dtype=bool)
+        self.sensor_cadence_seen = np.zeros(self.num_envs, dtype=bool)
+        self.sensor_swing_steps = np.zeros((self.num_envs, 2), dtype=np.int32)
         self.last_obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         self.stand_start = np.zeros(self.num_envs, dtype=bool)
         self.stand_start_transition_steps = np.ones(self.num_envs, dtype=np.int32)
@@ -542,7 +655,16 @@ class LytRobotAmpEnv:
         if not self.more_terrain_cfg.serial_course:
             return np.empty((0, 0), dtype=np.int32)
         if not isinstance(self.motion, MotionLibrary):
-            raise ValueError("serial terrain course requires a multi-motion library.")
+            # Sensor-policy terrain evaluation deliberately keeps the original
+            # single walking reference.  It tests terrain feedback, not a
+            # privileged terrain-labelled expert selector.
+            stage_count = len(course_motion_sequence(
+                self.more_terrain_cfg.normalized_course_orders[0]
+            ))
+            return np.zeros(
+                (len(self.more_terrain_cfg.normalized_course_orders), stage_count),
+                dtype=np.int32,
+            )
         name_to_id = {name.lower(): index for index, name in enumerate(motion_names)}
         # The original two-reference curriculum deliberately has no dedicated
         # slope clips.  Preserve it by using its rough-walk expert on either
@@ -1030,6 +1152,37 @@ class LytRobotAmpEnv:
     def _foot_contacts(self, data: mujoco.MjData) -> np.ndarray:
         return self._side_contacts_from_geom(self._foot_geom_contacts(data))
 
+    def _sensor_foot_roll_contacts(self, data: mujoco.MjData) -> np.ndarray:
+        """Classify floor contact points into heel, central sole and toe."""
+
+        zones = np.zeros((2, 3), dtype=bool)
+        for contact_id in range(data.ncon):
+            c = data.contact[contact_id]
+            geom1, geom2 = int(c.geom1), int(c.geom2)
+            if geom1 in self.terrain_geom_ids:
+                foot_geom = geom2
+            elif geom2 in self.terrain_geom_ids:
+                foot_geom = geom1
+            else:
+                continue
+            foot_index = self.contact_geom_id_to_index.get(foot_geom)
+            if foot_index is None:
+                continue
+            side = foot_index // 2
+            if foot_index % 2:
+                zones[side, 2] = True
+                continue
+            body_id = self.sensor_foot_body_ids[side]
+            local_x = float(np.dot(
+                np.asarray(c.pos) - data.xpos[body_id],
+                data.xmat[body_id].reshape(3, 3)[:, 0],
+            ))
+            zones[side, 0 if local_x <= 0.0 else 1] = True
+        # Heel and toe both loaded imply support through the sole even if
+        # the mesh narrowphase emits no central contact point this step.
+        zones[:, 1] |= zones[:, 0] & zones[:, 2]
+        return zones
+
     def reset(self, env_ids: np.ndarray | list[int] | None = None) -> np.ndarray:
         if env_ids is None:
             ids = np.arange(self.num_envs, dtype=np.int32)
@@ -1057,12 +1210,16 @@ class LytRobotAmpEnv:
             sampled_motion_ids = self.course_motion_sequences[
                 variants, start_stages
             ]
-            assert isinstance(self.motion, MotionLibrary)
             states = self.motion.sample_states(
                 len(ids), self.rng, motion_ids=sampled_motion_ids
-            )
+            ) if isinstance(self.motion, MotionLibrary) else self.motion.sample_states(len(ids), self.rng)
             for row, motion_id in enumerate(sampled_motion_ids):
-                states.qpos[row] = self.motion.motions[int(motion_id)].reference_qpos[0]
+                reference = (
+                    self.motion.motions[int(motion_id)]
+                    if isinstance(self.motion, MotionLibrary)
+                    else self.motion
+                )
+                states.qpos[row] = reference.reference_qpos[0]
                 # A serial course always starts at its entrance.  Starting at
                 # rest avoids turning a corrupt reference seam into an impulse
                 # and lets the policy learn the acceleration into its route.
@@ -1074,6 +1231,24 @@ class LytRobotAmpEnv:
         else:
             sampled_motion_ids = np.zeros(len(ids), dtype=np.int32)
             states = self.motion.sample_states(len(ids), self.rng)
+        if self.continuous_stair_phase_curriculum:
+            # Random arbitrary frames often begin in single support with a
+            # finite-difference swing velocity and immediately fall.  Reset
+            # only at the demonstrated 32-frame double-support landings and
+            # start at rest; this teaches every stair transition without
+            # injecting an unphysical impulse.
+            reference = (
+                self.motion.motions[0]
+                if isinstance(self.motion, MotionLibrary)
+                else self.motion
+            )
+            landing_frames = np.arange(
+                0, max(reference.frame_count - 1, 1), 32, dtype=np.int32
+            )
+            sampled_frames = self.rng.choice(landing_frames, size=len(ids))
+            states.qpos[:] = reference.reference_qpos[sampled_frames]
+            states.qvel[:] = 0.0
+            states.indices[:] = sampled_frames
         self.motion_ids[ids] = sampled_motion_ids
         use_stand_start = (
             np.zeros(len(ids), dtype=bool)
@@ -1090,6 +1265,25 @@ class LytRobotAmpEnv:
                 < float(np.clip(self.cfg.motion_reset_prob, 0.0, 1.0))
             )
         )
+        stair_fixed_start = (
+            np.zeros(len(ids), dtype=bool)
+            if serial_course
+            else self.stair_motion_mask[sampled_motion_ids]
+            & bool(self.cfg.stair_fixed_start)
+            & ~use_stand_start
+        )
+        use_motion_reset |= stair_fixed_start
+        if np.any(stair_fixed_start):
+            for row in np.flatnonzero(stair_fixed_start):
+                motion_id = int(sampled_motion_ids[row])
+                reference = (
+                    self.motion.motions[motion_id]
+                    if isinstance(self.motion, MotionLibrary)
+                    else self.motion
+                )
+                states.qpos[row] = reference.reference_qpos[0]
+                states.qvel[row] = reference.reference_qvel[0]
+                states.indices[row] = 0
         self._sample_domain_randomization(ids)
         self.stand_start[ids] = use_stand_start
         self.stand_start_transition_steps[ids] = self._sample_stand_transition_steps(len(ids))
@@ -1101,7 +1295,7 @@ class LytRobotAmpEnv:
             if use_stand_start[row]:
                 qpos = self.motion.model_qpos0.copy()
                 qvel = np.zeros(self.model.nv, dtype=np.float32)
-                phase = 0.0
+                phase = float(self.cfg.stand_start_motion_phase)
             elif use_motion_reset[row]:
                 qpos = states.qpos[row].copy()
                 qvel = states.qvel[row].copy()
@@ -1110,6 +1304,22 @@ class LytRobotAmpEnv:
                 qpos = self.motion.model_qpos0.copy()
                 qvel = np.zeros(self.model.nv, dtype=np.float32)
                 phase = 0.0
+
+            frame_count = (
+                int(self.motion.frame_counts[self.motion_ids[int(env_id)]])
+                if isinstance(self.motion, MotionLibrary)
+                else int(self.motion.frame_count)
+            )
+            looping = (
+                bool(self.motion.motion_loop[self.motion_ids[int(env_id)]])
+                if isinstance(self.motion, MotionLibrary)
+                else bool(self.motion.source_loop)
+            )
+            phase = (
+                float(np.remainder(phase, frame_count))
+                if looping
+                else float(np.clip(phase, 0.0, frame_count - 1.0))
+            )
 
             if use_motion_reset[row]:
                 motion_id = int(sampled_motion_ids[row])
@@ -1191,10 +1401,28 @@ class LytRobotAmpEnv:
             self.foot_stride_ema[int(env_id)] = 0.0
             self.contact_balance_ema[int(env_id)] = 0.0
             self.action_activity_ema[int(env_id)] = 0.0
+            self.sensor_last_foot_contact[int(env_id)] = False
+            self.sensor_foot_roll_stage[int(env_id)] = 0
+            self.sensor_toe_only_steps[int(env_id)] = 0
+            self.sensor_last_touchdown_side[int(env_id)] = -1
+            self.sensor_liftoff_x[int(env_id)] = self.last_foot_world_pos[int(env_id), [0, 2], 0]
+            self.sensor_had_liftoff[int(env_id)] = False
+            self.sensor_stride_ema[int(env_id)] = 0.0
+            self.sensor_stride_seen[int(env_id)] = False
+            self.sensor_contact_duty_ema[int(env_id)] = 0.0
+            self.sensor_single_support_ema[int(env_id)] = 0.0
+            self.sensor_time_since_touchdown[int(env_id)] = 0.0
+            self.sensor_step_interval_ema[int(env_id)] = 0.0
+            self.sensor_touchdown_seen[int(env_id)] = False
+            self.sensor_cadence_seen[int(env_id)] = False
+            self.sensor_swing_steps[int(env_id)] = 0
             self.episode_step[int(env_id)] = 0
             self.episode_timeout_step[int(env_id)] = self._sample_timeout_step()
             self.forward_progress_anchor_x[int(env_id)] = float(data.qpos[0])
             self.forward_progress_anchor_step[int(env_id)] = 0
+            self.stair_start_x[int(env_id)] = float(data.qpos[0])
+            self.stair_start_y[int(env_id)] = float(data.qpos[1])
+            self.stair_terminal_hold_elapsed[int(env_id)] = 0
             self.motion_phase[int(env_id)] = phase
 
         self.last_obs = self.observe()
@@ -1344,6 +1572,11 @@ class LytRobotAmpEnv:
         incomplete_motion_end_candidate = np.zeros(self.num_envs, dtype=bool)
         incomplete_motion_required_x = np.full(self.num_envs, np.inf, dtype=np.float32)
         incomplete_motion_end_flags = np.zeros(self.num_envs, dtype=bool)
+        stair_distance_error = np.zeros(self.num_envs, dtype=np.float32)
+        stair_distance_success = np.zeros(self.num_envs, dtype=bool)
+        stair_distance_failure = np.zeros(self.num_envs, dtype=bool)
+        stair_lateral_error = np.zeros(self.num_envs, dtype=np.float32)
+        stair_lateral_failure = np.zeros(self.num_envs, dtype=bool)
         if isinstance(self.motion, MotionLibrary):
             frequencies = self.motion.frequencies[self.motion_ids]
             frame_counts = self.motion.frame_counts[self.motion_ids].astype(np.float32)
@@ -1433,10 +1666,18 @@ class LytRobotAmpEnv:
                 ).astype(np.float32)
                 motion_complete = (~looping) & (next_phase >= frame_counts - 1.0)
         else:
+            next_phase = self.motion_phase + self.motion.frequency * self.dt * phase_scale
+            looping = bool(self.motion.source_loop)
             self.motion_phase = (
-                self.motion_phase + self.motion.frequency * self.dt * phase_scale
-            ) % self.motion.frame_count
-            motion_complete = np.zeros(self.num_envs, dtype=bool)
+                np.mod(next_phase, self.motion.frame_count)
+                if looping
+                else np.minimum(next_phase, self.motion.frame_count - 1.0)
+            ).astype(np.float32)
+            motion_complete = np.full(
+                self.num_envs,
+                (not looping) and self.motion.frame_count > 1,
+                dtype=bool,
+            ) & (next_phase >= self.motion.frame_count - 1.0)
         reference_targets = self._targets_at_current_phase()
 
         for env_id, data in enumerate(self.datas):
@@ -1497,6 +1738,59 @@ class LytRobotAmpEnv:
                 reward_parts = {key: 0.0 for key in reward_parts}
                 reward_parts["invalid_state"] = 1.0
                 reward_parts["termination"] = 1.0
+            # A non-looping stair reference defines both the action sequence and
+            # its required root displacement.  Gate terminal success on that
+            # displacement so stopping on a lower tread cannot count as a win.
+            stair_active = bool(
+                self.stair_motion_mask[self.motion_ids[env_id]]
+                and not self.more_terrain_cfg.serial_course
+            )
+            # Dedicated stair specialists keep commanding the final reference
+            # pose for a short, fixed interval.  This makes the terminal
+            # criterion a stable arrival rather than a one-control-step
+            # snapshot at the final motion frame.
+            if stair_active and bool(motion_complete[env_id]):
+                hold_steps = (
+                    max(int(self.cfg.stair_terminal_hold_steps), 0)
+                    if self.cfg.stair_fixed_start
+                    else 0
+                )
+                if hold_steps > 0:
+                    self.stair_terminal_hold_elapsed[env_id] = min(
+                        self.stair_terminal_hold_elapsed[env_id] + 1,
+                        hold_steps,
+                    )
+                    stair_terminal = bool(
+                        self.stair_terminal_hold_elapsed[env_id] >= hold_steps
+                    )
+                else:
+                    stair_terminal = True
+            else:
+                self.stair_terminal_hold_elapsed[env_id] = 0
+                stair_terminal = False
+            if stair_terminal:
+                expected_distance = float(
+                    self.motion_stair_distance[self.motion_ids[env_id]]
+                )
+                actual_distance = float(data.qpos[0] - self.stair_start_x[env_id])
+                distance_error = abs(actual_distance - expected_distance)
+                stair_distance_error[env_id] = distance_error
+                stair_distance_success[env_id] = (
+                    distance_error <= max(float(self.cfg.stair_distance_tolerance), 0.0)
+                )
+                stair_distance_failure[env_id] = not stair_distance_success[env_id]
+                if stair_distance_failure[env_id]:
+                    reward -= max(float(self.cfg.stair_distance_failure_penalty), 0.0)
+            if stair_active:
+                lateral_error = abs(float(data.qpos[1] - self.stair_start_y[env_id]))
+                stair_lateral_error[env_id] = lateral_error
+                stair_lateral_failure[env_id] = lateral_error > max(
+                    float(self.cfg.stair_lateral_tolerance), 0.0
+                )
+                if stair_lateral_failure[env_id]:
+                    reward -= max(
+                        float(self.cfg.stair_lateral_failure_penalty), 0.0
+                    )
             rewards[env_id] = reward
             if self.more_terrain_cfg.serial_course:
                 rewards[env_id] += (
@@ -1508,7 +1802,10 @@ class LytRobotAmpEnv:
             successful_motion_end = (
                 bool(course_suffix_complete[env_id])
                 if self.more_terrain_cfg.serial_course
-                else bool(motion_complete[env_id])
+                else (
+                    (bool(motion_complete[env_id]) and not stair_active)
+                    or (stair_terminal and not stair_distance_failure[env_id])
+                )
             )
             incomplete_motion_end = bool(
                 incomplete_motion_end_candidate[env_id]
@@ -1516,7 +1813,16 @@ class LytRobotAmpEnv:
             )
             incomplete_motion_end_flags[env_id] = incomplete_motion_end
             reward_parts["incomplete_motion_end"] = float(incomplete_motion_end)
-            dones[env_id] = done or successful_motion_end or incomplete_motion_end
+            reward_parts["stair_terminal_hold_elapsed"] = float(
+                self.stair_terminal_hold_elapsed[env_id]
+            )
+            dones[env_id] = (
+                done
+                or successful_motion_end
+                or stair_distance_failure[env_id]
+                or stair_lateral_failure[env_id]
+                or incomplete_motion_end
+            )
             time_outs[env_id] = timed_out or successful_motion_end
             episode_steps[env_id] = self.episode_step[env_id]
             self.last_action[env_id] = commanded_action
@@ -1558,12 +1864,13 @@ class LytRobotAmpEnv:
         reported_course_stage = self.course_stage_ids.copy()
         reported_course_start_stage = self.course_start_stage_ids.copy()
         done_ids = np.nonzero(dones)[0].astype(np.int32)
+        bootstrap_ids = np.nonzero(time_outs)[0].astype(np.int32)
         terminal_payload = None
         terminal_observer = getattr(self, "terminal_observer", None)
-        if len(done_ids) > 0 and callable(terminal_observer):
+        if len(bootstrap_ids) > 0 and callable(terminal_observer):
             # Capture the terminal state before autoreset so recurrent
             # trainers can bootstrap time-limit transitions correctly.
-            terminal_payload = terminal_observer(done_ids)
+            terminal_payload = terminal_observer(bootstrap_ids)
         if len(done_ids) > 0:
             self.reset(done_ids)
         else:
@@ -1572,9 +1879,14 @@ class LytRobotAmpEnv:
         info = {key: np.asarray(value, dtype=np.float32) for key, value in components.items()}
         info["episode_step"] = episode_steps
         info["time_outs"] = time_outs.astype(np.float32)
+        info["stair_distance_error"] = stair_distance_error
+        info["stair_distance_success"] = stair_distance_success.astype(np.float32)
+        info["stair_distance_failure"] = stair_distance_failure.astype(np.float32)
+        info["stair_lateral_error"] = stair_lateral_error
+        info["stair_lateral_failure"] = stair_lateral_failure.astype(np.float32)
         if terminal_payload is not None:
             info.update(terminal_payload)
-            info["terminal_env_ids"] = done_ids
+            info["terminal_env_ids"] = bootstrap_ids
         if self.more_terrain_cfg.serial_course:
             info["course_complete"] = course_complete.astype(np.float32)
             info["course_suffix_complete"] = course_suffix_complete.astype(np.float32)
@@ -1632,6 +1944,39 @@ class LytRobotAmpEnv:
         )
 
         height = float(np.exp(-((root_height - ref_root_height) ** 2) / (0.09**2)))
+        upright_span = max(1.0 - float(self.cfg.min_upright_z), 1.0e-6)
+        sensor_upright = float(
+            np.clip(
+                (up_z - float(self.cfg.min_upright_z)) / upright_span,
+                0.0,
+                1.0,
+            )
+        )
+        terrain_height = (
+            float(self.more_terrain_cfg.course_base_height)
+            if self.more_terrain_cfg.serial_course
+            else 0.0
+        )
+        root_clearance = root_height - terrain_height
+        clearance_span = max(
+            self.nominal_root_height - float(self.cfg.fall_height),
+            1.0e-6,
+        )
+        sensor_height = float(
+            np.clip(
+                (root_clearance - float(self.cfg.fall_height)) / clearance_span,
+                0.0,
+                1.0,
+            )
+        )
+        pelvis_tilt = float(np.arccos(np.clip(up_z, -1.0, 1.0)))
+        sensor_posture_track = float(np.exp(
+            -((pelvis_tilt / max(float(getattr(self.cfg, "sensor_upright_sigma", 0.12)), 1.0e-6)) ** 2)
+        ))
+        sensor_gait_height_track = float(np.exp(
+            -(((root_clearance - float(getattr(self.cfg, "sensor_gait_height_target", 0.845)))
+               / max(float(getattr(self.cfg, "sensor_gait_height_sigma", 0.07)), 1.0e-6)) ** 2)
+        ))
         (
             locomotion_stability,
             stable_forward_velocity_track,
@@ -1639,11 +1984,70 @@ class LytRobotAmpEnv:
         ) = _stability_gated_locomotion_terms(
             forward_velocity_track,
             forward_progress,
-            root_orientation,
-            height,
+            sensor_upright if self.cfg.sensor_stability_reward else root_orientation,
+            sensor_height if self.cfg.sensor_stability_reward else height,
         )
         joint_pos = np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)
         joint_vel = np.asarray(data.qvel[self.motion.robot_qvel_adrs], dtype=np.float32)
+        knee_target = max(float(self.cfg.sensor_knee_flexion_target), 1.0e-6)
+        knee_flexion_track = (
+            float(
+                np.clip(
+                    np.min(np.maximum(-joint_pos[self.knee_joint_indices], 0.0))
+                    / knee_target,
+                    0.0,
+                    1.0,
+                )
+            )
+            if len(self.knee_joint_indices) > 0
+            else 1.0
+        )
+        gait_progress = float(
+            np.clip(abs(target_forward_velocity) / target_velocity_scale, 0.0, 1.0)
+        )
+        sensor_gait_metrics = {}
+        if any(
+            float(getattr(self.cfg, name, 0.0)) > 0.0
+            for name in (
+                "sensor_mirror_reward_coef",
+                "sensor_natural_gait_reward_coef",
+                "sensor_knee_gait_reward_coef",
+                "sensor_stride_reward_coef",
+                "sensor_foot_roll_reward_coef",
+                "sensor_alternation_reward_coef",
+                "sensor_hop_penalty_coef",
+                "sensor_tiptoe_penalty_coef",
+                "sensor_stance_slip_penalty_coef",
+                "sensor_sync_forward_penalty_coef",
+            )
+        ):
+            sensor_gait_metrics = sensor_gait_scores_numpy(
+                self,
+                env_id,
+                self._sensor_foot_roll_contacts(data),
+                np.asarray(data.geom_xpos[self.contact_geom_ids[[0, 2]], 0], dtype=np.float32),
+                float(foot_pos[0, 1] + foot_pos[2, 1]),
+                np.linalg.norm(foot_world_vel[[0, 2], :2], axis=1),
+                foot_world_vel[[0, 2], 0],
+                np.asarray(
+                    [
+                        np.min(data.geom_xpos[self.contact_geom_ids[0:2], 2]),
+                        np.min(data.geom_xpos[self.contact_geom_ids[2:4], 2]),
+                    ],
+                    dtype=np.float32,
+                ),
+            )
+            quality_names = (
+                "sensor_stride_length", "sensor_step_cadence",
+                "sensor_swing_clearance", "sensor_foot_roll",
+                "sensor_alternation", "sensor_mirror",
+            )
+            sensor_gait_metrics["sensor_gait_quality"] = float(
+                len(quality_names) / sum(
+                    1.0 / np.clip(sensor_gait_metrics[name], 0.05, 1.0)
+                    for name in quality_names
+                )
+            )
         pose_error = float(
             np.average(np.square(joint_pos - reference_targets.joint_pos[env_id]), weights=self.joint_reward_weights)
         )
@@ -1755,18 +2159,48 @@ class LytRobotAmpEnv:
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
             - self.cfg.missed_contact_penalty_coef * missed_contact
         )
+        if self.cfg.deepmimic_reward:
+            def tensor(value: np.ndarray | float) -> torch.Tensor:
+                return torch.as_tensor(value, dtype=torch.float32).unsqueeze(0)
+
+            dm_reward, _dm_terms = deepmimic_reward(
+                root_height=tensor(root_height),
+                root_quat=tensor(root_quat),
+                root_lin_vel=tensor(np.asarray(data.qvel[:3])),
+                root_ang_vel=tensor(np.asarray(data.qvel[3:6])),
+                joint_pos=tensor(joint_pos),
+                joint_vel=tensor(joint_vel),
+                key_pos_root_local=tensor(foot_pos),
+                target_root_height=tensor(ref_root_height),
+                target_root_quat=tensor(ref_root_quat),
+                target_root_lin_vel=tensor(reference_targets.root_lin_vel[env_id]),
+                target_root_ang_vel=tensor(reference_targets.root_ang_vel[env_id]),
+                target_joint_pos=tensor(reference_targets.joint_pos[env_id]),
+                target_joint_vel=tensor(reference_targets.joint_vel[env_id]),
+                target_key_pos_root_local=tensor(reference_targets.foot_pos[env_id]),
+            )
+            reward = float(dm_reward.item())
+        if sensor_gait_metrics and not self.cfg.sensor_stability_reward:
+            reward += float(natural_gait_bonus(
+                sensor_gait_metrics, gait_progress, forward_velocity_track,
+                locomotion_stability, knee_flexion_track, self.cfg,
+            ))
 
         bad_state = not (
             np.isfinite(data.qpos).all()
             and np.isfinite(data.qvel).all()
             and np.isfinite(data.ctrl).all()
         )
-        min_root_height = ref_root_height + (
-            float(self.cfg.fall_height) - self.nominal_root_height
-        )
-        max_root_height = ref_root_height + (
-            float(self.cfg.max_height) - self.nominal_root_height
-        )
+        if self.cfg.sensor_stability_reward:
+            min_root_height = float(self.cfg.fall_height) + terrain_height
+            max_root_height = float(self.cfg.max_height) + terrain_height
+        else:
+            min_root_height = ref_root_height + (
+                float(self.cfg.fall_height) - self.nominal_root_height
+            )
+            max_root_height = ref_root_height + (
+                float(self.cfg.max_height) - self.nominal_root_height
+            )
         fallen = (
             root_height < min_root_height
             or root_height > max_root_height
@@ -1775,6 +2209,7 @@ class LytRobotAmpEnv:
         components = {
             "root_height_value": root_height,
             "reference_root_height_value": ref_root_height,
+            "sensor_root_clearance": root_clearance,
             "root_vel": root_vel,
             "forward_velocity": forward_velocity,
             "forward_velocity_error": forward_velocity_error,
@@ -1785,8 +2220,18 @@ class LytRobotAmpEnv:
             "stable_forward_progress": stable_forward_progress,
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
-            "root_orientation": root_orientation,
-            "height": height,
+            "root_orientation": (
+                sensor_upright if self.cfg.sensor_stability_reward else root_orientation
+            ),
+            "height": sensor_height if self.cfg.sensor_stability_reward else height,
+            "sensor_upright": sensor_upright,
+            "sensor_height": sensor_height,
+            "sensor_posture_track": sensor_posture_track,
+            "sensor_gait_height_track": sensor_gait_height_track,
+            "gait_progress": gait_progress,
+            "knee_flexion_track": knee_flexion_track,
+            "knee_extension": 1.0 - knee_flexion_track,
+            **sensor_gait_metrics,
             "pose_track": pose_track,
             "vel_track": vel_track,
             "foot_pos": foot_pos_track,
@@ -1817,6 +2262,11 @@ class LytRobotAmpEnv:
             "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
         }
+        if self.cfg.deepmimic_reward:
+            components.update({
+                f"deepmimic_{name}": float(value.item())
+                for name, value in _dm_terms.items()
+            })
         reward, bad_state, components = _sanitize_reward_outputs(
             reward,
             bad_state,

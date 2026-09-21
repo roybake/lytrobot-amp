@@ -7,6 +7,9 @@ import runpy
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_GAIT_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+
 
 def _has_arg(name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv)
@@ -24,10 +27,13 @@ if __name__ == "__main__":
     if not _has_arg("--sim-backend"):
         sys.argv.extend(["--sim-backend", "warp"])
 
-    # 复现 06-11 优质策略的训练口径。新增的逐脚参考奖励会学习参考数据本身
-    # 的左右不对称，并在当前机器人上表现为右脚前跳，因此 stage1 默认关闭。
+    # Train the privileged gait teacher against the closed OmniRetarget cycle.
+    # The legacy walk1_mjcf archive has static MTP joints and admits a locked-
+    # knee gait, so it must not be used as a natural-walking teacher.
     stage1_defaults = {
         "--num-envs": "4096",
+        "--motion-file": str(DEFAULT_GAIT_REFERENCE),
+        "--target-velocity": "0.87",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",
         "--side-foot-pos-coef": "0.0",

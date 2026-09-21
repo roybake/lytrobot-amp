@@ -30,12 +30,12 @@ def build_mlp(
 
 
 class SensorActorCritic(nn.Module):
-    """GRU actor-critic with a base MLP and softly weighted residual experts.
+    """GRU actor-critic, optionally with softly weighted residual experts.
 
-    The environment keeps its existing stacked sensor observation for AMP and
-    checkpoint metadata.  The recurrent policy consumes only the newest frame;
-    its hidden state carries causal information across policy steps instead of
-    repeatedly re-encoding overlapping fixed histories.
+    The recurrent policy consumes a fixed window of causal sensor frames and
+    carries additional information between policy steps in its hidden state.
+    Both inputs are deployable: the frame window is maintained by the control
+    process and the hidden state is explicit in the exported ONNX interface.
     """
 
     is_recurrent = True
@@ -51,7 +51,9 @@ class SensorActorCritic(nn.Module):
         max_action_std: float = 0.80,
         *,
         sensor_frame_dim: int | None = None,
+        actor_history_frames: int = 1,
         recurrent_hidden_dim: int = 128,
+        use_moe: bool = False,
         num_experts: int = 4,
         gate_hidden_dims: tuple[int, ...] = (128, 64),
         expert_hidden_dims: tuple[int, ...] = (128, 64),
@@ -62,32 +64,45 @@ class SensorActorCritic(nn.Module):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.sensor_frame_dim = int(sensor_frame_dim or obs_dim)
+        self.actor_history_frames = int(actor_history_frames)
+        self.recurrent_input_dim = self.sensor_frame_dim * self.actor_history_frames
         self.recurrent_hidden_dim = int(recurrent_hidden_dim)
+        self.use_moe = bool(use_moe)
         self.num_experts = int(num_experts)
         self.residual_scale = float(residual_scale)
         self.privileged_context_dim = int(privileged_context_dim)
         if not 0 < self.sensor_frame_dim <= self.obs_dim:
             raise ValueError("sensor_frame_dim must be in [1, obs_dim].")
+        if self.actor_history_frames < 1:
+            raise ValueError("actor_history_frames must be positive.")
+        if self.recurrent_input_dim > self.obs_dim:
+            raise ValueError(
+                "sensor_frame_dim * actor_history_frames must not exceed obs_dim."
+            )
         if self.recurrent_hidden_dim < 1:
             raise ValueError("recurrent_hidden_dim must be positive.")
-        if self.num_experts < 1:
+        if self.use_moe and self.num_experts < 1:
             raise ValueError("num_experts must be positive.")
         if self.residual_scale < 0.0:
             raise ValueError("residual_scale must be non-negative.")
         if self.privileged_context_dim < 0:
             raise ValueError("privileged_context_dim must be non-negative.")
 
-        self.recurrent = nn.GRUCell(self.sensor_frame_dim, self.recurrent_hidden_dim)
+        self.recurrent = nn.GRUCell(self.recurrent_input_dim, self.recurrent_hidden_dim)
         # Keep the public ``actor`` name for checkpoint/export compatibility.
         self.actor = build_mlp(
             self.recurrent_hidden_dim,
             actor_hidden_dims,
             self.action_dim,
         )
-        self.gate = build_mlp(
-            self.recurrent_hidden_dim,
-            gate_hidden_dims,
-            self.num_experts,
+        self.gate = (
+            build_mlp(
+                self.recurrent_hidden_dim,
+                gate_hidden_dims,
+                self.num_experts,
+            )
+            if self.use_moe
+            else None
         )
         self.experts = nn.ModuleList(
             build_mlp(
@@ -97,7 +112,7 @@ class SensorActorCritic(nn.Module):
                 output_activation=nn.Tanh(),
             )
             for _ in range(self.num_experts)
-        )
+        ) if self.use_moe else nn.ModuleList()
         critic_input_dim = self.recurrent_hidden_dim + self.privileged_context_dim
         self.critic = build_mlp(critic_input_dim, critic_hidden_dims, 1)
         self.median_critic = build_mlp(critic_input_dim, critic_hidden_dims, 1)
@@ -156,14 +171,21 @@ class SensorActorCritic(nn.Module):
         if episode_start is not None:
             reset = episode_start.to(device=obs.device, dtype=obs.dtype).reshape(-1, 1)
             hidden_state = hidden_state * (1.0 - torch.clamp(reset, 0.0, 1.0))
-        current_frame = obs[:, -self.sensor_frame_dim :]
-        return self.recurrent(current_frame, hidden_state)
+        sensor_history = obs[:, -self.recurrent_input_dim :]
+        return self.recurrent(sensor_history, hidden_state)
 
     def _actor_outputs(
         self,
         hidden_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_logits = self.actor(hidden_state)
+        if not self.use_moe:
+            return (
+                torch.tanh(base_logits),
+                hidden_state.new_zeros((hidden_state.shape[0], 1)),
+                hidden_state.new_zeros((hidden_state.shape[0], self.action_dim)),
+            )
+        assert self.gate is not None
         gate_weights = torch.softmax(self.gate(hidden_state), dim=-1)
         expert_actions = torch.stack(
             tuple(expert(hidden_state) for expert in self.experts),
@@ -265,6 +287,30 @@ class SensorActorCritic(nn.Module):
             residual,
         )
 
+    def rollout_action_and_value(
+        self,
+        obs: torch.Tensor,
+        hidden_state: torch.Tensor,
+        episode_start: torch.Tensor | None = None,
+        privileged_context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return only the tensors needed while collecting a rollout.
+
+        This intentionally omits entropy, the median critic and diagnostic
+        MoE outputs.  PPO evaluates those quantities during the gradient
+        update, while rollout needs only an action, its likelihood, the value
+        baseline and the next recurrent state.  Keeping this hot path narrow
+        also makes its one-step CUDA graph quick to compile and replay.
+        """
+
+        next_hidden = self._next_hidden(obs, hidden_state, episode_start)
+        dist, _gate_weights, _residual = self._distribution_from_hidden(next_hidden)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        critic_features = self._critic_features(next_hidden, privileged_context)
+        value = self.critic(critic_features).squeeze(-1)
+        return action, log_prob, value, next_hidden
+
     def evaluate_sequence(
         self,
         obs: torch.Tensor,
@@ -333,6 +379,29 @@ class SensorActorCritic(nn.Module):
             torch.stack(context_predictions),
         )
 
+    def action_mean_sequence(
+        self,
+        obs: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        episode_starts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return deterministic Actor means for a time-major rollout.
+
+        This is kept separate from likelihood evaluation so the distillation
+        loss compares teacher actions with the deployable deterministic Actor,
+        rather than with sampled Gaussian exploration actions.
+        """
+
+        if obs.ndim != 3:
+            raise ValueError(f"Expected time-major observations, got {tuple(obs.shape)}.")
+        hidden = initial_hidden
+        means: list[torch.Tensor] = []
+        for step in range(obs.shape[0]):
+            hidden = self._next_hidden(obs[step], hidden, episode_starts[step])
+            mean, _gate_weights, _residual = self._actor_outputs(hidden)
+            means.append(mean)
+        return torch.stack(means)
+
     # Stateless compatibility methods are useful for unit tests and one-shot
     # consumers.  Rollout and deployment use the recurrent methods above.
     def get_action_and_value(
@@ -390,7 +459,7 @@ class RecurrentSensorActorExport(nn.Module):
             1.0 - torch.clamp(reset, 0.0, 1.0)
         )
         next_hidden = self.policy.recurrent(
-            observation[:, -self.policy.sensor_frame_dim :],
+            observation[:, -self.policy.recurrent_input_dim :],
             recurrent_state,
         )
         action, _weights, _residual = self.policy._actor_outputs(next_hidden)

@@ -30,7 +30,7 @@ OmniRetarget 源码快照来自 `amazon-far/holosoma` 提交 `79d728c2c40e7f9ce8
 ## 重定向复现
 
 ```bash
-cd /home/yeah/code/LYTrobot_amp_recovered_20260806
+cd /path/to/LYTrobot_amp_recovered_20260806
 
 # 1. ASF/AMC -> Z-up 人体关键点、接触标签和动作片段
 uv run --project squat_training/retargeting \
@@ -47,6 +47,15 @@ done
 # 3. 映射到主 MJCF，并在完整 STL 几何上执行脚底滚动/防穿插 IK
 uv run --project squat_training/retargeting \
   python multimotion/retargeting/build_references.py
+
+# 仅重建固定楼梯专项（0.13 m 立板、0.32 m 踏步、5 级）
+uv run --project squat_training/retargeting \
+  python multimotion/retargeting/build_references.py \
+  --clips stair_up stair_down
+
+# 用上述 OmniRetarget 姿态先验生成连续上楼 -> 平台 -> 下楼参考
+uv run --project squat_training/retargeting \
+  python multimotion/retargeting/build_continuous_stair_reference.py
 
 # 4. 生成 rough、pit、gap 及独立 6°上下坡的接触 IK 数据
 uv run --project squat_training/retargeting \
@@ -97,6 +106,10 @@ uv run python scripts/view_multimotion_retarget.py --viewer
 uv run python scripts/view_multimotion_retarget.py \
   --clips stair_up stair_down --viewer --no-record
 
+# 仅播放连续上楼、平台、下楼参考
+uv run python scripts/view_multimotion_retarget.py \
+  --clips stair_up_down --viewer --viewer-loop --no-record
+
 # 生成脚跟 -> 脚掌 -> 脚趾慢放测试
 MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
   --speed 0.5 \
@@ -107,11 +120,16 @@ MUJOCO_GL=egl uv run python scripts/view_multimotion_retarget.py \
 
 源文件与许可证已复制到 `robot/terrains/more_discolrl/`，来源为本机
 `/home/yeah/code/unitreeG1/MORE/MoRE-discoRL`。`src/lytrobot_amp/terrain.py`
-地形实现支持 gap、pit、rough、6°上/下坡和 stairs；当前训练入口只把 rough
-和 6°上/下坡拼入 LYT 连续串联路线。gap、pit 和 stairs 数据与实现仍保留用于离线参考
-验证，不参与当前多动作训练。
-正式训练把 rough 最大高度差限制为 0.05 m，并使用 6° 上/下坡。楼梯参考数据和
-3 级阶梯几何参数仍保留给专项课程或离线验证，当前默认入口不拼入楼梯段。
+地形实现支持 gap、pit、rough、6°上/下坡和 stairs；常规多动作入口把 rough
+和 6°上/下坡拼入 LYT 连续串联路线。楼梯使用独立专项入口：`scripts/train_stair_up.py`
+只加载 `stair_up_omniretarget.npz`，`scripts/train_stair_down.py` 只加载
+`stair_down_omniretarget.npz`；`scripts/train_stair_up_down.py` 则只加载单个连续参考，
+不会在平台处切换或拼接动作。
+正式训练把 rough 最大高度差限制为 0.05 m，并使用 6° 上/下坡。楼梯专项使用
+CMU subject 114 的 OmniRetarget 重定向结果和上下连通的 5 级阶梯几何：立板高度固定为
+0.13 m，前进方向踏步宽度为 0.32 m，横向净宽为 2.0 m；最高 0.65 m 处由 0.64 m 短过渡平面连接。
+重建参考数据时，`build_references.py` 与预览脚本使用同一组参数，保证人体
+动作、接触 IK 和训练碰撞几何一致。
 
 每条完整状态路线只包含 rough 和 6°上/下坡，地形沿前进方向首尾拼接。由于所有
 Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8 条随机排列
@@ -124,6 +142,21 @@ Warp world 共享同一个编译模型，启动时会根据 `--seed` 预生成 8
 从 stage 0 出发的完整路线。
 
 ## 训练
+
+### 楼梯 DeepMimic 模仿训练
+
+`scripts/train_stairs_deepmimic.py` 转发到纯传感器训练入口。该入口把 [MimicKit DeepMimic](https://github.com/xbpeng/MimicKit/blob/main/docs/README_DeepMimic.md) 的五项指数跟踪奖励与裁剪 PPO 目标移植到本项目的 MuJoCo/Warp 肌腱机器人，关闭 AMP 判别器。Actor 只使用可部署的 IMU、肌腱长度、动作历史和板载步态指令；具体的机器人关节与足端对应关系见 `sensor_training/README.md`。
+
+```bash
+# 数据完成后先校验参考文件
+uv run python scripts/train_stairs_deepmimic.py --direction up_down --check-data
+
+# 连续上楼、平台、下楼；也可选 up 或 down
+uv run python scripts/train_stairs_deepmimic.py --direction up_down \
+  --num-envs 1024 --max-iterations 30000
+```
+
+入口使用 `robot/reference_data/multimotion/stair_{up,down,up_down}_omniretarget.npz`，阶梯几何固定为 5 级、0.13 m 立板、0.32 m 踏步。当前参考文件尚未齐备，入口会在启动仿真前报出缺失路径；生成数据后须核对根轨迹、脚底接触和阶梯几何，再运行训练。训练目标是模仿参考轨迹；稳定性与自然步态仍需通过仿真验收，不能由代码或奖励设计预先保证。
 
 策略网络只允许输入 IMU 和肌腱长度时，使用传感器专用入口。Actor 输入为连续 6 帧
 `42 维 IMU + 14 维肌腱长度`，共 336 维；不包含目标速度、动作 one-hot、参考相位、
@@ -226,7 +259,7 @@ uv run python scripts/train_multimotion.py \
 显示：
 
 ```bash
-cd /home/yeah/code/LYTrobot_amp_recovered_20260806
+cd /path/to/LYTrobot_amp_recovered_20260806
 uv run python scripts/play.py \
   --checkpoint logs/multimotion/07-30-11:52:12/model_26000.pt \
   --stage multimotion \

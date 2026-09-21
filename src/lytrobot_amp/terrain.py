@@ -24,6 +24,14 @@ MORE_TERRAIN_TYPES = (
     "slope_down",
     "stairs",
 )
+# 专项楼梯课程的固定几何。``step_depth`` 是机器人前进方向的踏步宽度；
+# ``StairTerrainCfg.width`` 仍表示横向净宽（为双脚提供足够支撑空间）。
+# 五级上下连通楼梯：每侧总爬升 0.65 m。顶部保留两级踏步宽度的短过渡平台，
+# 让上楼和下楼在同一连续结构上衔接。
+STAIR_TRAINING_STEP_HEIGHT_M = 0.13
+STAIR_TRAINING_TREAD_WIDTH_M = 0.32
+STAIR_TRAINING_STEP_COUNT = 5
+STAIR_TRAINING_TOP_LENGTH_M = 0.64
 # The acceptance course is a straight, narrow terrain lane.  Ninety-degree
 # turning clips cannot be concatenated in that lane without composing their
 # world-frame poses (and the resulting S turn would leave the 2 m corridor).
@@ -57,15 +65,21 @@ class StairTerrainCfg:
     """A straight run-in, ascent, top platform, descent, and run-out track."""
 
     enabled: bool = False
-    step_height: float = 0.08
-    step_depth: float = 0.30
-    step_count: int = 5
+    step_height: float = STAIR_TRAINING_STEP_HEIGHT_M
+    step_depth: float = STAIR_TRAINING_TREAD_WIDTH_M
+    step_count: int = STAIR_TRAINING_STEP_COUNT
     width: float = 2.0
     run_in: float = 1.5
-    top_length: float = 1.2
+    top_length: float = STAIR_TRAINING_TOP_LENGTH_M
     run_out: float = 1.5
     start_x: float = 1.0
     center_y: float = 0.0
+
+    @property
+    def tread_width(self) -> float:
+        """前进方向踏步宽度（兼容中文需求中的“阶梯宽度”叫法）。"""
+
+        return float(self.step_depth)
 
     @property
     def ascent_start(self) -> float:
@@ -245,6 +259,50 @@ def course_end_x(cfg: MoreTerrainCfg, variant: int) -> float:
     return float(last_x + cfg.course_run_out)
 
 
+def course_segment_base_heights(
+    cfg: MoreTerrainCfg,
+    variant: int,
+) -> tuple[float, ...]:
+    """Return the flat datum at the start of every serial-course segment.
+
+    A standalone descent starts on an elevated flat approach and ends on the
+    normal course datum; a standalone ascent does the converse.  Keeping this
+    profile explicit makes the test routes continuous instead of joining a
+    ramp to a vertical box edge.
+    """
+
+    rise = float(COURSE_TERRAIN_LENGTHS["slope_up"] * np.tan(np.deg2rad(cfg.slope_angle_deg)))
+    segments = course_segments(cfg, variant)
+    # A single down-slope has an elevated approach before descending to the
+    # default datum.  Paired routes still begin at the ordinary course height.
+    height = float(cfg.course_base_height)
+    if len(segments) == 1 and segments[0].kind == "slope_down":
+        height += rise
+    result: list[float] = []
+    for segment in segments:
+        result.append(height)
+        if segment.kind == "slope_up":
+            height += rise
+        elif segment.kind == "slope_down":
+            height -= rise
+    return tuple(result)
+
+
+def course_end_height(cfg: MoreTerrainCfg, variant: int) -> float:
+    """Return the top-surface height of the serial route's final platform."""
+
+    heights = course_segment_base_heights(cfg, variant)
+    segments = course_segments(cfg, variant)
+    if not segments:
+        return float(cfg.course_base_height)
+    last = segments[-1]
+    if last.kind == "slope_up":
+        return float(heights[-1] + last.length * np.tan(np.deg2rad(cfg.slope_angle_deg)))
+    if last.kind == "slope_down":
+        return float(heights[-1] - last.length * np.tan(np.deg2rad(cfg.slope_angle_deg)))
+    return float(heights[-1])
+
+
 def course_motion_sequence(order: Sequence[str]) -> tuple[str, ...]:
     """Expand a terrain order into the multi-action reference sequence."""
 
@@ -372,8 +430,6 @@ def _validate_more(cfg: MoreTerrainCfg) -> None:
     if invalid or cfg.gap_width <= 0.0 or cfg.gap_count < 2:
         raise ValueError(f"Invalid MoRE terrain configuration: {invalid} must be positive.")
     if cfg.serial_course:
-        if ("slope_up" in cfg.terrain_types) != ("slope_down" in cfg.terrain_types):
-            raise ValueError("serial courses must include slope_up and slope_down together.")
         if not 0.0 < float(cfg.slope_angle_deg) <= 6.0:
             raise ValueError("assessment slope_angle_deg must be in (0, 6].")
         if cfg.course_lane_spacing <= cfg.lane_width:
@@ -388,7 +444,11 @@ def _validate_more(cfg: MoreTerrainCfg) -> None:
                 raise ValueError(
                     "Every serial-course order must contain each enabled terrain exactly once."
                 )
-            if "slope_up" in order:
+            # Multi-terrain routes retain the up/down pair so their common
+            # datum is restored before another obstacle.  A one-slope route
+            # is intentionally allowed for the three independent sensor
+            # policy tests.
+            if "slope_up" in order and "slope_down" in order:
                 up_index = order.index("slope_up")
                 if up_index + 1 >= len(order) or order[up_index + 1] != "slope_down":
                     raise ValueError("slope_up must be immediately followed by slope_down.")
@@ -546,16 +606,17 @@ def serial_course_boxes(
     _validate_stairs(stairs)
     boxes: list[tuple[str, np.ndarray, np.ndarray]] = []
     half_width = 0.5 * cfg.lane_width
-    base_half_height = 0.5 * cfg.course_base_height
-
-    def add_platform(name: str, x0: float, x1: float, y: float) -> None:
-        if x1 <= x0:
+    def add_platform(name: str, x0: float, x1: float, y: float, top_height: float) -> None:
+        # A zero-height platform is exactly MuJoCo's built-in floor.  Omitting
+        # the degenerate box lets standalone sensor tests transition to/from
+        # the real default ground instead of a raised course platform.
+        if x1 <= x0 or top_height <= 1.0e-6:
             return
         boxes.append(
             (
                 name,
-                np.asarray([0.5 * (x0 + x1), y, base_half_height]),
-                np.asarray([0.5 * (x1 - x0), half_width, base_half_height]),
+                np.asarray([0.5 * (x0 + x1), y, 0.5 * top_height]),
+                np.asarray([0.5 * (x1 - x0), half_width, 0.5 * top_height]),
             )
         )
 
@@ -566,10 +627,13 @@ def serial_course_boxes(
             0.0,
             cfg.course_run_in,
             lane_y,
+            course_segment_base_heights(cfg, variant)[0] if cfg.terrain_types else cfg.course_base_height,
         )
         segments = course_segments(cfg, variant)
+        segment_heights = course_segment_base_heights(cfg, variant)
         for segment_index, segment in enumerate(segments):
             name = f"{prefix}_{segment_index:02d}_{segment.kind}"
+            top_height = segment_heights[segment_index]
             if segment.kind == "gap":
                 platform_length = (
                     segment.length - (cfg.gap_count - 1) * cfg.gap_width
@@ -583,6 +647,7 @@ def serial_course_boxes(
                         cursor,
                         cursor + platform_length,
                         lane_y,
+                        top_height,
                     )
                     cursor += platform_length + cfg.gap_width
             elif segment.kind == "stairs":
@@ -590,7 +655,7 @@ def serial_course_boxes(
                 # split.  The old compact layout put descent near the segment
                 # end, about 1.3 m after the stair-down reference had already
                 # begun lowering the pelvis.
-                add_platform(name + "_base", segment.start_x, segment.end_x, lane_y)
+                add_platform(name + "_base", segment.start_x, segment.end_x, lane_y, top_height)
                 step_depth = stairs.step_depth
                 flight_length = stairs.step_count * step_depth
                 half_length = segment.center_x - segment.start_x
@@ -620,13 +685,13 @@ def serial_course_boxes(
                 )
                 for stair_name, center, half_size in stair_boxes(local_stairs):
                     shifted = center.copy()
-                    shifted[2] += cfg.course_base_height
+                    shifted[2] += top_height
                     boxes.append((f"{name}_{stair_name}", shifted, half_size))
             elif segment.kind == "pit":
                 # MoRE's pit is a narrow elevated safe platform surrounded by
                 # the lower global floor; keeping its top at the course datum
                 # permits arbitrary ordering without height discontinuities.
-                add_platform(name, segment.start_x, segment.end_x, lane_y)
+                add_platform(name, segment.start_x, segment.end_x, lane_y, top_height)
             elif segment.kind in {"rough", "slope_up", "slope_down"}:
                 # Added as a heightfield or rotated ramp below.
                 continue
@@ -634,7 +699,7 @@ def serial_course_boxes(
                 raise ValueError(f"Unknown serial terrain kind: {segment.kind!r}.")
         end = course_end_x(cfg, variant)
         last = segments[-1].end_x if segments else cfg.course_run_in
-        add_platform(f"{prefix}_run_out", last, end, lane_y)
+        add_platform(f"{prefix}_run_out", last, end, lane_y, course_end_height(cfg, variant))
     return boxes
 
 
@@ -649,16 +714,21 @@ def serial_course_ramps(
     thickness = max(float(cfg.course_base_height), 0.05)
     result: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
     for variant, lane_y in enumerate(cfg.course_lane_ys):
+        segment_heights = course_segment_base_heights(cfg, variant)
         for index, segment in enumerate(course_segments(cfg, variant)):
             if segment.kind not in {"slope_up", "slope_down"}:
                 continue
             signed_angle = -angle if segment.kind == "slope_up" else angle
             slope_length = segment.length / np.cos(angle)
             rise = segment.length * np.tan(angle)
-            top_center_z = cfg.course_base_height + 0.5 * rise
+            direction = 1.0 if segment.kind == "slope_up" else -1.0
+            top_center_z = segment_heights[index] + direction * 0.5 * rise
             center = np.asarray(
                 [
-                    segment.center_x,
+                    # Align the *top* face (not the box centre) to both
+                    # adjacent platforms.  A rotated, finite-thickness box
+                    # otherwise leaves a centimetre-scale visual/physical lip.
+                    segment.center_x - 0.5 * thickness * np.sin(signed_angle),
                     lane_y,
                     top_center_z - 0.5 * thickness * np.cos(angle),
                 ],
@@ -844,7 +914,7 @@ def _attach_terrain(
                         f"course_v{variant:02d}_{index:02d}_rough",
                         segment.center_x,
                         more.course_lane_ys[variant],
-                        more.course_base_height,
+                        course_segment_base_heights(more, variant)[index],
                     )
                     for variant in range(len(more.normalized_course_orders))
                     for index, segment in enumerate(course_segments(more, variant))
@@ -1055,7 +1125,8 @@ def terrain_spawn_offset(
         lane_y = more.course_lane_ys[int(course_variant)]
         if kind == "flat":
             return np.asarray(
-                [0.30, lane_y, more.course_base_height], dtype=np.float32
+                [0.30, lane_y, course_segment_base_heights(more, int(course_variant))[0]],
+                dtype=np.float32,
             )
         segment = next(
             item
@@ -1064,7 +1135,11 @@ def terrain_spawn_offset(
         )
         if kind == "rough":
             return np.asarray(
-                [segment.start_x + 0.30, lane_y, more.course_base_height],
+                [
+                    segment.start_x + 0.30,
+                    lane_y,
+                    course_segment_base_heights(more, int(course_variant))[course_segments(more, int(course_variant)).index(segment)],
+                ],
                 dtype=np.float32,
             )
         if kind == "pit":
@@ -1080,7 +1155,11 @@ def terrain_spawn_offset(
             )
         if kind in {"slope_up", "slope_down"}:
             return np.asarray(
-                [segment.start_x, lane_y, more.course_base_height],
+                [
+                    segment.start_x,
+                    lane_y,
+                    course_segment_base_heights(more, int(course_variant))[course_segments(more, int(course_variant)).index(segment)],
+                ],
                 dtype=np.float32,
             )
 

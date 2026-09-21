@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_GMR_ROOT = Path("/home/yeah/code/unitreeG1/GMR-master")
-DEFAULT_BVH = DEFAULT_GMR_ROOT / "data" / "lafan1" / "walk1_subject1.bvh"
+DEFAULT_BVH = HERE / "source_data" / "walk1_subject1.bvh"
 
 DEMO_JOINTS = (
     "Hips",
@@ -119,13 +117,9 @@ def foot_roll_schedule(
     return phases, modes
 
 
-def load_lafan_keypoints(bvh: Path, gmr_root: Path) -> tuple[np.ndarray, list[str]]:
-    vendor_root = gmr_root / "general_motion_retargeting" / "utils"
-    if not vendor_root.exists():
-        raise FileNotFoundError(f"GMR LAFAN parser not found: {vendor_root}")
-    sys.path.insert(0, str(vendor_root))
-    from lafan_vendor import utils  # type: ignore[import-not-found]
-    from lafan_vendor.extract import read_bvh  # type: ignore[import-not-found]
+def load_lafan_keypoints(bvh: Path) -> tuple[np.ndarray, list[str]]:
+    from lafan_vendor import utils
+    from lafan_vendor.extract import read_bvh
 
     animation = read_bvh(str(bvh))
     _, global_positions = utils.quat_fk(animation.quats, animation.pos, animation.parents)
@@ -173,7 +167,6 @@ def infer_contacts(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bvh", type=Path, default=DEFAULT_BVH)
-    parser.add_argument("--gmr-root", type=Path, default=DEFAULT_GMR_ROOT)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--start", type=int, default=210)
     parser.add_argument("--period", type=int, default=44)
@@ -183,7 +176,7 @@ def main() -> None:
     parser.add_argument("--contact-velocity", type=float, default=0.30)
     args = parser.parse_args()
 
-    global_positions, bone_names = load_lafan_keypoints(args.bvh, args.gmr_root)
+    global_positions, bone_names = load_lafan_keypoints(args.bvh)
     missing = [name for name in BVH_JOINTS if name not in bone_names]
     if missing:
         raise ValueError(f"BVH joints missing: {missing}")

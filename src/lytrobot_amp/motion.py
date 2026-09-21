@@ -140,6 +140,11 @@ def _repair_loop_root_translation_velocity(
         return repaired
 
     root_steps = np.diff(positions[:, :2], axis=0)
+    # Some in-place retargets keep qpos root XY fixed while storing a real
+    # forward velocity in qvel.  Their seam velocity is already valid;
+    # differentiating fixed positions would erase it.
+    if np.max(np.abs(root_steps)) < 1.0e-5:
+        return repaired
     cycle_translation = (
         positions[-1, :2] - positions[0, :2] + np.median(root_steps, axis=0)
     )
@@ -170,6 +175,7 @@ class MotionReference:
         common_joint_names: Sequence[str] = DEFAULT_COMMON_JOINTS,
         actuator_ids: Sequence[int] | np.ndarray | None = None,
         zero_root_xy: bool = True,
+        loop_override: bool | None = None,
     ) -> None:
         self.motion_file = Path(motion_file).expanduser().resolve()
         if not self.motion_file.exists():
@@ -180,7 +186,9 @@ class MotionReference:
         self.source_qvel = np.asarray(archive["qvel"], dtype=np.float32)
         self.frequency = float(np.asarray(archive["frequency"]).item())
         self.source_loop = (
-            bool(np.asarray(archive["loop"]).item())
+            bool(loop_override)
+            if loop_override is not None
+            else bool(np.asarray(archive["loop"]).item())
             if "loop" in archive.files
             else False
         )
@@ -390,8 +398,13 @@ class MotionReference:
 
     def targets_at_phase(self, phase: np.ndarray) -> MotionTargets:
         phase_arr = np.asarray(phase, dtype=np.float32)
-        low_index = np.floor(phase_arr).astype(np.int32) % self.frame_count
-        high_index = (low_index + 1) % self.frame_count
+        floor_phase = np.floor(phase_arr).astype(np.int32)
+        if self.source_loop:
+            low_index = np.mod(floor_phase, self.frame_count)
+            high_index = np.mod(low_index + 1, self.frame_count)
+        else:
+            low_index = np.clip(floor_phase, 0, self.frame_count - 1)
+            high_index = np.minimum(low_index + 1, self.frame_count - 1)
         blend = (phase_arr - np.floor(phase_arr)).astype(np.float32)
 
         root_quat = _normalize_quat(self._interp(self.reference_root_quat, low_index, high_index, blend))
@@ -774,10 +787,19 @@ def load_motion_library(
     motion_weights: Sequence[float] | None = None,
     motion_names: Sequence[str] | None = None,
     motion_loop: Sequence[bool] | None = None,
+    zero_root_xy: bool = True,
 ) -> MotionReference | MotionLibrary:
     files = tuple(motion_files)
     if len(files) == 1:
-        return MotionReference(files[0], model, actuator_ids=actuator_ids)
+        if motion_loop is not None and len(motion_loop) != 1:
+            raise ValueError("motion_loop length must match motion_files.")
+        return MotionReference(
+            files[0], model, actuator_ids=actuator_ids,
+            zero_root_xy=zero_root_xy,
+            loop_override=bool(motion_loop[0]) if motion_loop is not None else None,
+        )
+    if not zero_root_xy:
+        raise ValueError("Preserving world root XY currently requires one motion file.")
     return MotionLibrary(
         files,
         model,

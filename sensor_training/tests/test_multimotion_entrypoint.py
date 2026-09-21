@@ -34,6 +34,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
 
         self.assertEqual(args[args.index("--log-group") + 1], "multimotion_four_ref")
         self.assertIn("--no-skill-conditioning", args)
+        self.assertIn("--use-moe", args)
         tags = args[args.index("--wandb-tags") + 1].split(",")
         self.assertIn("sensor-only", tags)
         self.assertIn("imu", tags)
@@ -43,6 +44,9 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         self.assertIn("--domain-randomization", args)
         self.assertEqual(args[args.index("--dr-curriculum-mode") + 1], "adaptive")
         self.assertIn("--warp-global-domain-randomization", args)
+        self.assertEqual(args[args.index("--decimation") + 1], "2")
+        self.assertEqual(args[args.index("--num-envs") + 1], "1536")
+        self.assertEqual(args[args.index("--num-steps") + 1], "64")
         self.assertGreater(
             float(args[args.index("--global-dr-resample-interval") + 1]),
             0.0,
@@ -80,7 +84,11 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         self.assertEqual(args[names_start:names_end], ["walk", "rough_walk"])
         self.assertIn("--no-skill-conditioning", args)
 
-    def test_real_multimotion_env_exposes_only_336_sensor_values(self) -> None:
+    def test_non_100hz_control_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires 100 Hz"):
+            default_train_args(decimation=4)
+
+    def test_real_multimotion_env_exposes_deployable_gait_commands(self) -> None:
         motion_dir = REPO_ROOT / "robot" / "reference_data" / "multimotion"
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
@@ -116,8 +124,9 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
         )
         try:
             observation = env.reset()
-            self.assertEqual(env.obs_dim, 336)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertEqual(env.sensor_frame_dim, 116)
+            self.assertEqual(env.obs_dim, 696)
+            self.assertEqual(observation.shape, (1, 696))
             self.assertTrue(np.isfinite(observation).all())
             privileged_context = env.privileged_observe()
             self.assertEqual(
@@ -144,7 +153,9 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             ):
                 env.base_env.course_stage_ids[0] = stage
                 np.testing.assert_allclose(
-                    env.privileged_observe()[0, 5:],
+                    env.privileged_observe()[
+                        0, 5 + len(env.base_motion.common_joint_names) :
+                    ],
                     _normalized_terrain_context(scenario, env.base_env.cfg),
                 )
             env.base_env.course_stage_ids[0] = 0
@@ -161,9 +172,10 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
                 env.obs_dim,
                 env.action_dim,
                 sensor_frame_dim=env.sensor_frame_dim,
+                actor_history_frames=env.obs_dim // env.sensor_frame_dim,
                 privileged_context_dim=env.privileged_context_dim,
             )
-            self.assertEqual(policy.recurrent.input_size, env.sensor_frame_dim)
+            self.assertEqual(policy.recurrent.input_size, env.obs_dim)
             self.assertEqual(policy.recurrent.hidden_size, 128)
             self.assertEqual(policy.actor[0].in_features, 128)
             self.assertEqual(
@@ -186,7 +198,7 @@ class SensorMultimotionEntrypointTests(unittest.TestCase):
             self.assertEqual(tuple(recurrent_state.shape), (1, 128))
             self.assertFalse(torch.equal(recurrent_state, torch.zeros_like(recurrent_state)))
             observation, reward, done, _info = env.step(action)
-            self.assertEqual(observation.shape, (1, 336))
+            self.assertEqual(observation.shape, (1, 696))
             self.assertTrue(np.isfinite(observation).all())
             self.assertTrue(np.isfinite(reward).all())
             self.assertTrue(np.isfinite(done).all())

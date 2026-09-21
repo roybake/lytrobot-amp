@@ -1,4 +1,4 @@
-"""Environment wrappers that expose only IMU and tendon-length policy inputs."""
+"""Sensor-policy wrappers with IMU, tendon-length and applied-action history."""
 
 from __future__ import annotations
 
@@ -10,17 +10,25 @@ import torch
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
+from lytrobot_amp.motion import MotionLibrary
 
 from .config import DEFAULT_SENSOR_OBSERVATION_CONFIG, SensorObservationConfig
+from .gait_command import (
+    GAIT_COMMAND_SCALAR_FIELDS,
+    assemble_gait_command,
+    gait_command_dim,
+)
 from .observation import HistoryMotionReference, ImuSensorLayout, resolve_imu_sensor_layout
 
 
-PRIVILEGED_CONTEXT_FIELDS = (
+ROOT_CONTEXT_FIELDS = (
     "root_velocity_x",
     "root_velocity_y",
     "root_velocity_z",
     "right_foot_contact",
     "left_foot_contact",
+)
+TERRAIN_CONTEXT_FIELDS = (
     "terrain_grade",
     "terrain_roughness",
     "terrain_step_height",
@@ -29,6 +37,121 @@ PRIVILEGED_CONTEXT_FIELDS = (
     "terrain_pit_depth",
 )
 ROOT_VELOCITY_NORMALIZER = 3.0
+JOINT_VELOCITY_NORMALIZER = 10.0
+
+
+def sensor_stability_task_reward(
+    info: dict[str, np.ndarray | torch.Tensor],
+    *,
+    fall_penalty: float,
+    stall_penalty: float,
+    knee_gait_reward_coef: float = 0.0,
+    natural_gait_reward_coef: float = 0.0,
+    mirror_reward_coef: float = 0.0,
+    stride_reward_coef: float = 0.0,
+    foot_roll_reward_coef: float = 0.0,
+    alternation_reward_coef: float = 0.0,
+    hop_penalty_coef: float = 0.0,
+    tiptoe_penalty_coef: float = 0.0,
+    stance_slip_penalty_coef: float = 0.0,
+    sync_forward_penalty_coef: float = 0.0,
+    velocity_excess_penalty_coef: float = 0.0,
+) -> np.ndarray | torch.Tensor:
+    """Return a sensor-deployable reward without hidden reference phase terms.
+
+    The full-state reward includes joint, foot and tendon targets sampled from
+    ``motion_phase``.  Those targets are intentionally absent from the
+    IMU+tendon actor input, so using them as the dominant student objective
+    creates contradictory labels after random resets.  This reward keeps only
+    stability and world-frame locomotion terms that the GRU can infer from its
+    causal feedback history.  A fall is an unambiguously bad terminal event,
+    not a small one-step deduction after many positive tracking rewards.
+    """
+
+    sensor_upright = info["sensor_upright"]
+    is_torch = torch.is_tensor(sensor_upright)
+    clip = torch.clamp if is_torch else np.clip
+    minimum = torch.minimum if is_torch else np.minimum
+    where = torch.where if is_torch else np.where
+    def gait_score(name: str, default: float, maximum: float = 1.0):
+        value = info.get(name)
+        if value is None:
+            return (
+                torch.full_like(sensor_upright, float(default))
+                if is_torch
+                else np.full_like(sensor_upright, float(default), dtype=np.float32)
+            )
+        return clip(value, 0.0, maximum)
+
+    posture_track = clip(info.get("sensor_posture_track", info["sensor_upright"]), 0.0, 1.0)
+    height_track = clip(info.get("sensor_gait_height_track", info["sensor_height"]), 0.0, 1.0)
+    stability = clip(
+        minimum(posture_track, height_track),
+        0.0,
+        1.0,
+    )
+    speed_track = clip(info.get("forward_velocity_track", info["stable_forward_velocity_track"]), 0.0, 1.0)
+    forward_progress = clip(info.get("forward_progress", info["stable_forward_progress"]), 0.0, 1.0)
+    velocity_deficit = clip(info["forward_velocity_deficit"], 0.0, 2.0)
+    velocity_excess = gait_score("forward_velocity_excess", 0.0, 2.0)
+    gait_progress = clip(info.get("gait_progress", 1.0), 0.0, 1.0)
+    knee_flexion_track = clip(info.get("knee_flexion_track", 1.0), 0.0, 1.0)
+    quality_terms = (
+        gait_score("sensor_stride_length", 0.5),
+        gait_score("sensor_step_cadence", 0.5),
+        gait_score("sensor_swing_clearance", 0.5),
+        gait_score("sensor_foot_roll", 0.5),
+        gait_score("sensor_alternation", 0.5),
+        gait_score("sensor_mirror", 0.5),
+    )
+    gait_quality = 6.0 / sum(1.0 / clip(term, 0.05, 1.0) for term in quality_terms)
+    control_cost = (
+        0.04 * info["ctrl_penalty"]
+        + 0.10 * info["action_rate"]
+        + 0.03 * info["distal_action"]
+        + 0.12 * info["distal_action_rate"]
+    )
+    # Natural walking is a joint condition rather than a sum of independently
+    # exploitable bonuses.  The harmonic gait score is dominated by its worst
+    # component, then speed and upright posture gate the whole walking reward.
+    reward = 0.50 * stability + stability * (
+        1.50 * speed_track
+        + 0.50 * forward_progress
+        - 2.50 * velocity_deficit
+        - float(velocity_excess_penalty_coef) * velocity_excess
+        + float(natural_gait_reward_coef)
+        * gait_progress
+        * speed_track
+        * gait_quality
+        + float(knee_gait_reward_coef)
+        * gait_progress
+        * (knee_flexion_track - 1.0)
+        + gait_progress * (
+            - float(hop_penalty_coef) * gait_score("sensor_hop", 0.0)
+            - float(tiptoe_penalty_coef) * (
+                gait_score("sensor_tiptoe", 0.0)
+                + gait_score("sensor_roll_violation", 0.0)
+            )
+            - float(stance_slip_penalty_coef) * gait_score("sensor_stance_slip", 0.0, 2.0)
+            - float(sync_forward_penalty_coef) * gait_score("sensor_synchronous_forward", 0.0, 2.0)
+        )
+    ) - control_cost
+    insufficient_progress = info.get("insufficient_progress")
+    if insufficient_progress is not None:
+        stall_value = (
+            torch.full_like(reward, -float(stall_penalty))
+            if is_torch
+            else np.full_like(reward, -float(stall_penalty), dtype=np.float32)
+        )
+        reward = where(insufficient_progress > 0.5, stall_value, reward)
+
+    termination = info.get("termination")
+    if termination is None:
+        return reward
+    fall_value = torch.full_like(reward, -float(fall_penalty)) if is_torch else np.full_like(
+        reward, -float(fall_penalty), dtype=np.float32
+    )
+    return where(termination > 0.5, fall_value, reward)
 
 
 def _normalized_terrain_context(
@@ -97,7 +220,21 @@ class SensorHistoryEnv:
 
     @property
     def sensor_frame_dim(self) -> int:
-        return int(self.imu_layout.dim + self.base_env.position_action_dim)
+        return int(
+            self.imu_layout.dim
+            + self.base_env.position_action_dim
+            + self.base_env.action_dim
+            + self.gait_command_dim
+        )
+
+    @property
+    def gait_command_dim(self) -> int:
+        if not self.sensor_observation_cfg.gait_command_enabled:
+            return 0
+        return gait_command_dim(
+            self.base_env.action_dim,
+            self.sensor_observation_cfg.gait_lookahead_seconds,
+        )
 
     @property
     def obs_dim(self) -> int:
@@ -109,36 +246,162 @@ class SensorHistoryEnv:
 
     @property
     def privileged_context_dim(self) -> int:
-        return len(PRIVILEGED_CONTEXT_FIELDS)
+        return len(self.privileged_context_fields)
+
+    @property
+    def privileged_context_fields(self) -> tuple[str, ...]:
+        joint_names = tuple(self.base_motion.common_joint_names)
+        joint_velocity_fields = tuple(
+            f"joint_velocity_{name}" for name in joint_names
+        )
+        return ROOT_CONTEXT_FIELDS + joint_velocity_fields + TERRAIN_CONTEXT_FIELDS
 
     @property
     def privileged_context_metadata(self) -> dict[str, Any]:
         return {
-            "fields": PRIVILEGED_CONTEXT_FIELDS,
+            "fields": self.privileged_context_fields,
             "dim": self.privileged_context_dim,
             "actor_input": False,
             "training_only": True,
             "root_velocity_normalizer": ROOT_VELOCITY_NORMALIZER,
+            "joint_velocity_normalizer": JOINT_VELOCITY_NORMALIZER,
+            "loss_weights": (
+                (2.0,) * len(ROOT_CONTEXT_FIELDS)
+                + (1.0,) * len(self.base_motion.common_joint_names)
+                + (0.5,) * len(TERRAIN_CONTEXT_FIELDS)
+            ),
             "terrain_encoding": "continuous_bounded_parameters",
         }
 
     @property
     def observation_metadata(self) -> dict[str, Any]:
+        command_fields = (
+            GAIT_COMMAND_SCALAR_FIELDS
+            + tuple(
+                f"reference_tendon_{seconds:.3f}s"
+                for seconds in self.sensor_observation_cfg.gait_lookahead_seconds
+            )
+            if self.sensor_observation_cfg.gait_command_enabled
+            else ()
+        )
         return {
             "config": asdict(self.sensor_observation_cfg),
             "frame_order": "oldest_to_current",
             "imu_sensor_names": self.imu_layout.names,
             "imu_dim_per_frame": self.imu_layout.dim,
             "tendon_length_dim_per_frame": self.base_env.position_action_dim,
+            "previous_action_dim_per_frame": self.base_env.action_dim,
             "actor_frame_dim": self.sensor_frame_dim,
-            "actor_input_fields": ("imu", "tendon_length"),
-            "command_fields": (),
-            "command_dim": 0,
-            "strict_sensor_only": True,
+            "actor_history_frames": self.sensor_observation_cfg.frame_count,
+            "actor_history_span_seconds": (
+                (self.sensor_observation_cfg.frame_count - 1) * self.base_env.dt
+            ),
+            "actor_input_fields": (
+                "imu",
+                "tendon_length",
+                "previous_action",
+                "gait_command",
+            ),
+            "hardware_sensor_fields": ("imu", "tendon_length"),
+            "command_fields": command_fields,
+            "command_dim": self.gait_command_dim,
+            "strict_sensor_only": False,
+            "hardware_sensor_only": True,
+            "deployable_command_only": True,
+            "gait_command": self.gait_command_metadata,
             "actor_obs_dim": self.obs_dim,
             "amp_frame_dim": self.base_motion.feature_dim,
             "amp_obs_dim": self.amp_obs_dim,
             "privileged_training_context": self.privileged_context_metadata,
+        }
+
+    @staticmethod
+    def _numpy(value: Any) -> np.ndarray:
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    @property
+    def gait_command_metadata(self) -> dict[str, Any]:
+        """Self-contained lookup data required beside the deployed ONNX Actor."""
+
+        motions = (
+            tuple(self.base_motion.motions)
+            if isinstance(self.base_motion, MotionLibrary)
+            else (self.base_motion,)
+        )
+        ctrl_mid = self._numpy(self.base_env.ctrl_mid).astype(np.float32)
+        ctrl_half_range = self._numpy(self.base_env.ctrl_half_range).astype(np.float32)
+        tables = [
+            np.clip(
+                (np.asarray(motion.reference_tendon_ctrl, dtype=np.float32) - ctrl_mid[None, :])
+                / ctrl_half_range[None, :],
+                -1.0,
+                1.0,
+            ).tolist()
+            for motion in motions
+        ]
+        stand = np.clip(
+            (self._numpy(self.base_env.stand_tendon_ctrl)[0] - ctrl_mid) / ctrl_half_range,
+            -1.0,
+            1.0,
+        ).astype(np.float32)
+        if isinstance(self.base_motion, MotionLibrary):
+            frequencies = np.asarray(self.base_motion.frequencies, dtype=np.float32)
+            frame_counts = np.asarray(self.base_motion.frame_counts, dtype=np.int32)
+            motion_loop = np.asarray(self.base_motion.motion_loop, dtype=bool)
+            motion_names = tuple(str(value) for value in self.base_motion.motion_names)
+        else:
+            frequencies = np.asarray([self.base_motion.frequency], dtype=np.float32)
+            frame_counts = np.asarray([self.base_motion.frame_count], dtype=np.int32)
+            motion_loop = np.asarray([self.base_motion.source_loop], dtype=bool)
+            motion_names = ("walk",)
+        return {
+            "source": "onboard_clock_and_reference_tendon_table",
+            "external_hardware_required": False,
+            "hardware_observations": ["imu", "tendon_length"],
+            "lookahead_seconds": list(self.sensor_observation_cfg.gait_lookahead_seconds),
+            "command_dim": self.gait_command_dim,
+            "control_dt": float(self.base_env.dt),
+            "target_velocity": float(self.base_env.cfg.target_velocity),
+            "target_velocity_normalizer": float(
+                self.sensor_observation_cfg.target_velocity_normalizer
+            ),
+            "target_velocity_normalized": float(
+                self.base_env.cfg.target_velocity
+                / self.sensor_observation_cfg.target_velocity_normalizer
+            ),
+            "motion_names": list(motion_names),
+            "frequencies": frequencies.tolist(),
+            "frame_counts": frame_counts.tolist(),
+            "motion_loop": motion_loop.tolist(),
+            "stand_start_motion_phase": float(self.base_env.cfg.stand_start_motion_phase),
+            "stand_start_phase_delay_steps": int(
+                self.base_env.cfg.stand_start_phase_delay_steps
+            ),
+            "startup_action_ramp_steps": int(
+                self.base_env.cfg.startup_action_ramp_steps
+            ),
+            "stand_start_transition_min_steps": int(
+                self.base_env.cfg.stand_start_transition_min_steps
+            ),
+            "stand_start_transition_max_steps": int(
+                self.base_env.cfg.stand_start_transition_max_steps
+            ),
+            "normalized_stand_tendon_target": stand.tolist(),
+            "normalized_reference_tendon_tables": tables,
+            "ctrl_mid": ctrl_mid.tolist(),
+            "ctrl_half_range": ctrl_half_range.tolist(),
+            "actuator_action_scale": self._numpy(self.base_env.action_scale).tolist(),
+            "action_residual_scale": float(self.base_env.cfg.action_residual_scale),
+            "reference_ctrl_blend": float(self.base_env.cfg.reference_ctrl_blend),
+            "frame_layout": [
+                *GAIT_COMMAND_SCALAR_FIELDS,
+                *(
+                    f"reference_tendon_{seconds:.3f}s[{self.base_env.action_dim}]"
+                    for seconds in self.sensor_observation_cfg.gait_lookahead_seconds
+                ),
+            ],
         }
 
     def _bind_sensor_tensors(self) -> None:
@@ -229,7 +492,7 @@ class SensorHistoryEnv:
         """Return simulator-only targets for estimator and asymmetric critic.
 
         These values never enter ``observe`` or the exported actor.  The GRU
-        must reconstruct them from causal IMU and tendon-length feedback.
+        must reconstruct them from causal IMU, tendon-length and action history.
         """
 
         if self.is_torch_env:
@@ -239,7 +502,16 @@ class SensorHistoryEnv:
                 1.0,
             )
             contacts = self.base_env._foot_contacts()
-            return torch.cat((velocity, contacts, self._terrain_context()), dim=1)
+            joint_velocity = torch.clamp(
+                self.base_env.qvel[:, self.base_env.robot_qvel_adrs]
+                / JOINT_VELOCITY_NORMALIZER,
+                -1.0,
+                1.0,
+            )
+            return torch.cat(
+                (velocity, contacts, joint_velocity, self._terrain_context()),
+                dim=1,
+            )
 
         velocity = np.stack(
             [np.asarray(data.qvel[:3], dtype=np.float32) for data in self.base_env.datas],
@@ -254,8 +526,23 @@ class SensorHistoryEnv:
             [self.base_env._foot_contacts(data) for data in self.base_env.datas],
             axis=0,
         )
+        joint_velocity = np.stack(
+            [
+                np.asarray(
+                    data.qvel[self.base_env.motion.robot_qvel_adrs],
+                    dtype=np.float32,
+                )
+                for data in self.base_env.datas
+            ],
+            axis=0,
+        )
+        joint_velocity = np.clip(
+            joint_velocity / JOINT_VELOCITY_NORMALIZER,
+            -1.0,
+            1.0,
+        ).astype(np.float32)
         return np.concatenate(
-            (velocity, contacts, self._terrain_context()),
+            (velocity, contacts, joint_velocity, self._terrain_context()),
             axis=1,
         ).astype(np.float32)
 
@@ -269,17 +556,22 @@ class SensorHistoryEnv:
             imu = self._sensordata[:, self._imu_addresses] / self._imu_divisors
             tendon = self.base_env.ten_length[:, self.base_env.actuator_tendon_ids]
             tendon = (tendon - self.base_env.ctrl_mid) / self.base_env.ctrl_half_range
-            frame = torch.cat((imu, tendon), dim=1)
-            frame = torch.nan_to_num(frame, nan=0.0, posinf=20.0, neginf=-20.0)
+            sensor = torch.cat((imu, tendon), dim=1)
+            sensor = torch.nan_to_num(sensor, nan=0.0, posinf=20.0, neginf=-20.0)
             if self.base_env.domain_randomization and self.base_env.cfg.obs_noise_std > 0.0:
                 noise_std = (
                     self.base_env.domain_randomization_scale * float(self.base_env.cfg.obs_noise_std)
                 )
-                frame = frame + noise_std * torch.randn_like(frame)
-            return torch.clamp(
-                frame,
+                sensor = sensor + noise_std * torch.randn_like(sensor)
+            sensor = torch.clamp(
+                sensor,
                 -self.sensor_observation_cfg.observation_clip,
                 self.sensor_observation_cfg.observation_clip,
+            )
+            previous_action = torch.clamp(self.base_env.last_action, -1.0, 1.0)
+            return torch.cat(
+                (sensor, previous_action, self._gait_command_frame()),
+                dim=1,
             )
 
         imu = np.stack(
@@ -295,19 +587,118 @@ class SensorHistoryEnv:
             axis=0,
         )
         tendon = (tendon - self.base_env.ctrl_mid[None, :]) / self.base_env.ctrl_half_range[None, :]
-        frame = np.concatenate((imu, tendon), axis=1).astype(np.float32)
-        frame = np.nan_to_num(frame, nan=0.0, posinf=20.0, neginf=-20.0)
+        sensor = np.concatenate((imu, tendon), axis=1).astype(np.float32)
+        sensor = np.nan_to_num(sensor, nan=0.0, posinf=20.0, neginf=-20.0)
         if self.base_env.domain_randomization and self.base_env.cfg.obs_noise_std > 0.0:
-            frame += self.base_env.rng.normal(
+            sensor += self.base_env.rng.normal(
                 0.0,
                 self.base_env.domain_randomization_scale * float(self.base_env.cfg.obs_noise_std),
-                size=frame.shape,
+                size=sensor.shape,
             ).astype(np.float32)
-        return np.clip(
-            frame,
+        sensor = np.clip(
+            sensor,
             -self.sensor_observation_cfg.observation_clip,
             self.sensor_observation_cfg.observation_clip,
         ).astype(np.float32)
+        previous_action = np.clip(
+            np.asarray(self.base_env.last_action, dtype=np.float32),
+            -1.0,
+            1.0,
+        )
+        return np.concatenate(
+            (sensor, previous_action, self._gait_command_frame()),
+            axis=1,
+        ).astype(np.float32)
+
+    def _gait_command_frame(self) -> np.ndarray | torch.Tensor:
+        """Return clock, smooth-start and reference-tendon commands."""
+
+        if not self.sensor_observation_cfg.gait_command_enabled:
+            if self.is_torch_env:
+                return torch.empty(
+                    (self.num_envs, 0),
+                    dtype=torch.float32,
+                    device=self.base_env.device,
+                )
+            return np.empty((self.num_envs, 0), dtype=np.float32)
+
+        lookaheads = self.sensor_observation_cfg.gait_lookahead_seconds
+        velocity_normalizer = float(
+            self.sensor_observation_cfg.target_velocity_normalizer
+        )
+        if self.is_torch_env:
+            phase = self.base_env.motion_phase
+            motion_ids = self.base_env.motion_ids
+            frame_count = self.base_env.motion_frame_counts[motion_ids].to(torch.float32)
+            frequency = self.base_env.motion_frequencies[motion_ids]
+            progress = self.base_env._stand_start_progress()
+            angle = 2.0 * torch.pi * phase / frame_count.clamp_min(1.0)
+            if self.base_env.cfg.use_reference_velocity:
+                velocity = self.base_env._targets_at_phase(
+                    phase, motion_ids
+                )["root_lin_vel"][:, 0] * progress
+            else:
+                velocity = float(self.base_env.cfg.target_velocity) * progress
+            scalar = torch.stack(
+                (
+                    torch.sin(angle),
+                    torch.cos(angle),
+                    progress,
+                    velocity / velocity_normalizer,
+                ),
+                dim=1,
+            )
+            stand = self.base_env.stand_tendon_ctrl.expand(self.num_envs, -1)
+            tendon_targets = []
+            for seconds in lookaheads:
+                future_phase = phase + frequency * float(seconds) * progress
+                walk = self.base_env._targets_at_phase(
+                    future_phase, motion_ids
+                )["tendon_ctrl"]
+                blended = (1.0 - progress[:, None]) * stand + progress[:, None] * walk
+                tendon_targets.append(self.base_env.ctrl_to_action(blended))
+            return torch.cat((scalar, *tendon_targets), dim=1)
+
+        phase = np.asarray(self.base_env.motion_phase, dtype=np.float32)
+        motion_ids = np.asarray(self.base_env.motion_ids, dtype=np.int32)
+        progress = np.asarray(self.base_env._stand_start_progress(), dtype=np.float32)
+        if isinstance(self.base_motion, MotionLibrary):
+            frame_count = np.asarray(self.base_motion.frame_counts, dtype=np.float32)[motion_ids]
+            frequency = np.asarray(self.base_motion.frequencies, dtype=np.float32)[motion_ids]
+
+            def targets_at(value: np.ndarray):
+                return self.base_motion.targets_at_phase(value, motion_ids)
+        else:
+            frame_count = np.full(self.num_envs, self.base_motion.frame_count, dtype=np.float32)
+            frequency = np.full(self.num_envs, self.base_motion.frequency, dtype=np.float32)
+
+            def targets_at(value: np.ndarray):
+                return self.base_motion.targets_at_phase(value)
+
+        current = targets_at(phase)
+        velocity = (
+            current.root_lin_vel[:, 0] * progress
+            if self.base_env.cfg.use_reference_velocity
+            else float(self.base_env.cfg.target_velocity) * progress
+        )
+        stand = np.repeat(
+            np.asarray(self.base_env.stand_tendon_ctrl, dtype=np.float32),
+            self.num_envs,
+            axis=0,
+        )
+        tendon_targets = []
+        for seconds in lookaheads:
+            future_phase = phase + frequency * float(seconds) * progress
+            walk = targets_at(future_phase).tendon_ctrl
+            blended = (1.0 - progress[:, None]) * stand + progress[:, None] * walk
+            tendon_targets.append(self.base_env.ctrl_to_action(blended))
+        return assemble_gait_command(
+            phase=phase,
+            frame_count=frame_count,
+            progress=progress,
+            target_velocity=velocity / velocity_normalizer,
+            reference_tendon_targets=tendon_targets,
+        )
 
     def _current_amp_frame(self) -> np.ndarray | torch.Tensor:
         return self.base_env.amp_observe()
@@ -389,6 +780,28 @@ class SensorHistoryEnv:
 
     def step(self, action: np.ndarray | torch.Tensor):
         _base_obs, reward, done, info = self.base_env.step(action)
+        if bool(getattr(self.base_env.cfg, "sensor_stability_reward", False)):
+            reward = sensor_stability_task_reward(
+                info,
+                fall_penalty=float(self.base_env.cfg.sensor_fall_penalty),
+                stall_penalty=float(self.base_env.cfg.forward_progress_termination_penalty),
+                knee_gait_reward_coef=float(
+                    self.base_env.cfg.sensor_knee_gait_reward_coef
+                ),
+                natural_gait_reward_coef=float(
+                    self.base_env.cfg.sensor_natural_gait_reward_coef
+                ),
+                mirror_reward_coef=float(self.base_env.cfg.sensor_mirror_reward_coef),
+                stride_reward_coef=float(self.base_env.cfg.sensor_stride_reward_coef),
+                foot_roll_reward_coef=float(self.base_env.cfg.sensor_foot_roll_reward_coef),
+                alternation_reward_coef=float(self.base_env.cfg.sensor_alternation_reward_coef),
+                hop_penalty_coef=float(self.base_env.cfg.sensor_hop_penalty_coef),
+                tiptoe_penalty_coef=float(self.base_env.cfg.sensor_tiptoe_penalty_coef),
+                stance_slip_penalty_coef=float(self.base_env.cfg.sensor_stance_slip_penalty_coef),
+                sync_forward_penalty_coef=float(self.base_env.cfg.sensor_sync_forward_penalty_coef),
+                velocity_excess_penalty_coef=float(self.base_env.cfg.sensor_velocity_excess_penalty_coef),
+            )
+            info["sensor_stability_reward"] = reward
         self._append_history()
         if self.is_torch_env:
             # Boolean indexing stays on device and avoids a second CUDA sync
