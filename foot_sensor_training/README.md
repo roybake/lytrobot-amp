@@ -21,10 +21,22 @@ uv run python foot_sensor_training/train_stage1.py --device cuda --sim-backend w
 uv run python foot_sensor_training/train_phase_force_stage1.py --device cuda --sim-backend warp
 
 # 正式严格足底力 ablation：两者均为 CUDA + Warp + AMP + 96-step BPTT
-uv run python foot_sensor_training/train_phase_no_force_stage1.py --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
-uv run python foot_sensor_training/train_phase_stage1.py --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
-uv run python foot_sensor_training/train_phase_force_stage1.py --device cuda --sim-backend warp --num-envs 1024 --num-steps 96
+# 58D
+uv run python foot_sensor_training/train_phase_no_force_stage1.py \
+  --device cuda \
+  --sim-backend warp \
+  --num-envs 1024 \
+  --num-steps 96
+
+# 64D
+uv run python foot_sensor_training/train_phase_force_stage1.py \
+  --device cuda \
+  --sim-backend warp \
+  --num-envs 1024 \
+  --num-steps 96
 ```
+
+`train_phase_stage1.py` 是 58D 的旧兼容入口，不是第三种 phase 实验。
 
 6 路足力顺序固定为 left heel/forefoot medial/forefoot lateral，再到对应 right 三路。CPU 使用 `mj_contactForce`，Warp 使用 `mujoco_warp.contact_force`。传感器 dynamics 每个 policy tick 只更新一次，observation/logging 只读缓存；autoreset 按 env 清 filter/delay。`delay_steps=N` 的精确定义为 `output_t=filtered_(t-N)`。
 

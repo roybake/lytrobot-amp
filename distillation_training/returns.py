@@ -29,12 +29,19 @@ def compute_gae_with_time_limit_bootstrap(
         next_values = torch.where(
             time_outs[step] > 0.0, timeout_bootstrap_values[step], next_values
         )
-        terminal = torch.clamp(dones[step] - time_outs[step], min=0.0, max=1.0)
-        next_non_terminal = 1.0 - terminal
-        delta = rewards[step] + float(gamma) * next_values * next_non_terminal - values[step]
+        true_terminal = torch.clamp(
+            dones[step] - time_outs[step], min=0.0, max=1.0
+        )
+        bootstrap_mask = 1.0 - true_terminal
+        trace_mask = 1.0 - torch.clamp(dones[step], min=0.0, max=1.0)
+        delta = (
+            rewards[step]
+            + float(gamma) * next_values * bootstrap_mask
+            - values[step]
+        )
         last_gae = (
             delta
-            + float(gamma) * float(gae_lambda) * next_non_terminal * last_gae
+            + float(gamma) * float(gae_lambda) * trace_mask * last_gae
         )
         advantages[step] = last_gae
     return advantages, advantages + values
