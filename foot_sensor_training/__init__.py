@@ -1,1 +1,1 @@
-"""Independent 62D IMU+tendon+plantar-force walking experiment."""
+"""Independent 56/58/62/64D force and deployable-phase ablations."""

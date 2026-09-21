@@ -1,8 +1,8 @@
-"""62D physical frame plus training-only, interpretable 20D privileged target."""
+"""64D deployable frame plus training-only, interpretable 20D target."""
 import torch, numpy as np
-from foot_sensor_training.envs import FootForceEnv,FootForceCpuAmpEnv,FootForceWarpAmpEnv
+from foot_sensor_training.envs import PhaseFootForceEnv
 from .config import PRIVILEGED_FIELDS
-class DistillationEnv(FootForceEnv):
+class DistillationEnv(PhaseFootForceEnv):
     @property
     def privileged_schema(self): return {"fields":PRIVILEGED_FIELDS,"dim":20,"actor_input":False,"reference_fields":False}
     def privileged_vector(self):

@@ -15,7 +15,7 @@ def main():
  for parameter in teacher_actor.parameters():parameter.requires_grad=False
  estimator=HistoryEstimator().to(device);estimator.load_state_dict(student['history_estimator']);critic=TeacherCritic().to(device);optimizer=torch.optim.Adam([actor.log_std,*estimator.parameters(),*critic.parameters()],lr=a.learning_rate);env,cfg=make_env(a);obs=tensor(env.reset(),device);n=a.num_envs;pa=torch.zeros(n,14,device=device);pt=obs[:,42:56].clone();start=torch.ones(n,device=device);hidden=torch.zeros(n,128,device=device);global_step=0
  for iteration in range(1,a.max_iterations+1):
-  rows=[]
+  rows=[];initial_hidden=hidden.detach().clone()
   for _ in range(a.num_steps):
    truth=tensor(env.privileged_vector(),device)
    with torch.no_grad():
@@ -25,10 +25,10 @@ def main():
   adv=[];gae=torch.zeros(n,device=device)
   for r in reversed(rows):
    delta=r[9]+.99*(1-r[10])*next_value-r[8];gae=delta+.99*.95*(1-r[10])*gae;adv.append(gae);next_value=r[8]
-  adv=torch.stack(list(reversed(adv)));ret=adv+torch.stack([r[8] for r in rows]);adv=(adv-adv.mean())/(adv.std()+1e-8);h=torch.zeros(n,128,device=device);logps=[];values=[];aux=[]
+  adv=torch.stack(list(reversed(adv)));ret=adv+torch.stack([r[8] for r in rows]);adv=(adv-adv.mean())/(adv.std()+1e-8);h=initial_hidden;logps=[];values=[];aux=[]
   anneal=max(0.,1.-iteration/max(a.max_iterations,1))
   for t,r in enumerate(rows):
    losses=distillation_losses(actor,estimator,r[0],r[1],r[2],h,r[4],r[5],r[3],a.lambda_p*anneal,a.lambda_kl*anneal);h=losses['hidden'];logps.append(actor.distribution(r[0],losses['predicted']).log_prob(r[6]).sum(-1));values.append(critic(r[0],r[4])[0]);aux.append(losses['loss'])
   new=torch.stack(logps);old=torch.stack([r[7] for r in rows]);ratio=(new-old).exp();policy=-torch.minimum(ratio*adv,ratio.clamp(.8,1.2)*adv).mean();value_loss=.5*(torch.stack(values)-ret).square().mean();loss=policy+value_loss+torch.stack(aux).mean();optimizer.zero_grad();loss.backward();grad=float(torch.nn.utils.clip_grad_norm_([*actor.parameters(),*estimator.parameters(),*critic.parameters()],1));optimizer.step();hidden=hidden.detach();print(f'[student-rl] iter={iteration} loss={loss.item():.6f} auxiliary_scale={anneal:.4f}')
- out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),'critic':critic.state_dict(),'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env),'privileged_schema':{'fields':list(PRIVILEGED_FIELDS),'dim':20},'iteration':a.max_iterations,'global_step':global_step,'bptt_steps':a.num_steps,'gradient_norm':grad},out);env.close();print(out.resolve());return out
+ out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),'critic':critic.state_dict(),'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env),'privileged_schema':{'fields':list(PRIVILEGED_FIELDS),'dim':20},'iteration':a.max_iterations,'global_step':global_step,'bptt_steps':a.num_steps,'recurrent_sequence_update':True,'rollout_initial_hidden_saved':True,'rl_finetune_stage':'A','frozen_modules':['sensor_encoder','privileged_encoder','actor_head'],'trainable_modules':['history_estimator','critic','log_std'],'gradient_norm':grad},out);env.close();print(out.resolve());return out
 if __name__=='__main__':main()

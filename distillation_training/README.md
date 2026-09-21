@@ -1,36 +1,18 @@
-# 足底力 Teacher → Student 蒸馏
+# 64D phase-enabled Teacher → Student 蒸馏
 
-Teacher actor：62D 物理传感器帧加训练期 20D 可解释向量：body root linear velocity (3)、projected gravity (3)、true tendon rate (14)。不包含 phase/reference/qpos/qvel/contact。Teacher 与 Student 都固定 `reference_ctrl_blend=0.0`。
+Teacher 与 Student 看到相同的 64D 部署输入：`IMU 42 + tendon 14 + foot force 6 + phase sin/cos 2`。Teacher 额外得到训练期 20D truth：body root linear velocity 3、projected gravity 3、true tendon velocity 14。phase 是 controller-known input，既不放进 privileged target，也不由 estimator 蒸馏。
 
-共享模块为 `SensorEncoder`、`PrivilegedEncoder`、`ActorHead`；Student 只训练 `HistoryEstimator`，输入 `sensor(62)+previous action(14)+causal tendon velocity(14)=90D`，GRU hidden 为 128。导出输入为 `observation(62), previous_action(14), recurrent_state(142), episode_start`，没有特权输入。
+Student estimator 输入为 `sensor 64 + previous action 14 + causal tendon velocity 14 = 92D`，GRU hidden 保持 128D。部署 recurrent state 仍为 `hidden 128 + previous tendon 14 = 142D`；phase 由外部 `DeployablePhaseClock` 维护。BC/DAgger/RL 默认完整 96-step BPTT，沿 env 维采样，不 flatten 时间维。
 
 ```bash
 uv run python distillation_training/train_teacher.py
-uv run python distillation_training/train_student_bc.py --teacher-checkpoint <path>
-uv run python distillation_training/train_student_dagger.py --teacher-checkpoint <path> --student-checkpoint <path>
-uv run python distillation_training/train_student_rl.py --teacher-checkpoint <path> --student-checkpoint <path>
-uv run python distillation_training/play.py --checkpoint <path>
-uv run python distillation_training/play.py --checkpoint <path> --teacher-checkpoint <teacher.pt> --oracle-privileged
+uv run python distillation_training/train_student_bc.py --teacher-checkpoint <teacher.pt> --num-envs 1024 --num-steps 96
+uv run python distillation_training/train_student_dagger.py --teacher-checkpoint <teacher.pt> --student-checkpoint <student_bc.pt> --num-envs 1024 --num-steps 96
+uv run python distillation_training/train_student_rl.py --teacher-checkpoint <teacher.pt> --student-checkpoint <student_dagger.pt> --num-envs 1024 --num-steps 96
+uv run python distillation_training/play.py --checkpoint <student_rl.pt> --teacher-checkpoint <teacher.pt> --oracle-privileged
+uv run python distillation_training/play.py --checkpoint <student_rl.pt> --export-onnx student.onnx
 ```
 
-Student BC、DAgger、RL 默认均为 `--num-envs 1024 --num-steps 96`，优化器以完整 environment sequence 做 0.96 s truncated BPTT，不把 timestep flatten。GPU/Warp 是默认执行路径；CPU 仅用于 CPU force 验收或显式 smoke 回退。
+Student RL stage A 只训练 HistoryEstimator、critic 与 `log_std`，冻结 SensorEncoder、PrivilegedEncoder、ActorHead。rollout 起点的非零 hidden 会被 detach/clone 保存，并用作 PPO sequence replay 的初始状态。导出的 ONNX 输入严格为 `observation(64), previous_action(14), recurrent_state(142), episode_start`，metadata 包含 64/92/128/142 schema 和完整 phase clock 参数。
 
-## 推荐：自动编排
-
-Teacher 训练完成并通过单独评估后，以下命令自动顺序执行 BC、DAgger、RL；每一阶段的路径会写入 `pipeline.json`，便于恢复和审计：
-
-```bash
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint logs/distillation/teacher/<run>/teacher.pt \
-  --run-dir logs/distillation/<run>
-```
-
-若 BC validation 的 reconstruction MAE / action MSE / KL 不达标，请停止在 BC 阶段检查可观测性，不要继续 DAgger：
-
-```bash
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint <teacher.pt> \
-  --run-dir logs/distillation/<run> --skip-dagger --skip-rl
-```
-
-BC/DAgger 使用 `SmoothL1(p_hat,p) + Gaussian-KL(teacher,student)` 并记录 reconstruction MAE/action MSE/KL。DAgger 以 student 控制状态、teacher 仅生成标签，replay 有上限；RL 后期退火两个蒸馏系数。
+默认 task reward 为 phase-independent sensor stability reward，AMP 仍使用 `robot/reference_data/walk1_mjcf.npz` 提供自然步态先验。

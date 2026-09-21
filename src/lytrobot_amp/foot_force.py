@@ -22,6 +22,22 @@ class FootForceSensorConfig:
     delay_steps: int = 0
     distribution_sigma: float = 0.035
 
+    def __post_init__(self) -> None:
+        if self.force_clip <= 0:
+            raise ValueError("force_clip must be positive")
+        if self.noise_std < 0:
+            raise ValueError("noise_std must be non-negative")
+        if not 0 <= self.gain_randomization < 1:
+            raise ValueError("gain_randomization must be in [0, 1)")
+        if self.bias_randomization < 0:
+            raise ValueError("bias_randomization must be non-negative")
+        if not 0 < self.lowpass_alpha <= 1:
+            raise ValueError("lowpass_alpha must be in (0, 1]")
+        if not isinstance(self.delay_steps, int) or self.delay_steps < 0:
+            raise ValueError("delay_steps must be a non-negative integer")
+        if self.distribution_sigma <= 0:
+            raise ValueError("distribution_sigma must be positive")
+
     def metadata(self) -> dict:
         return {"sensor_version": "virtual-plantar-force-v1", "names": FOOT_FORCE_NAMES,
                 "channel_order": list(FOOT_FORCE_NAMES), "normalization":
@@ -117,31 +133,63 @@ class FootForceSensorDynamics:
                  torch_device=None):
         self.num_envs, self.config = int(num_envs), config
         self.rng = np.random.default_rng(seed)
-        gain = self.rng.uniform(1.0-config.gain_randomization,
-                                1.0+config.gain_randomization, (num_envs, 6)).astype(np.float32)
-        bias = self.rng.uniform(-config.bias_randomization,
-                                config.bias_randomization, (num_envs, 6)).astype(np.float32)
         self._torch = torch_device is not None
+        self._torch_device = torch_device
+        gain, bias = self._sample_calibration(self.num_envs)
         if self._torch:
             import torch
             self.gain = torch.as_tensor(gain, device=torch_device)
             self.bias = torch.as_tensor(bias, device=torch_device)
             self.filtered = torch.zeros((num_envs, 6), device=torch_device)
             self.delay = torch.zeros((num_envs, config.delay_steps + 1, 6), device=torch_device)
+            self.cursor = torch.zeros(num_envs, dtype=torch.long, device=torch_device)
         else:
             self.gain, self.bias = gain, bias
             self.filtered = np.zeros((num_envs, 6), np.float32)
             self.delay = np.zeros((num_envs, config.delay_steps + 1, 6), np.float32)
-        self.cursor = 0
+            self.cursor = np.zeros(num_envs, dtype=np.int64)
+
+    def _sample_calibration(self, count):
+        cfg = self.config
+        gain = self.rng.uniform(
+            1.0-cfg.gain_randomization, 1.0+cfg.gain_randomization, (count, 6)
+        ).astype(np.float32)
+        bias = self.rng.uniform(
+            -cfg.bias_randomization, cfg.bias_randomization, (count, 6)
+        ).astype(np.float32)
+        return gain, bias
+
+    def _ids(self, env_ids=None):
+        if env_ids is None:
+            if self._torch:
+                import torch
+                return torch.arange(self.num_envs, device=self._torch_device)
+            return np.arange(self.num_envs, dtype=np.int64)
+        if self._torch:
+            import torch
+            return env_ids if torch.is_tensor(env_ids) else torch.as_tensor(
+                env_ids, dtype=torch.long, device=self._torch_device
+            )
+        return np.asarray(env_ids, dtype=np.int64)
 
     def reset(self, env_ids=None):
-        ids = slice(None) if env_ids is None else env_ids
+        ids = self._ids(env_ids)
         self.filtered[ids] = 0
         self.delay[ids] = 0
+        self.cursor[ids] = 0
+        gain, bias = self._sample_calibration(len(ids))
+        if self._torch:
+            import torch
+            self.gain[ids] = torch.as_tensor(gain, device=self._torch_device)
+            self.bias[ids] = torch.as_tensor(bias, device=self._torch_device)
+        else:
+            self.gain[ids] = gain
+            self.bias[ids] = bias
 
-    def apply(self, force):
+    def apply(self, force, env_ids=None):
         cfg = self.config
-        value = force * self.gain + self.bias
+        ids = self._ids(env_ids)
+        value = force * self.gain[ids] + self.bias[ids]
         if cfg.noise_std:
             if self._torch:
                 import torch
@@ -149,9 +197,13 @@ class FootForceSensorDynamics:
             else:
                 value = value + self.rng.normal(0, cfg.noise_std, value.shape).astype(np.float32)
         value = value.clip(min=0) if self._torch else np.clip(value, 0, None)
-        self.filtered = cfg.lowpass_alpha * value + (1.0-cfg.lowpass_alpha) * self.filtered
-        self.delay[:, self.cursor] = self.filtered
-        read = (self.cursor + 1) % self.delay.shape[1]
-        result = self.delay[:, read].clone() if self._torch else self.delay[:, read].copy()
-        self.cursor = read
+        self.filtered[ids] = (
+            cfg.lowpass_alpha * value + (1.0-cfg.lowpass_alpha) * self.filtered[ids]
+        )
+        cursor = self.cursor[ids]
+        self.delay[ids, cursor] = self.filtered[ids]
+        read = (cursor + 1) % self.delay.shape[1]
+        result = self.delay[ids, read]
+        result = result.clone() if self._torch else result.copy()
+        self.cursor[ids] = read
         return result

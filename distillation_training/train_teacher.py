@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real 62D+20D asymmetric teacher PPO trainer."""
+"""Real 64D deployable-sensor + 20D asymmetric teacher PPO trainer."""
 from pathlib import Path
 import sys
 root=Path(__file__).resolve().parents[1]
