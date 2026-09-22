@@ -172,16 +172,22 @@ class FootForceEnv(SensorHistoryEnv):
             done_ids=torch.nonzero(done>0,as_tuple=False).flatten()
         else:
             done_ids=np.nonzero(np.asarray(done)>0)[0].astype(np.int64)
-        if not self._force_updated_this_tick:
-            self._update_foot_force_sensor()
         if len(done_ids)>0:
-            # The base environment has already autoreset these worlds.  Clear
-            # only their stateful sensor components.  Do not advance dynamics
-            # a second time in the same policy tick.
+            # The base environment has already autoreset these worlds.  Reset
+            # their stateful sensor components before sampling the new physical
+            # state, so the first observation is standing contact rather than
+            # an artificial all-zero flight frame.
             self.force_dynamics.reset(done_ids)
-            self._force_sensor_output[done_ids]=0
-            self._last_force_raw[done_ids]=0
-            self._last_force_normalized[done_ids]=0
+        if not self._force_updated_this_tick:
+            # Normal path: advance every world exactly once.  Reset worlds use
+            # fresh dynamics and their post-autoreset physical state.
+            self._update_foot_force_sensor()
+        elif len(done_ids)>0:
+            # A timeout requested a pre-reset terminal observation, which has
+            # already advanced the old episode's sensor frame.  Seed only the
+            # newly reset episodes from their new physical state; normal worlds
+            # must not advance twice in this policy tick.
+            self._update_foot_force_sensor(done_ids)
         self._append_history()
         if len(done_ids)>0:self._fill_history(done_ids)
         force=self._last_force_normalized

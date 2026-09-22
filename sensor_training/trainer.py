@@ -321,6 +321,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         completed_reward_values = torch.zeros_like(rewards)
         completed_length_values = torch.zeros_like(rewards)
         episode_progress_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        termination_episode_step_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        termination_episode_step_count = torch.zeros((), dtype=torch.float32, device=self.device)
+        termination_episode_step_min = torch.full((), torch.inf, dtype=torch.float32, device=self.device)
+        termination_episode_step_max = torch.zeros((), dtype=torch.float32, device=self.device)
         nonfinite_task_reward_count = torch.zeros((), dtype=torch.float32, device=self.device)
         reward_component_keys: tuple[str, ...] = ()
         reward_component_sums: torch.Tensor | None = None
@@ -413,6 +417,26 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             done = torch.maximum(done, invalid_task_reward.to(done.dtype))
             time_out = self._as_device_tensor(
                 info.get("time_outs", np.zeros(num_envs, dtype=np.float32))
+            )
+            real_termination = (done > 0.0) & (time_out <= 0.0)
+            termination_steps = episode_step.to(torch.float32)
+            termination_episode_step_sum += torch.where(
+                real_termination, termination_steps, torch.zeros_like(termination_steps)
+            ).sum()
+            termination_episode_step_count += real_termination.sum()
+            termination_episode_step_min = torch.minimum(
+                termination_episode_step_min,
+                torch.where(
+                    real_termination,
+                    termination_steps,
+                    torch.full_like(termination_steps, torch.inf),
+                ).min(),
+            )
+            termination_episode_step_max = torch.maximum(
+                termination_episode_step_max,
+                torch.where(
+                    real_termination, termination_steps, torch.zeros_like(termination_steps)
+                ).max(),
             )
             success = self._as_device_tensor(info.get("successes", time_out))
             amp_reward = torch.nan_to_num(amp_reward, nan=0.0, posinf=0.0, neginf=0.0)
@@ -543,16 +567,37 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         if reward_component_sums is None:
             reward_component_sums = torch.zeros(0, dtype=torch.float32, device=self.device)
         component_means = reward_component_sums / max(num_steps * num_envs, 1)
+        has_termination = termination_episode_step_count > 0.0
+        termination_episode_step_mean = torch.where(
+            has_termination,
+            termination_episode_step_sum / termination_episode_step_count.clamp_min(1.0),
+            torch.zeros_like(termination_episode_step_sum),
+        )
+        termination_episode_step_min = torch.where(
+            has_termination,
+            termination_episode_step_min,
+            torch.zeros_like(termination_episode_step_min),
+        )
         summary_components = torch.cat(
             (
                 component_means,
                 (episode_progress_sum / max(num_steps * num_envs, 1)).reshape(1),
+                torch.stack((
+                    termination_episode_step_mean,
+                    termination_episode_step_min,
+                    termination_episode_step_max,
+                )),
             )
         )
         component_values = summary_components.detach().cpu().tolist()
         reward_components = {
             key: float(component_values[index])
             for index, key in enumerate(reward_component_keys)
+        }
+        self._last_termination_episode_step_metrics = {
+            "termination_episode_step_mean": float(component_values[-3]),
+            "termination_episode_step_min": float(component_values[-2]),
+            "termination_episode_step_max": float(component_values[-1]),
         }
         # This runs once per rollout after the existing summary transfer, so
         # force acceptance checks add no per-policy-tick CUDA synchronization.
@@ -585,10 +630,15 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "privileged_contexts": privileged_contexts,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
-            "episode_progress": float(component_values[-1]),
+            "episode_progress": float(component_values[-4]),
             "reward_components": reward_components,
             "nonfinite_task_reward_count": nonfinite_task_reward_count,
         }
+
+    def train_iteration(self) -> dict[str, float]:
+        metrics = super().train_iteration()
+        metrics.update(getattr(self, "_last_termination_episode_step_metrics", {}))
+        return metrics
 
     def _actor_auxiliary_loss(
         self,

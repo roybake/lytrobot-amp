@@ -759,6 +759,8 @@ def _setup_wandb_metrics() -> None:
         "rollout_episode_length",
         "mean_episode_progress", "done_fraction",
         "timeout_fraction", "termination_fraction",
+        "termination_episode_step_mean", "termination_episode_step_min",
+        "termination_episode_step_max",
         "episode_success_rate", "mean_episode_success_rate", "rollout_episode_success_rate",
         "completed_episode_count", "successful_episode_count",
         "bottom_depth_success_rate",
