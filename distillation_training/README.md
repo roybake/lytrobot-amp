@@ -13,6 +13,8 @@ Teacher 的 training-only privileged vector 对两条路线完全相同：body-f
 
 Teacher 和 Student RL 共用 `AMPTrainingModule`、expert motion、AMP reward、discriminator、gradient penalty 和 optimizer。AMP feature 只用于 discriminator/reward，不进入 actor observation 或 ONNX。Student RL 优先恢复 Student checkpoint 中的 discriminator，否则使用 Teacher checkpoint；默认继续训练，`--freeze-amp-discriminator` 仅供诊断。
 
+正式任务默认使用 `--task-reward-mode stage1_reference`、`walk1_omniretarget.npz` 和 `target_velocity=0.87`。该模式直接透传基础环境现有 Stage1 reference-conditioned reward，不在 sensor wrapper 中复制公式；`--task-reward-mode sensor_stability` 仅保留为显式消融。两种模式都保持 `reference_ctrl_blend=0.0`，reference tendon 只能作为 reward target，不能进入 Actor 或控制前馈。
+
 ## 正式命令
 
 Teacher 显式选择 variant；BC、DAgger、Student RL 从 checkpoint 自动继承并验证 variant，禁止 silent mismatch。

@@ -33,7 +33,7 @@ def main() -> None:
     if not teacher.is_file(): p.error(f'teacher checkpoint does not exist: {teacher}')
     out=(ROOT/a.run_dir).resolve(); out.mkdir(parents=True,exist_ok=True)
     bc=out/'student_bc.pt'; dagger=out/'student_dagger.pt'; final=out/'student_rl.pt'
-    teacher_payload=validate_checkpoint(teacher,'teacher');variant=checkpoint_variant(teacher_payload,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--no-wandb']
+    teacher_payload=validate_checkpoint(teacher,'teacher');variant=checkpoint_variant(teacher_payload,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--task-reward-mode',teacher_payload['task_reward_mode'],'--motion-file',teacher_payload['motion_file'],'--target-velocity',str(teacher_payload['target_velocity']),'--no-wandb']
     manual=a.max_validation_action_mse is not None and a.max_validation_kl is not None
     relative=a.max_validation_normalized_action_mse is not None
     if not (manual or relative):p.error('automatic pipeline requires explicit BC manual thresholds or --max-validation-normalized-action-mse')

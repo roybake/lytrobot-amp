@@ -65,10 +65,12 @@ def config_from_args(args) -> AMPConfig:
 class AMPTrainingModule:
     """The one AMP implementation used by both feed-forward training stages."""
 
-    def __init__(self, feature_dim: int, device, config: AMPConfig) -> None:
+    def __init__(self, feature_dim: int, device, config: AMPConfig,
+                 reference_motion: str | None = None) -> None:
         self.device = torch.device(device)
         self.feature_dim = int(feature_dim)
         self.config = config
+        self.reference_motion = reference_motion
         self.discriminator = AmpDiscriminator(self.feature_dim).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.discriminator.parameters(), lr=config.discriminator_learning_rate
@@ -81,7 +83,7 @@ class AMPTrainingModule:
             "feature_dim": self.feature_dim,
             "actor_input": False,
             "training_only": True,
-            "reference_motion": "robot/reference_data/walk1_mjcf.npz",
+            "reference_motion": self.reference_motion,
             "gradient_penalty": "mean(sum(grad(D(x))**2))",
         }
 

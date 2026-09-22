@@ -13,6 +13,7 @@ from .env import (
     LytRobotEnvCfg,
     _stair_root_height_transform,
     scaled_randomization_range,
+    sensor_stability_reward_enabled,
 )
 from .gait_constraints import natural_gait_bonus, sensor_gait_scores
 from .mimickit_deepmimic import deepmimic_reward
@@ -1869,7 +1870,7 @@ class LytRobotWarpAmpEnv:
             if self.cfg.use_reference_velocity
             else float(self.cfg.target_velocity) * phase_scale
         )
-        sensor_reward_fast_path = bool(self.cfg.sensor_stability_reward)
+        sensor_reward_fast_path = sensor_stability_reward_enabled(self.cfg)
         if sensor_reward_fast_path:
             # SensorHistoryEnv replaces the reference-tracking reward.  Skip
             # pose, foot, contact and symmetry terms that it would discard.

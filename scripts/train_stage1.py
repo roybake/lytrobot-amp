@@ -32,6 +32,7 @@ if __name__ == "__main__":
     # knee gait, so it must not be used as a natural-walking teacher.
     stage1_defaults = {
         "--num-envs": "4096",
+        "--task-reward-mode": "stage1_reference",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
         "--target-velocity": "0.87",
         "--symmetry-reward-coef": "1.2",

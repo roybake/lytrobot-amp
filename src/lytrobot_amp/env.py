@@ -173,6 +173,15 @@ def scaled_randomization_range(
     )
 
 
+def sensor_stability_reward_enabled(cfg: "LytRobotEnvCfg") -> bool:
+    mode = getattr(cfg, "task_reward_mode", None)
+    if mode is None:
+        return bool(cfg.sensor_stability_reward)
+    if mode not in ("stage1_reference", "sensor_stability"):
+        raise ValueError(f"unknown task_reward_mode: {mode!r}")
+    return mode == "sensor_stability"
+
+
 @dataclass
 class LytRobotEnvCfg:
     model_xml: str = "robot/MJCFmodelposition.xml"
@@ -263,6 +272,9 @@ class LytRobotEnvCfg:
     # full-state imitation reward.  Enable a phase-independent task reward in
     # the sensor wrapper instead of asking the deployable actor to optimize an
     # unobserved target.
+    # Explicit selector used by new training paths.  ``None`` preserves the
+    # legacy boolean for old configs/checkpoints only.
+    task_reward_mode: str | None = None
     sensor_stability_reward: bool = False
     sensor_fall_penalty: float = 25.0
     # Phase-independent anti-locking constraint for the sensor policy.  The
@@ -1984,8 +1996,8 @@ class LytRobotAmpEnv:
         ) = _stability_gated_locomotion_terms(
             forward_velocity_track,
             forward_progress,
-            sensor_upright if self.cfg.sensor_stability_reward else root_orientation,
-            sensor_height if self.cfg.sensor_stability_reward else height,
+            sensor_upright if sensor_stability_reward_enabled(self.cfg) else root_orientation,
+            sensor_height if sensor_stability_reward_enabled(self.cfg) else height,
         )
         joint_pos = np.asarray(data.qpos[self.motion.robot_qpos_adrs], dtype=np.float32)
         joint_vel = np.asarray(data.qvel[self.motion.robot_qvel_adrs], dtype=np.float32)
@@ -2180,7 +2192,7 @@ class LytRobotAmpEnv:
                 target_key_pos_root_local=tensor(reference_targets.foot_pos[env_id]),
             )
             reward = float(dm_reward.item())
-        if sensor_gait_metrics and not self.cfg.sensor_stability_reward:
+        if sensor_gait_metrics and not sensor_stability_reward_enabled(self.cfg):
             reward += float(natural_gait_bonus(
                 sensor_gait_metrics, gait_progress, forward_velocity_track,
                 locomotion_stability, knee_flexion_track, self.cfg,
@@ -2191,7 +2203,7 @@ class LytRobotAmpEnv:
             and np.isfinite(data.qvel).all()
             and np.isfinite(data.ctrl).all()
         )
-        if self.cfg.sensor_stability_reward:
+        if sensor_stability_reward_enabled(self.cfg):
             min_root_height = float(self.cfg.fall_height) + terrain_height
             max_root_height = float(self.cfg.max_height) + terrain_height
         else:
@@ -2221,9 +2233,9 @@ class LytRobotAmpEnv:
             "forward_velocity_deficit": forward_velocity_deficit,
             "forward_velocity_excess": forward_velocity_excess,
             "root_orientation": (
-                sensor_upright if self.cfg.sensor_stability_reward else root_orientation
+                sensor_upright if sensor_stability_reward_enabled(self.cfg) else root_orientation
             ),
-            "height": sensor_height if self.cfg.sensor_stability_reward else height,
+            "height": sensor_height if sensor_stability_reward_enabled(self.cfg) else height,
             "sensor_upright": sensor_upright,
             "sensor_height": sensor_height,
             "sensor_posture_track": sensor_posture_track,

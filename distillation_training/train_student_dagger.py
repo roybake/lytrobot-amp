@@ -5,7 +5,7 @@ root=Path(__file__).resolve().parents[1]
 if str(root) not in sys.path: sys.path.insert(0,str(root))
 from distillation_training.networks import SharedActor,HistoryEstimator
 from distillation_training.runtime import (add_runtime_args,dimension_metadata,inherit_checkpoint_variant,
- make_env,tensor,env_step,validate_checkpoint,sensor_metadata)
+ make_env,tensor,env_step,validate_checkpoint,sensor_metadata,task_metadata)
 from distillation_training.trainer_student import BoundedReplay,sequence_losses
 from distillation_training.config import PRIVILEGED_FIELDS
 def rollout(env,actor,estimator,steps,device,student_control):
@@ -23,7 +23,7 @@ def rollout(env,actor,estimator,steps,device,student_control):
  return {k:torch.stack([r[k] for r in rows],1) for k in rows[0]},health # [N,T,...]
 def main():
  p=argparse.ArgumentParser();p.add_argument('--teacher-checkpoint',required=True);p.add_argument('--student-checkpoint',required=True);p.add_argument('--max-buffer',type=int,default=4096);add_runtime_args(p);p.set_defaults(output='student_dagger.pt');a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
- teacher=validate_checkpoint(a.teacher_checkpoint,'teacher');student=validate_checkpoint(a.student_checkpoint,'student');spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student));actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(teacher['shared_actor']);actor.eval()
+ teacher=validate_checkpoint(a.teacher_checkpoint,'teacher',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);student=validate_checkpoint(a.student_checkpoint,'student',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student));actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(teacher['shared_actor']);actor.eval()
  for x in actor.parameters():x.requires_grad=False
  estimator=HistoryEstimator(spec.sensor_dim).to(device);estimator.load_state_dict(student['history_estimator']);optimizer=torch.optim.Adam(estimator.parameters(),lr=a.learning_rate);env,cfg=make_env(a);replay=BoundedReplay(a.max_buffer,storage_device=device);global_step=0
  for iteration in range(1,a.max_iterations+1):
@@ -37,5 +37,5 @@ def main():
   if not bool(torch.isfinite(grad_tensor)):
    emergency=Path(a.output).with_suffix('.emergency.pt');emergency.parent.mkdir(parents=True,exist_ok=True);torch.save({'stage':'dagger','iteration':iteration,'history_estimator':estimator.state_dict(),'optimizer':optimizer.state_dict(),'gradient_norm':grad_tensor.detach().cpu()},emergency);raise RuntimeError(f'DAgger gradient became NaN/Inf at iteration {iteration}; saved {emergency}')
   grad=float(grad_tensor);optimizer.step();global_step+=2*a.num_envs*a.num_steps;counts=replay.last_sample_counts;print(f"[dagger] iter={iteration} replay={len(replay.items)} requested_teacher_fraction={fraction:.3f} actual_teacher_samples={counts['teacher']} actual_student_samples={counts['student']} loss={losses['loss'].item():.6f}")
- out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env,spec),'phase_clock':env.observation_metadata['phase_clock'],'privileged_schema':{'fields':list(PRIVILEGED_FIELDS),'dim':20},'iteration':a.max_iterations,'global_step':global_step,'bptt_steps':a.num_steps,'replay_format':'bounded device-resident ReplaySequence[N,96,...]','replay_storage_device':str(device),'replay_transfer_strategy':'device_resident_no_per_batch_transfer','dagger_sequence_starts_from_env_reset':True,'gradient_norm':grad,**dimension_metadata(spec)},out);env.close();print(out.resolve());return out
+ out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'shared_actor':actor.state_dict(),'history_estimator':estimator.state_dict(),'log_std':actor.log_std.detach().cpu(),'optimizer':optimizer.state_dict(),'teacher_checkpoint':str(a.teacher_checkpoint),'sensor_metadata':sensor_metadata(env,spec),'phase_clock':env.observation_metadata['phase_clock'],'privileged_schema':{'fields':list(PRIVILEGED_FIELDS),'dim':20},'iteration':a.max_iterations,'global_step':global_step,'bptt_steps':a.num_steps,'replay_format':'bounded device-resident ReplaySequence[N,96,...]','replay_storage_device':str(device),'replay_transfer_strategy':'device_resident_no_per_batch_transfer','dagger_sequence_starts_from_env_reset':True,'gradient_norm':grad,**task_metadata(env),**dimension_metadata(spec)},out);env.close();print(out.resolve());return out
 if __name__=='__main__':main()

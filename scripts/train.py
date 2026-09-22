@@ -270,6 +270,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-progress-termination-penalty", type=float, default=2.0)
     parser.add_argument("--fall-penalty", type=float, default=2.0)
     parser.add_argument(
+        "--task-reward-mode",
+        choices=("stage1_reference", "sensor_stability"),
+        default=None,
+        help="Explicit task objective; supersedes the legacy sensor-stability boolean.",
+    )
+    parser.add_argument(
         "--sensor-stability-reward",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1340,6 +1346,7 @@ def main() -> None:
         forward_progress_window_steps=args.forward_progress_window_steps,
         forward_progress_termination_penalty=args.forward_progress_termination_penalty,
         fall_penalty=args.fall_penalty,
+        task_reward_mode=args.task_reward_mode,
         sensor_stability_reward=bool(args.sensor_stability_reward),
         sensor_fall_penalty=args.sensor_fall_penalty,
         sensor_knee_flexion_target=args.sensor_knee_flexion_target,

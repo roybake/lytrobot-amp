@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from sensor_training.envs import SensorHistoryEnv, sensor_stability_task_reward
 from sensor_training.config import SensorObservationConfig
+from lytrobot_amp.env import sensor_stability_reward_enabled
 from lytrobot_amp.foot_force import (CpuFootForceSensor, FootForceSensorConfig,
                                      FootForceSensorDynamics, FOOT_FORCE_NAMES)
 from .phase_clock import DeployablePhaseClock
@@ -151,7 +152,7 @@ class FootForceEnv(SensorHistoryEnv):
     def step(self,action):
         self._force_updated_this_tick=False
         _base_obs,reward,done,info=self.base_env.step(action)
-        if bool(getattr(self.base_env.cfg,"sensor_stability_reward",False)):
+        if sensor_stability_reward_enabled(self.base_env.cfg):
             reward=sensor_stability_task_reward(
                 info,fall_penalty=float(self.base_env.cfg.sensor_fall_penalty),
                 stall_penalty=float(self.base_env.cfg.forward_progress_termination_penalty),

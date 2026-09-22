@@ -10,7 +10,7 @@ from distillation_training.amp import AMPTrainingModule,add_amp_args,config_from
 from distillation_training.networks import SharedActor,HistoryEstimator,TeacherCritic
 from distillation_training.returns import compute_gae_with_time_limit_bootstrap
 from distillation_training.runtime import (add_runtime_args,dimension_metadata,inherit_checkpoint_variant,
-  make_env,selected_variant,tensor,env_step,validate_checkpoint,sensor_metadata)
+  make_env,selected_variant,tensor,env_step,validate_checkpoint,sensor_metadata,task_metadata)
 from distillation_training.trainer_student import distillation_losses
 from distillation_training.config import PRIVILEGED_FIELDS
 
@@ -29,7 +29,7 @@ def _checkpoint_payload(a,actor,estimator,critic,optimizer,amp,env,iteration,glo
       'frozen_modules':['sensor_encoder','privileged_encoder','actor_head'],
       'trainable_modules':['history_estimator','critic','log_std'],
       'amp_discriminator_frozen':bool(a.freeze_amp_discriminator),'gradient_norm':grad,
-      **dimension_metadata(spec)}
+      **task_metadata(env),**dimension_metadata(spec)}
 
 
 def _emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,diagnostics):
@@ -43,7 +43,7 @@ def main():
     p.add_argument('--student-checkpoint',required=True);add_runtime_args(p);p.set_defaults(output='student_rl.pt')
     p.add_argument('--lambda-p',type=float,default=.5);p.add_argument('--lambda-kl',type=float,default=.5)
     add_amp_args(p);a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
-    teacher=validate_checkpoint(a.teacher_checkpoint,'teacher');student=validate_checkpoint(a.student_checkpoint,'student')
+    teacher=validate_checkpoint(a.teacher_checkpoint,'teacher',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);student=validate_checkpoint(a.student_checkpoint,'student',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint)
     spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student))
     actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(student['shared_actor'])
     for name,parameter in actor.named_parameters():parameter.requires_grad=(name=='log_std')
@@ -54,7 +54,7 @@ def main():
     if student.get('rl_finetune_stage') and student.get('critic') is not None:critic.load_state_dict(student['critic'])
     optimizer=torch.optim.Adam([actor.log_std,*estimator.parameters(),*critic.parameters()],lr=a.learning_rate)
     if student.get('rl_finetune_stage') and student.get('optimizer') is not None:optimizer.load_state_dict(student['optimizer'])
-    env,cfg=make_env(a);amp=AMPTrainingModule(env.amp_obs_dim,device,config_from_args(a))
+    env,cfg=make_env(a);amp=AMPTrainingModule(env.amp_obs_dim,device,config_from_args(a),cfg.motion_file)
     amp_source=student if student.get('discriminator') is not None else teacher
     a.amp_discriminator_source='student_resume' if amp_source is student else 'teacher'
     amp.load(amp_source,load_optimizer=amp_source is student and student.get('discriminator_optimizer') is not None)

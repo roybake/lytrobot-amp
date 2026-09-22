@@ -5,7 +5,7 @@ root=Path(__file__).resolve().parents[1]
 if str(root) not in sys.path: sys.path.insert(0,str(root))
 from distillation_training.networks import SharedActor,HistoryEstimator
 from distillation_training.runtime import (add_runtime_args,dimension_metadata,inherit_checkpoint_variant,
-  make_env,tensor,env_step,validate_checkpoint,sensor_metadata)
+  make_env,tensor,env_step,validate_checkpoint,sensor_metadata,task_metadata)
 from distillation_training.trainer_student import BoundedReplay,sequence_losses
 from distillation_training.config import PRIVILEGED_FIELDS
 
@@ -45,7 +45,8 @@ def main():
     p.add_argument('--allow-unvalidated-output',action='store_true')
     p.add_argument('--max-buffer',type=int,default=4096);p.add_argument('--updates-per-iteration',type=int,default=2)
     a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
-    ck=validate_checkpoint(a.teacher_checkpoint,'teacher');spec=inherit_checkpoint_variant(a,('teacher',ck))
+    ck=validate_checkpoint(a.teacher_checkpoint,'teacher',
+      allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);spec=inherit_checkpoint_variant(a,('teacher',ck))
     actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(ck['shared_actor']);actor.eval()
     for parameter in actor.parameters():parameter.requires_grad=False
     estimator=HistoryEstimator(spec.sensor_dim).to(device);optimizer=torch.optim.Adam(estimator.parameters(),lr=a.learning_rate)
@@ -103,7 +104,7 @@ def main():
       'replay_format':'bounded device-resident ReplaySequence[N,96,...]',
       'replay_storage_device':str(device),'replay_transfer_strategy':'device_resident_no_per_batch_transfer',
       'bc_sequence_starts_from_env_reset':True,
-      'bc_updates_per_iteration':a.updates_per_iteration,**dimension_metadata(spec)},out)
+      'bc_updates_per_iteration':a.updates_per_iteration,**task_metadata(env),**dimension_metadata(spec)},out)
     env.close();print(out.resolve())
     if a.require_validation_thresholds and not passed and not a.allow_unvalidated_output:raise SystemExit(2)
     return out
