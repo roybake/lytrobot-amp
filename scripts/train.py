@@ -102,6 +102,18 @@ def parse_args() -> argparse.Namespace:
         "--terrain-asset-dir",
         default=str(REPO_ROOT / "robot" / "terrains" / "more_discolrl"),
     )
+    parser.add_argument(
+        "--terrain-embedded-in-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use terrain already authored in --model-xml instead of attaching another copy.",
+    )
+    parser.add_argument(
+        "--preserve-motion-world-xy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep reference root XY in the MJCF world frame (for contact-solved terrain clips).",
+    )
     parser.add_argument("--stair-terrain", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--stair-step-height", type=float, default=0.13,
@@ -1293,6 +1305,8 @@ def main() -> None:
         deepmimic_reward=bool(args.deepmimic_reward),
         terrain_types=tuple(args.terrain_types or ()),
         terrain_asset_dir=args.terrain_asset_dir,
+        terrain_embedded_in_model=bool(args.terrain_embedded_in_model),
+        preserve_motion_world_xy=bool(args.preserve_motion_world_xy),
         stair_terrain=bool(args.stair_terrain),
         stair_step_height=args.stair_step_height,
         stair_step_depth=args.stair_step_depth,

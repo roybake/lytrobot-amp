@@ -195,6 +195,13 @@ class LytRobotEnvCfg:
     deepmimic_reward: bool = False
     terrain_types: tuple[str, ...] = ()
     terrain_asset_dir: str = ""
+    # The selected MJCF already contains its terrain geometry.  Task semantics
+    # (stair resets, completion checks, privileged context) remain enabled,
+    # but no second procedural terrain is attached to the model.
+    terrain_embedded_in_model: bool = False
+    # Contact-solved references may be authored in the exact MJCF world frame.
+    # Preserve root XY so their feet remain aligned with that embedded terrain.
+    preserve_motion_world_xy: bool = False
     stair_terrain: bool = False
     # Stair-specialist defaults: 0.13 m riser and 0.32 m tread width.
     # ``stair_width`` below is lateral clearance, not the forward tread width.
@@ -426,8 +433,8 @@ class LytRobotAmpEnv:
         )
         self.model = load_model(
             self.model_path,
-            self.stair_cfg,
-            self.more_terrain_cfg,
+            None if cfg.terrain_embedded_in_model else self.stair_cfg,
+            None if cfg.terrain_embedded_in_model else self.more_terrain_cfg,
         )
         self.model.opt.timestep = float(cfg.timestep)
         self.model.opt.iterations = max(1, int(cfg.solver_iterations))
@@ -441,9 +448,12 @@ class LytRobotAmpEnv:
         # actual stair world frame.  Zeroing its initial XY shifts the feet
         # off their calibrated treads while leaving the terrain unchanged.
         preserve_stair_world_xy = bool(
-            cfg.stair_terrain
-            and len(motion_files) == 1
-            and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+            cfg.preserve_motion_world_xy
+            or (
+                cfg.stair_terrain
+                and len(motion_files) == 1
+                and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+            )
         )
         self.continuous_stair_phase_curriculum = bool(
             preserve_stair_world_xy and not cfg.stair_fixed_start
@@ -486,20 +496,24 @@ class LytRobotAmpEnv:
         for motion_id, motion_reference in enumerate(motion_references):
             if not self.stair_motion_mask[motion_id]:
                 continue
-            anchor, scale = _stair_root_height_transform(
-                motion_reference,
-                step_height=self.stair_cfg.step_height,
-                step_count=self.stair_cfg.step_count,
-                descending=bool(self.stair_down_motion_mask[motion_id]),
-            )
-            if (
-                self.continuous_stair_phase_curriculum
-                or self.cfg.stair_fixed_start
-            ) and not self.more_terrain_cfg.serial_course:
-                # The specialist NPZ was contact-IK'd against this exact fixed
-                # 0.13 m geometry.  Scaling only its floating pelvis after IK
-                # would lift the down-stair reset out of support.
-                scale = 1.0
+            if preserve_stair_world_xy and not self.more_terrain_cfg.serial_course:
+                # A continuous up/platform/down reference returns to its start
+                # height, so endpoint rise cannot be used to infer a scale.
+                # It was contact-solved in this exact world and needs no
+                # runtime pelvis transform.
+                anchor, scale = 0.0, 1.0
+            else:
+                anchor, scale = _stair_root_height_transform(
+                    motion_reference,
+                    step_height=self.stair_cfg.step_height,
+                    step_count=self.stair_cfg.step_count,
+                    descending=bool(self.stair_down_motion_mask[motion_id]),
+                )
+                if (
+                    self.cfg.stair_fixed_start
+                    and not self.more_terrain_cfg.serial_course
+                ):
+                    scale = 1.0
             self.motion_stair_height_anchor[motion_id] = anchor
             self.motion_stair_height_scale[motion_id] = scale
             self.motion_stair_distance[motion_id] = float(

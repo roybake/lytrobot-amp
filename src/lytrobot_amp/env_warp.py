@@ -216,8 +216,8 @@ class LytRobotWarpAmpEnv:
         )
         self.model = load_model(
             self.model_path,
-            self.stair_cfg,
-            self.more_terrain_cfg,
+            None if cfg.terrain_embedded_in_model else self.stair_cfg,
+            None if cfg.terrain_embedded_in_model else self.more_terrain_cfg,
         )
         self.model.opt.timestep = float(cfg.timestep)
         self.model.opt.iterations = max(1, int(cfg.solver_iterations))
@@ -237,9 +237,12 @@ class LytRobotWarpAmpEnv:
         self.ctrl_dim = int(self.model.nu)
         motion_files = cfg.motion_files or (cfg.motion_file,)
         preserve_stair_world_xy = bool(
-            cfg.stair_terrain
-            and len(motion_files) == 1
-            and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+            cfg.preserve_motion_world_xy
+            or (
+                cfg.stair_terrain
+                and len(motion_files) == 1
+                and Path(motion_files[0]).stem == "stair_up_down_omniretarget"
+            )
         )
         self.continuous_stair_phase_curriculum = bool(
             preserve_stair_world_xy and not cfg.stair_fixed_start
@@ -286,20 +289,22 @@ class LytRobotWarpAmpEnv:
         for motion_id, motion_reference in enumerate(motion_references):
             if not self.stair_motion_mask_np[motion_id]:
                 continue
-            anchor, scale = _stair_root_height_transform(
-                motion_reference,
-                step_height=self.stair_cfg.step_height,
-                step_count=self.stair_cfg.step_count,
-                descending=bool(self.stair_down_motion_mask_np[motion_id]),
-            )
-            if (
-                self.continuous_stair_phase_curriculum
-                or self.cfg.stair_fixed_start
-            ) and not self.more_terrain_cfg.serial_course:
-                # Specialist references are already solved for their compiled
-                # 0.13 m stairs; do not invalidate down-stair foot contacts by
-                # applying a second pelvis-only height scale at runtime.
-                scale = 1.0
+            if preserve_stair_world_xy and not self.more_terrain_cfg.serial_course:
+                # Continuous ascent/descent returns to its initial height and
+                # is already contact-solved in the embedded MJCF world.
+                anchor, scale = 0.0, 1.0
+            else:
+                anchor, scale = _stair_root_height_transform(
+                    motion_reference,
+                    step_height=self.stair_cfg.step_height,
+                    step_count=self.stair_cfg.step_count,
+                    descending=bool(self.stair_down_motion_mask_np[motion_id]),
+                )
+                if (
+                    self.cfg.stair_fixed_start
+                    and not self.more_terrain_cfg.serial_course
+                ):
+                    scale = 1.0
             self.motion_stair_height_anchor_np[motion_id] = anchor
             self.motion_stair_height_scale_np[motion_id] = scale
             self.motion_stair_distance_np[motion_id] = float(

@@ -1,0 +1,510 @@
+<mujoco model="Standlet2">
+  <compiler angle="radian"/>
+
+  <visual>
+    <global azimuth="-130" elevation="-20"/>
+    <headlight ambient="0.3 0.3 0.3" diffuse="0.6 0.6 0.6" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+  </visual>
+
+  <default>
+    <joint stiffness="1.5" limited="true" armature="0.01" damping="0.1"/>
+    <geom contype="0" conaffinity="0" condim="1" margin="0.001" rgba="0.8 0.6 0.4 1"/>
+    <site size="0.003 0.005 0.005" rgba="1 0 0 0.2"/>
+
+    <tendon limited="false" rgba="0.95 0.3 0.3 1"/>
+    <general ctrllimited="true" ctrlrange="-1 1"/>
+  </default>
+
+  <asset>
+    <texture type="skybox" colorspace="auto" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" colorspace="auto" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <texture type="2d" colorspace="auto" name="stairs_xml_checker" builtin="checker" rgb1="0.8 0.7 0.5" rgb2="0.7 0.6 0.4" width="100" height="100"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" specular="0" shininess="0" metallic="0" roughness="1"/>
+    <material name="stairs_xml_grid_mat" texture="stairs_xml_checker" texrepeat="20 20" reflectance="0.1"/>
+    <material name="stairs_xml_step_mat" rgba="0.2 0.4 0.8 1"/>
+    <mesh name="pelvis" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/pelvis.STL"/>
+    <mesh name="femur_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/femur_r.STL"/>
+    <mesh name="tibia_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/tibia_r.STL"/>
+    <mesh name="patella_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/patella_r.STL"/>
+    <mesh name="talus_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/talus_r.STL"/>
+    <mesh name="foot_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/foot_r.STL"/>
+    <mesh name="toe_r" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/toe_r.STL"/>
+    <mesh name="femur_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/femur_l.STL"/>
+    <mesh name="tibia_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/tibia_l.STL"/>
+    <mesh name="patella_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/patella_l.STL"/>
+    <mesh name="talus_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/talus_l.STL"/>
+    <mesh name="foot_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/foot_l.STL"/>
+    <mesh name="toe_l" content_type="model/stl" file="/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/toe_l.STL"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="10 10 0.1" type="plane" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_grid_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_up_0" size="0.16 1 0.1" pos="0.16 0 0.1" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_up_1" size="0.16 1 0.2" pos="0.48 0 0.2" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_up_2" size="0.16 1 0.3" pos="0.8 0 0.3" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_up_3" size="0.16 1 0.4" pos="1.12 0 0.4" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_up_4" size="0.16 1 0.5" pos="1.44 0 0.5" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_platform" size="0.16 1 0.5" pos="1.76 0 0.5" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_down_0" size="0.16 1 0.4" pos="2.08 0 0.4" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_down_1" size="0.16 1 0.3" pos="2.4 0 0.3" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_down_2" size="0.16 1 0.2" pos="2.72 0 0.2" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <geom name="step_down_3" size="0.16 1 0.1" pos="3.04 0 0.1" type="box" contype="1" conaffinity="1" condim="3" group="2" margin="0" material="stairs_xml_step_mat" rgba="0.5 0.5 0.5 1"/>
+    <light pos="0 0 10.3" dir="0 0 -1" type="directional" castshadow="false" cutoff="1000" specular="0 0 0"/>
+    <light pos="0 0 10" dir="0 0 -1" diffuse="1 1 1"/>
+    <body name="pelvis" pos="0 0 0.875">
+      <joint name="root" type="free"/>
+      <geom type="mesh" density="3325.68" rgba="1 1 1 1" mesh="pelvis"/>
+      <site name="root" pos="0 0 0" rgba="1 0 0 1"/>
+      <site name="rootIMU" pos="0 0 -0.081"/>
+      <site name="l0" pos="0.040696 0.111423 -0.038411"/>
+      <site name="l2" pos="0.0116897 0.106131 0.0374162"/>
+      <site name="l3" pos="0.00724396 0.0610029 0.0290833"/>
+      <site name="l5" pos="-0.0537618 0.0373409 0.0161501"/>
+      <site name="l6" pos="-0.0101538 0.058422 -0.121618"/>
+      <site name="l26" pos="0.0180461 0.0610681 0.0277899"/>
+      <site name="l27" pos="0.0535226 0.0734824 0.0130708"/>
+      <site name="l28" pos="0.0661105 0.0796901 -0.00144926"/>
+      <site name="l29" pos="0.0366988 0.0672292 0.0225908"/>
+      <site name="l30" pos="0.0699306 0.0852731 -0.0203097"/>
+      <site name="l31" pos="0.0646207 0.091437 -0.0388837"/>
+      <site name="l92" pos="-0.0560541 0.0463781 0.00521297"/>
+      <site name="l93" pos="-0.0557092 0.0501378 -0.000602529"/>
+      <site name="l94" pos="-0.0537606 0.0520859 -0.00704288"/>
+      <site name="l95" pos="-0.0516557 0.0538253 -0.0135004"/>
+      <site name="l96" pos="-0.0361994 0.0712093 -0.0629233"/>
+      <site name="l97" pos="-0.0335173 0.0745775 -0.0720797"/>
+      <site name="l98" pos="-0.0308351 0.0779456 -0.0812361"/>
+      <site name="r0" pos="0.040696 -0.111423 -0.038411"/>
+      <site name="r2" pos="0.0116897 -0.106131 0.0374162"/>
+      <site name="r3" pos="0.00724396 -0.0610029 0.0290833"/>
+      <site name="r5" pos="-0.0537618 -0.0373409 0.0161501"/>
+      <site name="r6" pos="-0.0101538 -0.058422 -0.121618"/>
+      <site name="r26" pos="0.0180461 -0.0610681 0.0277899"/>
+      <site name="r27" pos="0.0535226 -0.0734824 0.0130708"/>
+      <site name="r28" pos="0.0661105 -0.0796901 -0.00144926"/>
+      <site name="r29" pos="0.0366988 -0.0672292 0.0225908"/>
+      <site name="r30" pos="0.0699306 -0.0852731 -0.0203097"/>
+      <site name="r31" pos="0.0646207 -0.091437 -0.0388837"/>
+      <site name="r92" pos="-0.0560541 -0.0463781 0.00521297"/>
+      <site name="r93" pos="-0.0557092 -0.0501378 -0.000602529"/>
+      <site name="r94" pos="-0.0537606 -0.0520859 -0.00704288"/>
+      <site name="r95" pos="-0.0516557 -0.0538253 -0.0135004"/>
+      <site name="r96" pos="-0.0361994 -0.0712093 -0.0629233"/>
+      <site name="r97" pos="-0.0335173 -0.0745775 -0.0720797"/>
+      <site name="r98" pos="-0.0308351 -0.0779456 -0.0812361"/>
+      <camera name="track" pos="0 -4 0" quat="0.707107 0.707107 0 0" mode="trackcom"/>
+      <light name="spotlight" pos="0 50 2" dir="0 -1 0" diffuse="0 0 0" specular="0 0 0" mode="trackcom"/>
+      <body name="femur_r" pos="0.012032 -0.082674 -0.074584">
+        <joint name="hip_flexion_r" pos="0 0 0" axis="0 -1 0" stiffness="10" range="-0.223402 0.422369"/>
+        <joint name="hip_adduction_r" pos="0 0 0" axis="1 0 0" stiffness="10" range="-0.188496 0.036652" damping="5"/>
+        <joint name="hip_rotation_r" pos="0 0 0" axis="0 0 1" stiffness="20" range="-0.148353 0.013963" damping="5"/>
+        <geom type="mesh" density="2718.16" rgba="1 1 1 1" mesh="femur_r"/>
+        <geom name="knee_r" size="0.02 0.01" pos="0.038 0 -0.358" quat="0.707107 -0.707107 0 0" type="cylinder" density="0" rgba="1 0 0 0"/>
+        <site name="femur_r_IMU" pos="0.0236346 -0.0106664 -0.189887"/>
+        <site name="s9r" pos="-0.004035 -0.0587266 -0.00678609"/>
+        <site name="s10r" pos="-0.00371526 -0.05999 -0.0161263"/>
+        <site name="s11r" pos="-0.00269918 -0.059017 -0.0254504"/>
+        <site name="s12r" pos="-0.00125415 -0.056595 -0.0344749"/>
+        <site name="s13r" pos="-0.000249474 -0.0539684 -0.0434321"/>
+        <site name="s14r" pos="0.00160162 -0.0518667 -0.0525482"/>
+        <site name="s15r" pos="0.0015729 -0.0487943 -0.0829277"/>
+        <site name="s16r" pos="0.0224923 -0.0187035 -0.0493431"/>
+        <site name="s17r" pos="0.00911052 -0.0133524 -0.0517447"/>
+        <site name="s18r" pos="0.0260882 -0.0166593 -0.0739985"/>
+        <site name="s19r" pos="0.0296841 -0.0146149 -0.0986539"/>
+        <site name="s20r" pos="0.000350593 0.0100332 -0.0905996"/>
+        <site name="s21r" pos="0.00254553 0.00756634 -0.0982699"/>
+        <site name="s22r" pos="0.00453468 0.00593795 -0.106215"/>
+        <site name="s23r" pos="0.00628285 0.00520883 -0.114348"/>
+        <site name="s24r" pos="0.00776751 0.00538973 -0.122562"/>
+        <site name="s25r" pos="0.00898183 0.00643918 -0.130757"/>
+        <site name="s26r" pos="-0.0176808 -0.018072 -0.0814192"/>
+        <site name="s27r" pos="-0.0162905 -0.0225306 -0.0885485"/>
+        <site name="s28r" pos="-0.0148757 -0.0252015 -0.0965144"/>
+        <site name="s29r" pos="-0.0134673 -0.0263928 -0.10485"/>
+        <site name="s30r" pos="-0.0120477 -0.0269833 -0.113247"/>
+        <site name="s31r" pos="-0.0104672 -0.0275428 -0.121627"/>
+        <site name="s32r" pos="-0.0095153 -0.0281949 -0.146624"/>
+        <site name="r120" pos="0.0235342 0.0225152 -0.235165"/>
+        <site name="r121" pos="0.0259275 0.0254629 -0.256285"/>
+        <site name="r122" pos="0.0251745 0.0271937 -0.277661"/>
+        <site name="r123" pos="0.0220013 0.0271362 -0.298893"/>
+        <site name="r124" pos="0.0177152 0.0243222 -0.319729"/>
+        <site name="r125" pos="0.013353 0.0180597 -0.339781"/>
+        <site name="r126" pos="0.0554129 -3.6486e-05 -0.275048"/>
+        <site name="r127" pos="0.0590088 0.00200791 -0.299704"/>
+        <site name="r128" pos="0.0626048 0.00405232 -0.324359"/>
+        <site name="r10" pos="-0.0029648 0.0103784 -0.310482"/>
+        <body name="tibia_r" pos="0.021988 0.0085393 -0.3638">
+          <joint name="knee_angle_r" pos="0 0 0" axis="-0.0270811 -0.997283 0.0685032" range="-1.0472 0.20944"/>
+          <geom type="mesh" density="3292.03" rgba="1 1 1 1" mesh="tibia_r"/>
+          <site name="tibia_r_IMU" pos="0.0187567 -0.00702121 -0.191147"/>
+          <site name="r12" pos="-0.00149737 -0.00559195 -0.0478683"/>
+          <site name="r129" pos="-0.0111006 0.00301946 -0.0698483"/>
+          <site name="r130" pos="-0.00792533 0.00253564 -0.0835185"/>
+          <site name="r131" pos="-0.0056939 0.00233758 -0.0973812"/>
+          <site name="r132" pos="-0.00426639 0.00238107 -0.111353"/>
+          <site name="r133" pos="-0.00331027 0.00256542 -0.125364"/>
+          <site name="r134" pos="-0.0025325 0.0028029 -0.139386"/>
+          <site name="r15" pos="0.033619 -0.0322465 -0.261878"/>
+          <site name="r135" pos="0.035998 -0.02915 -0.283828"/>
+          <site name="r136" pos="0.0377789 -0.0245874 -0.298151"/>
+          <site name="r137" pos="0.0390039 -0.0176516 -0.311559"/>
+          <site name="r138" pos="0.0405912 -0.0098194 -0.324441"/>
+          <site name="r139" pos="0.0439738 -0.00315394 -0.337596"/>
+          <site name="r140" pos="0.049903 0.000901669 -0.350931"/>
+          <site name="r141" pos="0.000524697 0.0017268 -0.289621"/>
+          <site name="r142" pos="-0.0029112 0.000577956 -0.302081"/>
+          <site name="r143" pos="-0.00627389 -0.000875442 -0.314528"/>
+          <site name="r144" pos="-0.00969288 -0.00229137 -0.326966"/>
+          <site name="r145" pos="-0.0134072 -0.00302255 -0.339372"/>
+          <site name="r146" pos="-0.0175758 -0.00256589 -0.351645"/>
+          <body name="patella_r">
+            <joint name="patella_r_j1" pos="0 0 0" axis="1 0 0" type="slide" solimplimit="0.9 0.99" stiffness="10" range="-0.015 0.005" margin="0.001" damping="10"/>
+            <geom type="mesh" density="2732.66" rgba="1 1 1 1" mesh="patella_r"/>
+            <site name="r11" pos="0.0392277 -0.00312932 0.0218137"/>
+          </body>
+          <body name="talus_r" pos="0.022557 -0.0061213 -0.38882">
+            <joint name="ankle_angle_r" pos="0 0 0" axis="-0.051785 -0.99459 0.090048" range="-0.349066 0.785398"/>
+            <geom type="mesh" density="2718.18" rgba="1 1 1 1" mesh="talus_r"/>
+            <body name="foot_r" pos="-0.0086471 0.00034291 -0.015818">
+              <joint name="subtalar_angle_r" pos="0 0 0" axis="0.762058 0.313439 0.566589" range="-0.261799 0.349066"/>
+              <geom name="foot_r" type="mesh" contype="1" conaffinity="1" condim="3" friction="1 0.1 0.1" density="2718.18" rgba="1 1 1 1" mesh="foot_r"/>
+              <site name="foot_r_IMU" pos="0.0588938 -0.00476238 0.008022"/>
+              <site name="r13" pos="-0.0427781 -0.000869093 -0.0138254"/>
+              <site name="r14" pos="0.0620048 0.0166801 0.014082"/>
+              <site name="r147" pos="-0.0427781 -0.000869093 -0.001"/>
+              <body name="toe_r" pos="0.11963 -0.012783 -0.01619">
+                <joint name="mtp_angle_r" pos="0 0 0" axis="-0.375959 -0.926408 -0.02056" range="-1 1"/>
+                <geom name="toe_r" type="mesh" contype="1" conaffinity="1" condim="3" friction="1 0.1 0.1" density="2718.18" rgba="0.698039 0.698039 0.698039 1" mesh="toe_r"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="femur_l" pos="0.012032 0.082674 -0.074584">
+        <joint name="hip_flexion_l" pos="0 0 0" axis="0 -1 0" stiffness="10" range="-0.223402 0.422369" damping="5"/>
+        <joint name="hip_adduction_l" pos="0 0 0" axis="-1 0 0" stiffness="10" range="-0.188496 0.036652" damping="5"/>
+        <joint name="hip_rotation_l" pos="0 0 0" axis="0 0 -1" stiffness="20" range="-0.148353 0.013963" damping="5"/>
+        <geom type="mesh" density="2718.16" rgba="1 1 1 1" mesh="femur_l"/>
+        <site name="femur_l_IMU" pos="0.0236346 0.0106664 -0.189887"/>
+        <site name="s9l" pos="-0.004035 0.0587266 -0.00678609"/>
+        <site name="s10l" pos="-0.00371526 0.05999 -0.0161263"/>
+        <site name="s11l" pos="-0.00269918 0.059017 -0.0254504"/>
+        <site name="s12l" pos="-0.00125415 0.056595 -0.0344749"/>
+        <site name="s13l" pos="-0.000249474 0.0539684 -0.0434321"/>
+        <site name="s14l" pos="0.00160162 0.0518667 -0.0525482"/>
+        <site name="s15l" pos="0.0015729 0.0487943 -0.0829277"/>
+        <site name="s16l" pos="0.0224923 0.0187035 -0.0493431"/>
+        <site name="s17l" pos="0.00911052 0.0133524 -0.0517447"/>
+        <site name="s18l" pos="0.0260882 0.0166593 -0.0739985"/>
+        <site name="s19l" pos="0.0296841 0.0146149 -0.0986539"/>
+        <site name="s20l" pos="0.000350593 -0.0100332 -0.0905996"/>
+        <site name="s21l" pos="0.00254553 -0.00756634 -0.0982699"/>
+        <site name="s22l" pos="0.00453468 -0.00593795 -0.106215"/>
+        <site name="s23l" pos="0.00628285 -0.00520883 -0.114348"/>
+        <site name="s24l" pos="0.00776751 -0.00538973 -0.122562"/>
+        <site name="s25l" pos="0.00898183 -0.00643918 -0.130757"/>
+        <site name="s26l" pos="-0.0176808 0.018072 -0.0814192"/>
+        <site name="s27l" pos="-0.0162905 0.0225306 -0.0885485"/>
+        <site name="s28l" pos="-0.0148757 0.0252015 -0.0965144"/>
+        <site name="s29l" pos="-0.0134673 0.0263928 -0.10485"/>
+        <site name="s30l" pos="-0.0120477 0.0269833 -0.113247"/>
+        <site name="s31l" pos="-0.0104672 0.0275428 -0.121627"/>
+        <site name="s32l" pos="-0.0095153 0.0281949 -0.146624"/>
+        <site name="l120" pos="0.0235342 -0.0225152 -0.235165"/>
+        <site name="l121" pos="0.0259275 -0.0254629 -0.256285"/>
+        <site name="l122" pos="0.0251745 -0.0271937 -0.277661"/>
+        <site name="l123" pos="0.0220013 -0.0271362 -0.298893"/>
+        <site name="l124" pos="0.0177152 -0.0243222 -0.319729"/>
+        <site name="l125" pos="0.013353 -0.0180597 -0.339781"/>
+        <site name="l126" pos="0.0554129 3.6486e-05 -0.275048"/>
+        <site name="l127" pos="0.0590088 -0.00200791 -0.299704"/>
+        <site name="l128" pos="0.0626048 -0.00405232 -0.324359"/>
+        <site name="l10" pos="-0.0029648 -0.0103784 -0.310482"/>
+        <body name="knee_l">
+          <geom name="knee_l" size="0.02 0.01" pos="0.038 0 -0.358" quat="0.707107 -0.707107 0 0" type="cylinder" density="0" rgba="1 0 0 0"/>
+          <site name="side_l" pos="0.07 0 -0.358" rgba="1 0 0 0"/>
+        </body>
+        <body name="tibia_l" pos="0.021988 -0.0085393 -0.3638">
+          <joint name="knee_angle_l" pos="0 0 0" axis="0.0270811 -0.997283 -0.0685032" range="-1.0472 0.20944"/>
+          <geom type="mesh" density="3292.03" rgba="1 1 1 1" mesh="tibia_l"/>
+          <site name="tibia_l_IMU" pos="0.0187567 0.00702121 -0.191147"/>
+          <site name="l12" pos="-0.00149737 0.00559195 -0.0478683"/>
+          <site name="l129" pos="-0.0111006 -0.00301946 -0.0698483"/>
+          <site name="l130" pos="-0.00792533 -0.00253564 -0.0835185"/>
+          <site name="l131" pos="-0.0056939 -0.00233758 -0.0973812"/>
+          <site name="l132" pos="-0.00426639 -0.00238107 -0.111353"/>
+          <site name="l133" pos="-0.00331027 -0.00256542 -0.125364"/>
+          <site name="l134" pos="-0.0025325 -0.0028029 -0.139386"/>
+          <site name="l15" pos="0.033619 0.0322465 -0.261878"/>
+          <site name="l135" pos="0.035998 0.02915 -0.283828"/>
+          <site name="l136" pos="0.0377789 0.0245874 -0.298151"/>
+          <site name="l137" pos="0.0390039 0.0176516 -0.311559"/>
+          <site name="l138" pos="0.0405912 0.0098194 -0.324441"/>
+          <site name="l139" pos="0.0439738 0.00315394 -0.337596"/>
+          <site name="l140" pos="0.049903 -0.000901669 -0.350931"/>
+          <site name="l141" pos="0.000524697 -0.0017268 -0.289621"/>
+          <site name="l142" pos="-0.0029112 -0.000577956 -0.302081"/>
+          <site name="l143" pos="-0.00627389 0.000875442 -0.314528"/>
+          <site name="l144" pos="-0.00969288 0.00229137 -0.326966"/>
+          <site name="l145" pos="-0.0134072 0.00302255 -0.339372"/>
+          <site name="l146" pos="-0.0175758 0.00256589 -0.351645"/>
+          <body name="patella_l">
+            <joint name="patella_l_j1" pos="0 0 0" axis="1 0 0" type="slide" stiffness="10" range="-0.015 0.01" damping="10"/>
+            <geom type="mesh" density="2732.66" rgba="1 1 1 1" mesh="patella_l"/>
+            <site name="l11" pos="0.0392277 0.00312932 0.0218137"/>
+          </body>
+          <body name="talus_l" pos="0.022557 0.0061213 -0.38882">
+            <joint name="ankle_angle_l" pos="0 0 0" axis="0.051785 -0.99459 -0.090048" range="-0.349066 0.785398"/>
+            <geom type="mesh" density="2718.18" rgba="1 1 1 1" mesh="talus_l"/>
+            <body name="foot_l" pos="-0.0086471 -0.00034291 -0.015818">
+              <joint name="subtalar_angle_l" pos="0 0 0" axis="-0.762058 0.313439 -0.566589" range="-0.261799 0.349066"/>
+              <geom name="foot_l" type="mesh" contype="1" conaffinity="1" condim="3" friction="1 0.1 0.1" density="2718.18" rgba="1 1 1 1" mesh="foot_l"/>
+              <site name="foot_l_IMU" pos="0.0588938 0.00476238 0.008022"/>
+              <site name="l13" pos="-0.0427781 0.000869093 -0.0138254"/>
+              <site name="l14" pos="0.0620048 -0.0166801 0.014082"/>
+              <site name="l147" pos="-0.0427781 0.000869093 -0.001"/>
+              <body name="toe_l" pos="0.11963 0.012783 -0.01619">
+                <joint name="mtp_angle_l" pos="0 0 0" axis="0.375959 -0.926408 0.02056" range="-1 1"/>
+                <geom name="toe_l" type="mesh" contype="1" conaffinity="1" condim="3" friction="1 0.1 0.1" density="2718.18" rgba="1 1 1 1" mesh="toe_l"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="pelvis" body2="femur_r"/>
+    <exclude body1="pelvis" body2="femur_l"/>
+    <exclude body1="femur_r" body2="patella_r"/>
+    <exclude body1="femur_l" body2="patella_l"/>
+  </contact>
+
+  <equality>
+    <joint joint1="patella_r_j1" joint2="knee_angle_r" polycoef="0.005 0.012 0 0 0" solref="0.001" solimp="0.99 0.999"/>
+    <joint joint1="patella_l_j1" joint2="knee_angle_l" polycoef="0.005 0.012 0 0 0" solref="0.001" solimp="0.99 0.999"/>
+  </equality>
+
+  <tendon>
+    <spatial name="hip_rf_tendon" range="0.195 0.237">
+      <site site="r3"/>
+      <site site="r26"/>
+      <site site="r29"/>
+      <site site="r27"/>
+      <site site="r28"/>
+      <site site="r30"/>
+      <site site="r31"/>
+      <site site="s17r"/>
+    </spatial>
+    <spatial name="hip_lf_tendon" range="0.195 0.237">
+      <site site="l3"/>
+      <site site="l26"/>
+      <site site="l29"/>
+      <site site="l27"/>
+      <site site="l28"/>
+      <site site="l30"/>
+      <site site="l31"/>
+      <site site="s17l"/>
+    </spatial>
+    <spatial name="hip_rb_tendon" range="0.235 0.28">
+      <site site="r5"/>
+      <site site="r92"/>
+      <site site="r93"/>
+      <site site="r94"/>
+      <site site="r95"/>
+      <site site="r96"/>
+      <site site="r97"/>
+      <site site="r98"/>
+      <site site="s26r"/>
+      <site site="s27r"/>
+      <site site="s28r"/>
+      <site site="s29r"/>
+      <site site="s30r"/>
+      <site site="s31r"/>
+      <site site="s32r"/>
+    </spatial>
+    <spatial name="hip_lb_tendon" range="0.235 0.28">
+      <site site="l5"/>
+      <site site="l92"/>
+      <site site="l93"/>
+      <site site="l94"/>
+      <site site="l95"/>
+      <site site="l96"/>
+      <site site="l97"/>
+      <site site="l98"/>
+      <site site="s26l"/>
+      <site site="s27l"/>
+      <site site="s28l"/>
+      <site site="s29l"/>
+      <site site="s30l"/>
+      <site site="s31l"/>
+      <site site="s32l"/>
+    </spatial>
+    <spatial name="hip_rm_tendon" range="0.17 0.21">
+      <site site="r2"/>
+      <site site="s9r"/>
+      <site site="s10r"/>
+      <site site="s11r"/>
+      <site site="s12r"/>
+      <site site="s13r"/>
+      <site site="s14r"/>
+      <site site="s15r"/>
+    </spatial>
+    <spatial name="hip_lm_tendon" range="0.17 0.21">
+      <site site="l2"/>
+      <site site="s9l"/>
+      <site site="s10l"/>
+      <site site="s11l"/>
+      <site site="s12l"/>
+      <site site="s13l"/>
+      <site site="s14l"/>
+      <site site="s15l"/>
+    </spatial>
+    <spatial name="knee_rf_tendon" range="0.335 0.405">
+      <site site="r0"/>
+      <site site="s16r"/>
+      <site site="s18r"/>
+      <site site="s19r"/>
+      <site site="r126"/>
+      <site site="r127"/>
+      <site site="r128"/>
+      <geom geom="knee_r"/>
+      <site site="r11"/>
+    </spatial>
+    <spatial name="knee_lf_tendon" range="0.335 0.405">
+      <site site="l0"/>
+      <site site="s16l"/>
+      <site site="s18l"/>
+      <site site="s19l"/>
+      <site site="l126"/>
+      <site site="l127"/>
+      <site site="l128"/>
+      <geom geom="knee_l" sidesite="side_l"/>
+      <site site="l11"/>
+    </spatial>
+    <spatial name="knee_rb_tendon" range="0.38 0.405">
+      <site site="r6"/>
+      <site site="s20r"/>
+      <site site="s21r"/>
+      <site site="s22r"/>
+      <site site="s23r"/>
+      <site site="s24r"/>
+      <site site="s25r"/>
+      <site site="r120"/>
+      <site site="r121"/>
+      <site site="r122"/>
+      <site site="r123"/>
+      <site site="r124"/>
+      <site site="r125"/>
+      <site site="r12"/>
+    </spatial>
+    <spatial name="knee_lb_tendon" range="0.38 0.405">
+      <site site="l6"/>
+      <site site="s20l"/>
+      <site site="s21l"/>
+      <site site="s22l"/>
+      <site site="s23l"/>
+      <site site="s24l"/>
+      <site site="s25l"/>
+      <site site="l120"/>
+      <site site="l121"/>
+      <site site="l122"/>
+      <site site="l123"/>
+      <site site="l124"/>
+      <site site="l125"/>
+      <site site="l12"/>
+    </spatial>
+    <spatial name="ankle_rf_tendon" range="0.129 0.173">
+      <site site="r15"/>
+      <site site="r135"/>
+      <site site="r136"/>
+      <site site="r137"/>
+      <site site="r138"/>
+      <site site="r139"/>
+      <site site="r140"/>
+      <site site="r14"/>
+    </spatial>
+    <spatial name="ankle_lf_tendon" range="0.1295 0.173">
+      <site site="l15"/>
+      <site site="l135"/>
+      <site site="l136"/>
+      <site site="l137"/>
+      <site site="l138"/>
+      <site site="l139"/>
+      <site site="l140"/>
+      <site site="l14"/>
+    </spatial>
+    <spatial name="ankle_rb_tendon" range="0.36 0.505">
+      <site site="r10"/>
+      <site site="r129"/>
+      <site site="r130"/>
+      <site site="r131"/>
+      <site site="r132"/>
+      <site site="r133"/>
+      <site site="r134"/>
+      <site site="r141"/>
+      <site site="r142"/>
+      <site site="r143"/>
+      <site site="r144"/>
+      <site site="r145"/>
+      <site site="r146"/>
+      <site site="r147"/>
+      <site site="r13"/>
+    </spatial>
+    <spatial name="ankle_lb_tendon" range="0.36 0.505">
+      <site site="l10"/>
+      <site site="l129"/>
+      <site site="l130"/>
+      <site site="l131"/>
+      <site site="l132"/>
+      <site site="l133"/>
+      <site site="l134"/>
+      <site site="l141"/>
+      <site site="l142"/>
+      <site site="l143"/>
+      <site site="l144"/>
+      <site site="l145"/>
+      <site site="l146"/>
+      <site site="l147"/>
+      <site site="l13"/>
+    </spatial>
+  </tendon>
+
+  <actuator>
+    <general name="hip_rm" tendon="hip_rm_tendon" ctrlrange="0.15 0.21" forcerange="-450 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="hip_lm" tendon="hip_lm_tendon" ctrlrange="0.15 0.21" forcerange="-450 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="hip_rb" tendon="hip_rb_tendon" ctrlrange="0.21 0.28" forcerange="-450 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="hip_lb" tendon="hip_lb_tendon" ctrlrange="0.21 0.28" forcerange="-450 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="hip_rf" tendon="hip_rf_tendon" ctrlrange="0.175 0.237" forcerange="-465 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="hip_lf" tendon="hip_lf_tendon" ctrlrange="0.175 0.237" forcerange="-465 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="knee_rb" tendon="knee_rb_tendon" ctrlrange="0.32 0.405" forcerange="-1000 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="knee_lb" tendon="knee_lb_tendon" ctrlrange="0.32 0.405" forcerange="-1000 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="knee_rf" tendon="knee_rf_tendon" ctrlrange="0.325 0.405" forcerange="-465 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="knee_lf" tendon="knee_lf_tendon" ctrlrange="0.325 0.405" forcerange="-465 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="ankle_rb" tendon="ankle_rb_tendon" ctrlrange="0.36 0.505" forcerange="-300 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="ankle_lb" tendon="ankle_lb_tendon" ctrlrange="0.36 0.505" forcerange="-300 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="ankle_rf" tendon="ankle_rf_tendon" ctrlrange="0.109 0.173" forcerange="-300 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+    <general name="ankle_lf" tendon="ankle_lf_tendon" ctrlrange="0.109 0.173" forcerange="-300 0" biastype="affine" gainprm="50000" biasprm="0 -50000"/>
+  </actuator>
+
+  <sensor>
+    <accelerometer site="rootIMU" name="rootacc"/>
+    <gyro site="rootIMU" name="rootgyro"/>
+    <accelerometer site="femur_r_IMU" name="femur_racc"/>
+    <gyro site="femur_r_IMU" name="femur_rgyro"/>
+    <accelerometer site="tibia_r_IMU" name="tibia_racc"/>
+    <gyro site="tibia_r_IMU" name="tibia_rgyro"/>
+    <accelerometer site="foot_r_IMU" name="foot_racc"/>
+    <gyro site="foot_r_IMU" name="foot_rgyro"/>
+    <accelerometer site="femur_l_IMU" name="femur_lacc"/>
+    <gyro site="femur_l_IMU" name="femur_lgyro"/>
+    <accelerometer site="tibia_l_IMU" name="tibia_lacc"/>
+    <gyro site="tibia_l_IMU" name="tibia_lgyro"/>
+    <accelerometer site="foot_l_IMU" name="foot_lacc"/>
+    <gyro site="foot_l_IMU" name="foot_lgyro"/>
+  </sensor>
+</mujoco>

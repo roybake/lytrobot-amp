@@ -168,7 +168,10 @@ def _normalized_terrain_context(
         context[0] = float(cfg.slope_angle_deg) / 30.0
     elif scenario == "slope_down":
         context[0] = -float(cfg.slope_angle_deg) / 30.0
-    elif scenario == "stair_up":
+    elif scenario in {"stair_up", "stairs"}:
+        # A single continuous ascent/platform/descent clip uses the generic
+        # "stairs" label.  Direction is already encoded by its gait command;
+        # the privileged table records the shared physical geometry.
         context[2] = float(cfg.stair_step_height) / 0.25
         context[3] = float(cfg.stair_step_depth) / 0.60
     elif scenario == "stair_down":

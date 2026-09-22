@@ -1,0 +1,277 @@
+{
+  "reference": "/home/yeah/code/LYTrobot_amp_recovered_20260806/multimotion/retargeting/results/stairs_xml/candidate.npz",
+  "model_xml": "/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/MJCFmodelposition.xml",
+  "terrain_xml": "/home/yeah/code/LYTrobot_amp_recovered_20260806/robot/terrains/more_discolrl/stairs.xml",
+  "reference_sha256": "fb431a7bf6dbcfd9ee4e7f2d3756553a0450aa35257a417bceebe214f8a6c669",
+  "model_xml_sha256": "2725c9abff4b77ea532ecd6682ff58daac13453a3d4db47879ef2705dc2aebcd",
+  "terrain_xml_sha256": "48bfb7c68c0a496b4d48b2b8fc25cba21abeddf181065f83f66aff35c05eb0fc",
+  "mujoco_version": "3.9.0",
+  "nq": 23,
+  "nv": 22,
+  "nu": 14,
+  "frame_count": 737,
+  "fps": 20.0,
+  "duration_s": 36.8,
+  "treads": [
+    {
+      "name": "step_up_0",
+      "x_min": 0.0,
+      "x_max": 0.32,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.2
+    },
+    {
+      "name": "step_up_1",
+      "x_min": 0.31999999999999995,
+      "x_max": 0.64,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.4
+    },
+    {
+      "name": "step_up_2",
+      "x_min": 0.64,
+      "x_max": 0.9600000000000001,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.6
+    },
+    {
+      "name": "step_up_3",
+      "x_min": 0.9600000000000001,
+      "x_max": 1.28,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.8
+    },
+    {
+      "name": "step_up_4",
+      "x_min": 1.28,
+      "x_max": 1.5999999999999999,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 1.0
+    },
+    {
+      "name": "step_platform",
+      "x_min": 1.6,
+      "x_max": 1.92,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 1.0
+    },
+    {
+      "name": "step_down_0",
+      "x_min": 1.9200000000000002,
+      "x_max": 2.24,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.8
+    },
+    {
+      "name": "step_down_1",
+      "x_min": 2.2399999999999998,
+      "x_max": 2.56,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.6
+    },
+    {
+      "name": "step_down_2",
+      "x_min": 2.56,
+      "x_max": 2.8800000000000003,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.4
+    },
+    {
+      "name": "step_down_3",
+      "x_min": 2.88,
+      "x_max": 3.2,
+      "y_min": -1.0,
+      "y_max": 1.0,
+      "height": 0.2
+    }
+  ],
+  "collision_sample_count": 2209,
+  "interpolation_subframes": 2,
+  "collision_method": "MuJoCo signed geom distance; compiled STL convex hulls; masks ignored",
+  "robot_mesh_count": 13,
+  "opposite_leg_pair_count": 36,
+  "penetration_tolerance_m": 0.0001,
+  "terrain_min_signed_distance_m": 0.0,
+  "terrain_worst": {
+    "frame": 0.3333333333333333,
+    "pair": [
+      "tibia_r",
+      "step_up_0"
+    ]
+  },
+  "self_min_signed_distance_m": 0.0,
+  "self_worst": {
+    "frame": 8.0,
+    "pair": [
+      "tibia_r",
+      "tibia_l"
+    ]
+  },
+  "terrain_penetrating_samples": 0,
+  "self_penetrating_samples": 0,
+  "joint_limit_violations": {
+    "hip_flexion_r": 0.5308309857275679,
+    "hip_adduction_r": 0.22637224637612927,
+    "hip_rotation_r": 0.24713927092584115,
+    "knee_angle_r": 0.6828949489105818,
+    "patella_r_j1": 0.0007611153869269832,
+    "ankle_angle_r": 0.0938519504565094,
+    "subtalar_angle_r": 0.26177972512597014,
+    "hip_flexion_l": 0.348777522897192,
+    "hip_adduction_l": 0.1963055581884318,
+    "hip_rotation_l": 0.3051523106010823,
+    "knee_angle_l": 0.6657463756292545,
+    "patella_l_j1": 0.0005553325075510554,
+    "ankle_angle_l": 0.17461272183968968,
+    "subtalar_angle_l": 0.2617677589813814
+  },
+  "quaternion_norm_max_error": 2.220446049250313e-16,
+  "equality_max_error_m": {
+    "r": 0.0,
+    "l": 0.0
+  },
+  "root_roll_abs_max_deg": 8.062629194158275,
+  "root_pitch_abs_max_deg": 16.566407602591458,
+  "root_speed_m_s": {
+    "max": 0.8343476370836131,
+    "mean": 0.20617974129733654,
+    "p95": 0.6543296316665391
+  },
+  "joint_speed_rad_s": {
+    "max": 3.841709328051375,
+    "mean": 0.41836834608790135,
+    "p95": 1.7277140172970242
+  },
+  "root_mean_forward_speed_m_s": 0.1043558964457805,
+  "stance_landmark_planar_speed_m_s": {
+    "right": {
+      "max": 0.06310478081703579,
+      "mean": 0.0017125038017468113,
+      "p95": 0.00241991922807475,
+      "max_contact_bout_drift_m": 0.003242446241948417
+    },
+    "left": {
+      "max": 0.04432055618214814,
+      "mean": 0.001456568108914709,
+      "p95": 0.001804119168051103,
+      "max_contact_bout_drift_m": 0.0020868818705775186
+    }
+  },
+  "qvel_present": true,
+  "qvel_vs_central_difference_max_error": 0.0,
+  "kinematic_checks_passed": false,
+  "dynamics_validated": false,
+  "maximum_planned_contact_error_m": 0.00824587959070857,
+  "full_course": true,
+  "required_joint_envelope": {
+    "hip_flexion_r": {
+      "minimum_deg": -9.94878980922036,
+      "maximum_deg": 54.61433621411995,
+      "current_model_minimum_deg": -12.799991734781617,
+      "current_model_maximum_deg": 24.19996109716107
+    },
+    "hip_adduction_r": {
+      "minimum_deg": -12.744049190361384,
+      "maximum_deg": 15.070179226961343,
+      "current_model_minimum_deg": -10.800025255097966,
+      "current_model_maximum_deg": 2.1000049107134933
+    },
+    "hip_rotation_r": {
+      "minimum_deg": -17.465489811974624,
+      "maximum_deg": 14.960058145332079,
+      "current_model_minimum_deg": -8.500000778104303,
+      "current_model_maximum_deg": 0.8000209693411685
+    },
+    "knee_angle_r": {
+      "minimum_deg": -99.1270241379191,
+      "maximum_deg": -0.0125038019469838,
+      "current_model_minimum_deg": -60.00002571454079,
+      "current_model_maximum_deg": 12.000028061219961
+    },
+    "ankle_angle_r": {
+      "minimum_deg": -8.80789479817339,
+      "maximum_deg": 50.37731129824472,
+      "current_model_minimum_deg": -20.000008571513593,
+      "current_model_maximum_deg": 44.99999063801583
+    },
+    "subtalar_angle_r": {
+      "minimum_deg": -29.99885119255832,
+      "maximum_deg": 30.009115794689848,
+      "current_model_minimum_deg": -14.99997778074544,
+      "current_model_maximum_deg": 20.000008571513593
+    },
+    "mtp_angle_r": {
+      "minimum_deg": -0.06890458613043232,
+      "maximum_deg": 12.4822745052122,
+      "current_model_minimum_deg": -57.29577951308232,
+      "current_model_maximum_deg": 57.29577951308232
+    },
+    "hip_flexion_l": {
+      "minimum_deg": -27.28156766595031,
+      "maximum_deg": 44.1834411481976,
+      "current_model_minimum_deg": -12.799991734781617,
+      "current_model_maximum_deg": 24.19996109716107
+    },
+    "hip_adduction_l": {
+      "minimum_deg": -17.48315053451012,
+      "maximum_deg": 13.347484889870433,
+      "current_model_minimum_deg": -10.800025255097966,
+      "current_model_maximum_deg": 2.1000049107134933
+    },
+    "hip_rotation_l": {
+      "minimum_deg": -20.319520565519728,
+      "maximum_deg": 18.283960475448392,
+      "current_model_minimum_deg": -8.500000778104303,
+      "current_model_maximum_deg": 0.8000209693411685
+    },
+    "knee_angle_l": {
+      "minimum_deg": -98.14448326422824,
+      "maximum_deg": -1.3079166278227163,
+      "current_model_minimum_deg": -60.00002571454079,
+      "current_model_maximum_deg": 12.000028061219961
+    },
+    "ankle_angle_l": {
+      "minimum_deg": 5.999715831207562,
+      "maximum_deg": 55.004562648721866,
+      "current_model_minimum_deg": -20.000008571513593,
+      "current_model_maximum_deg": 44.99999063801583
+    },
+    "subtalar_angle_l": {
+      "minimum_deg": -29.99816558297634,
+      "maximum_deg": 30.00603832976181,
+      "current_model_minimum_deg": -14.99997778074544,
+      "current_model_maximum_deg": 20.000008571513593
+    },
+    "mtp_angle_l": {
+      "minimum_deg": -20.562541902868908,
+      "maximum_deg": 1.8804317421780006,
+      "current_model_minimum_deg": -57.29577951308232,
+      "current_model_maximum_deg": 57.29577951308232
+    }
+  },
+  "joint_limits_enforced": false,
+  "acceptance_limits": {
+    "maximum_planned_contact_error_m": 0.015,
+    "maximum_root_roll_deg": 10.0,
+    "maximum_root_pitch_deg": 20.0,
+    "maximum_joint_speed_rad_s": 4.0,
+    "maximum_root_speed_m_s": 1.2,
+    "mean_forward_speed_range_m_s": [
+      0.1,
+      0.6
+    ],
+    "stance_p95_planar_speed_m_s": 0.05,
+    "stance_bout_drift_m": 0.015,
+    "requires_full_course": true
+  },
+  "accepted_for_export": true
+}

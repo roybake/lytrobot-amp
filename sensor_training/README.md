@@ -2,17 +2,17 @@
 
 ## 纯传感器上下楼梯 DeepMimic
 
-`sensor_training/train_stairs_deepmimic.py` 使用本目录的 GRU 传感器 Actor，输入是 IMU、肌腱长度、上一动作，以及板载时钟/参考肌腱表生成的步态指令；仿真关节、脚端、接触和楼梯真值只参与训练期奖励或 critic，不进入 Actor。该入口采用显式 DeepMimic 五项跟踪奖励，关闭 AMP 判别器，并对 Actor 增加 LCP 观测梯度正则项。训练固定匹配 5 级、0.13 m 立板、0.32 m 踏步的楼梯参考；目前不支持仅凭这些传感器识别未知台阶几何。
+`sensor_training/train_stairs_deepmimic.py` 使用本目录的 GRU 传感器 Actor，输入是 IMU、肌腱长度、上一动作，以及板载时钟/参考肌腱表生成的步态指令；仿真关节、脚端、接触和楼梯真值只参与训练期奖励或 critic，不进入 Actor。该入口采用显式 DeepMimic 五项跟踪奖励，关闭 AMP 判别器，并对 Actor 增加 LCP 观测梯度正则项。默认训练固定匹配 `robot/reference_data/multimotion/stairs.npz` 与 `robot/terrains/stairs.xml`：三阶、0.13 m 立板、0.32 m 踏步，连续完成上楼—平台—下楼。参考保留重定向时的世界坐标，场景直接使用 XML 内置地形，不会重复生成第二套楼梯。
 
 奖励公式已从 [MimicKit DeepMimic `compute_reward`](https://github.com/xbpeng/MimicKit/blob/main/mimickit/envs/deepmimic_env.py) 移植到 `src/lytrobot_amp/mimickit_deepmimic.py`：使用同样的五组权重和指数误差尺度，并在传感器训练器中使用同样的裁剪 PPO 目标。适配点是 LYT 的 14 个一轴关节用环绕角差计算，四个脚跟/脚尖碰撞点用作 key points；由于纯传感器 Actor 无全局目标位置输入，使用上游 `track_root=False` 分支，只跟踪根部高度和局部姿态/速度。物理求解仍由项目的 MuJoCo/Warp 环境承担；不加载 MimicKit 的 Isaac/Newton engine。
 
 ```bash
-uv run python sensor_training/train_stairs_deepmimic.py --direction up_down --check-data
+uv run python sensor_training/train_stairs_deepmimic.py --check-data
 uv run python sensor_training/train_stairs_deepmimic.py \
-  --direction up_down --num-envs 1024 --max-iterations 30000
+  --num-envs 1024 --max-iterations 30000
 ```
 
-`--direction` 也可选 `up` 或 `down`，分别加载同名 OmniRetarget NPZ。当前楼梯重定向参考尚缺；补齐并校验后才能实际训练和评估。`scripts/train_stairs_deepmimic.py` 是此纯传感器入口的兼容别名。
+默认 `--direction exact` 使用上述精确场景数据。`--direction up`、`down` 或 `up_down` 仍保留旧的程序化五级楼梯课程。`scripts/train_stairs_deepmimic.py` 是此纯传感器入口的兼容别名。
 
 动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。
 

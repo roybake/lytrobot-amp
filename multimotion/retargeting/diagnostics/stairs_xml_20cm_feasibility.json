@@ -1,0 +1,1035 @@
+{
+  "purpose": "Local kinematic diagnostic only; candidates are not approved motion references.",
+  "limitations": [
+    "Multi-start local least-squares cannot prove global infeasibility.",
+    "COM inside the support hull is a quasi-static proxy, not dynamic balance or actuator feasibility.",
+    "Contact hull uses mesh vertices within 10 mm of the intended tread height; tilted/noncontact feet can leave no hull.",
+    "All joint bounds are original model values. COM support is a weighted residual and must be checked after optimization.",
+    "No temporal smoothness, speed, dynamics, or self-collision acceptance is claimed."
+  ],
+  "model": "robot/MJCFmodelposition.xml",
+  "terrain": "robot/terrains/more_discolrl/stairs.xml",
+  "model_sha256": "2725c9abff4b77ea532ecd6682ff58daac13453a3d4db47879ef2705dc2aebcd",
+  "terrain_sha256": "48bfb7c68c0a496b4d48b2b8fc25cba21abeddf181065f83f66aff35c05eb0fc",
+  "step_height_m": 0.2,
+  "step_depth_m": 0.32,
+  "mujoco_version": "3.10.0",
+  "attempts_per_case_profile": 8,
+  "max_nfev_per_attempt": 140,
+  "profiles": {
+    "wide_posture_search": {
+      "roll_bound_deg": 15.0,
+      "pitch_bound_deg": 30.0,
+      "root_lateral_bound_m": 0.2,
+      "com_support_residual": false
+    },
+    "moderate_posture_and_support_com": {
+      "roll_bound_deg": 8.0,
+      "pitch_bound_deg": 15.0,
+      "root_lateral_bound_m": 0.12,
+      "com_support_residual": true
+    }
+  },
+  "results": {
+    "ascent_adjacent_flat_feet": {
+      "wide_posture_search": {
+        "maximum_foot_landmark_error_m": 0.006495691519172823,
+        "landmark_errors_xyz_m": [
+          [
+            -0.0011053052493731341,
+            -0.005888302532919512,
+            -0.002510020298478799
+          ],
+          [
+            0.0008639644356195908,
+            0.003064118724489126,
+            0.0030424978347403653
+          ],
+          [
+            5.091467610154887e-05,
+            -0.0016074107931577375,
+            0.0009122621954521367
+          ],
+          [
+            0.0008841305488620638,
+            0.004610997946312076,
+            0.0038484146485791284
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": 0.00016719980287411597,
+        "minimum_all_body_mesh_terrain_distance_m": 0.0,
+        "closest_robot_body": "tibia_r",
+        "closest_terrain_geom": "audit_source_step_up_1",
+        "root_xyz_m": [
+          -0.3953346928205469,
+          0.15167924345543535,
+          0.8276243240423364
+        ],
+        "root_roll_pitch_deg": [
+          -9.87616838817714,
+          -29.687003053527754
+        ],
+        "subtree_com_xyz_m": [
+          -0.2272930177007827,
+          0.10008224048123746,
+          0.5941933455550293
+        ],
+        "planned_support_hull_margin_m": 0.003917223613525145,
+        "actual_contact_hull_margin_m": 0.002300815217731206,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 23.80597375950782,
+          "hip_adduction_r": -5.598674982498692,
+          "hip_rotation_r": -0.7350238027810821,
+          "knee_angle_r": -32.56844486167696,
+          "ankle_angle_r": -17.20536264475312,
+          "subtalar_angle_r": 19.37286558786729,
+          "mtp_angle_r": 18.76179527156174,
+          "hip_flexion_l": -7.398468401805783,
+          "hip_adduction_l": 0.12282372929636183,
+          "hip_rotation_l": 0.7225666869560647,
+          "knee_angle_l": -27.192189243486357,
+          "ankle_angle_l": 1.799121833533832,
+          "subtalar_angle_l": -2.471118064935195,
+          "mtp_angle_l": 2.1067708072280564
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_r",
+          "hip_rotation_l"
+        ],
+        "root_roll_limit_active": false,
+        "root_pitch_limit_active": false,
+        "best_weighted_residual_norm": 1.9927541406554468,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.3953346928205469,
+          0.15167924345543535,
+          0.8276243240423364,
+          0.9630413265386919,
+          -0.08320663569421743,
+          -0.2552288775792879,
+          0.022051739266176346,
+          0.4154926237467842,
+          -0.09771531219363808,
+          -0.012828585439059337,
+          -0.5684265950904921,
+          -0.0018211191410859055,
+          -0.3002902271505814,
+          0.3381202900545911,
+          0.327455101073856,
+          -0.12912763321627369,
+          0.002143678475799732,
+          0.012611167752610493,
+          -0.47459323312422297,
+          -0.0006951187974906757,
+          0.0314005996396827,
+          -0.04312914643863019,
+          0.03677008717102834
+        ],
+        "target_landmarks": [
+          [
+            0.08394571973407906,
+            -0.08065191619037437,
+            0.203
+          ],
+          [
+            0.23605428026592096,
+            -0.06934808380962564,
+            0.203
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      },
+      "moderate_posture_and_support_com": {
+        "maximum_foot_landmark_error_m": 0.02847925578623377,
+        "landmark_errors_xyz_m": [
+          [
+            0.013341637415459282,
+            -0.024665679227365817,
+            -0.004967191305440266
+          ],
+          [
+            0.0026439953213419354,
+            0.0016268620185449223,
+            0.025716923433871608
+          ],
+          [
+            -0.01247223238603612,
+            0.005280571574317425,
+            0.01274279263705078
+          ],
+          [
+            -0.01055320787726341,
+            0.011502469282720668,
+            0.009516781032522806
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": -0.002232059018182186,
+        "minimum_all_body_mesh_terrain_distance_m": -0.002232059018182186,
+        "closest_robot_body": "foot_r",
+        "closest_terrain_geom": "audit_source_step_up_0",
+        "root_xyz_m": [
+          -0.38816964594488634,
+          0.11363137852333902,
+          0.8739970983636995
+        ],
+        "root_roll_pitch_deg": [
+          -7.999152125619148,
+          -14.93492537736038
+        ],
+        "subtree_com_xyz_m": [
+          -0.25518828783945247,
+          0.07308728191592763,
+          0.610712179177854
+        ],
+        "planned_support_hull_margin_m": -0.004699368418778216,
+        "actual_contact_hull_margin_m": -0.13345918589864708,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 24.198767034129826,
+          "hip_adduction_r": -3.7683817038718406,
+          "hip_rotation_r": 0.7832344699606644,
+          "knee_angle_r": -5.400451073152071,
+          "ankle_angle_r": -19.999669718999872,
+          "subtalar_angle_r": 19.818244957221154,
+          "mtp_angle_r": -27.543145120547848,
+          "hip_flexion_l": -5.453438387354936,
+          "hip_adduction_l": -1.4652794880440356,
+          "hip_rotation_l": -6.01318529590367,
+          "knee_angle_l": -3.361101378800813,
+          "ankle_angle_l": -8.715778786484602,
+          "subtalar_angle_l": 8.996448786339732,
+          "mtp_angle_l": 9.672177657152542
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_r",
+          "hip_rotation_r",
+          "ankle_angle_r",
+          "subtalar_angle_r"
+        ],
+        "root_roll_limit_active": true,
+        "root_pitch_limit_active": true,
+        "best_weighted_residual_norm": 10.480261931006613,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.38816964594488634,
+          0.11363137852333902,
+          0.8739970983636995,
+          0.9891040468430942,
+          -0.0691575384148158,
+          -0.12964662969336352,
+          0.009064811535234278,
+          0.4223481596686285,
+          -0.06577066820447756,
+          0.013670020315926215,
+          -0.0942556523193648,
+          0.0038689321721676224,
+          -0.3490600859079569,
+          0.3458936264702719,
+          -0.4807185687081704,
+          -0.09518045541399353,
+          -0.025573951528305307,
+          -0.10494988194602853,
+          -0.058662285553395324,
+          0.004296052573359256,
+          -0.15211903669963214,
+          0.15701765230867618,
+          0.16881134595514313
+        ],
+        "target_landmarks": [
+          [
+            0.08394571973407906,
+            -0.08065191619037437,
+            0.203
+          ],
+          [
+            0.23605428026592096,
+            -0.06934808380962564,
+            0.203
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      }
+    },
+    "ascent_swing_over_riser": {
+      "wide_posture_search": {
+        "maximum_foot_landmark_error_m": 0.022460839124168862,
+        "landmark_errors_xyz_m": [
+          [
+            0.0018952756153332584,
+            -0.008003842726222704,
+            -0.01414615284189702
+          ],
+          [
+            -0.002632605051147305,
+            -0.020051335016067304,
+            -0.0009093504346595893
+          ],
+          [
+            -0.00030110787443374254,
+            0.014960825513721729,
+            0.016750293375273215
+          ],
+          [
+            0.00208584220532039,
+            0.013318721062308525,
+            0.0061590845294725504
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": -1.9518041147425363e-05,
+        "minimum_all_body_mesh_terrain_distance_m": -1.9518041147425363e-05,
+        "closest_robot_body": "toe_l",
+        "closest_terrain_geom": "audit_source_floor",
+        "root_xyz_m": [
+          -0.36874365991929914,
+          0.18312860571929784,
+          0.8560673050253829
+        ],
+        "root_roll_pitch_deg": [
+          -14.292024526056842,
+          -29.99993141813821
+        ],
+        "subtree_com_xyz_m": [
+          -0.2207867359884393,
+          0.11546737520964583,
+          0.6223480886172149
+        ],
+        "planned_support_hull_margin_m": -0.009250119855308714,
+        "actual_contact_hull_margin_m": -0.09749809268665949,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 24.199911731412193,
+          "hip_adduction_r": -10.767863772470044,
+          "hip_rotation_r": -8.49994684576221,
+          "knee_angle_r": -59.8501054132569,
+          "ankle_angle_r": 6.98522710974676,
+          "subtalar_angle_r": 18.22735508692586,
+          "mtp_angle_r": -46.54210499203781,
+          "hip_flexion_l": -12.799973102879969,
+          "hip_adduction_l": -3.7326694387493786,
+          "hip_rotation_l": 0.7998198392777803,
+          "knee_angle_l": -21.078942015838596,
+          "ankle_angle_l": -2.885579403633426,
+          "subtalar_angle_l": 3.9624795412869758,
+          "mtp_angle_l": 18.069440171515488
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_r",
+          "hip_adduction_r",
+          "hip_rotation_r",
+          "knee_angle_r",
+          "hip_flexion_l",
+          "hip_rotation_l"
+        ],
+        "root_roll_limit_active": false,
+        "root_pitch_limit_active": true,
+        "best_weighted_residual_norm": 7.7374931164970535,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.36874365991929914,
+          0.18312860571929784,
+          0.8560673050253829,
+          0.9584230138064732,
+          -0.12015959280411193,
+          -0.25680805776761795,
+          0.03219658877724187,
+          0.4223681384051444,
+          -0.1879346762358198,
+          -0.14835205870305718,
+          -1.0445813971270144,
+          -0.007534976765524173,
+          0.12191521206464825,
+          0.3181273601969935,
+          -0.812312972919949,
+          -0.22340167481197032,
+          -0.06514737159474547,
+          0.013959489618169132,
+          -0.3678969410133542,
+          0.0005852367078397498,
+          -0.05036286142113771,
+          0.06915831453837232,
+          0.31537122498507414
+        ],
+        "target_landmarks": [
+          [
+            -0.05605428026592095,
+            -0.08065191619037437,
+            0.233
+          ],
+          [
+            0.09605428026592094,
+            -0.06934808380962564,
+            0.233
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          1
+        ]
+      },
+      "moderate_posture_and_support_com": {
+        "maximum_foot_landmark_error_m": 0.07361786682754048,
+        "landmark_errors_xyz_m": [
+          [
+            -0.014655881391813425,
+            -0.046954325942232256,
+            -0.05477304749762604
+          ],
+          [
+            -0.01623305304436408,
+            -0.027952475455265455,
+            -0.006176728624022826
+          ],
+          [
+            0.013935424047900491,
+            0.023789151682889656,
+            0.045005987871824256
+          ],
+          [
+            0.016178658523002015,
+            0.01967743673035746,
+            0.016000049737374487
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": 0.0004017141578661998,
+        "minimum_all_body_mesh_terrain_distance_m": 0.0004017141578661998,
+        "closest_robot_body": "foot_r",
+        "closest_terrain_geom": "audit_source_step_up_0",
+        "root_xyz_m": [
+          -0.21377517548021527,
+          0.11999995383516626,
+          0.9129751968412511
+        ],
+        "root_roll_pitch_deg": [
+          -7.9999999995583115,
+          -14.999999904498225
+        ],
+        "subtree_com_xyz_m": [
+          -0.12762853186624284,
+          0.07108746811834345,
+          0.6439561863422558
+        ],
+        "planned_support_hull_margin_m": 0.013291697690019422,
+        "actual_contact_hull_margin_m": null,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 24.199961067872785,
+          "hip_adduction_r": -9.839956764827996,
+          "hip_rotation_r": -2.432121241673253,
+          "knee_angle_r": -60.00002571452216,
+          "ankle_angle_r": 42.05013864087647,
+          "subtalar_angle_r": 20.000004261481823,
+          "mtp_angle_r": 57.29556650448441,
+          "hip_flexion_l": -12.799991734347124,
+          "hip_adduction_l": -2.215211709062818,
+          "hip_rotation_l": 0.8000151318341523,
+          "knee_angle_l": -10.014597783916987,
+          "ankle_angle_l": -5.595526870507314,
+          "subtalar_angle_l": 3.038271993090967,
+          "mtp_angle_l": 34.037734510368146
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_r",
+          "knee_angle_r",
+          "subtalar_angle_r",
+          "mtp_angle_r",
+          "hip_flexion_l",
+          "hip_rotation_l"
+        ],
+        "root_roll_limit_active": true,
+        "root_pitch_limit_active": true,
+        "best_weighted_residual_norm": 23.430055224169983,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.21377517548021527,
+          0.11999995383516626,
+          0.9129751968412511,
+          0.9890297516301317,
+          -0.06915969744494621,
+          -0.1302082361517946,
+          0.009105046842378398,
+          0.42236899948882306,
+          -0.17173964380013787,
+          -0.04244852347489098,
+          -1.047197999999675,
+          -0.007566375999996101,
+          0.7339133702033878,
+          0.34906592477575477,
+          0.9999962822986315,
+          -0.22340199999241667,
+          -0.03866273795187688,
+          0.013962898116282459,
+          -0.17478770459227905,
+          0.0029025475448926515,
+          -0.09766036727416702,
+          0.053027849850567785,
+          0.5940705371256242
+        ],
+        "target_landmarks": [
+          [
+            -0.05605428026592095,
+            -0.08065191619037437,
+            0.233
+          ],
+          [
+            0.09605428026592094,
+            -0.06934808380962564,
+            0.233
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          1
+        ]
+      }
+    },
+    "ascent_rear_heel_raised": {
+      "wide_posture_search": {
+        "maximum_foot_landmark_error_m": 0.0006921524177582946,
+        "landmark_errors_xyz_m": [
+          [
+            -0.0005416889753843829,
+            -0.0003824790573958292,
+            -0.00019838798857105266
+          ],
+          [
+            0.0001926979661699968,
+            0.00047770989114162554,
+            -5.501706096330827e-05
+          ],
+          [
+            -0.0001534130090566077,
+            0.00015204366012154524,
+            0.0001739322340974167
+          ],
+          [
+            0.00014408820477618267,
+            9.375792663766924e-05,
+            8.477293816116019e-05
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": 0.00043513170453913196,
+        "minimum_all_body_mesh_terrain_distance_m": 0.0,
+        "closest_robot_body": "tibia_l",
+        "closest_terrain_geom": "audit_source_step_up_0",
+        "root_xyz_m": [
+          -0.3125059018753619,
+          0.13422028329505786,
+          0.8962940357914997
+        ],
+        "root_roll_pitch_deg": [
+          -14.48835072679449,
+          -22.78310701720738
+        ],
+        "subtree_com_xyz_m": [
+          -0.17947404556114735,
+          0.08642037986684722,
+          0.6379581021026569
+        ],
+        "planned_support_hull_margin_m": -0.07943118987781324,
+        "actual_contact_hull_margin_m": -0.06803294390637354,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 21.297081246143303,
+          "hip_adduction_r": 1.7031419988199932,
+          "hip_rotation_r": -2.285163259281415,
+          "knee_angle_r": -29.07882969000621,
+          "ankle_angle_r": -16.013522927375313,
+          "subtalar_angle_r": 6.454774894964313,
+          "mtp_angle_r": 4.02423204420366,
+          "hip_flexion_l": -12.395867156573306,
+          "hip_adduction_l": -6.668621887581327,
+          "hip_rotation_l": 0.3137513619783244,
+          "knee_angle_l": -14.162469255331436,
+          "ankle_angle_l": -13.713239802264845,
+          "subtalar_angle_l": 3.0332735778034166,
+          "mtp_angle_l": 35.323315574259006
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_adduction_r",
+          "hip_flexion_l",
+          "hip_rotation_l"
+        ],
+        "root_roll_limit_active": false,
+        "root_pitch_limit_active": false,
+        "best_weighted_residual_norm": 0.15089712651652823,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.3125059018753619,
+          0.13422028329505786,
+          0.8962940357914997,
+          0.9724753237012553,
+          -0.12361402729663977,
+          -0.1959362354902874,
+          0.024905996658212134,
+          0.37170418880993755,
+          0.02972543550840626,
+          -0.03988362282006556,
+          -0.5075213207172904,
+          -0.0010902558486074847,
+          -0.2794886999263,
+          0.11265707439219841,
+          0.07023609903561585,
+          -0.21634869552203165,
+          -0.1163894085088533,
+          0.00547599429913831,
+          -0.24718171871800304,
+          0.0020338193753839636,
+          -0.2393411856650577,
+          0.05294061104641801,
+          0.6165081594918111
+        ],
+        "target_landmarks": [
+          [
+            0.08394571973407906,
+            -0.08065191619037437,
+            0.203
+          ],
+          [
+            0.23605428026592096,
+            -0.06934808380962564,
+            0.203
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.043000000000000003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      },
+      "moderate_posture_and_support_com": {
+        "maximum_foot_landmark_error_m": 0.07106068688168966,
+        "landmark_errors_xyz_m": [
+          [
+            -0.05072849895384651,
+            -0.014471387874902888,
+            -0.006277433661728338
+          ],
+          [
+            -0.042007296780716186,
+            -0.02832418712190428,
+            0.0019099773246234741
+          ],
+          [
+            0.0518740929051853,
+            0.023334952615388316,
+            0.04259318832629611
+          ],
+          [
+            0.040861701427618025,
+            0.01946065745623067,
+            0.016396817268661473
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": -0.0034410135062853393,
+        "minimum_all_body_mesh_terrain_distance_m": -0.0034410135062853393,
+        "closest_robot_body": "foot_r",
+        "closest_terrain_geom": "audit_source_step_up_0",
+        "root_xyz_m": [
+          -0.10304157486887579,
+          0.11948147963144451,
+          0.9276157831666908
+        ],
+        "root_roll_pitch_deg": [
+          -7.999999999999998,
+          -14.999999999999996
+        ],
+        "subtree_com_xyz_m": [
+          -0.022231319415259528,
+          0.07061793194313609,
+          0.6586878995685546
+        ],
+        "planned_support_hull_margin_m": 0.023234373545418976,
+        "actual_contact_hull_margin_m": -0.16414291646553913,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 24.199961097161065,
+          "hip_adduction_r": -10.800025255097964,
+          "hip_rotation_r": -8.500000778103855,
+          "knee_angle_r": -60.000025714540776,
+          "ankle_angle_r": 23.242968810215356,
+          "subtalar_angle_r": 19.257922426731596,
+          "mtp_angle_r": 57.295758523574825,
+          "hip_flexion_l": -12.799991734781615,
+          "hip_adduction_l": -2.255822793455171,
+          "hip_rotation_l": 0.8000209693409406,
+          "knee_angle_l": -19.667823384670303,
+          "ankle_angle_l": -10.661702431066312,
+          "subtalar_angle_l": 1.815202855259372,
+          "mtp_angle_l": 25.942531016853472
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_r",
+          "hip_adduction_r",
+          "hip_rotation_r",
+          "knee_angle_r",
+          "mtp_angle_r",
+          "hip_flexion_l",
+          "hip_rotation_l"
+        ],
+        "root_roll_limit_active": true,
+        "root_pitch_limit_active": true,
+        "best_weighted_residual_norm": 18.998766431497124,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          -0.10304157486887579,
+          0.11948147963144451,
+          0.9276157831666908,
+          0.9890297515213482,
+          -0.06915969744117013,
+          -0.130208236976027,
+          0.009105046900518676,
+          0.42236899999999994,
+          -0.18849599999999997,
+          -0.1483529999999922,
+          -1.0471979999999999,
+          -0.007566375999999999,
+          0.405666333676607,
+          0.3361141534401228,
+          0.9999996336639858,
+          -0.22340199999999996,
+          -0.03937153508732873,
+          0.013962999999996022,
+          -0.343268274763232,
+          0.0008807807028412161,
+          -0.1860818112899909,
+          0.03168126641587811,
+          0.45278258254484566
+        ],
+        "target_landmarks": [
+          [
+            0.08394571973407906,
+            -0.08065191619037437,
+            0.203
+          ],
+          [
+            0.23605428026592096,
+            -0.06934808380962564,
+            0.203
+          ],
+          [
+            -0.23605428052809824,
+            0.08065192714781313,
+            0.043000000000000003
+          ],
+          [
+            -0.08394571947190178,
+            0.06934807285218685,
+            0.003
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      }
+    },
+    "descent_adjacent_flat_feet": {
+      "wide_posture_search": {
+        "maximum_foot_landmark_error_m": 0.0020823913747449957,
+        "landmark_errors_xyz_m": [
+          [
+            -0.0006716285893322294,
+            0.0018204746702814162,
+            7.282004727971435e-06
+          ],
+          [
+            0.0004449823822723076,
+            -0.001946665423119956,
+            0.0005906253021237895
+          ],
+          [
+            -0.0005410641539245198,
+            0.001877261410571207,
+            7.808435036810168e-05
+          ],
+          [
+            0.0007785609354882261,
+            -0.0019170089201458879,
+            -1.7148817503254143e-05
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": 0.00044009949561759666,
+        "minimum_all_body_mesh_terrain_distance_m": 0.00044009949561759666,
+        "closest_robot_body": "toe_r",
+        "closest_terrain_geom": "audit_source_floor",
+        "root_xyz_m": [
+          3.5143340734702444,
+          -0.17217274648140682,
+          0.8550602408941184
+        ],
+        "root_roll_pitch_deg": [
+          12.464839744920146,
+          29.702820062801212
+        ],
+        "subtree_com_xyz_m": [
+          3.3903039263801484,
+          -0.11152412125511567,
+          0.5919450593271821
+        ],
+        "planned_support_hull_margin_m": 0.010151182051734764,
+        "actual_contact_hull_margin_m": 0.010843247827926672,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": 11.440491470844888,
+          "hip_adduction_r": -0.9263198130509432,
+          "hip_rotation_r": 0.6301653976888802,
+          "knee_angle_r": 3.935909238298678,
+          "ankle_angle_r": 9.120102456436186,
+          "subtalar_angle_r": -6.605832656232227,
+          "mtp_angle_r": 4.62056620210187,
+          "hip_flexion_l": -12.555795873555676,
+          "hip_adduction_l": -1.8151310670644984,
+          "hip_rotation_l": -3.8099251427653944,
+          "knee_angle_l": -3.1819121124877126,
+          "ankle_angle_l": 43.66450317659192,
+          "subtalar_angle_l": -2.264446583752386,
+          "mtp_angle_l": 9.83621111073978
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_rotation_r",
+          "hip_flexion_l"
+        ],
+        "root_roll_limit_active": false,
+        "root_pitch_limit_active": false,
+        "best_weighted_residual_norm": 0.5137320260645051,
+        "optimizer_reported_convergence": false,
+        "qpos": [
+          3.5143340734702444,
+          -0.17217274648140682,
+          0.8550602408941184,
+          0.9608809305523519,
+          0.10493522244407408,
+          0.25479827187327037,
+          0.027825834072924764,
+          0.19967424421257216,
+          -0.0161673306641973,
+          0.010998461021810426,
+          0.06869457526797403,
+          0.0058243349032156885,
+          0.15917581598403416,
+          -0.11529352968701508,
+          0.08064409353304736,
+          -0.21913997820186418,
+          -0.031680013475513503,
+          -0.06649573799577115,
+          -0.055534842871998766,
+          0.004333581885536015,
+          0.762089346679052,
+          -0.039522048622016664,
+          0.17167426980365774
+        ],
+        "target_landmarks": [
+          [
+            3.283945719734079,
+            -0.08065191619037437,
+            0.003
+          ],
+          [
+            3.4360542802659206,
+            -0.06934808380962564,
+            0.003
+          ],
+          [
+            2.963945719471902,
+            0.08065192714781313,
+            0.203
+          ],
+          [
+            3.116054280528098,
+            0.06934807285218685,
+            0.203
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      },
+      "moderate_posture_and_support_com": {
+        "maximum_foot_landmark_error_m": 0.018476408642063354,
+        "landmark_errors_xyz_m": [
+          [
+            0.0036284667187858055,
+            -0.0028194385182275378,
+            0.008832170033981148
+          ],
+          [
+            0.005215715765383155,
+            -0.0019397509837839055,
+            0.002542482404983489
+          ],
+          [
+            -0.00452951840979221,
+            -0.009779663691015766,
+            0.012280117802071194
+          ],
+          [
+            -0.004819821397923807,
+            0.01748867282762606,
+            -0.003506183213821401
+          ]
+        ],
+        "minimum_foot_terrain_distance_m": -0.0013038824761331946,
+        "minimum_all_body_mesh_terrain_distance_m": -0.0013038824761331946,
+        "closest_robot_body": "toe_l",
+        "closest_terrain_geom": "audit_source_step_down_3",
+        "root_xyz_m": [
+          3.424632923305323,
+          -0.05640873075293224,
+          0.8893412745606962
+        ],
+        "root_roll_pitch_deg": [
+          7.9148692771793545,
+          7.424937615614629
+        ],
+        "subtree_com_xyz_m": [
+          3.3620745058049644,
+          -0.03217678686330517,
+          0.602829225615323
+        ],
+        "planned_support_hull_margin_m": 0.021805061612863108,
+        "actual_contact_hull_margin_m": 0.021503901266214154,
+        "contact_hull_vertex_height_tolerance_m": 0.01,
+        "joint_angles_deg": {
+          "hip_flexion_r": -4.13629143668058,
+          "hip_adduction_r": -4.929741683537191,
+          "hip_rotation_r": -1.7841588307320164,
+          "knee_angle_r": 0.8416982337583924,
+          "ankle_angle_r": 5.51346106238236,
+          "subtalar_angle_r": 1.1952125987084643,
+          "mtp_angle_r": 10.76460345304,
+          "hip_flexion_l": -12.719825299181762,
+          "hip_adduction_l": 1.8792502943672547,
+          "hip_rotation_l": -3.296428912121504,
+          "knee_angle_l": -38.97250275323508,
+          "ankle_angle_l": 44.99921126526659,
+          "subtalar_angle_l": -14.884487802242964,
+          "mtp_angle_l": 5.024207612114597
+        },
+        "joint_limit_violation_rad": 0.0,
+        "joints_within_half_degree_of_limit": [
+          "hip_flexion_l",
+          "hip_adduction_l",
+          "ankle_angle_l",
+          "subtalar_angle_l"
+        ],
+        "root_roll_limit_active": true,
+        "root_pitch_limit_active": false,
+        "best_weighted_residual_norm": 5.72101390770035,
+        "optimizer_reported_convergence": true,
+        "qpos": [
+          3.424632923305323,
+          -0.05640873075293224,
+          0.8893412745606962,
+          0.9955221520103629,
+          0.06887053333018398,
+          0.06459508605372599,
+          0.004468708223162601,
+          -0.07219190439212267,
+          -0.08604022365053232,
+          -0.031139445974805877,
+          0.014690405487304832,
+          0.005176284865847658,
+          0.09622804871907666,
+          0.020860395108780426,
+          0.18787777292709879,
+          -0.22200283174919455,
+          0.03279910510578124,
+          -0.057533538074455055,
+          -0.6801984907865073,
+          -0.003162381889438087,
+          0.7853843973794254,
+          -0.25978331962207435,
+          0.08768896513516186
+        ],
+        "target_landmarks": [
+          [
+            3.283945719734079,
+            -0.08065191619037437,
+            0.003
+          ],
+          [
+            3.4360542802659206,
+            -0.06934808380962564,
+            0.003
+          ],
+          [
+            2.963945719471902,
+            0.08065192714781313,
+            0.203
+          ],
+          [
+            3.116054280528098,
+            0.06934807285218685,
+            0.203
+          ]
+        ],
+        "support_sides_right_zero_left_one": [
+          0,
+          1
+        ]
+      }
+    }
+  }
+}
