@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools==82.0.1", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lytrobot-amp"
+version = "0.1.0"
+description = "PPO-AMP training code for the LYT biped MuJoCo robot."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mjlab==1.6.0",
+  "mujoco==3.11.0",
+  "mujoco-warp==3.11.0",
+  "numpy==2.4.6",
+  "onnx==1.22.0",
+  "onnxruntime==1.27.0",
+  "torch==2.10.0+cu130",
+  "warp-lang==1.17.0+cu13",
+  "wandb==0.27.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+torch = { path = "vendor/torch-2.10.0+cu130-cp312-cp312-manylinux_2_28_x86_64.whl" }
+warp-lang = { path = "vendor/warp_lang-1.17.0+cu13-py3-none-manylinux_2_28_x86_64.whl" }
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]

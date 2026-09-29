@@ -1,0 +1,66 @@
+[
+  {
+    "file": "143.asf",
+    "url": "https://mocap.cs.cmu.edu/subjects/143/143.asf",
+    "sha256": "6d7207da3bb9eceeaa32f23fb641b69f5836d11242b00c052e7d64f0cbe20a35",
+    "bytes": 7264,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "143_17.amc",
+    "url": "https://mocap.cs.cmu.edu/subjects/143/143_17.amc",
+    "sha256": "a895b4c8821feb4d50ea40d67c663592d9dc3162732b9c5203b366727faea1a0",
+    "bytes": 504557,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "113.asf",
+    "url": "https://mocap.cs.cmu.edu/subjects/113/113.asf",
+    "sha256": "7787c299639b95360a6469542d6543002b0b2d2d1cb6866c20bc11651ea74d63",
+    "bytes": 7258,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "113_19.amc",
+    "url": "https://mocap.cs.cmu.edu/subjects/113/113_19.amc",
+    "sha256": "7cf21705b0e3855b0a20252db51d6e32d4d7a335a1af5cf6e760acc2c4ef58d4",
+    "bytes": 642071,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "113_20.amc",
+    "url": "https://mocap.cs.cmu.edu/subjects/113/113_20.amc",
+    "sha256": "1d575099b7a9bc31b59ea32a0e4c00c83b8f791847ddfe101ed5f73995d962f4",
+    "bytes": 1158252,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "141.asf",
+    "url": "https://mocap.cs.cmu.edu/subjects/141/141.asf",
+    "sha256": "e32993b8079c0914ed4d865ad53f7b9646398808855233e6f650d4f4417df2bb",
+    "bytes": 7269,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "141_07.amc",
+    "url": "https://mocap.cs.cmu.edu/subjects/141/141_07.amc",
+    "sha256": "4707c8d81255db01dccdbaff02744b217bda2a8949e388d02123caeb000deec9",
+    "bytes": 238849,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  },
+  {
+    "file": "141_08.amc",
+    "url": "https://mocap.cs.cmu.edu/subjects/141/141_08.amc",
+    "sha256": "3ef910329960c7adbbc2cdb8e7a553a774914fe96010d2969fd21cf2bd93922b",
+    "bytes": 264387,
+    "download_utc_date": "2026-09-22",
+    "tls_note": "Local trust chain failed; fetched public dataset with certificate verification disabled."
+  }
+]

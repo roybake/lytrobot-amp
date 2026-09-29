@@ -1,0 +1,70 @@
+[
+  {
+    "file": "143_17_up_two_steps_aligned_120hz.npz",
+    "source": "143_17",
+    "clip": "up_two_steps",
+    "start_frame_zero_based": 0,
+    "end_frame_zero_based_inclusive": 155,
+    "source_fps": 120,
+    "original_duration_s": 1.2916666666666667,
+    "original_forward_xy": [
+      -0.9999198913574219,
+      0.012658846564590931
+    ],
+    "root_progress_m": 0.8845353722572327,
+    "root_height_change_m": 0.3927574157714844,
+    "recommended_step_duration_s": null,
+    "notes": "Use as measured human phase template, adapt stance anchors to exact target terrain with collision-constrained retargeting; do not assume source bones equal robot soles."
+  },
+  {
+    "file": "143_17_up_single_step_aligned_120hz.npz",
+    "source": "143_17",
+    "clip": "up_single_step",
+    "start_frame_zero_based": 53,
+    "end_frame_zero_based_inclusive": 100,
+    "source_fps": 120,
+    "original_duration_s": 0.39166666666666666,
+    "original_forward_xy": [
+      -0.9999198913574219,
+      0.012658846564590931
+    ],
+    "root_progress_m": 0.28768154978752136,
+    "root_height_change_m": 0.1982160210609436,
+    "recommended_step_duration_s": 0.7,
+    "notes": "Use as measured human phase template, adapt stance anchors to exact target terrain with collision-constrained retargeting; do not assume source bones equal robot soles."
+  },
+  {
+    "file": "141_08_down_two_steps_aligned_120hz.npz",
+    "source": "141_08",
+    "clip": "down_two_steps",
+    "start_frame_zero_based": 169,
+    "end_frame_zero_based_inclusive": 251,
+    "source_fps": 120,
+    "original_duration_s": 0.6833333333333333,
+    "original_forward_xy": [
+      0.9962036609649658,
+      -0.08705304563045502
+    ],
+    "root_progress_m": 0.7879666090011597,
+    "root_height_change_m": -0.4420955777168274,
+    "recommended_step_duration_s": null,
+    "notes": "Use as measured human phase template, adapt stance anchors to exact target terrain with collision-constrained retargeting; do not assume source bones equal robot soles."
+  },
+  {
+    "file": "141_08_down_single_step_aligned_120hz.npz",
+    "source": "141_08",
+    "clip": "down_single_step",
+    "start_frame_zero_based": 215,
+    "end_frame_zero_based_inclusive": 245,
+    "source_fps": 120,
+    "original_duration_s": 0.25,
+    "original_forward_xy": [
+      0.9962036609649658,
+      -0.08705304563045502
+    ],
+    "root_progress_m": 0.3993217945098877,
+    "root_height_change_m": -0.22170817852020264,
+    "recommended_step_duration_s": 0.7,
+    "notes": "Use as measured human phase template, adapt stance anchors to exact target terrain with collision-constrained retargeting; do not assume source bones equal robot soles."
+  }
+]

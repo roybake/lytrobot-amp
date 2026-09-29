@@ -1,0 +1,30 @@
+{
+  "model_xml": "/home/yeah/code/lytrobot/robot/terrains/stairs.xml",
+  "motion_file": "/home/yeah/code/lytrobot/robot/reference_data/multimotion/stairs.npz",
+  "root_x_offset_m": -0.39,
+  "frame_count": 912,
+  "frequency_hz": 40.0,
+  "maximum_foot_penetration_m": 0.01000325029031084,
+  "worst_penetration_frame": 373,
+  "worst_penetration_pair": [
+    "top_platform",
+    "foot_box_l"
+  ],
+  "maximum_visual_foot_mesh_penetration_m": 0.008105311835504116,
+  "worst_visual_mesh_frame": 373,
+  "worst_visual_mesh_pair": [
+    "top_platform",
+    "foot_geom_l"
+  ],
+  "frames_over_2cm_penetration": 0,
+  "tread_top_contact_frames": 377,
+  "tread_overhang_frames": 0,
+  "minimum_visual_tread_edge_margin_m": 0.031007686038370785,
+  "minimum_box_tread_edge_margin_m": 0.03042744874584105,
+  "unsupported_frames": 180,
+  "longest_unsupported_run_s": 1.1,
+  "longest_unsupported_start_frame": 446,
+  "longest_unsupported_end_frame": 489,
+  "alignment_pass": true,
+  "contact_geometry_pass": false
+}
