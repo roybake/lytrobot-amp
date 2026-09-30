@@ -36,16 +36,17 @@ def test_entry_uses_sensor_trainer_and_explicit_imitation() -> None:
     assert "--no-amp" in args
     assert "--use-reference-velocity" in args
     assert "--no-use-reference-velocity" not in args
-    assert "--deepmimic-track-root-xy" not in args
-    assert "--no-deepmimic-track-root-xy" in args
+    assert "--deepmimic-track-root-xy" in args
+    assert args[args.index("--deepmimic-root-xy-penalty") + 1] == "0.0"
+    assert "--deepmimic-route-tracking" in args
     assert "--no-trajectory-feedback" in args
     assert "--no-sensor-gait-command" in args
     assert "--sensor-root-imu-only" in args
-    assert args[args.index("--stair-phase-reset-prob") + 1] == "1.0"
+    assert args[args.index("--stair-phase-reset-prob") + 1] == "0.9"
     assert args[args.index("--lcp-weight") + 1] == "0.0"
     assert "--sensor-phase-observation" in args
     assert args[args.index("--task-reward-lerp") + 1] == "1.0"
-    assert args[args.index("--motion-files") + 1].endswith("stairs.npz")
+    assert args[args.index("--motion-files") + 1].endswith("stairs_supported.npz")
     assert args[args.index("--model-xml") + 1].endswith("robot/terrains/stairs.xml")
     assert args[args.index("--reference-root-x-offset") + 1] == "-0.39"
     assert args[args.index("--log-root") + 1] == str(REPO_ROOT / "logs")
@@ -82,6 +83,20 @@ def test_deepmimic_best_checkpoint_uses_imitation_reward(tmp_path: Path) -> None
     assert load_best_checkpoint_quality(
         metrics, min_completed=32, deepmimic_ppo=False
     ) == (0.0, 300.0)
+
+
+def test_stair_best_checkpoint_prioritizes_full_route_success(tmp_path: Path) -> None:
+    metrics = tmp_path / "metrics.csv"
+    metrics.write_text(
+        "completed_episode_count,rollout_episode_success_rate,"
+        "rollout_mean_task_reward,mean_episode_length\n"
+        "64,0.0,0.81,300\n"
+        "64,0.05,0.70,2400\n",
+        encoding="utf-8",
+    )
+    assert load_best_checkpoint_quality(
+        metrics, min_completed=32, deepmimic_ppo=True, stair_route=True
+    ) == (0.05, 0.70)
 
 
 def test_exact_stair_scene_and_motion_cpu_smoke() -> None:

@@ -195,6 +195,10 @@ class LytRobotEnvCfg:
     deepmimic_reward: bool = False
     deepmimic_track_root_xy: bool = False
     deepmimic_root_xy_penalty: float = 0.0
+    deepmimic_route_tracking: bool = False
+    deepmimic_route_xy_sigma: float = 0.35
+    deepmimic_route_velocity_sigma: float = 0.25
+    deepmimic_route_max_xy_error: float = 0.60
     trajectory_feedback: bool = False
     sensor_gait_command_enabled: bool = True
     # DeepMimic includes the normalized motion phase in the policy state.  A
@@ -302,6 +306,7 @@ class LytRobotEnvCfg:
     sensor_knee_flexion_target: float = 0.25
     sensor_knee_gait_reward_coef: float = 0.0
     sensor_natural_gait_reward_coef: float = 0.0
+    reference_gait_style_reward_coef: float = 0.0
     sensor_gait_height_target: float = 0.845
     sensor_gait_height_sigma: float = 0.07
     sensor_upright_sigma: float = 0.12
@@ -2276,6 +2281,9 @@ class LytRobotAmpEnv:
                 root_xy=(tensor(np.asarray(data.qpos[:2])) if self.cfg.deepmimic_track_root_xy else None),
                 target_root_xy=(tensor(reference_targets.root_xy[env_id]) if self.cfg.deepmimic_track_root_xy else None),
                 root_xy_penalty=self.cfg.deepmimic_root_xy_penalty,
+                route_tracking=self.cfg.deepmimic_route_tracking,
+                route_xy_sigma=self.cfg.deepmimic_route_xy_sigma,
+                route_velocity_sigma=self.cfg.deepmimic_route_velocity_sigma,
             )
             reward = float(dm_reward.item())
         if sensor_gait_metrics and not sensor_stability_reward_enabled(self.cfg):
@@ -2283,6 +2291,13 @@ class LytRobotAmpEnv:
                 sensor_gait_metrics, gait_progress, forward_velocity_track,
                 locomotion_stability, knee_flexion_track, self.cfg,
             ))
+        reference_gait_style = float(np.exp(
+            -np.mean(np.square(joint_pos-reference_targets.joint_pos[env_id])) / .20**2
+            -foot_pos_error / .07**2
+        ))
+        if self.cfg.reference_gait_style_reward_coef > 0:
+            reward += self.cfg.reference_gait_style_reward_coef * gait_progress * (
+                reference_gait_style * forward_velocity_track * locomotion_stability - 1.0)
 
         bad_state = not (
             np.isfinite(data.qpos).all()
@@ -2329,6 +2344,7 @@ class LytRobotAmpEnv:
             "gait_progress": gait_progress,
             "knee_flexion_track": knee_flexion_track,
             "knee_extension": 1.0 - knee_flexion_track,
+            "reference_gait_style": reference_gait_style,
             **sensor_gait_metrics,
             "pose_track": pose_track,
             "vel_track": vel_track,
@@ -2373,8 +2389,16 @@ class LytRobotAmpEnv:
             fall_penalty=self.cfg.fall_penalty,
         )
         timed_out = self.episode_step[env_id] >= self.episode_timeout_step[env_id]
-        done = bool(bad_state or fallen or timed_out)
-        termination = bool(bad_state or fallen)
+        route_failure = bool(
+            self.cfg.deepmimic_route_tracking
+            and components.get("deepmimic_root_xy_error", 0.0)
+            > self.cfg.deepmimic_route_max_xy_error
+        )
+        if self.cfg.deepmimic_route_tracking:
+            components["deepmimic_route_failure"] = float(route_failure)
+        timed_out = bool(timed_out and not route_failure)
+        done = bool(bad_state or fallen or route_failure or timed_out)
+        termination = bool(bad_state or fallen or route_failure)
         components["termination"] = float(termination)
         return float(reward), done, bool(timed_out), components
 

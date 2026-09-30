@@ -53,6 +53,8 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
         self._teacher_loss_sum = torch.zeros((), device=self.device)
         self._teacher_mae_sum = torch.zeros((), device=self.device)
         self._teacher_update_count = 0
+        self._latest_teacher_labels = None
+        self._use_teacher_action = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
 
     def _teacher_action_loss_coef(self) -> float:
         return linear_distillation_coefficient(
@@ -82,15 +84,42 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
         raw_action = raw_action * self.env.teacher_action_ramp(
             self.teacher.metadata.startup_action_ramp_steps
         )
-        return self.env.remap_teacher_action(
+        applied_residual = self.env.remap_teacher_action(
             raw_action,
             teacher_reference_blend=self.teacher.metadata.reference_ctrl_blend,
             teacher_action_residual_scale=self.teacher.metadata.action_residual_scale,
             teacher_distal_action_scale=self.teacher.metadata.distal_action_scale,
         )
+        # Labels describe the Actor output before the Student's own startup
+        # ramp. Without this division equal ramps apply the fade twice.
+        student_ramp = self.env.teacher_action_ramp(self.env.cfg.startup_action_ramp_steps)
+        return torch.clamp(applied_residual / student_ramp.clamp_min(1e-6), -1., 1.)
+
+    def _teacher_behavior_probability(self) -> float:
+        return linear_distillation_coefficient(
+            self.cfg.teacher_action_probability,
+            self.cfg.teacher_action_probability_final,
+            self.distillation_iteration,
+            self.cfg.teacher_action_probability_decay_iterations)
+
+    def _select_behavior_action(self, action, log_prob, next_hidden, episode_starts):
+        self._latest_teacher_labels = self._teacher_label()
+        draw = torch.rand(self.env.num_envs, device=self.device) < self._teacher_behavior_probability()
+        self._use_teacher_action = torch.where(
+            episode_starts > .5, draw, self._use_teacher_action)
+        executed = torch.where(self._use_teacher_action[:, None],
+                               self._latest_teacher_labels, action)
+        distribution, _, _ = self.actor_critic._distribution_from_hidden(next_hidden)
+        executed_log_prob = distribution.log_prob(executed).sum(dim=-1)
+        return executed, executed_log_prob, (~self._use_teacher_action).to(torch.float32)
+
+    def _rollout_teacher_label(self):
+        if self._latest_teacher_labels is None:
+            raise RuntimeError('Teacher labels must be generated before stepping physics.')
+        return self._latest_teacher_labels
 
     def collect_rollout(self) -> dict[str, torch.Tensor | np.ndarray]:
-        self.env.begin_teacher_rollout(self._teacher_label)
+        self.env.begin_teacher_rollout(self._rollout_teacher_label)
         labels: torch.Tensor | None = None
         try:
             rollout = super().collect_rollout()
@@ -119,7 +148,8 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
             episode_starts,
         )
         targets = self._active_teacher_actions[:, env_indices]
-        teacher_loss = F.smooth_l1_loss(action_mean, targets)
+        scale = max(float(self.cfg.teacher_action_loss_scale), 1e-6)
+        teacher_loss = F.smooth_l1_loss(action_mean / scale, targets / scale)
         with torch.no_grad():
             self._teacher_loss_sum += teacher_loss.detach()
             self._teacher_mae_sum += (action_mean - targets).abs().mean().detach()
@@ -175,6 +205,8 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
         metrics["teacher_action_loss"] = float((self._teacher_loss_sum / count).cpu())
         metrics["teacher_action_mae"] = float((self._teacher_mae_sum / count).cpu())
         metrics["teacher_action_loss_coef"] = self._teacher_action_loss_coef()
+        metrics["teacher_behavior_probability"] = self._teacher_behavior_probability()
+        metrics["student_on_policy_fraction"] = float(rollout['policy_sample_mask'].mean().cpu())
         self.distillation_iteration += 1
         return metrics
 
@@ -210,6 +242,9 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
                         "observes_executed_student_action_history": True,
                     },
                     "teacher_action_loss_coef": self._teacher_action_loss_coef(),
+                    "teacher_action_loss_scale": self.cfg.teacher_action_loss_scale,
+                    "teacher_behavior_probability": self._teacher_behavior_probability(),
+                    "actor_labels_pre_startup_ramp": True,
                 },
             }
         )

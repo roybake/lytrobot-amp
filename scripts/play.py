@@ -35,8 +35,14 @@ class OnnxPolicy:
     def __init__(self, path: str | Path) -> None:
         import onnxruntime as ort
 
+        session_options = ort.SessionOptions()
+        # Small recurrent playback batches benefit from one CPU worker and
+        # leave CPU resources available to the simulator and training jobs.
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
             str(Path(path).expanduser()),
+            sess_options=session_options,
             providers=("CPUExecutionProvider",),
         )
         self.inputs = {value.name: value for value in self.session.get_inputs()}
@@ -623,6 +629,7 @@ def main() -> None:
 
     rewards: list[float] = []
     forward_velocities: list[float] = []
+    first_stair_episode: dict[str, float | str] | None = None
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
@@ -645,6 +652,38 @@ def main() -> None:
                 else:
                     action = policy.act_inference(obs_tensor).cpu().numpy()
             obs, reward, done, _info = env.step(action)
+            if env.cfg.stair_fixed_start and first_stair_episode is None and bool(done[0]):
+                def stair_value(name: str, fallback: float = 0.0) -> float:
+                    return float(np.asarray(_info.get(name, [fallback]))[0])
+
+                route_success = stair_value("successes")
+                if route_success:
+                    reason = "route_complete"
+                elif stair_value("stair_distance_failure"):
+                    reason = "distance_failure"
+                elif stair_value("stair_lateral_failure"):
+                    reason = "lateral_failure"
+                elif stair_value("deepmimic_route_failure"):
+                    reason = "route_tracking_failure"
+                elif stair_value("termination"):
+                    reason = "fall_or_invalid_state"
+                elif stair_value("incomplete_motion_end"):
+                    reason = "motion_end_shortfall"
+                elif stair_value("time_outs"):
+                    reason = "timeout"
+                else:
+                    reason = "other"
+                first_stair_episode = {
+                    "steps": float(step_count + 1),
+                    "success": route_success,
+                    "reason": reason,
+                    "distance_error": (
+                        stair_value("stair_distance_error")
+                        if reason in {"route_complete", "distance_failure"}
+                        else float("nan")
+                    ),
+                    "xy_error": stair_value("deepmimic_root_xy_error", float("nan")),
+                }
             episode_start = np.asarray(done, dtype=np.float32)
             rewards.extend(float(value) for value in reward)
             if "forward_velocity" in _info:
@@ -679,6 +718,19 @@ def main() -> None:
         f"mean_reward={mean_reward:.4f} "
         f"mean_forward_velocity={mean_forward_velocity:.4f}m/s"
     )
+    if env.cfg.stair_fixed_start:
+        if first_stair_episode is None:
+            print(f"[STAIRS] first_episode=incomplete after {step_count} steps")
+        else:
+            distance_error = first_stair_episode["distance_error"]
+            xy_error = first_stair_episode["xy_error"]
+            print(
+                f"[STAIRS] first_episode_steps={int(first_stair_episode['steps'])} "
+                f"route_success={bool(first_stair_episode['success'])} "
+                f"reason={first_stair_episode['reason']} "
+                f"terminal_distance_error={f'{distance_error:.3f}m' if np.isfinite(distance_error) else 'n/a'} "
+                f"terminal_xy_error={f'{xy_error:.3f}m' if np.isfinite(xy_error) else 'n/a'}"
+            )
 
 
 if __name__ == "__main__":

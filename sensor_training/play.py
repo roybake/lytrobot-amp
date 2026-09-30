@@ -20,26 +20,33 @@ from sensor_training.envs import SensorHistoryCpuAmpEnv
 def main() -> None:
     # Stair trajectory tracking starts at its physical reference frame zero.
     # General sensor walking starts from the commanded standing state.
+    checkpoint_arg = next(
+        (sys.argv[index + 1] for index, value in enumerate(sys.argv[:-1])
+         if value == "--checkpoint"),
+        None,
+    )
+    stair_fixed_start = False
+    episode_steps = 2400
+    if checkpoint_arg:
+        checkpoint_path = Path(checkpoint_arg)
+        if checkpoint_path.suffix.lower() == ".onnx":
+            metadata = base_play.load_onnx_metadata(checkpoint_path)
+        else:
+            metadata = base_play.torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
+        env_config = metadata.get("env_config", {})
+        stair_fixed_start = bool(env_config.get("stair_fixed_start", False))
+        episode_steps = int(env_config.get("episode_steps", episode_steps))
     if not any(
         arg == "--stand-start-prob" or arg.startswith("--stand-start-prob=")
         for arg in sys.argv[1:]
     ):
-        checkpoint_arg = next(
-            (sys.argv[index + 1] for index, value in enumerate(sys.argv[:-1])
-             if value == "--checkpoint"),
-            None,
-        )
-        stair_fixed_start = False
-        if checkpoint_arg:
-            checkpoint_path = Path(checkpoint_arg)
-            if checkpoint_path.suffix.lower() == ".onnx":
-                metadata = base_play.load_onnx_metadata(checkpoint_path)
-            else:
-                metadata = base_play.torch.load(
-                    checkpoint_path, map_location="cpu", weights_only=False
-                )
-            stair_fixed_start = bool(metadata.get("env_config", {}).get("stair_fixed_start", False))
         sys.argv.extend(["--stand-start-prob", "0.0" if stair_fixed_start else "1.0"])
+    if stair_fixed_start and not any(
+        arg == "--steps" or arg.startswith("--steps=") for arg in sys.argv[1:]
+    ):
+        sys.argv.extend(["--steps", str(episode_steps)])
     base_play.LytRobotAmpEnv = SensorHistoryCpuAmpEnv
     base_play.main()
 

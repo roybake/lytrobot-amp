@@ -44,7 +44,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             self.captured[self.captured.index("--reference-ctrl-blend") + 1],
-            "0.0",
+            "1.0",
         )
         self.assertEqual(
             self.captured[self.captured.index("--motion-file") + 1].split("/")[-1],

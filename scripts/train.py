@@ -23,6 +23,8 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -39,6 +41,14 @@ except Exception as exc:  # pragma: no cover - optional backend import guard.
     WARP_IMPORT_ERROR = exc
 else:
     WARP_IMPORT_ERROR = None
+
+try:
+    from lytrobot_amp.env_mjlab import LytRobotMjlabAmpEnv
+except Exception as exc:  # pragma: no cover - optional backend import guard.
+    LytRobotMjlabAmpEnv = None
+    MJLAB_IMPORT_ERROR = exc
+else:
+    MJLAB_IMPORT_ERROR = None
 
 
 RESOURCE_METRIC_KEYS = (
@@ -116,6 +126,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--deepmimic-track-root-xy", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--deepmimic-root-xy-penalty", type=float, default=0.0)
+    parser.add_argument("--deepmimic-route-tracking", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--deepmimic-route-xy-sigma", type=float, default=0.35)
+    parser.add_argument("--deepmimic-route-velocity-sigma", type=float, default=0.25)
+    parser.add_argument("--deepmimic-route-max-xy-error", type=float, default=0.60)
     parser.add_argument("--trajectory-feedback", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sensor-gait-command", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sensor-phase-observation", action=argparse.BooleanOptionalAction, default=False)
@@ -251,7 +265,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
-    parser.add_argument("--sim-backend", default="warp", choices=("warp", "cpu"))
+    parser.add_argument("--sim-backend", default="warp", choices=("warp", "mjlab", "cpu"))
+    parser.add_argument("--quiet-startup", action="store_true")
     parser.add_argument("--torch-threads", type=int, default=0)
 
     parser.add_argument("--num-envs", type=int, default=4096)
@@ -308,6 +323,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensor-knee-flexion-target", type=float, default=0.25)
     parser.add_argument("--sensor-knee-gait-reward-coef", type=float, default=0.0)
     parser.add_argument("--sensor-natural-gait-reward-coef", type=float, default=0.0)
+    parser.add_argument("--reference-gait-style-reward-coef", type=float, default=0.0)
     parser.add_argument("--sensor-gait-height-target", type=float, default=0.845)
     parser.add_argument("--sensor-gait-height-sigma", type=float, default=0.07)
     parser.add_argument("--sensor-upright-sigma", type=float, default=0.12)
@@ -508,6 +524,10 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument("--teacher-action-loss-coef", type=float, default=0.0)
         parser.add_argument("--teacher-action-loss-final-coef", type=float, default=0.0)
         parser.add_argument("--teacher-action-loss-decay-iterations", type=int, default=0)
+        parser.add_argument("--teacher-action-loss-scale", type=float, default=1.0)
+        parser.add_argument("--teacher-action-probability", type=float, default=0.0)
+        parser.add_argument("--teacher-action-probability-final", type=float, default=0.0)
+        parser.add_argument("--teacher-action-probability-decay-iterations", type=int, default=5000)
         parser.add_argument(
             "--distillation-reset-schedule",
             action="store_true",
@@ -517,6 +537,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-action-std", type=float, default=0.60)
     parser.add_argument("--episode-metric-window", type=int, default=4096)
     parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument("--evaluate-gait", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gait-evaluation-seconds", type=float, default=20.0)
+    parser.add_argument("--gait-evaluation-seeds", type=int, nargs='+', default=[42, 123, 2026])
+    parser.add_argument("--stop-on-gait-acceptance", action="store_true")
     parser.add_argument(
         "--save-best-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -613,13 +637,15 @@ def select_device(device_arg: str) -> str:
 def select_sim_backend(backend_arg: str, device: str) -> str:
     if backend_arg == "cpu":
         return "cpu"
-    if backend_arg != "warp":
+    if backend_arg not in ("warp", "mjlab"):
         raise RuntimeError(f"Unsupported simulation backend: {backend_arg}.")
     if device != "cuda":
-        raise RuntimeError("--sim-backend warp requires --device cuda.")
-    if LytRobotWarpAmpEnv is None:
+        raise RuntimeError(f"--sim-backend {backend_arg} requires --device cuda.")
+    if backend_arg == "warp" and LytRobotWarpAmpEnv is None:
         raise RuntimeError("The warp backend is unavailable; install mujoco-warp and warp-lang.") from WARP_IMPORT_ERROR
-    return "warp"
+    if backend_arg == "mjlab" and LytRobotMjlabAmpEnv is None:
+        raise RuntimeError("The mjlab backend is unavailable; install mjlab.") from MJLAB_IMPORT_ERROR
+    return backend_arg
 
 
 def make_log_dir(
@@ -1073,12 +1099,12 @@ def load_best_checkpoint_quality(
     *,
     min_completed: int,
     deepmimic_ppo: bool = False,
+    stair_route: bool = False,
 ) -> tuple[float, float]:
     """Recover the best checkpoint score when a run is resumed.
 
-    DeepMimic RSI episodes usually begin after frame zero, so route success is
-    deliberately false for most training episodes.  Rank pure DeepMimic runs
-    by imitation reward; task locomotion runs retain success/length ranking.
+    A fixed stair route must rank actual full-route completions ahead of
+    imitation reward.  RSI-only DeepMimic tasks retain reward ranking.
     """
 
     if not metrics_csv_path.is_file():
@@ -1088,21 +1114,23 @@ def load_best_checkpoint_quality(
         with metrics_csv_path.open(newline="", encoding="utf-8") as file:
             for row in csv.DictReader(file):
                 completed = float(row.get("completed_episode_count", "0") or 0.0)
-                primary = float(
-                    row.get(
-                        "rollout_mean_task_reward"
-                        if deepmimic_ppo
-                        else "rollout_episode_success_rate",
-                        "nan",
-                    )
+                primary_key = (
+                    "rollout_episode_success_rate"
+                    if stair_route or not deepmimic_ppo
+                    else "rollout_mean_task_reward"
                 )
-                length = float(row.get("mean_episode_length", "nan"))
+                secondary_key = (
+                    "rollout_mean_task_reward" if stair_route
+                    else "mean_episode_length"
+                )
+                primary = float(row.get(primary_key, "nan"))
+                secondary = float(row.get(secondary_key, "nan"))
                 if (
                     completed >= max(int(min_completed), 1)
                     and np.isfinite(primary)
-                    and np.isfinite(length)
+                    and np.isfinite(secondary)
                 ):
-                    best = max(best, (primary, length))
+                    best = max(best, (primary, secondary))
     except (OSError, ValueError):
         return best
     return best
@@ -1224,6 +1252,12 @@ def main() -> None:
         raise ValueError("--deepmimic-root-xy-penalty must be non-negative.")
     if args.deepmimic_track_root_xy and not args.deepmimic_reward:
         raise ValueError("--deepmimic-track-root-xy requires --deepmimic-reward.")
+    if args.deepmimic_route_tracking:
+        if not args.deepmimic_reward or not args.deepmimic_track_root_xy or args.sensor_stability_reward:
+            raise ValueError("Route tracking requires DeepMimic world-XY tracking without the sensor stability reward.")
+        if min(args.deepmimic_route_xy_sigma, args.deepmimic_route_velocity_sigma,
+               args.deepmimic_route_max_xy_error) <= 0:
+            raise ValueError("DeepMimic route tolerances must be positive.")
     if args.lcp_weight < 0.0:
         raise ValueError("--lcp-weight must be non-negative.")
     if args.stair_distance_failure_penalty < 0.0:
@@ -1261,6 +1295,21 @@ def main() -> None:
         raise ValueError("Teacher action-loss coefficients must be non-negative.")
     if teacher_action_loss_decay_iterations < 0:
         raise ValueError("--teacher-action-loss-decay-iterations must be non-negative.")
+    if args.reference_gait_style_reward_coef < 0:
+        raise ValueError('Reference gait style coefficient must be non-negative.')
+    if args.reference_gait_style_reward_coef > 0 and args.sensor_stability_reward:
+        raise ValueError('Phase-aligned gait style requires the reference task reward.')
+    if args.gait_evaluation_seconds <= 0:
+        raise ValueError('Gait evaluation duration must be positive.')
+    if args.stop_on_gait_acceptance and not args.evaluate_gait:
+        raise ValueError('Stopping on gait acceptance requires --evaluate-gait.')
+    if DISTILLATION_CLI_ENABLED:
+        if args.teacher_action_loss_scale <= 0:
+            raise ValueError('Teacher action loss scale must be positive.')
+        if not all(0 <= p <= 1 for p in (args.teacher_action_probability, args.teacher_action_probability_final)):
+            raise ValueError('Teacher behavior probabilities must be in [0, 1].')
+        if args.teacher_action_probability_decay_iterations < 0:
+            raise ValueError('Teacher probability decay iterations must be non-negative.')
     if args.compile_policy_chunk_steps is not None and args.compile_policy_chunk_steps < 1:
         raise ValueError("--compile-policy-chunk-steps must be positive.")
     if teacher_checkpoint is None and (
@@ -1312,13 +1361,14 @@ def main() -> None:
     device = select_device(args.device)
     sim_backend = select_sim_backend(args.sim_backend, device)
     log_dir = resolve_log_dir(args)
-    print(f"[INFO] log_dir={log_dir}")
-    print(
-        f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
-        f"seed={args.seed}, control=position, "
-        f"domain_randomization={args.domain_randomization}, "
-        f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
-    )
+    if not args.quiet_startup:
+        print(f"[INFO] log_dir={log_dir}")
+        print(
+            f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
+            f"seed={args.seed}, control=position, "
+            f"domain_randomization={args.domain_randomization}, "
+            f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
+        )
 
     env_cfg = LytRobotEnvCfg(
         model_xml=args.model_xml,
@@ -1332,6 +1382,10 @@ def main() -> None:
         deepmimic_reward=bool(args.deepmimic_reward),
         deepmimic_track_root_xy=bool(args.deepmimic_track_root_xy),
         deepmimic_root_xy_penalty=args.deepmimic_root_xy_penalty,
+        deepmimic_route_tracking=args.deepmimic_route_tracking,
+        deepmimic_route_xy_sigma=args.deepmimic_route_xy_sigma,
+        deepmimic_route_velocity_sigma=args.deepmimic_route_velocity_sigma,
+        deepmimic_route_max_xy_error=args.deepmimic_route_max_xy_error,
         trajectory_feedback=bool(args.trajectory_feedback),
         sensor_gait_command_enabled=bool(args.sensor_gait_command),
         sensor_phase_observation=bool(args.sensor_phase_observation),
@@ -1403,6 +1457,7 @@ def main() -> None:
         sensor_knee_flexion_target=args.sensor_knee_flexion_target,
         sensor_knee_gait_reward_coef=args.sensor_knee_gait_reward_coef,
         sensor_natural_gait_reward_coef=args.sensor_natural_gait_reward_coef,
+        reference_gait_style_reward_coef=args.reference_gait_style_reward_coef,
         sensor_gait_height_target=args.sensor_gait_height_target,
         sensor_gait_height_sigma=args.sensor_gait_height_sigma,
         sensor_upright_sigma=args.sensor_upright_sigma,
@@ -1541,6 +1596,10 @@ def main() -> None:
                 "teacher_action_loss_final_coef": teacher_action_loss_final_coef,
                 "teacher_action_loss_decay_iterations": teacher_action_loss_decay_iterations,
                 "distillation_reset_schedule": distillation_reset_schedule,
+                "teacher_action_loss_scale": args.teacher_action_loss_scale,
+                "teacher_action_probability": args.teacher_action_probability,
+                "teacher_action_probability_final": args.teacher_action_probability_final,
+                "teacher_action_probability_decay_iterations": args.teacher_action_probability_decay_iterations,
             }
             if supports_distillation
             else {}
@@ -1566,6 +1625,9 @@ def main() -> None:
     if sim_backend == "warp":
         assert LytRobotWarpAmpEnv is not None
         env = LytRobotWarpAmpEnv(env_cfg, device=device)
+    elif sim_backend == "mjlab":
+        assert LytRobotMjlabAmpEnv is not None
+        env = LytRobotMjlabAmpEnv(env_cfg, device=device)
     else:
         env = LytRobotAmpEnv(env_cfg)
     trainer = PPOAMPTrainer(env, ppo_cfg, device=device, log_dir=log_dir)
@@ -1704,7 +1766,34 @@ def main() -> None:
         metrics_csv_path,
         min_completed=args.best_checkpoint_min_completed,
         deepmimic_ppo=bool(args.deepmimic_ppo),
+        stair_route=bool(args.deepmimic_ppo and args.stair_fixed_start),
     )
+    fixed_route_evaluation = bool(
+        args.deepmimic_route_tracking and args.stair_fixed_start
+        and hasattr(trainer, "evaluate_fixed_route")
+    )
+    evaluation_quality_path = log_dir / "best_route_evaluation.json"
+    if fixed_route_evaluation:
+        best_checkpoint_quality = (-1.0, -1.0)
+        if evaluation_quality_path.is_file():
+            previous_evaluation = json.loads(evaluation_quality_path.read_text())
+            best_checkpoint_quality = (
+                float(previous_evaluation["eval/stair_route_success"]),
+                float(previous_evaluation["eval/stair_route_progress"]),
+            )
+    if args.evaluate_gait:
+        evaluation_quality_path = log_dir / "best_gait_evaluation.json"
+        best_checkpoint_quality = (-1.0, -1.0)
+        if evaluation_quality_path.is_file():
+            previous_evaluation = json.loads(evaluation_quality_path.read_text())
+            if previous_evaluation.get('eval/gait_seed_count') != len(args.gait_evaluation_seeds):
+                from sensor_training.gait_evaluation import evaluate_gait_suite
+                previous_evaluation.update(evaluate_gait_suite(
+                    log_dir / 'model_best.onnx', seconds=args.gait_evaluation_seconds,
+                    seeds=args.gait_evaluation_seeds))
+                evaluation_quality_path.write_text(json.dumps(previous_evaluation, indent=2)+'\n')
+            best_checkpoint_quality = (previous_evaluation['eval/gait_accepted'],
+                                       previous_evaluation['eval/gait_score'])
     try:
         for iteration in range(start_iteration, args.max_iterations):
             current_course_random_start_prob = (
@@ -1900,21 +1989,52 @@ def main() -> None:
                 ckpt_path = log_dir / f"model_{ckpt_step}.pt"
                 saved_pt, saved_onnx = trainer.save(ckpt_path, iteration=iteration)
                 run_logger.emit(f"[INFO] saved latest models: {saved_pt}, {saved_onnx}", force=True)
-                checkpoint_quality = (
-                    float(metrics.get(
-                        "rollout_mean_task_reward"
-                        if args.deepmimic_ppo
-                        else "rollout_episode_success_rate",
-                        -1.0,
-                    )),
-                    float(metrics.get("mean_episode_length", -1.0)),
+                stair_route = bool(args.deepmimic_ppo and args.stair_fixed_start)
+                primary_key = (
+                    "rollout_episode_success_rate"
+                    if stair_route or not args.deepmimic_ppo
+                    else "rollout_mean_task_reward"
                 )
+                secondary_key = (
+                    "rollout_mean_task_reward" if stair_route
+                    else "mean_episode_length"
+                )
+                checkpoint_quality = (
+                    float(metrics.get(primary_key, -1.0)),
+                    float(metrics.get(secondary_key, -1.0)),
+                )
+                evaluation = None
+                if fixed_route_evaluation:
+                    evaluation = trainer.evaluate_fixed_route()
+                    checkpoint_quality = (
+                        evaluation["eval/stair_route_success"],
+                        evaluation["eval/stair_route_progress"],
+                    )
+                    evaluation_record = dict(evaluation, iteration=iteration, checkpoint=str(saved_pt))
+                    with (log_dir / "route_evaluations.jsonl").open("a") as evaluation_file:
+                        evaluation_file.write(json.dumps(evaluation_record) + "\n")
+                    run_logger.emit(f"[ROUTE_EVAL] {json.dumps(evaluation_record)}", force=True)
+                    if run is not None:
+                        run.log(evaluation, step=int(trainer.global_step) + 1)
+                if args.evaluate_gait:
+                    from sensor_training.gait_evaluation import evaluate_gait_suite
+                    evaluation = evaluate_gait_suite(
+                        saved_onnx, seconds=args.gait_evaluation_seconds,
+                        seeds=args.gait_evaluation_seeds,
+                        trace_path=log_dir / 'gait_evaluation_latest.csv')
+                    checkpoint_quality = (evaluation['eval/gait_accepted'], evaluation['eval/gait_score'])
+                    evaluation_record = dict(evaluation, iteration=iteration, checkpoint=str(saved_pt))
+                    with (log_dir / 'gait_evaluations.jsonl').open('a') as evaluation_file:
+                        evaluation_file.write(json.dumps(evaluation_record)+'\n')
+                    run_logger.emit(f'[GAIT_EVAL] {json.dumps(evaluation_record)}', force=True)
+                    if run is not None:
+                        run.log(evaluation, step=int(trainer.global_step)+1)
                 completed_episodes = float(metrics.get("completed_episode_count", 0.0))
                 knee_flexion_track = float(
                     metrics.get("task_knee_flexion_track", float("nan"))
                 )
                 natural_gait_ok = (
-                    args.sensor_knee_gait_reward_coef <= 0.0
+                    args.evaluate_gait or args.sensor_knee_gait_reward_coef <= 0.0
                     or (
                         np.isfinite(knee_flexion_track)
                         and knee_flexion_track >= 0.90
@@ -1922,7 +2042,7 @@ def main() -> None:
                 )
                 if (
                     args.save_best_checkpoint
-                    and completed_episodes >= max(int(args.best_checkpoint_min_completed), 1)
+                    and (args.evaluate_gait or fixed_route_evaluation or completed_episodes >= max(int(args.best_checkpoint_min_completed), 1))
                     and all(np.isfinite(value) for value in checkpoint_quality)
                     and natural_gait_ok
                     and checkpoint_quality > best_checkpoint_quality
@@ -1931,17 +2051,24 @@ def main() -> None:
                     shutil.copy2(saved_pt, best_path)
                     shutil.copy2(saved_onnx, best_path.with_suffix(".onnx"))
                     best_checkpoint_quality = checkpoint_quality
+                    if evaluation is not None:
+                        evaluation_quality_path.write_text(json.dumps(evaluation_record, indent=2) + "\n")
+                        if args.evaluate_gait:
+                            shutil.copy2(log_dir / 'gait_evaluation_latest.csv', log_dir / 'gait_evaluation_best.csv')
                     run_logger.emit(
                         "[BEST] "
                         f"iter={iteration:05d} "
-                        f"{'imitation_reward' if args.deepmimic_ppo else 'rollout_success'}="
+                        f"{'gait_accepted' if args.evaluate_gait else 'route_success' if stair_route else 'imitation_reward' if args.deepmimic_ppo else 'rollout_success'}="
                         f"{checkpoint_quality[0]:.3f} "
-                        f"episode_length={checkpoint_quality[1]:.1f} "
+                        f"{'gait_score' if args.evaluate_gait else 'evaluated_progress' if fixed_route_evaluation else 'imitation_reward' if stair_route else 'episode_length'}={checkpoint_quality[1]:.3f} "
                         f"knee_flexion_track={knee_flexion_track:.3f} "
                         f"saved {best_path}",
                         iteration=iteration,
                         force=True,
                     )
+                if args.stop_on_gait_acceptance and evaluation is not None and evaluation.get('eval/gait_accepted', 0) > 0:
+                    run_logger.emit('[GAIT_ACCEPTED] Continuous walking and reference tracking passed; completing this phase.', force=True)
+                    break
             if args.iteration_sleep_ms > 0.0:
                 torch.cuda.synchronize()
                 time.sleep(args.iteration_sleep_ms / 1000.0)

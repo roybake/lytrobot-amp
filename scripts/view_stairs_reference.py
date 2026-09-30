@@ -312,7 +312,9 @@ class VideoWriter:
     ) -> None:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
-            raise RuntimeError("ffmpeg not found; it is required for MP4 export.")
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         self.output = output
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.width = max(2, int(width) // 2 * 2)

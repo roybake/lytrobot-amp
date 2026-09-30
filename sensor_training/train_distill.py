@@ -15,7 +15,10 @@ for path in (REPO_ROOT, SRC_ROOT):
 from scripts import train as base_train
 
 from sensor_training.distillation_config import SensorDistillationPPOAMPConfig
-from sensor_training.distillation_env import SensorDistillationWarpAmpEnv
+from sensor_training.distillation_env import (
+    SensorDistillationMjlabAmpEnv,
+    SensorDistillationWarpAmpEnv,
+)
 from sensor_training.distillation_trainer import SensorDistillationPPOAMPTrainer
 from sensor_training.training_defaults import (
     DEFAULT_SENSOR_DECIMATION,
@@ -44,6 +47,7 @@ def main() -> None:
         )
 
     base_train.LytRobotWarpAmpEnv = SensorDistillationWarpAmpEnv
+    base_train.LytRobotMjlabAmpEnv = SensorDistillationMjlabAmpEnv
     base_train.PPOAMPConfig = SensorDistillationPPOAMPConfig
     base_train.PPOAMPTrainer = SensorDistillationPPOAMPTrainer
     base_train.DISTILLATION_CLI_ENABLED = True

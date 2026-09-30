@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
+from lytrobot_amp.env_mjlab import LytRobotMjlabAmpEnv
 from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
 from lytrobot_amp.motion import MotionLibrary
 
@@ -914,6 +915,18 @@ class SensorHistoryWarpAmpEnv(SensorHistoryEnv):
         observation_cfg: SensorObservationConfig = DEFAULT_SENSOR_OBSERVATION_CONFIG,
     ) -> None:
         super().__init__(LytRobotWarpAmpEnv(cfg, device=device), observation_cfg)
+
+
+class SensorHistoryMjlabAmpEnv(SensorHistoryEnv):
+    """Sensor-policy wrapper for the mjlab Simulation backend."""
+
+    def __init__(
+        self,
+        cfg: LytRobotEnvCfg,
+        device: str = "cuda",
+        observation_cfg: SensorObservationConfig = DEFAULT_SENSOR_OBSERVATION_CONFIG,
+    ) -> None:
+        super().__init__(LytRobotMjlabAmpEnv(cfg, device=device), observation_cfg)
 
 
 class SensorHistoryCpuAmpEnv(SensorHistoryEnv):

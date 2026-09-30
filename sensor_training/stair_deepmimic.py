@@ -16,10 +16,35 @@ class SensorStairDeepMimicConfig(SensorPPOAMPConfig):
 
     lcp_weight: float = 0.0
     privileged_context_loss_coef: float = 0.0
+    # At 100 Hz the discount horizon of gamma=.99 is only about one second.
+    gamma: float = 0.999
+    gae_lambda: float = 0.97
+    init_std: float = 0.20
+    stair_rsi_initial_probability: float = 0.90
+    stair_rsi_final_probability: float = 0.20
+    stair_rsi_warmup_iterations: int = 2000
+    stair_rsi_ramp_iterations: int = 10000
 
 
 class SensorStairDeepMimicTrainer(SensorHistoryPPOAMPTrainer):
     """Add MimicKit's observation-gradient policy regularizer to sensor PPO."""
+
+    def train_iteration(self) -> dict[str, float]:
+        if self.env.cfg.deepmimic_route_tracking:
+            iteration = self.global_step / (self.env.num_envs * self.cfg.num_steps)
+            fraction = min(1.0, max(0.0,
+                (iteration - self.cfg.stair_rsi_warmup_iterations)
+                / max(self.cfg.stair_rsi_ramp_iterations, 1)))
+            probability = ((1-fraction) * self.cfg.stair_rsi_initial_probability
+                           + fraction * self.cfg.stair_rsi_final_probability)
+            self.env.cfg.stair_phase_reset_prob = probability
+        metrics = super().train_iteration()
+        metrics["stair_phase_reset_probability"] = self.env.cfg.stair_phase_reset_prob
+        return metrics
+
+    def evaluate_fixed_route(self) -> dict[str, float]:
+        from .stair_evaluation import evaluate_fixed_stair_route
+        return evaluate_fixed_stair_route(self.actor_critic, self.env.cfg)
 
     def _actor_auxiliary_loss(
         self,

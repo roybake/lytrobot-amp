@@ -10,7 +10,7 @@ import torch
 from lytrobot_amp.env import LytRobotEnvCfg
 
 from .config import DEFAULT_SENSOR_OBSERVATION_CONFIG, SensorObservationConfig
-from .envs import SensorHistoryWarpAmpEnv
+from .envs import SensorHistoryMjlabAmpEnv, SensorHistoryWarpAmpEnv
 
 
 def remap_teacher_position_action(
@@ -47,8 +47,8 @@ def remap_teacher_position_action(
     return torch.clamp((teacher_target - student_base) / student_range, -1.0, 1.0)
 
 
-class SensorDistillationWarpAmpEnv(SensorHistoryWarpAmpEnv):
-    """Warp sensor environment that records labels only for distillation runs."""
+class _SensorDistillationMixin:
+    """Record teacher labels alongside the sensor-policy rollout."""
 
     def __init__(
         self,
@@ -149,3 +149,11 @@ class SensorDistillationWarpAmpEnv(SensorHistoryWarpAmpEnv):
         if self._teacher_labeler is not None:
             self._teacher_action_labels.append(self._teacher_labeler().detach().clone())
         return super().step(action)
+
+
+class SensorDistillationWarpAmpEnv(_SensorDistillationMixin, SensorHistoryWarpAmpEnv):
+    """Warp sensor environment with teacher labels."""
+
+
+class SensorDistillationMjlabAmpEnv(_SensorDistillationMixin, SensorHistoryMjlabAmpEnv):
+    """mjlab sensor environment with teacher labels."""

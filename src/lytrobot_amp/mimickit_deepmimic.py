@@ -4,8 +4,8 @@ The five error terms and their scales follow MimicKit's
 ``mimickit/envs/deepmimic_env.py:compute_reward`` (Apache-2.0).  LYT has
 one-axis joints, so wrapped hinge-angle differences replace joint-quaternion
 angle differences. Four heel/toe contact geoms are the available key points.
-The deployable sensor actor has no global target-position observation, hence
-the original ``track_root=False`` branch is used: only root height is tracked.
+Fixed-route tasks may additionally track world root XY in the training reward.
+This target is never part of the deployable sensor actor observation.
 """
 
 from __future__ import annotations
@@ -72,8 +72,11 @@ def deepmimic_reward(
     root_xy: torch.Tensor | None = None,
     target_root_xy: torch.Tensor | None = None,
     root_xy_penalty: float = 0.0,
+    route_tracking: bool = False,
+    route_xy_sigma: float = 0.35,
+    route_velocity_sigma: float = 0.25,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Return the original five-term reward with LYT hinge/key-point mapping."""
+    """Return five-term imitation, optionally gated by fixed-route tracking."""
     root_quat = _normalize_quat(root_quat)
     target_root_quat = _normalize_quat(target_root_quat)
     inv_heading = _heading_inverse(root_quat)
@@ -119,7 +122,19 @@ def deepmimic_reward(
         + 0.15 * terms["root_pose"] + 0.10 * terms["root_velocity"]
         + 0.15 * terms["key_position"]
     )
+    if route_tracking:
+        if xy_error is None:
+            raise ValueError("route_tracking requires world root XY targets")
+        # All imitation credit must depend on keeping up with the moving
+        # reference. Local joint poses alone cannot establish route progress.
+        position_gate = torch.exp(-0.5 * (xy_error / max(route_xy_sigma, 1e-6)).square())
+        velocity_gate = torch.exp(-0.5 * root_vel_err / max(route_velocity_sigma, 1e-6) ** 2)
+        reward = reward * position_gate * velocity_gate
+        terms["route_position_gate"] = position_gate
+        terms["route_velocity_gate"] = velocity_gate
     if xy_error is not None:
         terms["root_xy_error"] = xy_error
-        reward = reward - float(root_xy_penalty) * xy_error
+        # Large trajectory errors must not turn a long surviving episode into
+        # negative return: that would make early falls an attractive shortcut.
+        reward = torch.clamp_min(reward - float(root_xy_penalty) * xy_error, 0.0)
     return reward, terms

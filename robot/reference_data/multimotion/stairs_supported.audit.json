@@ -1,0 +1,35 @@
+{
+  "model_xml": "/home/yeah/code/lytrobot-amp/robot/terrains/stairs.xml",
+  "motion_file": "/home/yeah/code/lytrobot-amp/robot/reference_data/multimotion/stairs_supported.npz",
+  "root_x_offset_m": -0.39,
+  "frame_count": 912,
+  "frequency_hz": 40.0,
+  "maximum_foot_penetration_m": 0.0010000565833578924,
+  "worst_penetration_frame": 375,
+  "worst_penetration_pair": [
+    "top_platform",
+    "foot_l"
+  ],
+  "maximum_visual_foot_mesh_penetration_m": 0.0014543260619888712,
+  "worst_visual_mesh_frame": 83,
+  "worst_visual_mesh_pair": [
+    "floor",
+    "toe_l"
+  ],
+  "frames_over_2cm_penetration": 0,
+  "tread_top_contact_frames": 531,
+  "tread_overhang_frames": 0,
+  "minimum_visual_tread_edge_margin_m": 0.029568441466458317,
+  "minimum_box_tread_edge_margin_m": 0.0289768451552148,
+  "unsupported_frames": 0,
+  "longest_unsupported_run_s": 0.0,
+  "longest_unsupported_start_frame": 0,
+  "longest_unsupported_end_frame": -1,
+  "alignment_pass": true,
+  "contact_geometry_pass": true,
+  "source": "/home/yeah/code/lytrobot-amp/robot/reference_data/multimotion/stairs.npz",
+  "source_sha256": "85fa9c1f00e133df28df645d33897de8682d45bc4594343896156894ad7e9589",
+  "correction": "contact-constrained root height only",
+  "max_root_height_change_m": 0.016214530592603686,
+  "joint_motion_and_root_xy_preserved": true
+}

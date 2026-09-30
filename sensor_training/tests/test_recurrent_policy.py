@@ -335,6 +335,36 @@ class RecurrentSensorPolicyTests(unittest.TestCase):
         )
         self.assertEqual(float(rollout["timeout_bootstrap_values"][0, 1]), 0.0)
 
+    def test_timeout_gae_does_not_include_next_episode_reward(self) -> None:
+        class LargeNextRewardEnv(_TimeoutSensorEnv):
+            def step(self, action):
+                observation, reward, done, info = super().step(action)
+                if self.step_count == 2:
+                    reward[0] = 1000.0
+                return observation, reward, done, info
+
+        env = LargeNextRewardEnv()
+        cfg = SensorPPOAMPConfig(
+            num_steps=2,
+            update_epochs=1,
+            num_minibatches=1,
+            amp_enabled=False,
+            recurrent_hidden_dim=8,
+            num_experts=2,
+            actor_hidden_dims=(8,),
+            critic_hidden_dims=(8,),
+            gate_hidden_dims=(8,),
+            expert_hidden_dims=(8,),
+        )
+        trainer = SensorHistoryPPOAMPTrainer(env, cfg, "cpu", ".")
+        rollout = trainer.collect_rollout()
+        expected = (
+            rollout["rewards"][0, 0]
+            + cfg.gamma * rollout["timeout_bootstrap_values"][0, 0]
+            - rollout["values"][0, 0]
+        )
+        torch.testing.assert_close(rollout["advantages"][0, 0], expected)
+
     def test_privileged_context_trains_estimator_and_critic_but_not_actor_input(self) -> None:
         policy = SensorActorCritic(
             obs_dim=18,

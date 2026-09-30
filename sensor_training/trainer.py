@@ -31,6 +31,9 @@ def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
         gait = metadata.get("gait_command")
         if isinstance(gait, dict):
             for key in (
+                "motion_loop",
+                "stand_start_prob",
+                "stand_start_motion_phase",
                 "stand_start_phase_delay_steps",
                 "stand_start_transition_min_steps",
                 "stand_start_transition_max_steps",
@@ -293,6 +296,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.recurrent_state.zero_()
         self.episode_starts.fill_(1.0)
 
+    def _select_behavior_action(self, action, log_prob, next_hidden, episode_starts):
+        """Extension point for supervised roll-in; ordinary PPO stays on-policy."""
+        return action, log_prob, torch.ones_like(log_prob)
+
     def collect_rollout(self) -> dict[str, torch.Tensor | np.ndarray]:
         """Collect recurrent trajectories while preserving episode boundaries."""
 
@@ -310,6 +317,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         timeout_bootstrap_values = torch.zeros_like(rewards)
         successes = torch.empty_like(rewards)
         episode_starts = torch.empty_like(rewards)
+        policy_sample_mask = torch.empty_like(rewards)
         amp_features = torch.empty(
             (num_steps, num_envs, self.env.amp_obs_dim),
             device=self.device,
@@ -349,6 +357,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     current_episode_starts,
                     privileged_context,
                 )
+                action, log_prob, on_policy = self._select_behavior_action(
+                    action, log_prob, next_recurrent_state, current_episode_starts)
                 amp_reward = (
                     self._rollout_amp_reward(amp_tensor)
                     if self.cfg.amp_enabled
@@ -503,6 +513,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             time_outs[step] = time_out
             successes[step] = success
             episode_starts[step] = current_episode_starts
+            policy_sample_mask[step] = on_policy
             amp_features[step] = amp_tensor
             privileged_contexts[step] = privileged_context
             self.obs = next_obs
@@ -532,17 +543,18 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 timeout_bootstrap_values[step],
                 next_values,
             )
-            next_non_terminal = 1.0 - terminal
+            bootstrap_mask = 1.0 - terminal
+            trace_mask = 1.0 - torch.clamp(dones[step], min=0.0, max=1.0)
             delta = (
                 rewards[step]
-                + self.cfg.gamma * next_values * next_non_terminal
+                + self.cfg.gamma * next_values * bootstrap_mask
                 - values[step]
             )
             last_gae = (
                 delta
                 + self.cfg.gamma
                 * self.cfg.gae_lambda
-                * next_non_terminal
+                * trace_mask
                 * last_gae
             )
             advantages[step] = last_gae
@@ -625,6 +637,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "timeout_bootstrap_values": timeout_bootstrap_values,
             "successes": successes,
             "episode_starts": episode_starts,
+            "policy_sample_mask": policy_sample_mask,
             "initial_recurrent_state": initial_recurrent_state,
             "amp_features": amp_features,
             "privileged_contexts": privileged_contexts,
@@ -667,6 +680,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         initial_hidden = rollout["initial_recurrent_state"]
         privileged_contexts = rollout["privileged_contexts"]
         advantages = rollout["advantages"]
+        policy_sample_mask = rollout.get("policy_sample_mask", torch.ones_like(advantages))
         assert all(torch.is_tensor(value) for value in (
             obs,
             actions,
@@ -700,6 +714,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         initial_hidden = initial_hidden[finite_envs]
         privileged_contexts = privileged_contexts[:, finite_envs]
         advantages = advantages[:, finite_envs]
+        policy_sample_mask = policy_sample_mask[:, finite_envs]
         env_batch_size = obs.shape[1]
         minibatches = max(1, min(self.cfg.num_minibatches, env_batch_size))
         metric_names = (
@@ -775,20 +790,24 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     log_ratio_limit,
                 )
                 ratio = log_ratio.exp()
+                sample_mask = policy_sample_mask[:, mb]
+                def policy_mean(value):
+                    return (value * sample_mask).sum() / sample_mask.sum().clamp_min(1.0)
 
                 if self.cfg.deepmimic_ppo:
                     # MimicKit PPO: min(A*r, A*clip(r,1-eps,1+eps)).
                     mb_advantage = advantages[:, mb]
+                    advantage_mean = policy_mean(mb_advantage)
+                    advantage_std = policy_mean((mb_advantage-advantage_mean).square()).sqrt()
                     normalized_advantage = (
-                        (mb_advantage - mb_advantage.mean())
-                        / mb_advantage.std(unbiased=False).clamp_min(1.0e-6)
+                        (mb_advantage-advantage_mean) / advantage_std.clamp_min(1e-6)
                     ).clamp(-4.0, 4.0)
-                    policy_loss = -torch.minimum(
+                    policy_loss = -policy_mean(torch.minimum(
                         normalized_advantage * ratio,
                         normalized_advantage * ratio.clamp(
                             1.0 - ratio_eps, 1.0 + ratio_eps
                         ),
-                    ).mean()
+                    ))
                     median_advantage = mb_returns - median_value
                     target_ratio = torch.ones_like(ratio)
                     policy_weight = torch.ones_like(ratio)
@@ -804,7 +823,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                             + float(max(self.cfg.bpo_tv_coef, 0.0))
                         )
                     ratio_error = (target_ratio - ratio).abs()
-                    policy_loss = (ratio_error * policy_weight).mean()
+                    policy_loss = policy_mean(ratio_error * policy_weight)
 
                 value_clip = float(max(self.cfg.value_clip_coef, 0.0))
                 value_pred_clipped = (
@@ -832,7 +851,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                         )
                     ).mean()
                 )
-                entropy_loss = entropy.mean()
+                entropy_loss = policy_mean(entropy)
 
                 if self.cfg.use_moe and gate_weights.shape[0] > 1:
                     valid_transition = 1.0 - episode_starts[1:, mb]
@@ -897,8 +916,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 self.actor_critic.clamp_log_std_()
 
                 with torch.no_grad():
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = ((ratio - 1.0).abs() > ratio_eps).float().mean()
+                    approx_kl = policy_mean((ratio - 1.0) - log_ratio)
+                    clip_fraction = policy_mean(((ratio - 1.0).abs() > ratio_eps).float())
                     if (
                         kl_stop > 0.0
                         and torch.isfinite(approx_kl)

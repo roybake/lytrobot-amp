@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -22,7 +24,8 @@ from scripts.train_stairs import (  # noqa: E402
 )
 
 
-EXACT_STAIR_REFERENCE = REFERENCE_DIR / "stairs.npz"
+EXACT_STAIR_SOURCE_REFERENCE = REFERENCE_DIR / "stairs.npz"
+EXACT_STAIR_REFERENCE = REFERENCE_DIR / "stairs_supported.npz"
 EXACT_STAIR_MODEL = REPO_ROOT / "robot" / "terrains" / "stairs.xml"
 # 912 frames at 40 Hz need 2,280 control steps at 100 Hz.  Leave enough room
 # for the fixed 30-step terminal hold used by the stair completion contract.
@@ -78,6 +81,11 @@ def _validate_exact_contract(user_args: list[str]) -> None:
         "--deepmimic-track-root-xy",
         "--no-deepmimic-track-root-xy",
         "--deepmimic-root-xy-penalty",
+        "--deepmimic-route-tracking",
+        "--no-deepmimic-route-tracking",
+        "--deepmimic-route-xy-sigma",
+        "--deepmimic-route-velocity-sigma",
+        "--deepmimic-route-max-xy-error",
         "--trajectory-feedback",
         "--no-trajectory-feedback",
         "--sensor-gait-command",
@@ -107,11 +115,14 @@ def exact_train_args() -> list[str]:
         "--preserve-motion-world-xy",
         "--reference-root-x-offset", str(EXACT_STAIR_ROOT_X_OFFSET_M),
         "--stair-fixed-start",
-        # Original DeepMimic reference-state initialization (RSI): every
-        # training episode starts from a sampled reference phase.  Evaluation
-        # still starts deterministically at frame zero.
-        "--stair-phase-reset-prob", "1.0",
-        "--no-deepmimic-track-root-xy",
+        # The trainer reduces RSI to 20% after local tracking is learned.
+        "--stair-phase-reset-prob", "0.9",
+        "--deepmimic-track-root-xy",
+        "--deepmimic-root-xy-penalty", "0.0",
+        "--deepmimic-route-tracking",
+        "--deepmimic-route-xy-sigma", "0.35",
+        "--deepmimic-route-velocity-sigma", "0.25",
+        "--deepmimic-route-max-xy-error", "0.60",
         "--no-trajectory-feedback",
         "--no-sensor-gait-command",
         # The phase scalar is part of the original DeepMimic policy state.  It
@@ -125,6 +136,7 @@ def exact_train_args() -> list[str]:
         "--stair-width", "2.0",
         "--reference-ctrl-blend", "1.0",
         "--action-residual-scale", "0.5",
+        "--startup-action-ramp-steps", "0",
         "--use-reference-velocity",
         "--motion-reset-prob", "0.0",
         "--stand-start-prob", "0.0",
@@ -139,8 +151,12 @@ def exact_train_args() -> list[str]:
         "--stair-lateral-failure-penalty", "5.0",
         "--stair-terminal-hold-steps", "30",
         "--decimation", "2",
+        "--learning-rate", "1e-4",
+        "--max-learning-rate", "1e-4",
+        "--target-kl", "0.015",
+        "--compile-policy-chunk-steps", "8",
         "--wandb-tags",
-        "lytrobot,deepmimic,ppo,rsi,phase,stairs,exact-xml,continuous-up-down",
+        "lytrobot,deepmimic,ppo,rsi,phase,stairs,route-v2,support-corrected",
     ]
 
 
@@ -177,13 +193,19 @@ def build_train_args(
         # Match the demonstrated root velocity throughout the clip.
         "--lcp-weight", "0.0", "--deepmimic-ppo", "--stage", "stage1",
         "--max-iterations", str(STAIR_MAX_ITERATIONS),
-        "--device", "cuda", "--sim-backend", "warp",
+        "--device", "cuda", "--sim-backend", "warp", "--quiet-startup",
         "--no-domain-randomization", "--log-root",
         str(REPO_ROOT / "logs"),
         "--log-group", "stairs",
     ]
-    if not _has_option(user_args, "--num-envs"):
-        args += ["--num-envs", "4096"]
+    # Longer recurrent sequences cover support transfers at 100 Hz.
+    for option, value in (
+        ("--num-envs", "4096"),
+        ("--num-steps", "64" if direction == "exact" else "24"),
+        ("--minibatches", "8"),
+    ):
+        if not _has_option(user_args, option):
+            args += [option, value]
     return args + user_args
 
 
@@ -211,6 +233,17 @@ def main() -> None:
         if options.direction == "exact"
         else REPO_ROOT / "robot" / "MJCFmodelposition.xml"
     )
+    if options.direction == "exact" and EXACT_STAIR_SOURCE_REFERENCE.is_file():
+        regenerate = not clip.is_file()
+        if not regenerate:
+            import numpy as np
+            with np.load(clip, allow_pickle=False) as prepared:
+                provenance = json.loads(str(prepared["provenance_json"].item()))
+            regenerate = (provenance["source_sha256"]
+                          != hashlib.sha256(EXACT_STAIR_SOURCE_REFERENCE.read_bytes()).hexdigest())
+        if regenerate:
+            from scripts.prepare_stair_support import prepare
+            prepare(EXACT_STAIR_SOURCE_REFERENCE, clip, model_xml, EXACT_STAIR_ROOT_X_OFFSET_M)
     if not clip.is_file():
         raise SystemExit(
             f"缺少楼梯机器人参考：{clip}\n"
@@ -259,7 +292,7 @@ def main() -> None:
             if not report["alignment_pass"]:
                 raise SystemExit("参考轨迹与楼梯的 X 对齐仍不合格，停止训练。")
             if not report["contact_geometry_pass"]:
-                print("警告：参考仍有连续无支撑时段；训练策略必须通过接触反馈补偿。")
+                raise SystemExit("参考存在无支撑时段，先运行 scripts/prepare_stair_support.py。")
         return
 
     if options.direction == "exact" and not options.skip_reference_audit:
@@ -275,11 +308,7 @@ def main() -> None:
                 "仅代码冒烟测试可用 --skip-reference-audit。"
             )
         if not report["contact_geometry_pass"]:
-            print(
-                "警告：对齐后参考仍有最长 "
-                f"{report['longest_unsupported_run_s']:.2f} s 连续无支撑时段；"
-                "训练策略需靠接触反馈保持稳定。"
-            )
+            raise SystemExit("参考接触检查失败，停止训练；先修复参考支撑。")
 
     args = build_train_args(options.direction, user_args)
     import sensor_training.train as sensor_train

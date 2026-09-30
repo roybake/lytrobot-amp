@@ -34,6 +34,7 @@ if __name__ == "__main__":
         "--num-envs": "4096",
         "--task-reward-mode": "stage1_reference",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
+        "--motion-loop": "true",
         "--target-velocity": "0.87",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",

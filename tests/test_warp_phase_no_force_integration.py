@@ -44,9 +44,19 @@ def test_real_cuda_warp_phase_no_force_integration(monkeypatch):
         assert stale_reset_called
         assert obs.shape == (4, 58) and torch.isfinite(obs).all()
 
-        for _ in range(32):
+        for step in range(32):
             obs, reward, _, _ = env.step(torch.zeros(4, 14, device='cuda'))
             assert torch.isfinite(obs).all() and torch.isfinite(reward).all()
+            if step == 0:
+                # A second forward pass should not move geometry: observations
+                # and rewards must already use transforms at the new state.
+                foot_pos = env.geom_xpos[:, env.contact_geom_ids].clone()
+                with warp_env_module.wp.ScopedDevice(env.wp_device):
+                    env._warp_forward()
+                torch.testing.assert_close(
+                    env.geom_xpos[:, env.contact_geom_ids], foot_pos,
+                    rtol=1e-5, atol=1e-5,
+                )
             torch.testing.assert_close(
                 obs[:, 56].square() + obs[:, 57].square(),
                 torch.ones(4, device='cuda'), rtol=1e-4, atol=1e-4,

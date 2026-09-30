@@ -14,7 +14,11 @@ for path in (REPO_ROOT, SRC_ROOT):
 
 from scripts import train as base_train
 
-from sensor_training.envs import SensorHistoryCpuAmpEnv, SensorHistoryWarpAmpEnv
+from sensor_training.envs import (
+    SensorHistoryCpuAmpEnv,
+    SensorHistoryMjlabAmpEnv,
+    SensorHistoryWarpAmpEnv,
+)
 from sensor_training.ppo_config import SensorPPOAMPConfig
 from sensor_training.trainer import SensorHistoryPPOAMPTrainer
 from sensor_training.training_defaults import (
@@ -55,6 +59,7 @@ def main() -> None:
         sys.argv.append("--no-compile-rollout")
 
     base_train.LytRobotWarpAmpEnv = SensorHistoryWarpAmpEnv
+    base_train.LytRobotMjlabAmpEnv = SensorHistoryMjlabAmpEnv
     base_train.LytRobotAmpEnv = SensorHistoryCpuAmpEnv
     base_train.PPOAMPConfig = SensorPPOAMPConfig
     base_train.PPOAMPTrainer = SensorHistoryPPOAMPTrainer

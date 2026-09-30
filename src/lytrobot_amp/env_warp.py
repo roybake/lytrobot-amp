@@ -792,6 +792,10 @@ class LytRobotWarpAmpEnv:
             )
             mjwarp.forward(self.wp_model, self.wp_data)
 
+        self._init_warp_views()
+
+    def _init_warp_views(self) -> None:
+        """Expose the selected simulation's Warp buffers to the LYT task."""
         self.qpos = wp.to_torch(self.wp_data.qpos)
         self.qvel = wp.to_torch(self.wp_data.qvel)
         self.ctrl = wp.to_torch(self.wp_data.ctrl)
@@ -1948,6 +1952,10 @@ class LytRobotWarpAmpEnv:
                     applied_action = self._delayed_action(commanded_action)
                     self.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl)
                     self._warp_step()
+            # mj_step leaves derived body/geom transforms at the state before
+            # its final integration. Rewards and observations below read those
+            # transforms, so refresh them at the new qpos/qvel first.
+            self._warp_forward()
 
         self.episode_step += 1
         target_forward_velocity = (
@@ -2662,12 +2670,22 @@ class LytRobotWarpAmpEnv:
                 root_xy=(self.qpos[:, :2] if self.cfg.deepmimic_track_root_xy else None),
                 target_root_xy=(targets["root_xy"] if self.cfg.deepmimic_track_root_xy else None),
                 root_xy_penalty=self.cfg.deepmimic_root_xy_penalty,
+                route_tracking=self.cfg.deepmimic_route_tracking,
+                route_xy_sigma=self.cfg.deepmimic_route_xy_sigma,
+                route_velocity_sigma=self.cfg.deepmimic_route_velocity_sigma,
             )
         if gait_scores:
             reward = reward + natural_gait_bonus(
                 gait_scores, gait_progress, forward_velocity_track,
                 locomotion_stability, knee_flexion_track, self.cfg,
             )
+        reference_gait_style = torch.exp(
+            -torch.mean((joint_pos-targets["joint_pos"]).square(), dim=1) / .20**2
+            -torch.mean((foot_pos-targets["foot_pos"]).square(), dim=(1, 2)) / .07**2
+        )
+        if self.cfg.reference_gait_style_reward_coef > 0:
+            reward = reward + self.cfg.reference_gait_style_reward_coef * gait_progress * (
+                reference_gait_style * forward_velocity_track * locomotion_stability - 1.0)
 
         bad_state = ~(
             torch.isfinite(self.qpos).all(dim=1)
@@ -2706,6 +2724,7 @@ class LytRobotWarpAmpEnv:
             "gait_progress": gait_progress,
             "knee_flexion_track": knee_flexion_track,
             "knee_extension": 1.0 - knee_flexion_track,
+            "reference_gait_style": reference_gait_style,
             **gait_scores,
             "pose_track": pose_track,
             "vel_track": vel_track,
@@ -2750,8 +2769,16 @@ class LytRobotWarpAmpEnv:
             fall_penalty=self.cfg.fall_penalty,
         )
         timed_out = self.episode_step >= self.episode_timeout_step
-        dones = bad_state | fallen | timed_out
-        termination = bad_state | fallen
+        route_failure = torch.zeros_like(fallen)
+        if self.cfg.deepmimic_route_tracking:
+            route_failure = (
+                components["deepmimic_root_xy_error"]
+                > self.cfg.deepmimic_route_max_xy_error
+            )
+            components["deepmimic_route_failure"] = route_failure.to(torch.float32)
+        timed_out = timed_out & ~route_failure
+        dones = bad_state | fallen | route_failure | timed_out
+        termination = bad_state | fallen | route_failure
         components["termination"] = termination.to(torch.float32)
         return reward, dones, timed_out, components
 

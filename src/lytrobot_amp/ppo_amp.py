@@ -103,6 +103,9 @@ class PPOAMPTrainer:
             self.discriminator.parameters(), lr=cfg.discriminator_learning_rate
         )
 
+        # The environment autoresets done worlds inside step(). Capture the
+        # actual final observation before reset for time-limit bootstrapping.
+        self.env.terminal_observer = self._terminal_observation
         self.obs = env.reset()
         self.global_step = 0
         self.episode_reward_sums = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
@@ -112,6 +115,16 @@ class PPOAMPTrainer:
         self.completed_episode_lengths: deque[int] = deque(maxlen=window)
         self.completed_episode_successes: deque[float] = deque(maxlen=window)
         self.loaded_domain_randomization_scale: float | None = None
+
+    def _terminal_observation(
+        self, ids: np.ndarray | torch.Tensor
+    ) -> dict[str, torch.Tensor | np.ndarray]:
+        observation = self.env.observe()[ids]
+        return {
+            "terminal_observation": (
+                observation.clone() if torch.is_tensor(observation) else observation.copy()
+            )
+        }
 
     def reset_training_env(self) -> None:
         """Synchronously reset every world and discard partial episode totals."""
@@ -233,6 +246,7 @@ class PPOAMPTrainer:
         amp_rewards = torch.empty((num_steps, num_envs), device=self.device)
         dones = torch.empty((num_steps, num_envs), device=self.device)
         time_outs = torch.empty((num_steps, num_envs), device=self.device)
+        timeout_bootstrap_values = torch.zeros((num_steps, num_envs), device=self.device)
         successes = torch.empty((num_steps, num_envs), device=self.device)
         amp_features = torch.empty((num_steps, num_envs, amp_dim), device=self.device)
         completed_reward_values = torch.zeros((num_steps, num_envs), device=self.device)
@@ -254,12 +268,23 @@ class PPOAMPTrainer:
 
             env_action = action if getattr(self.env, "is_torch_env", False) else action.cpu().numpy()
             next_obs, task_reward_value, done_value, _info = self.env.step(env_action)
+            if "terminal_observation" in _info:
+                terminal_ids = self._as_device_tensor(
+                    _info["terminal_env_ids"], dtype=torch.long
+                )
+                terminal_obs = self._as_device_tensor(_info["terminal_observation"])
+                with torch.no_grad():
+                    terminal_values = self.actor_critic.critic(terminal_obs).squeeze(-1)
+                timeout_bootstrap_values[step, terminal_ids] = terminal_values
             episode_step = self._as_device_tensor(_info["episode_step"])
             episode_progress_sum = episode_progress_sum + episode_step.sum()
             component_items = [
                 (key, info_value)
                 for key, info_value in _info.items()
-                if key not in ("episode_step", "time_outs", "successes")
+                if key not in (
+                    "episode_step", "time_outs", "successes",
+                    "terminal_observation", "terminal_env_ids",
+                )
             ]
             if not reward_component_keys:
                 reward_component_keys = tuple(key for key, _value in component_items)
@@ -336,14 +361,14 @@ class PPOAMPTrainer:
         last_gae = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
         for step in reversed(range(num_steps)):
             terminal = torch.clamp(dones[step] - time_outs[step], min=0.0, max=1.0)
-            if step == num_steps - 1:
-                next_non_terminal = 1.0 - terminal
-                next_values = next_value
-            else:
-                next_non_terminal = 1.0 - terminal
-                next_values = values[step + 1]
-            delta = rewards[step] + self.cfg.gamma * next_values * next_non_terminal - values[step]
-            last_gae = delta + self.cfg.gamma * self.cfg.gae_lambda * next_non_terminal * last_gae
+            next_values = next_value if step == num_steps - 1 else values[step + 1]
+            next_values = torch.where(
+                time_outs[step] > 0.0, timeout_bootstrap_values[step], next_values
+            )
+            bootstrap_mask = 1.0 - terminal
+            trace_mask = 1.0 - torch.clamp(dones[step], min=0.0, max=1.0)
+            delta = rewards[step] + self.cfg.gamma * next_values * bootstrap_mask - values[step]
+            last_gae = delta + self.cfg.gamma * self.cfg.gae_lambda * trace_mask * last_gae
             advantages[step] = last_gae
         returns = advantages + values
 
@@ -390,6 +415,7 @@ class PPOAMPTrainer:
             "amp_rewards": amp_rewards,
             "dones": dones,
             "time_outs": time_outs,
+            "timeout_bootstrap_values": timeout_bootstrap_values,
             "successes": successes,
             "amp_features": amp_features,
             "completed_episode_rewards": completed_episode_rewards,

@@ -2,9 +2,11 @@
 
 ## 纯传感器上下楼梯 DeepMimic
 
-`sensor_training/train_stairs_deepmimic.py` 使用 GRU Actor。楼梯专项每帧输入为机身一个 IMU 的三轴加速度与三轴角速度、14 条肌腱实际长度、上一时刻 14 维动作，以及原始 DeepMimic 定义的一个归一化相位标量；6 帧历史共 210 维。相位由控制器单调时钟产生，不是仿真真值；参考动作、目标速度、世界坐标和脚端接触均不进入 Actor。仿真全状态只参与训练奖励或 critic。默认训练匹配 `robot/reference_data/multimotion/stairs.npz` 与 `robot/terrains/stairs.xml`：三阶、0.13 m 立板、0.32 m 踏步，连续完成上楼—平台—下楼。
+`sensor_training/train_stairs_deepmimic.py` 使用 GRU Actor。楼梯专项每帧输入为机身一个 IMU 的三轴加速度与三轴角速度、14 条肌腱实际长度、上一时刻 14 维动作，以及一个归一化相位标量；6 帧历史共 210 维。相位由控制器单调时钟产生；参考动作、目标速度、世界坐标和脚端接触均不进入 Actor。仿真全状态只参与训练奖励或 critic。默认训练匹配 `robot/reference_data/multimotion/stairs_supported.npz` 与 `robot/terrains/stairs.xml`，连续完成上楼—平台—下楼。
 
-训练使用纯 DeepMimic 模仿目标：五组姿态、速度、key point、根部姿态和根部速度指数项，PPO clipped objective、GAE、Reference State Initialization（RSI）和跌倒提前终止；关闭 AMP、LCP、根部世界坐标 XY 惩罚以及自然步态/接触/抬脚塑形奖励。训练回合从完整参考中均匀采样相位，避免固定从第 0 帧起步导致策略永远看不到后半程；播放和验收仍固定从第 0 帧开始。逐帧参考只用于 DeepMimic 奖励和控制器前馈肌腱目标，不作为 Actor 的参考姿态输入。旧 204/696/708 维 checkpoint 不能直接用于新的 210 维输入。
+训练使用 DeepMimic 的五项模仿奖励和 clipped PPO，关闭 AMP、LCP、教师蒸馏。固定路线版本把模仿奖励乘以根部 XY 和速度跟踪因子（尺度分别为 0.35 m、0.25 m/s），偏离参考 XY 超过 0.60 m 时提前终止，使静止姿态无法持续获取模仿分。`gamma=0.999`、`gae_lambda=0.97`。前 2000 轮 RSI 比例为 90%，随后 10000 轮逐渐降到 20%，让完整起点回合增加到 80%。逐帧参考用于训练奖励和板载肌腱前馈，不作为 Actor 姿态输入。
+
+每次保存 checkpoint 都额外用 CPU MuJoCo 从第 0 帧确定性回放；`model_best` 按实际完整路线成功和沿参考路线的前进比例选择。结果保存在 `route_evaluations.jsonl`、`best_route_evaluation.json`，并同步到 W&B 的 `eval/stair_*` 指标。成功率为 0 的最佳模型仍属于未完成路线的模型。
 
 ```bash
 uv run python sensor_training/train_stairs_deepmimic.py --check-data
@@ -16,13 +18,19 @@ uv run python sensor_training/play.py \
   --viewer
 ```
 
-楼梯专项默认使用 4096 个并行环境，可通过 `--num-envs` 覆盖。`model_best.pt/.onnx` 和 `model_final.pt/.onnx` 保存在 `logs/stairs/<时间戳>/`。每次训练自动按现有训练器的 `MM-DD-HH:MM:SS` 格式命名；同秒启动时自动附加数字后缀，避免覆盖。
+楼梯回放默认运行完整的 2400 个控制步，并输出首次回合的 `route_success` 与终点误差。旧的 `model_best` 仅按模仿奖励选出；更改训练目标后应启动新训练，不要把旧权重当成已学会完整路线的证明。
 
-楼梯专项训练会在运行时把参考根节点 X 平移 `-0.39 m`，与 MuJoCo 中验证的机器人和 `robot/terrains/stairs.xml` 距离一致；原始 `stairs.npz` 的每帧关节姿态、速度和文件内容都不改。对齐后，377 个踏步着地帧无脚部外伸，脚网格最小台面余量约 3.1 cm，足部碰撞盒最大穿透约 1.0 cm。参考仍有最长 1.10 秒连续无接触，训练入口会警告这一点，不能保证严格物理重现。`--check-data` 可查看对齐审计；`--skip-reference-audit` 仅供代码冒烟测试。详细结果见 `multimotion/retargeting/diagnostics/stairs_offset_minus_039_audit.json`。
+楼梯专项默认使用 4096 个并行环境、每环境 64 个控制步和 8 个 minibatch，每轮 PPO 更新采集 262,144 条控制转换；可通过 `--num-envs`、`--num-steps`、`--minibatches` 覆盖。学习率上限为 `1e-4`，每个编译图处理 8 步。默认使用 CUDA/Warp，控制频率固定 100 Hz。checkpoint 保存在 `logs/stairs/<时间戳>/`；旧训练应重新开始。
+
+原始 `stairs.npz` 保留。`scripts/prepare_stair_support.py` 生成独立的 `stairs_supported.npz`，仅修正根部高度及其竖直速度，最大高度改动约 1.62 cm；关节姿态、水平路径和时序相同。修正后的无支撑帧数为 0，碰撞盒最大穿透约 1 mm，脚网格最小台面余量约 3 cm。运行时仍施加 `-0.39 m` 的 X 对齐偏移。接触或对齐审计失败会停止正式训练；几何检查通过并不保证动力学跟踪成功。缺少派生数据时训练入口会自动生成，也可手动运行：
+
+```bash
+uv run python scripts/prepare_stair_support.py
+```
 
 默认 `--direction exact` 使用上述精确场景数据。`--direction up`、`down` 或 `up_down` 仍保留旧的程序化五级楼梯课程。`scripts/train_stairs_deepmimic.py` 是此纯传感器入口的兼容别名。
 
-动力学、奖励和 AMP 判别器复用现有实现；Actor 使用 recurrent BPO 更新，AMP 判别器和 AMP reward 保留。所有训练统一使用纯位置控制。
+楼梯专项复用仿真动力学，使用 DeepMimic 奖励和 recurrent PPO，关闭 AMP；下面的普通行走训练仍可使用 AMP 或教师蒸馏。所有训练统一使用纯位置控制。
 
 sensor stage1 默认使用独立 PPO+BPO+AMP 训练，不启用教师蒸馏。参考动作使用含完整脚跟—脚掌—脚趾滚动的 `walk1_omniretarget.npz`，目标速度为 `0.87 m/s`。Actor 获得可在实机控制器生成的 gait command，执行器同时使用该参考表作为板载前馈肌腱目标；Actor 只学习 IMU/肌腱反馈残差。任务奖励同时跟踪参考动作、前向速度和实测步态质量，AMP 作为辅助风格先验。训练回合中70%从站立开始，固定选择参考动作第15帧的双支撑相位：先站立0.2秒，再用0.8～1.0秒 smoothstep 渐入步态。其余30%从随机参考相位及其对应物理状态开始，只用于覆盖完整步态周期。Stage2 保留同一起步分布并加入领域随机化；实机和默认播放始终100%从站立开始。
 
