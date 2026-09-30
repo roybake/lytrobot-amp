@@ -53,6 +53,18 @@ def add_runtime_args(parser, *, steps=96, sensor_variant_default=None):
     parser.add_argument('--output', default=None)
 
 
+def resolve_training_output(args, stage: str) -> None:
+    """Place default checkpoints in a timestamp run; validate explicit outputs."""
+    from training_paths import new_run_dir, validate_run_name
+    output = Path(args.output or f"{stage}.pt").expanduser()
+    if output.parent == Path("."):
+        output = new_run_dir(ROOT / "logs" / "distillation" / stage) / output.name
+    else:
+        validate_run_name(output.parent.name)
+    args.output = str(output.resolve())
+    print(f"[INFO] training output={args.output}")
+
+
 def selected_variant(args) -> SensorVariantSpec:
     value = getattr(args, 'sensor_variant', None) or PHASE_FORCE.name
     return sensor_variant_spec(value)

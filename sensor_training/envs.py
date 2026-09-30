@@ -14,6 +14,8 @@ from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
 from lytrobot_amp.motion import MotionLibrary
 
 from .config import DEFAULT_SENSOR_OBSERVATION_CONFIG, SensorObservationConfig
+from .tendon_features import CausalTendonFeatures
+from .state_estimation import state_layout, STATE_SCALES
 from .gait_command import (
     GAIT_COMMAND_SCALAR_FIELDS,
     assemble_gait_command,
@@ -234,6 +236,9 @@ class SensorHistoryEnv:
             + self.base_env.action_dim
             + int(self.base_env.cfg.sensor_phase_observation)
             + self.gait_command_dim
+            + self.base_env.position_action_dim * (
+                int(self.sensor_observation_cfg.include_tendon_velocity)
+                + int(self.sensor_observation_cfg.include_tendon_tracking_error))
         )
 
     @property
@@ -309,7 +314,10 @@ class SensorHistoryEnv:
             ),
             "actor_input_fields": (
                 (
-                    "imu", "tendon_length", "previous_action",
+                    "imu", "tendon_length",
+                    *(("tendon_velocity",) if self.sensor_observation_cfg.include_tendon_velocity else ()),
+                    *(("tendon_tracking_error",) if self.sensor_observation_cfg.include_tendon_tracking_error else ()),
+                    "previous_action",
                     *(("phase",) if self.base_env.cfg.sensor_phase_observation else ()),
                     *(("gait_command",) if self.sensor_observation_cfg.gait_command_enabled else ()),
                 )
@@ -462,6 +470,7 @@ class SensorHistoryEnv:
     def _allocate_histories(self) -> None:
         shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.sensor_frame_dim)
         amp_shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.base_motion.feature_dim)
+        self._tendon_features = CausalTendonFeatures(self._measured_tendon_lengths(), self.sensor_observation_cfg)
         if self.is_torch_env:
             self._actor_history = torch.zeros(shape, dtype=torch.float32, device=self.base_env.device)
             self._amp_history = torch.zeros(amp_shape, dtype=torch.float32, device=self.base_env.device)
@@ -585,12 +594,59 @@ class SensorHistoryEnv:
             axis=1,
         ).astype(np.float32)
 
+    @property
+    def state_supervision_metadata(self):
+        return {'layout': state_layout(True), 'scales': STATE_SCALES,
+                'training_only': True, 'contact_order': ['right', 'left'],
+                'joint_order': list(self.base_motion.common_joint_names),
+                'root_velocity_frame': 'world', 'foot_position_frame': 'pelvis_local'}
+
+    def state_supervision_observe(self, include_foot=False):
+        """Raw physical labels, aligned with the current sensor observation."""
+        base = self.base_env
+        if len(self.base_motion.common_joint_names) != 14:
+            raise ValueError('State estimation requires the 14-joint robot layout.')
+        if self.is_torch_env:
+            values = [base.qpos[:, base.robot_qpos_adrs], base.qvel[:, base.robot_qvel_adrs],
+                      base.qvel[:, :3], base._foot_contacts()]
+            if include_foot:
+                values.append(base._foot_positions_local().reshape(self.num_envs, 12))
+            return torch.cat(values, dim=-1)
+        values = [np.stack([data.qpos[self.base_motion.robot_qpos_adrs] for data in base.datas]),
+                  np.stack([data.qvel[self.base_motion.robot_qvel_adrs] for data in base.datas]),
+                  np.stack([data.qvel[:3] for data in base.datas]),
+                  np.stack([base._foot_contacts(data) for data in base.datas])]
+        if include_foot:
+            values.append(np.stack([base._foot_positions_local(data).reshape(12) for data in base.datas]))
+        return np.concatenate(values, axis=-1).astype(np.float32)
+
+    def _measured_tendon_lengths(self):
+        if self.is_torch_env:
+            return self.base_env.ten_length[:, self.base_env.actuator_tendon_ids]
+        return np.stack([data.ten_length[self.base_env.actuator_tendon_ids]
+                         for data in self.base_env.datas]).astype(np.float32)
+
+    def _tendon_feature_frame(self, command):
+        if not (self.sensor_observation_cfg.include_tendon_velocity or
+                self.sensor_observation_cfg.include_tendon_tracking_error):
+            return self._tendon_features.previous[:, :0]
+        lengths = self._measured_tendon_lengths()
+        if self.sensor_observation_cfg.include_tendon_tracking_error:
+            # Four command scalars precede the 0-second tendon table sample.
+            ref = command[:, 4:4+self.base_env.position_action_dim]
+            reference = ref * self.base_env.ctrl_half_range + self.base_env.ctrl_mid
+        else:
+            reference = lengths
+        return self._tendon_features.frame(lengths, reference)
+
     def _all_env_ids(self) -> np.ndarray | torch.Tensor:
         if self.is_torch_env:
             return torch.arange(self.num_envs, dtype=torch.long, device=self.base_env.device)
         return np.arange(self.num_envs, dtype=np.int64)
 
     def _normalized_sensor_frame(self) -> np.ndarray | torch.Tensor:
+        command = self._gait_command_frame()
+        tendon_features = self._tendon_feature_frame(command)
         if self.is_torch_env:
             imu = self._sensordata[:, self._imu_addresses] / self._imu_divisors
             tendon = self.base_env.ten_length[:, self.base_env.actuator_tendon_ids]
@@ -611,9 +667,10 @@ class SensorHistoryEnv:
             return torch.cat(
                 (
                     sensor,
+                    tendon_features,
                     previous_action,
                     self._deepmimic_phase_frame(),
-                    self._gait_command_frame(),
+                    command,
                 ),
                 dim=1,
             )
@@ -652,9 +709,10 @@ class SensorHistoryEnv:
         return np.concatenate(
             (
                 sensor,
+                tendon_features,
                 previous_action,
                 self._deepmimic_phase_frame(),
-                self._gait_command_frame(),
+                command,
             ),
             axis=1,
         ).astype(np.float32)
@@ -792,6 +850,8 @@ class SensorHistoryEnv:
         return self.base_env.amp_observe()
 
     def _fill_history(self, env_ids: np.ndarray | torch.Tensor) -> None:
+        if self.sensor_observation_cfg.include_tendon_velocity:
+            self._tendon_features.reset(self._measured_tendon_lengths(), env_ids)
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
@@ -817,6 +877,8 @@ class SensorHistoryEnv:
         )
 
     def _append_history(self) -> None:
+        if self.sensor_observation_cfg.include_tendon_velocity:
+            self._tendon_features.update(self._measured_tendon_lengths(), self.base_env.dt)
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
@@ -855,6 +917,7 @@ class SensorHistoryEnv:
     def _terminal_observation(self, ids):
         """Build the next sensor history before autoreset, including squat phase."""
         actor_history, amp_history = self._actor_history, self._amp_history
+        previous, velocity = self._tendon_features.previous, self._tendon_features.velocity
         try:
             self._append_history()
             observation = self.observe()[ids]
@@ -865,6 +928,7 @@ class SensorHistoryEnv:
             }
         finally:
             self._actor_history, self._amp_history = actor_history, amp_history
+            self._tendon_features.previous, self._tendon_features.velocity = previous, velocity
 
     def step(self, action: np.ndarray | torch.Tensor):
         _base_obs, reward, done, info = self.base_env.step(action)

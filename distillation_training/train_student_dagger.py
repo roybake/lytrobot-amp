@@ -21,8 +21,10 @@ def rollout(env,actor,estimator,steps,device,student_control):
   pt=torch.where(done[:,None]>0,nxt[:,42:56],obs[:,42:56]);pa=torch.where(done[:,None]>0,torch.zeros_like(action),action);start=done;obs=nxt
  zero=torch.zeros((),device=device);health={key:(torch.stack(values).mean() if values else zero) for key,values in force.items()}
  return {k:torch.stack([r[k] for r in rows],1) for k in rows[0]},health # [N,T,...]
+from distillation_training.runtime import resolve_training_output
+
 def main():
- p=argparse.ArgumentParser();p.add_argument('--teacher-checkpoint',required=True);p.add_argument('--student-checkpoint',required=True);p.add_argument('--max-buffer',type=int,default=4096);add_runtime_args(p);p.set_defaults(output='student_dagger.pt');a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
+ p=argparse.ArgumentParser();p.add_argument('--teacher-checkpoint',required=True);p.add_argument('--student-checkpoint',required=True);p.add_argument('--max-buffer',type=int,default=4096);add_runtime_args(p);p.set_defaults(output='student_dagger.pt');a=p.parse_args();resolve_training_output(a, "student_dagger");device=torch.device(a.device);torch.manual_seed(a.seed)
  teacher=validate_checkpoint(a.teacher_checkpoint,'teacher',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);student=validate_checkpoint(a.student_checkpoint,'student',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student));actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(teacher['shared_actor']);actor.eval()
  for x in actor.parameters():x.requires_grad=False
  estimator=HistoryEstimator(spec.sensor_dim).to(device);estimator.load_state_dict(student['history_estimator']);optimizer=torch.optim.Adam(estimator.parameters(),lr=a.learning_rate);env,cfg=make_env(a);replay=BoundedReplay(a.max_buffer,storage_device=device);global_step=0

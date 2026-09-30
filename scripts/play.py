@@ -544,6 +544,7 @@ def main() -> None:
     else:
         if recurrent_sensor_policy:
             from sensor_training.networks import SensorActorCritic
+            from sensor_training.experiment_options import estimator_kwargs
 
             policy = SensorActorCritic(
                 obs_dim=env.obs_dim,
@@ -562,6 +563,7 @@ def main() -> None:
                 expert_hidden_dims=tuple(sensor_architecture["expert_hidden_dims"]),
                 residual_scale=float(sensor_architecture["residual_scale"]),
                 privileged_context_dim=int(sensor_architecture.get("privileged_context_dim", 0)),
+                **estimator_kwargs(sensor_architecture),
             ).to(args.device)
             recurrent_state = policy.initial_state(env.num_envs)
         else:

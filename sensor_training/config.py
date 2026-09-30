@@ -17,7 +17,22 @@ class SensorObservationConfig:
     gait_lookahead_seconds: tuple[float, ...] = (0.0, 0.1, 0.2)
     target_velocity_normalizer: float = 3.0
 
+    include_tendon_velocity: bool = False
+    include_tendon_tracking_error: bool = False
+    tendon_velocity_scale: float = 1.0  # m/s, before clipping
+    tendon_velocity_filter_alpha: float = 1.0  # causal one-pole filter
+    tendon_tracking_error_scale: float = 0.05  # m
+
     def __post_init__(self) -> None:
+        if self.tendon_velocity_scale <= 0 or self.tendon_tracking_error_scale <= 0:
+            raise ValueError("Tendon feature scales must be positive.")
+        if not 0 < self.tendon_velocity_filter_alpha <= 1:
+            raise ValueError("Tendon velocity filter alpha must be in (0, 1].")
+        if self.include_tendon_tracking_error and (
+            not self.gait_command_enabled or not self.gait_lookahead_seconds
+            or self.gait_lookahead_seconds[0] != 0.0
+        ):
+            raise ValueError("Tracking error requires a current onboard tendon command.")
         if self.history_steps < 0:
             raise ValueError("history_steps must be non-negative.")
         if self.accelerometer_scale <= 0.0:

@@ -63,6 +63,8 @@ def main() -> None:
     base_train.LytRobotAmpEnv = SensorHistoryCpuAmpEnv
     base_train.PPOAMPConfig = SensorPPOAMPConfig
     base_train.PPOAMPTrainer = SensorHistoryPPOAMPTrainer
+    from sensor_training.experiment_options import install_training_options
+    install_training_options(base_train)
     base_train.main()
 
 

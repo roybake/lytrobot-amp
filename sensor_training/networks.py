@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
+from .state_estimation import state_layout
+
 
 def build_mlp(
     input_dim: int,
@@ -59,6 +61,12 @@ class SensorActorCritic(nn.Module):
         expert_hidden_dims: tuple[int, ...] = (128, 64),
         residual_scale: float = 0.35,
         privileged_context_dim: int = 0,
+        state_estimator_enabled: bool = False,
+        state_estimator_include_foot_position: bool = False,
+        actor_use_estimated_state: bool = False,
+        future_prediction_enabled: bool = False,
+        future_prediction_steps: tuple[int, ...] = (1, 3, 5),
+        future_prediction_dim: int = 0,
     ) -> None:
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -88,16 +96,41 @@ class SensorActorCritic(nn.Module):
         if self.privileged_context_dim < 0:
             raise ValueError("privileged_context_dim must be non-negative.")
 
+        self.state_estimator_enabled = bool(state_estimator_enabled)
+        self.actor_use_estimated_state = bool(actor_use_estimated_state)
+        self.state_estimator_include_foot_position = bool(state_estimator_include_foot_position)
+        self.future_prediction_steps = tuple(future_prediction_steps)
+        self.future_prediction_enabled = bool(future_prediction_enabled)
+        self.future_prediction_dim = int(future_prediction_dim)
+        if self.actor_use_estimated_state and not self.state_estimator_enabled:
+            raise ValueError("Estimated-state Actor input requires the state estimator.")
+        if any(k <= 0 for k in self.future_prediction_steps) or not self.future_prediction_steps:
+            raise ValueError("Future prediction offsets must be positive and nonempty.")
+        if self.future_prediction_enabled and self.future_prediction_dim <= 0:
+            raise ValueError("Future prediction requires an IMU+tendon dimension.")
+        self.state_target_layout = state_layout(self.state_estimator_include_foot_position)
+        head_names = {'root_linear_velocity': 'root_velocity', 'foot_contact': 'contact',
+                      'foot_local_position': 'foot_position'}
+        if self.state_estimator_enabled:
+            for name, dim in self.state_target_layout.items():
+                setattr(self, head_names.get(name, name) + '_head',
+                        build_mlp(self.recurrent_hidden_dim, (64,), dim))
+        self.future_heads = nn.ModuleList(
+            build_mlp(self.recurrent_hidden_dim, (64,), self.future_prediction_dim)
+            for _ in self.future_prediction_steps
+        ) if self.future_prediction_enabled else nn.ModuleList()
+        actor_input_dim = self.recurrent_hidden_dim + (
+            sum(self.state_target_layout.values()) if self.actor_use_estimated_state else 0)
         self.recurrent = nn.GRUCell(self.recurrent_input_dim, self.recurrent_hidden_dim)
         # Keep the public ``actor`` name for checkpoint/export compatibility.
         self.actor = build_mlp(
-            self.recurrent_hidden_dim,
+            actor_input_dim,
             actor_hidden_dims,
             self.action_dim,
         )
         self.gate = (
             build_mlp(
-                self.recurrent_hidden_dim,
+                actor_input_dim,
                 gate_hidden_dims,
                 self.num_experts,
             )
@@ -106,7 +139,7 @@ class SensorActorCritic(nn.Module):
         )
         self.experts = nn.ModuleList(
             build_mlp(
-                self.recurrent_hidden_dim,
+                actor_input_dim,
                 expert_hidden_dims,
                 self.action_dim,
                 output_activation=nn.Tanh(),
@@ -178,7 +211,13 @@ class SensorActorCritic(nn.Module):
         self,
         hidden_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        base_logits = self.actor(hidden_state)
+        actor_features = hidden_state
+        if self.actor_use_estimated_state:
+            estimates = self.predict_state(hidden_state)
+            state = [estimates[k].sigmoid() if k == 'foot_contact' else estimates[k]
+                     for k in self.state_target_layout]
+            actor_features = torch.cat((hidden_state, *state), dim=-1)
+        base_logits = self.actor(actor_features)
         if not self.use_moe:
             return (
                 torch.tanh(base_logits),
@@ -186,9 +225,9 @@ class SensorActorCritic(nn.Module):
                 hidden_state.new_zeros((hidden_state.shape[0], self.action_dim)),
             )
         assert self.gate is not None
-        gate_weights = torch.softmax(self.gate(hidden_state), dim=-1)
+        gate_weights = torch.softmax(self.gate(actor_features), dim=-1)
         expert_actions = torch.stack(
-            tuple(expert(hidden_state) for expert in self.experts),
+            tuple(expert(actor_features) for expert in self.experts),
             dim=1,
         )
         residual = torch.sum(gate_weights.unsqueeze(-1) * expert_actions, dim=1)
@@ -242,6 +281,35 @@ class SensorActorCritic(nn.Module):
             ),
             dim=-1,
         )
+
+    def predict_state(self, hidden_state: torch.Tensor) -> dict[str, torch.Tensor]:
+        if not self.state_estimator_enabled:
+            return {}
+        names = {'root_linear_velocity': 'root_velocity', 'foot_contact': 'contact',
+                 'foot_local_position': 'foot_position'}
+        return {key: getattr(self, names.get(key, key) + '_head')(hidden_state)
+                for key in self.state_target_layout}
+
+    def auxiliary_sequence(self, obs, initial_hidden, episode_starts):
+        hidden = initial_hidden
+        states = {key: [] for key in self.state_target_layout} if self.state_estimator_enabled else {}
+        futures = [[] for _ in self.future_heads]
+        for t in range(obs.shape[0]):
+            hidden = self._next_hidden(obs[t], hidden, episode_starts[t])
+            for key, prediction in self.predict_state(hidden).items():
+                states[key].append(prediction)
+            for values, head in zip(futures, self.future_heads):
+                values.append(head(hidden))
+        return ({key: torch.stack(values) for key, values in states.items()},
+                [torch.stack(values) for values in futures])
+
+    def estimator_metadata(self) -> dict:
+        return dict(state_estimator_enabled=self.state_estimator_enabled,
+                    state_estimator_include_foot_position=self.state_estimator_include_foot_position,
+                    actor_use_estimated_state=self.actor_use_estimated_state,
+                    future_prediction_enabled=self.future_prediction_enabled,
+                    future_prediction_steps=list(self.future_prediction_steps),
+                    future_prediction_dim=self.future_prediction_dim)
 
     def predict_context(self, hidden_state: torch.Tensor) -> torch.Tensor:
         if self.context_estimator is None:

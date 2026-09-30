@@ -25,6 +25,7 @@ class _DummyDistillationEnv(_DummySensorEnv):
         super().__init__()
         self.cfg = SimpleNamespace(
             decimation=2,
+            startup_action_ramp_steps=20,
             reference_ctrl_blend=0.0,
             action_residual_scale=0.5,
             distal_action_scale=1.0,

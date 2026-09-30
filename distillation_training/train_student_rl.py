@@ -38,11 +38,13 @@ def _emergency(a,iteration,actor,estimator,critic,optimizer,amp,env,global_step,
     payload.update({'emergency':True,'diagnostics':diagnostics});torch.save(payload,target);return target
 
 
+from distillation_training.runtime import resolve_training_output
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--teacher-checkpoint',required=True)
     p.add_argument('--student-checkpoint',required=True);add_runtime_args(p);p.set_defaults(output='student_rl.pt')
     p.add_argument('--lambda-p',type=float,default=.5);p.add_argument('--lambda-kl',type=float,default=.5)
-    add_amp_args(p);a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
+    add_amp_args(p);a=p.parse_args();resolve_training_output(a, "student_rl");device=torch.device(a.device);torch.manual_seed(a.seed)
     teacher=validate_checkpoint(a.teacher_checkpoint,'teacher',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);student=validate_checkpoint(a.student_checkpoint,'student',allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint)
     spec=inherit_checkpoint_variant(a,('teacher',teacher),('student',student))
     actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(student['shared_actor'])

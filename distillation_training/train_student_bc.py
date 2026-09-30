@@ -35,6 +35,8 @@ def split(batch,fraction=.8):
       {k:v[:,cut:] if cut<n else v[:,:1] for k,v in batch.items()})
 
 
+from distillation_training.runtime import resolve_training_output
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--teacher-checkpoint',required=True);add_runtime_args(p)
     p.set_defaults(output='student_bc.pt')
@@ -44,7 +46,7 @@ def main():
     p.add_argument('--require-validation-thresholds',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--allow-unvalidated-output',action='store_true')
     p.add_argument('--max-buffer',type=int,default=4096);p.add_argument('--updates-per-iteration',type=int,default=2)
-    a=p.parse_args();device=torch.device(a.device);torch.manual_seed(a.seed)
+    a=p.parse_args();resolve_training_output(a, "student_bc");device=torch.device(a.device);torch.manual_seed(a.seed)
     ck=validate_checkpoint(a.teacher_checkpoint,'teacher',
       allow_legacy_reward_checkpoint=a.allow_legacy_reward_checkpoint);spec=inherit_checkpoint_variant(a,('teacher',ck))
     actor=SharedActor(spec.sensor_dim).to(device);actor.load_state_dict(ck['shared_actor']);actor.eval()

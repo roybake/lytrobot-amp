@@ -15,6 +15,8 @@ for path in (REPO_ROOT, SRC_ROOT):
 from scripts import play as base_play
 
 from sensor_training.envs import SensorHistoryCpuAmpEnv
+from sensor_training.experiment_options import observation_config_from_metadata
+from functools import partial
 
 
 def main() -> None:
@@ -47,7 +49,8 @@ def main() -> None:
         arg == "--steps" or arg.startswith("--steps=") for arg in sys.argv[1:]
     ):
         sys.argv.extend(["--steps", str(episode_steps)])
-    base_play.LytRobotAmpEnv = SensorHistoryCpuAmpEnv
+    base_play.LytRobotAmpEnv = partial(SensorHistoryCpuAmpEnv,
+        observation_cfg=observation_config_from_metadata(metadata if checkpoint_arg else {}))
     base_play.main()
 
 

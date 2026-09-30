@@ -54,13 +54,15 @@ def _emergency(path, iteration, actor, critic, optimizer, amp, diagnostics):
     return target
 
 
+from distillation_training.runtime import resolve_training_output
+
 def main():
     p=argparse.ArgumentParser();add_runtime_args(p,steps=96,sensor_variant_default=PHASE_FORCE.name);p.add_argument('--epochs',type=int,default=4)
     p.set_defaults(learning_rate=1e-4)
     p.add_argument('--clip-coef',type=float,default=.2)
     p.add_argument('--target-kl',type=float,default=.025)
     p.add_argument('--resume',default=None,help='Resume an optimized Teacher checkpoint.')
-    add_amp_args(p);a=p.parse_args();torch.manual_seed(a.seed)
+    add_amp_args(p);a=p.parse_args();resolve_training_output(a, "teacher");torch.manual_seed(a.seed)
     device=torch.device(a.device);env,cfg=make_env(a);spec=selected_variant(a)
     wandb_run=_init_wandb(a,spec)
     actor=SharedActor(spec.sensor_dim).to(device);critic=TeacherCritic(spec.sensor_dim).to(device)

@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from training_paths import timestamp_name, validate_run_name
+
 from sensor_training.training_defaults import (
     distillation_rollout_shape,
     validate_sensor_decimation,
@@ -32,7 +34,10 @@ from sensor_training.training_defaults import (
 def _run_name(value: str) -> str:
     if Path(value).name != value or value in {"", ".", ".."}:
         raise argparse.ArgumentTypeError("--run-name must be one directory name.")
-    return value
+    try:
+        return validate_run_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-name",
         type=_run_name,
-        default=datetime.now().strftime("%Y%m%d_%H%M%S"),
-        help="Shared name used in every phase directory and the pipeline manifest.",
+        default=timestamp_name(),
+        help="Shared MM-DD-HH:MM:SS timestamp; reuse it to resume the pipeline.",
     )
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument(
@@ -83,7 +88,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the selected phase commands without launching training.",
     )
-    return parser.parse_args()
+    from sensor_training.experiment_options import option_parser
+    extension = option_parser()
+    options, remaining = extension.parse_known_args()
+    args = parser.parse_args(remaining)
+    vars(args).update(vars(options))
+    return args
 
 
 def _phase_paths(run_name: str) -> dict[str, Path]:
@@ -199,6 +209,18 @@ def _common_train_args(
         wandb_flag,
     ]
     if sensor_student:
+        from sensor_training.experiment_options import OBS_OPTIONS, POLICY_OPTIONS, OPTIONAL_POLICY_OPTIONS
+        for key in OBS_OPTIONS + POLICY_OPTIONS + OPTIONAL_POLICY_OPTIONS:
+            value = getattr(args, key, None)
+            if value is None:
+                continue
+            flag = '--' + key.replace('_', '-')
+            if isinstance(value, bool):
+                command.append(flag if value else '--no-' + key.replace('_', '-'))
+            elif isinstance(value, (tuple, list)):
+                command.extend([flag, *map(str, value)])
+            else:
+                command.extend([flag, str(value)])
         command.extend(("--num-steps", str(_student_num_steps(args))))
         command.append('--sensor-root-imu-only' if getattr(args, 'student_root_imu_only', False)
                        else '--no-sensor-root-imu-only')

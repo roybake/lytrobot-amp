@@ -112,7 +112,7 @@ uv run python sensor_training/train_stage2.py \
 uv run python sensor_training/train_stage1.py \
   --resume-checkpoint logs/sensor_policy/stage1/gait-feedforward-v2/model_final.pt \
   --resume-reset-optimizer \
-  --run-name gait-forward-recovery
+  --run-name 09-30-10:47:29
 ```
 
 用训练输出的 ONNX 在 CPU MuJoCo 做固定种子步态核验，报告写入 checkpoint 目录；`natural_gait_pass` 同时检查无重置、腾空、踮脚、足部滚动、镜像、步幅、落脚节奏、摆动脚离地、交替支撑、躯干姿态、骨盆高度和前向速度。门槛按 `walk1_omniretarget.npz` 的统计标定：
@@ -156,7 +156,7 @@ uv run python scripts/evaluate_acceptance.py \
 ```bash
 uv run python sensor_training/train_stage1.py \
   --resume-checkpoint logs/sensor_policy/stage1/gait-feedforward-v2/model_<iteration>.pt \
-  --run-name gait-feedforward-v2-resumed
+  --run-name 09-30-10:47:29
 ```
 
 快速冒烟训练：
@@ -164,7 +164,7 @@ uv run python sensor_training/train_stage1.py \
 ```bash
 uv run python sensor_training/train_stage1.py \
   --num-envs 32 --max-iterations 1 --num-steps 4 \
-  --no-wandb --run-name smoke
+  --no-wandb --run-name 09-30-10:47:29
 ```
 
 普通传感器训练默认 checkpoint 写入 `logs/sensor_policy/`，楼梯专项写入 `logs/stairs/`。新训练只能
@@ -195,3 +195,11 @@ uv run python sensor_training/play.py \
   --stage multimotion \
   --viewer
 ```
+
+
+## 可选状态估计与步态复现实验
+
+新增功能默认关闭，保留旧 checkpoint 和训练默认配置。状态估计、因果肌腱
+速度/跟踪误差、Actor 接入估计状态、未来传感器预测、A–G 消融和 Teacher/Student
+统一评估见 [STATE_ESTIMATION.md](STATE_ESTIMATION.md)。部署输入仍只有现有
+传感器、上一动作和板载 gait command；MuJoCo 真值只用于训练标签。

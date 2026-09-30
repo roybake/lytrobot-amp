@@ -30,6 +30,8 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
+from training_paths import new_run_dir
+
 from lytrobot_amp import __version__
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
@@ -658,14 +660,7 @@ def make_log_dir(
     if Path(group).name != group or group in ("", ".", ".."):
         raise ValueError(f"--log-group must be one directory name, got: {group!r}")
     root = Path(log_root).expanduser().resolve() / group
-    stem = run_name or datetime.now().strftime("%m-%d-%H:%M:%S")
-    log_dir = root / stem
-    suffix = 1
-    while log_dir.exists():
-        log_dir = root / f"{stem}_{suffix}"
-        suffix += 1
-    log_dir.mkdir(parents=True, exist_ok=False)
-    return log_dir
+    return new_run_dir(root, run_name)
 
 
 def resolve_log_dir(args: argparse.Namespace) -> Path:

@@ -51,6 +51,8 @@ def main() -> None:
     base_train.PPOAMPConfig = SensorDistillationPPOAMPConfig
     base_train.PPOAMPTrainer = SensorDistillationPPOAMPTrainer
     base_train.DISTILLATION_CLI_ENABLED = True
+    from sensor_training.experiment_options import install_training_options
+    install_training_options(base_train)
     base_train.main()
 
 

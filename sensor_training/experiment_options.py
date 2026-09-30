@@ -1,0 +1,90 @@
+"""Explicit sensor CLI extensions, isolated from the privileged training CLI."""
+from __future__ import annotations
+import argparse
+from dataclasses import asdict, fields
+from functools import partial
+import sys
+
+from .config import SensorObservationConfig
+from .ppo_config import SensorPPOAMPConfig
+
+OPTIONAL_POLICY_OPTIONS = ('gamma', 'gae_lambda', 'init_std', 'amp_startup_gate')
+
+OBS_OPTIONS = ('include_tendon_velocity', 'include_tendon_tracking_error',
+               'tendon_velocity_scale', 'tendon_velocity_filter_alpha', 'tendon_tracking_error_scale')
+POLICY_OPTIONS = ('recurrent_hidden_dim', 'state_estimator_enabled',
+                  'state_estimator_include_foot_position', 'actor_use_estimated_state',
+                  'state_joint_position_loss_weight', 'state_joint_velocity_loss_weight',
+                  'state_root_velocity_loss_weight', 'state_contact_loss_weight',
+                  'state_foot_position_loss_weight', 'future_prediction_enabled',
+                  'future_prediction_steps', 'future_prediction_coef', 'privileged_context_loss_coef')
+
+
+def option_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    defaults = {**asdict(SensorObservationConfig()), **asdict(SensorPPOAMPConfig())}
+    for name in OBS_OPTIONS + POLICY_OPTIONS:
+        value = defaults[name]
+        kwargs = {'default': value}
+        if isinstance(value, bool):
+            kwargs['action'] = argparse.BooleanOptionalAction
+        elif isinstance(value, tuple):
+            kwargs.update(type=int, nargs='+')
+        else:
+            kwargs['type'] = type(value)
+        parser.add_argument('--' + name.replace('_', '-'), **kwargs)
+    for name in OPTIONAL_POLICY_OPTIONS:
+        parser.add_argument('--'+name.replace('_', '-'), default=None,
+                            **({'action': argparse.BooleanOptionalAction} if name == 'amp_startup_gate'
+                               else {'type': float}))
+    return parser
+
+
+def install_training_options(base_train):
+    """Attach explicit observation config and preserve config/argv recording."""
+    parser = option_parser()
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print('Sensor state estimation and observation options:')
+        parser.print_help()
+    options, remaining = parser.parse_known_args(sys.argv[1:])
+    if options.recurrent_hidden_dim < 1:
+        parser.error('recurrent-hidden-dim must be positive')
+    options.future_prediction_steps = tuple(options.future_prediction_steps)
+    observation = SensorObservationConfig(**{key: getattr(options, key) for key in OBS_OPTIONS})
+    sys.argv[1:] = remaining
+    original_parse = base_train.parse_args
+    def parse_args():
+        args = original_parse()
+        vars(args).update(vars(options))
+        return args
+    base_train.parse_args = parse_args
+    original_config = base_train.PPOAMPConfig
+    def config(**kwargs):
+        cfg = original_config(**kwargs)
+        for key in POLICY_OPTIONS:
+            setattr(cfg, key, getattr(options, key))
+        for key in OPTIONAL_POLICY_OPTIONS:
+            if getattr(options, key) is not None:
+                setattr(cfg, key, getattr(options, key))
+        return cfg
+    base_train.PPOAMPConfig = config
+    for key in ('LytRobotAmpEnv', 'LytRobotWarpAmpEnv', 'LytRobotMjlabAmpEnv'):
+        constructor = getattr(base_train, key)
+        if constructor is not None:
+            setattr(base_train, key, partial(constructor, observation_cfg=observation))
+
+
+def observation_config_from_metadata(metadata):
+    saved = dict(metadata.get('sensor_observation', {}).get('config', {}))
+    if 'gait_lookahead_seconds' in saved:
+        saved['gait_lookahead_seconds'] = tuple(saved['gait_lookahead_seconds'])
+    allowed = {field.name for field in fields(SensorObservationConfig)}
+    return SensorObservationConfig(**{key: value for key, value in saved.items() if key in allowed})
+
+
+def estimator_kwargs(architecture):
+    """Missing fields mean the legacy network, never a changed dimension."""
+    defaults = dict(state_estimator_enabled=False, state_estimator_include_foot_position=False,
+                    actor_use_estimated_state=False, future_prediction_enabled=False,
+                    future_prediction_steps=(1, 3, 5), future_prediction_dim=0)
+    return {key: architecture.get(key, value) for key, value in defaults.items()}

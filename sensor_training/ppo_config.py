@@ -42,3 +42,16 @@ class SensorPPOAMPConfig(PPOAMPConfig):
     # is still accelerating, fade in AMP according to the target-speed ramp so
     # it does not contradict the balance/slow-start task objective.
     amp_startup_gate: bool = True
+
+    # New features default off: legacy checkpoints retain identical networks.
+    state_estimator_enabled: bool = False
+    state_estimator_include_foot_position: bool = False
+    actor_use_estimated_state: bool = False
+    state_joint_position_loss_weight: float = 1.0
+    state_joint_velocity_loss_weight: float = 0.5
+    state_root_velocity_loss_weight: float = 0.5
+    state_contact_loss_weight: float = 0.5
+    state_foot_position_loss_weight: float = 0.5
+    future_prediction_enabled: bool = False
+    future_prediction_steps: tuple[int, ...] = (1, 3, 5)
+    future_prediction_coef: float = 0.1

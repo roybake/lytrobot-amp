@@ -71,7 +71,7 @@ Warp 的质量、惯量、地面摩擦和重力属于整个批次共享参数，
 
 ```bash
 uv run python squat_training/train_stage1.py \
-  --num-envs 32 --num-steps 4 --max-iterations 1 --no-wandb --run-name smoke
+  --num-envs 32 --num-steps 4 --max-iterations 1 --no-wandb --run-name 09-30-10:47:29
 uv run python squat_training/play.py \
   --checkpoint <checkpoint.pt> \
   --no-domain-randomization --seed 42 --no-episode-random-seed

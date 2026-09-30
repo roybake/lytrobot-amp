@@ -96,7 +96,7 @@ logs/
 
 ```bash
 uv run python sensor_training/train_serial_distillation.py \
-  --run-name imu_walk_100hz_v1
+  --run-name 09-30-10:47:29
 ```
 
 总控默认执行 `Teacher Stage1 → Student Stage1`，两者均为 100 Hz（`--decimation 2`），

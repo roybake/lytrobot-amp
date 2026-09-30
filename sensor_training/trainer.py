@@ -16,6 +16,8 @@ from lytrobot_amp.networks import AmpDiscriminator
 
 from .networks import RecurrentSensorActorExport, SensorActorCritic
 from .ppo_config import SensorPPOAMPConfig
+from .config import SensorObservationConfig
+from .state_estimation import state_layout, STATE_SCALES, state_estimation_loss, future_prediction_loss
 
 
 def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
@@ -28,6 +30,13 @@ def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
     saved_normalized = json.loads(json.dumps(saved))
     current_normalized = json.loads(json.dumps(current))
     for metadata in (saved_normalized, current_normalized):
+        config = metadata.get('config')
+        if isinstance(config, dict):
+            defaults = SensorObservationConfig()
+            for key in ('include_tendon_velocity', 'include_tendon_tracking_error',
+                        'tendon_velocity_scale', 'tendon_velocity_filter_alpha',
+                        'tendon_tracking_error_scale'):
+                config.setdefault(key, getattr(defaults, key))
         gait = metadata.get("gait_command")
         if isinstance(gait, dict):
             for key in (
@@ -57,6 +66,13 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         self.device = torch.device(device)
         self.log_dir = Path(log_dir)
         self.rng = np.random.default_rng(cfg.seed + 1000)
+        for key, value in vars(cfg).items():
+            if key.startswith('state_') and key.endswith('_loss_weight') and value < 0:
+                raise ValueError(f'{key} must be non-negative.')
+        if cfg.future_prediction_coef < 0:
+            raise ValueError('future_prediction_coef must be non-negative.')
+        self._auxiliary_metric_sums = {}
+        self._auxiliary_update_count = 0
         if env.obs_dim % env.sensor_frame_dim != 0:
             raise ValueError(
                 "Sensor observation dimension must contain an integer number of frames."
@@ -92,6 +108,13 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             expert_hidden_dims=cfg.expert_hidden_dims,
             residual_scale=cfg.residual_scale,
             privileged_context_dim=env.privileged_context_dim,
+            state_estimator_enabled=cfg.state_estimator_enabled,
+            state_estimator_include_foot_position=cfg.state_estimator_include_foot_position,
+            actor_use_estimated_state=cfg.actor_use_estimated_state,
+            future_prediction_enabled=cfg.future_prediction_enabled,
+            future_prediction_steps=cfg.future_prediction_steps,
+            future_prediction_dim=(
+                env.imu_layout.dim + env.position_action_dim if cfg.future_prediction_enabled else 0),
         ).to(self.device)
         self.discriminator = AmpDiscriminator(
             input_dim=env.amp_obs_dim,
@@ -326,6 +349,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             (num_steps, num_envs, self.env.privileged_context_dim),
             device=self.device,
         )
+        state_targets = (torch.empty((num_steps, num_envs,
+                         sum(state_layout(self.cfg.state_estimator_include_foot_position).values())),
+                         device=self.device) if self.cfg.state_estimator_enabled else None)
         completed_reward_values = torch.zeros_like(rewards)
         completed_length_values = torch.zeros_like(rewards)
         episode_progress_sum = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -344,6 +370,10 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             privileged_context = self._as_device_tensor(
                 self.env.privileged_observe()
             )
+            if state_targets is not None:
+                target = self._as_device_tensor(self.env.state_supervision_observe(
+                    self.cfg.state_estimator_include_foot_position))
+                state_targets[step] = target
             current_episode_starts = self.episode_starts
             with torch.no_grad():
                 (
@@ -641,6 +671,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "initial_recurrent_state": initial_recurrent_state,
             "amp_features": amp_features,
             "privileged_contexts": privileged_contexts,
+            "state_targets": state_targets,
             "completed_episode_rewards": completed_episode_rewards,
             "completed_episode_lengths": completed_episode_lengths,
             "episode_progress": float(component_values[-4]),
@@ -665,13 +696,40 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         del obs, initial_hidden, episode_starts, env_indices
         return None
 
+    def _state_and_future_loss(self, obs, initial_hidden, episode_starts, state_targets):
+        if not (self.cfg.state_estimator_enabled or self.cfg.future_prediction_enabled):
+            return obs.new_zeros(())
+        states, futures = self.actor_critic.auxiliary_sequence(obs, initial_hidden, episode_starts)
+        loss = obs.new_zeros(())
+        metrics = {}
+        if self.cfg.state_estimator_enabled:
+            value, state_metrics = state_estimation_loss(states, state_targets, self.cfg)
+            loss = loss + value
+            metrics.update(state_metrics)
+        if self.cfg.future_prediction_enabled:
+            frames = obs[..., -self.env.sensor_frame_dim:][..., :self.actor_critic.future_prediction_dim]
+            value = future_prediction_loss(futures, frames, episode_starts, self.cfg.future_prediction_steps)
+            loss = loss + self.cfg.future_prediction_coef * value
+            metrics['future/prediction_loss'] = value.detach()
+        for key, value in metrics.items():
+            self._auxiliary_metric_sums[key] = self._auxiliary_metric_sums.get(key, 0) + value
+        self._auxiliary_update_count += 1
+        return loss
+
     def update_policy(
         self,
         rollout: dict[str, torch.Tensor | np.ndarray],
     ) -> dict[str, float]:
         """Update whole environment sequences with truncated BPTT."""
 
+        self._auxiliary_metric_sums = {}
+        self._auxiliary_update_count = 0
         obs = rollout["obs"]
+        state_targets = rollout.get('state_targets')
+        if self.cfg.state_estimator_enabled and (
+            not torch.is_tensor(state_targets) or not torch.isfinite(state_targets).all()
+        ):
+            raise RuntimeError('Missing or non-finite state supervision targets.')
         actions = rollout["actions"]
         old_log_probs = rollout["log_probs"]
         returns = rollout["returns"]
@@ -705,6 +763,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         dropped_sample_count = int(
             ((~finite_envs).sum() * obs.shape[0]).detach().cpu()
         )
+        if state_targets is not None:
+            state_targets = state_targets[:, finite_envs]
         obs = obs[:, finite_envs]
         actions = actions[:, finite_envs]
         old_log_probs = old_log_probs[:, finite_envs]
@@ -902,6 +962,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     + self.cfg.privileged_context_loss_coef
                     * privileged_context_loss
                 )
+                loss = loss + self._state_and_future_loss(
+                    obs[:, mb], initial_hidden[mb], episode_starts[:, mb],
+                    None if state_targets is None else state_targets[:, mb])
                 if auxiliary_actor_loss is not None:
                     loss = loss + auxiliary_actor_loss
                 stepped = self._optimizer_step_if_finite(
@@ -975,6 +1038,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         metrics["importance_ratio_log_clip_fraction"] = float(
             clipped_ratio_count.detach().cpu() / max(ratio_sample_count, 1)
         )
+        metrics.update({key: float((value / max(self._auxiliary_update_count, 1)).cpu())
+                        for key, value in self._auxiliary_metric_sums.items()})
         return metrics
 
     def load(self, path: str | Path, *, load_optimizers: bool = True) -> int:
@@ -985,6 +1050,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 "Checkpoint uses the legacy feed-forward sensor policy; recurrent MoE "
                 "training must start in a new run instead of resuming that checkpoint."
             )
+        current_estimator = self.actor_critic.estimator_metadata()
+        legacy_defaults = dict(state_estimator_enabled=False,
+            state_estimator_include_foot_position=False, actor_use_estimated_state=False,
+            future_prediction_enabled=False, future_prediction_steps=[1, 3, 5], future_prediction_dim=0)
+        for key, value in current_estimator.items():
+            saved = architecture.get(key, legacy_defaults[key])
+            if saved != value:
+                raise ValueError(f'Checkpoint {key}={saved} differs from current {value}; start a new run.')
+        if int(architecture.get('recurrent_hidden_dim', 128)) != self.cfg.recurrent_hidden_dim:
+            raise ValueError('Checkpoint recurrent hidden dimension differs; start a new run.')
         saved_context_dim = int(architecture.get("privileged_context_dim", 0))
         # Old recurrent sensor checkpoints predate this switch and use MoE.
         saved_use_moe = bool(architecture.get("use_moe", True))
@@ -1018,6 +1093,19 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             raise ValueError(
                 "Checkpoint sensor observation layout does not match the current sensor_training layout."
             )
+        if self.cfg.state_estimator_enabled or self.cfg.future_prediction_enabled:
+            saved_state = checkpoint.get('actor_critic', {})
+            expected = self.actor_critic.state_dict()
+            if set(saved_state) != set(expected) or any(
+                saved_state[key].shape != value.shape for key, value in expected.items()
+            ):
+                raise ValueError('Checkpoint network tensors do not match estimator architecture.')
+            if checkpoint.get('state_estimation', {}).get('target_layout') != state_layout(
+                self.cfg.state_estimator_include_foot_position
+            ):
+                raise ValueError('Checkpoint state target layout differs; start a new run.')
+            if checkpoint.get('state_estimation', {}).get('target_scales') != STATE_SCALES:
+                raise ValueError('Checkpoint state normalization differs; start a new run.')
         next_iteration = super().load(path, load_optimizers=load_optimizers)
         self.recurrent_state.zero_()
         self.episode_starts.fill_(1.0)
@@ -1026,6 +1114,16 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
     def _checkpoint_payload(self, iteration: int) -> dict:
         checkpoint = super()._checkpoint_payload(iteration)
         checkpoint.update({
+            "state_estimation": {
+                'enabled': self.cfg.state_estimator_enabled,
+                'target_layout': state_layout(self.cfg.state_estimator_include_foot_position),
+                'target_scales': STATE_SCALES,
+                'contact_order': ['right', 'left'], 'root_velocity_frame': 'world',
+                'foot_position_frame': 'pelvis_local',
+                'target_actor_input': False,
+                'loss_weights': {key: value for key, value in vars(self.cfg).items()
+                                 if key.startswith('state_') and key.endswith('_loss_weight')},
+            },
             "sensor_observation": self.env.observation_metadata,
             "sensor_policy_architecture": {
                 "name": (
@@ -1033,6 +1131,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     if self.cfg.use_moe
                     else "proprioceptive_history_gru_context"
                 ),
+                **self.actor_critic.estimator_metadata(),
                 "recurrent": True,
                 "use_moe": self.cfg.use_moe,
                 "sensor_frame_dim": self.env.sensor_frame_dim,
@@ -1101,6 +1200,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "ppo_amp_config": checkpoint["ppo_amp_config"],
             "env_config": checkpoint["env_config"],
             "common_joint_names": checkpoint["common_joint_names"],
+            "distillation": checkpoint.get("distillation", {}),
+            "state_estimation": checkpoint.get("state_estimation", {"enabled": False}),
             "sensor_observation": checkpoint["sensor_observation"],
             "sensor_policy_architecture": checkpoint["sensor_policy_architecture"],
         }
