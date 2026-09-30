@@ -139,14 +139,14 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
         initial_hidden: torch.Tensor,
         episode_starts: torch.Tensor,
         env_indices: torch.Tensor,
+        action_means: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._active_teacher_actions is None:
             raise RuntimeError("Teacher targets are unavailable during the policy update.")
-        action_mean = self.actor_critic.action_mean_sequence(
-            obs,
-            initial_hidden,
-            episode_starts,
-        )
+        # PPO supplies deterministic means from the SAME recurrent forward.
+        # The fallback preserves this helper's direct-call compatibility.
+        action_mean = action_means if action_means is not None else self.actor_critic.action_mean_sequence(
+            obs, initial_hidden, episode_starts)
         targets = self._active_teacher_actions[:, env_indices]
         scale = max(float(self.cfg.teacher_action_loss_scale), 1e-6)
         teacher_loss = F.smooth_l1_loss(action_mean / scale, targets / scale)

@@ -15,6 +15,7 @@ from lytrobot_amp.motion import MotionLibrary
 
 from .config import DEFAULT_SENSOR_OBSERVATION_CONFIG, SensorObservationConfig
 from .tendon_features import CausalTendonFeatures
+from .measurement import CausalMeasurement, MeasurementSpec
 from .state_estimation import state_layout, STATE_SCALES
 from .gait_command import (
     GAIT_COMMAND_SCALAR_FIELDS,
@@ -198,6 +199,7 @@ class SensorHistoryEnv:
         observation_cfg: SensorObservationConfig = DEFAULT_SENSOR_OBSERVATION_CONFIG,
     ) -> None:
         self.base_env = base_env
+        self._state_include_foot_position = False
         self.sensor_observation_cfg = (
             observation_cfg if base_env.cfg.sensor_gait_command_enabled
             else replace(observation_cfg, gait_command_enabled=False)
@@ -220,6 +222,11 @@ class SensorHistoryEnv:
             policy_dt=base_env.dt,
         )
         self._bind_sensor_tensors()
+        # Initialize shared sensor state independently of history allocation:
+        # existing force/no-force wrappers override _allocate_histories.
+        self._init_measurement_layers()
+        self._sensor_tick_advanced = False
+        self._tendon_features = CausalTendonFeatures(self.measured_tendon_lengths(), self.sensor_observation_cfg)
         self._allocate_histories()
         self._build_privileged_context_tables()
         self._fill_history(self._all_env_ids())
@@ -302,6 +309,10 @@ class SensorHistoryEnv:
         )
         return {
             "config": asdict(self.sensor_observation_cfg),
+            **({'tendon_signal_semantics': 'shared_cached_measurement_v1'}
+               if self.sensor_observation_cfg.include_tendon_velocity or
+                  self.sensor_observation_cfg.include_tendon_tracking_error or
+                  self.sensor_observation_cfg.tendon_measurement_enabled else {}),
             "frame_order": "oldest_to_current",
             "imu_sensor_names": self.imu_layout.names,
             "imu_dim_per_frame": self.imu_layout.dim,
@@ -470,7 +481,6 @@ class SensorHistoryEnv:
     def _allocate_histories(self) -> None:
         shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.sensor_frame_dim)
         amp_shape = (self.num_envs, self.sensor_observation_cfg.frame_count, self.base_motion.feature_dim)
-        self._tendon_features = CausalTendonFeatures(self._measured_tendon_lengths(), self.sensor_observation_cfg)
         if self.is_torch_env:
             self._actor_history = torch.zeros(shape, dtype=torch.float32, device=self.base_env.device)
             self._amp_history = torch.zeros(amp_shape, dtype=torch.float32, device=self.base_env.device)
@@ -596,14 +606,21 @@ class SensorHistoryEnv:
 
     @property
     def state_supervision_metadata(self):
-        return {'layout': state_layout(True), 'scales': STATE_SCALES,
+        layout = state_layout(self._state_include_foot_position)
+        return {'layout': layout, 'dim': sum(layout.values()),
+                'scales': {name: STATE_SCALES[name] for name in layout},
                 'training_only': True, 'contact_order': ['right', 'left'],
                 'joint_order': list(self.base_motion.common_joint_names),
                 'root_velocity_frame': 'world', 'foot_position_frame': 'pelvis_local'}
 
-    def state_supervision_observe(self, include_foot=False):
+    def configure_state_supervision(self, include_foot):
+        self._state_include_foot_position = bool(include_foot)
+
+    def state_supervision_observe(self, include_foot=None):
         """Raw physical labels, aligned with the current sensor observation."""
         base = self.base_env
+        if include_foot is None:
+            include_foot = self._state_include_foot_position
         if len(self.base_motion.common_joint_names) != 14:
             raise ValueError('State estimation requires the 14-joint robot layout.')
         if self.is_torch_env:
@@ -620,11 +637,77 @@ class SensorHistoryEnv:
             values.append(np.stack([base._foot_positions_local(data).reshape(12) for data in base.datas]))
         return np.concatenate(values, axis=-1).astype(np.float32)
 
-    def _measured_tendon_lengths(self):
+    def _true_tendon_lengths(self):
         if self.is_torch_env:
             return self.base_env.ten_length[:, self.base_env.actuator_tendon_ids]
         return np.stack([data.ten_length[self.base_env.actuator_tendon_ids]
                          for data in self.base_env.datas]).astype(np.float32)
+
+    def _true_normalized_imu(self):
+        if self.is_torch_env:
+            return self._sensordata[:, self._imu_addresses] / self._imu_divisors
+        return np.stack([data.sensordata[self.imu_layout.addresses] for data in self.base_env.datas]).astype(np.float32) / self.imu_layout.divisors
+
+    def _init_measurement_layers(self):
+        cfg = self.sensor_observation_cfg
+        truth = self._true_tendon_lengths()
+        if cfg.tendon_measurement_enabled:
+            spec = MeasurementSpec(cfg.tendon_measurement_noise_std, cfg.tendon_measurement_dr_noise_std,
+                cfg.tendon_measurement_bias_m, cfg.tendon_measurement_bias_range_m,
+                cfg.tendon_measurement_scale_error, cfg.tendon_measurement_quantization_m,
+                cfg.tendon_measurement_delay_max_ticks)
+            lower = self.base_env.ctrl_low - cfg.tendon_measurement_clip_margin_m
+            upper = self.base_env.ctrl_high + cfg.tendon_measurement_clip_margin_m
+        else:
+            spec = MeasurementSpec()
+            # Preserve the legacy sensor clipping domain, including unclipped
+            # physical readings needed before normalized observation clipping.
+            lower = self.base_env.ctrl_mid - cfg.observation_clip * self.base_env.ctrl_half_range
+            upper = self.base_env.ctrl_mid + cfg.observation_clip * self.base_env.ctrl_half_range
+        self._tendon_measurement = CausalMeasurement(truth, spec, center=self.base_env.ctrl_mid,
+            lower=lower, upper=upper, seed=int(self.base_env.cfg.seed)+6001)
+        imu = self._true_normalized_imu()
+        zeros = torch.zeros_like(imu) if self.is_torch_env else np.zeros_like(imu)
+        spec = MeasurementSpec(cfg.imu_measurement_noise_std, cfg.imu_measurement_dr_noise_std,
+                               reset_bias_range=cfg.imu_measurement_bias_range,
+                               max_delay_ticks=cfg.imu_measurement_delay_max_ticks)
+        self._imu_measurement = CausalMeasurement(imu, spec, center=zeros,
+            lower=zeros-cfg.observation_clip, upper=zeros+cfg.observation_clip,
+            seed=int(self.base_env.cfg.seed)+6002)
+
+    def _measurement_scale(self):
+        return float(self.base_env.domain_randomization_scale) if self.base_env.domain_randomization else 0.
+
+    def _legacy_measurement_noise(self):
+        # Existing normalized sensor noise now applies BEFORE derived tendon
+        # features, using exactly the same cached encoder sample for all three.
+        return self._measurement_scale() * float(self.base_env.cfg.obs_noise_std)
+
+    def measured_tendon_lengths(self):
+        """Cached simulated encoder output in metres; reading is side-effect free."""
+        return self._tendon_measurement.output
+
+    def _measured_tendon_lengths(self):
+        """Compatibility alias. This deliberately never returns bare truth."""
+        return self.measured_tendon_lengths()
+
+    def _reset_measurements(self, ids):
+        scale = self._measurement_scale()
+        noise = self._legacy_measurement_noise()
+        self._tendon_measurement.reset(self._true_tendon_lengths(), ids, scale=scale,
+                                      extra_noise_std=noise*self.base_env.ctrl_half_range)
+        self._imu_measurement.reset(self._true_normalized_imu(), ids, scale=scale, extra_noise_std=noise)
+        self._tendon_features.reset(self.measured_tendon_lengths(), ids)
+
+    def _advance_measurements(self):
+        scale = self._measurement_scale()
+        noise = self._legacy_measurement_noise()
+        self._tendon_measurement.advance(self._true_tendon_lengths(), scale=scale,
+                                        extra_noise_std=noise*self.base_env.ctrl_half_range)
+        self._imu_measurement.advance(self._true_normalized_imu(), scale=scale, extra_noise_std=noise)
+        if self.sensor_observation_cfg.include_tendon_velocity:
+            self._tendon_features.update(self.measured_tendon_lengths(), self.base_env.dt)
+        self._sensor_tick_advanced = True
 
     def _tendon_feature_frame(self, command):
         if not (self.sensor_observation_cfg.include_tendon_velocity or
@@ -646,76 +729,20 @@ class SensorHistoryEnv:
 
     def _normalized_sensor_frame(self) -> np.ndarray | torch.Tensor:
         command = self._gait_command_frame()
-        tendon_features = self._tendon_feature_frame(command)
+        tendon = (self.measured_tendon_lengths() - self.base_env.ctrl_mid) / self.base_env.ctrl_half_range
+        imu = self._imu_measurement.output
+        features = self._tendon_feature_frame(command)
         if self.is_torch_env:
-            imu = self._sensordata[:, self._imu_addresses] / self._imu_divisors
-            tendon = self.base_env.ten_length[:, self.base_env.actuator_tendon_ids]
-            tendon = (tendon - self.base_env.ctrl_mid) / self.base_env.ctrl_half_range
-            sensor = torch.cat((imu, tendon), dim=1)
-            sensor = torch.nan_to_num(sensor, nan=0.0, posinf=20.0, neginf=-20.0)
-            if self.base_env.domain_randomization and self.base_env.cfg.obs_noise_std > 0.0:
-                noise_std = (
-                    self.base_env.domain_randomization_scale * float(self.base_env.cfg.obs_noise_std)
-                )
-                sensor = sensor + noise_std * torch.randn_like(sensor)
-            sensor = torch.clamp(
-                sensor,
-                -self.sensor_observation_cfg.observation_clip,
-                self.sensor_observation_cfg.observation_clip,
-            )
-            previous_action = torch.clamp(self.base_env.last_action, -1.0, 1.0)
-            return torch.cat(
-                (
-                    sensor,
-                    tendon_features,
-                    previous_action,
-                    self._deepmimic_phase_frame(),
-                    command,
-                ),
-                dim=1,
-            )
-
-        imu = np.stack(
-            [np.asarray(data.sensordata[self.imu_layout.addresses], dtype=np.float32) for data in self.base_env.datas],
-            axis=0,
-        )
-        imu = imu / self.imu_layout.divisors[None, :]
-        tendon = np.stack(
-            [
-                np.asarray(data.ten_length[self.base_env.actuator_tendon_ids], dtype=np.float32)
-                for data in self.base_env.datas
-            ],
-            axis=0,
-        )
-        tendon = (tendon - self.base_env.ctrl_mid[None, :]) / self.base_env.ctrl_half_range[None, :]
-        sensor = np.concatenate((imu, tendon), axis=1).astype(np.float32)
-        sensor = np.nan_to_num(sensor, nan=0.0, posinf=20.0, neginf=-20.0)
-        if self.base_env.domain_randomization and self.base_env.cfg.obs_noise_std > 0.0:
-            sensor += self.base_env.rng.normal(
-                0.0,
-                self.base_env.domain_randomization_scale * float(self.base_env.cfg.obs_noise_std),
-                size=sensor.shape,
-            ).astype(np.float32)
-        sensor = np.clip(
-            sensor,
-            -self.sensor_observation_cfg.observation_clip,
-            self.sensor_observation_cfg.observation_clip,
-        ).astype(np.float32)
-        previous_action = np.clip(
-            np.asarray(self.base_env.last_action, dtype=np.float32),
-            -1.0,
-            1.0,
-        )
-        return np.concatenate(
-            (
-                sensor,
-                tendon_features,
-                previous_action,
-                self._deepmimic_phase_frame(),
-                command,
-            ),
-            axis=1,
-        ).astype(np.float32)
+            tendon = torch.clamp(tendon, -self.sensor_observation_cfg.observation_clip,
+                                 self.sensor_observation_cfg.observation_clip)
+            previous = torch.clamp(self.base_env.last_action, -1., 1.)
+            return torch.cat((imu, tendon, features, previous,
+                              self._deepmimic_phase_frame(), command), dim=-1)
+        tendon = np.clip(tendon, -self.sensor_observation_cfg.observation_clip,
+                         self.sensor_observation_cfg.observation_clip)
+        previous = np.clip(np.asarray(self.base_env.last_action, dtype=np.float32), -1., 1.)
+        return np.concatenate((imu, tendon, features, previous,
+                               self._deepmimic_phase_frame(), command), axis=-1).astype(np.float32)
 
     def _deepmimic_phase_frame(self) -> np.ndarray | torch.Tensor:
         """Return DeepMimic's scalar phase in [0, 1], or an empty frame."""
@@ -849,9 +876,9 @@ class SensorHistoryEnv:
     def _current_amp_frame(self) -> np.ndarray | torch.Tensor:
         return self.base_env.amp_observe()
 
-    def _fill_history(self, env_ids: np.ndarray | torch.Tensor) -> None:
-        if self.sensor_observation_cfg.include_tendon_velocity:
-            self._tendon_features.reset(self._measured_tendon_lengths(), env_ids)
+    def _fill_history(self, env_ids: np.ndarray | torch.Tensor, *, reset_measurements=True) -> None:
+        if reset_measurements:
+            self._reset_measurements(env_ids)
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
@@ -876,9 +903,9 @@ class SensorHistoryEnv:
             axis=1,
         )
 
-    def _append_history(self) -> None:
-        if self.sensor_observation_cfg.include_tendon_velocity:
-            self._tendon_features.update(self._measured_tendon_lengths(), self.base_env.dt)
+    def _append_history(self, *, advance_measurements=True) -> None:
+        if advance_measurements:
+            self._advance_measurements()
         actor_frame = self._normalized_sensor_frame()
         amp_frame = self._current_amp_frame()
         if self.is_torch_env:
@@ -917,7 +944,6 @@ class SensorHistoryEnv:
     def _terminal_observation(self, ids):
         """Build the next sensor history before autoreset, including squat phase."""
         actor_history, amp_history = self._actor_history, self._amp_history
-        previous, velocity = self._tendon_features.previous, self._tendon_features.velocity
         try:
             self._append_history()
             observation = self.observe()[ids]
@@ -928,9 +954,9 @@ class SensorHistoryEnv:
             }
         finally:
             self._actor_history, self._amp_history = actor_history, amp_history
-            self._tendon_features.previous, self._tendon_features.velocity = previous, velocity
 
     def step(self, action: np.ndarray | torch.Tensor):
+        self._sensor_tick_advanced = False
         _base_obs, reward, done, info = self.base_env.step(action)
         if bool(getattr(self.base_env.cfg, "sensor_stability_reward", False)):
             reward = sensor_stability_task_reward(
@@ -954,15 +980,12 @@ class SensorHistoryEnv:
                 velocity_excess_penalty_coef=float(self.base_env.cfg.sensor_velocity_excess_penalty_coef),
             )
             info["sensor_stability_reward"] = reward
-        self._append_history()
-        if self.is_torch_env:
-            # Boolean indexing stays on device and avoids a second CUDA sync
-            # after the base environment has already handled resets.
-            self._fill_history(done > 0.0)
-        else:
-            done_ids = np.nonzero(np.asarray(done) > 0.0)[0].astype(np.int64)
-            if len(done_ids) > 0:
-                self._fill_history(done_ids)
+        if not self._sensor_tick_advanced:
+            self._advance_measurements()
+        done_ids = done > 0.0 if self.is_torch_env else np.nonzero(np.asarray(done) > 0.0)[0].astype(np.int64)
+        self._reset_measurements(done_ids)
+        self._append_history(advance_measurements=False)
+        self._fill_history(done_ids, reset_measurements=False)
         return self.observe(), reward, done, info
 
     def close(self) -> None:

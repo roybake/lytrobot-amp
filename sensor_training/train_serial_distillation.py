@@ -50,6 +50,9 @@ def parse_args() -> argparse.Namespace:
         default=timestamp_name(),
         help="Shared MM-DD-HH:MM:SS timestamp; reuse it to resume the pipeline.",
     )
+    parser.add_argument('--final-sensor-gait', action='store_true', help='Recommended GRU256/45D measured-sensor gait pipeline.')
+    parser.add_argument('--phase', choices=('all', 'stage1', 'stage2'), default='all',
+                        help='Final workflow stage; stage2 requires a completed Student Stage1 checkpoint.')
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument(
         "--student-num-envs",
@@ -93,6 +96,9 @@ def parse_args() -> argparse.Namespace:
     options, remaining = extension.parse_known_args()
     args = parser.parse_args(remaining)
     vars(args).update(vars(options))
+    if args.final_sensor_gait:
+        from sensor_training.final_profile import apply_final_profile
+        apply_final_profile(args)
     return args
 
 
@@ -234,9 +240,13 @@ def _phase_command(
     *,
     resume_checkpoint: Path | None,
 ) -> list[str]:
-    teacher_stage1 = _handoff_checkpoint(paths["teacher_stage1"])
+    final = bool(getattr(args, 'final_sensor_gait', False))
+    teacher_stage1 = (args.teacher_stage1_checkpoint if final and args.teacher_stage1_checkpoint
+                      else _handoff_checkpoint(paths['teacher_stage1']))
     teacher_stage2 = _handoff_checkpoint(paths["teacher_stage2"])
-    student_stage1 = _handoff_checkpoint(paths["student_stage1"])
+    student_stage1 = (args.student_stage1_checkpoint if final and args.student_stage1_checkpoint
+                      else paths['student_stage1']/'model_final.pt' if final
+                      else _handoff_checkpoint(paths['student_stage1']))
     script: Path
     command: list[str]
 
@@ -245,7 +255,11 @@ def _phase_command(
         command = [sys.executable, str(script)] + _common_train_args(
             args, paths[name], getattr(args, 'teacher_stage1_iterations', None) or args.stage1_iterations
         )
-        command.append('--stop-on-gait-acceptance')
+        if final:
+            from sensor_training.final_profile import final_training_flags
+            command.extend(final_training_flags(iterations=getattr(args, 'teacher_stage1_iterations', None) or args.stage1_iterations))
+        else:
+            command.append('--stop-on-gait-acceptance')
         if resume_checkpoint is not None:
             command.extend(("--resume-checkpoint", str(resume_checkpoint)))
         elif getattr(args, 'teacher_stage1_checkpoint', None) is not None:
@@ -271,7 +285,11 @@ def _phase_command(
             args, paths[name], args.stage1_iterations, sensor_student=True
         )
         command.extend(("--teacher-checkpoint", str(teacher_stage1)))
-        command.append('--stop-on-gait-acceptance')
+        if final:
+            from sensor_training.final_profile import final_training_flags
+            command.extend(final_training_flags(student=True, iterations=args.stage1_iterations))
+        else:
+            command.append('--stop-on-gait-acceptance')
         if resume_checkpoint is not None:
             command.extend(("--resume-checkpoint", str(resume_checkpoint)))
         elif getattr(args, 'student_stage1_checkpoint', None) is not None:
@@ -285,8 +303,12 @@ def _phase_command(
         command = [sys.executable, str(script)] + _common_train_args(
             args, paths[name], args.stage2_iterations, sensor_student=True
         )
-        command.extend(("--teacher-checkpoint", str(teacher_stage2)))
-        command.extend(('--dr-curriculum-mode', 'adaptive', '--dr-curriculum-initial-scale', '0.1'))
+        command.extend(("--teacher-checkpoint", str(teacher_stage1 if final else teacher_stage2)))
+        if final:
+            from sensor_training.final_profile import final_training_flags
+            command.extend(final_training_flags(student=True, robust=True, iterations=args.stage2_iterations))
+        else:
+            command.extend(('--dr-curriculum-mode', 'adaptive', '--dr-curriculum-initial-scale', '0.1'))
         if resume_checkpoint is not None:
             command.extend(("--resume-distillation-checkpoint", str(resume_checkpoint)))
         else:
@@ -296,8 +318,132 @@ def _phase_command(
     raise ValueError(f"Unknown serial-distillation phase: {name}")
 
 
+def run_final_pipeline(args):
+    """Use the same phase commands/trainers, with strict pure-Student handoff."""
+    from sensor_training.gait_evaluation import evaluate_gait_suite, gait_quality_failures
+    from sensor_training.final_profile import final_checkpoint_errors, REFERENCE
+    import torch
+    for count in (args.num_envs, _student_num_envs(args), args.stage1_iterations, args.stage2_iterations):
+        if count <= 0:
+            raise ValueError('Environment and iteration counts must be positive.')
+    if args.phase == 'stage2' and not args.student_stage1_checkpoint:
+        raise ValueError('Stage2 requires --student-checkpoint (completed final Student Stage1).')
+    if args.phase == 'stage2' and not args.teacher_stage1_checkpoint:
+        raise ValueError('Stage2 requires --teacher-checkpoint (the same privileged Teacher).')
+    paths = _phase_paths(args.run_name)
+    manifest_path = REPO_ROOT/'logs/serial_distillation'/args.run_name/'pipeline.json'
+    manifest = _load_manifest(manifest_path, run_name=args.run_name, phases=paths, args=args)
+    if manifest_path.exists() and manifest.get('workflow') != 'final_sensor_gait':
+        raise ValueError('This run belongs to a legacy workflow; use a new timestamp.')
+    manifest['workflow'] = 'final_sensor_gait'
+    manifest['final_profile'] = {key: value for key, value in vars(args).items()
+                                 if key not in ('teacher_stage1_checkpoint', 'student_stage1_checkpoint')}
+    manifest['hardware'] = {'imu_groups': 7, 'imu_values': 42, 'tendon_encoders': 14,
+                            'additional_sensors': [], 'control_hz': 100}
+    teacher = args.teacher_stage1_checkpoint or _handoff_checkpoint(paths['teacher_stage1'])
+    phases = ([] if args.teacher_stage1_checkpoint or args.phase == 'stage2' else ['teacher_stage1'])
+    if args.phase in ('all', 'stage1'):
+        phases += ['student_stage1']
+    if args.phase in ('all', 'stage2'):
+        phases += ['student_stage2']
+    manifest['enabled_phases'] = phases
+
+    def check_teacher():
+        payload = torch.load(teacher, map_location='cpu', weights_only=False)
+        if payload.get('sensor_policy_architecture'):
+            raise ValueError('Teacher must be a privileged full-state policy.')
+        cfg = payload['env_config']
+        if Path(cfg['motion_file']).resolve() != REFERENCE.resolve() or cfg['decimation'] != 2 or cfg['reference_ctrl_blend'] != 1.:
+            raise ValueError('Teacher reference, 100 Hz control and tendon feedforward must match the final recipe.')
+        quality = evaluate_gait_suite(teacher, seconds=30.)
+        manifest['teacher_quality'] = quality
+        _write_manifest(manifest_path, manifest)
+        failures = gait_quality_failures(quality)
+        if failures:
+            raise RuntimeError('Teacher reference fidelity is insufficient; improve Teacher before judging Student: '+ '; '.join(failures))
+        return quality
+
+    def check_student(path, *, robust=False):
+        payload = torch.load(path, map_location='cpu', weights_only=False)
+        errors = final_checkpoint_errors(payload)
+        if errors:
+            raise ValueError('Student handoff rejected: '+ '; '.join(errors))
+        quality = evaluate_gait_suite(path, seconds=30., teacher_checkpoint=teacher)
+        (Path(path).parent/'final_gait_evaluation.json').write_text(json.dumps(quality, indent=2)+'\n')
+        failures = gait_quality_failures(quality)
+        if failures:
+            raise RuntimeError('Pure Student reference fidelity is insufficient: '+ '; '.join(failures))
+        if quality['eval/teacher_execution_probability'] != 0.:
+            raise RuntimeError('Student evaluation must have zero Teacher execution.')
+        if robust:
+            perturbed = evaluate_gait_suite(path, seconds=30., teacher_checkpoint=teacher, domain_randomization=True)
+            quality.update({'robust/'+key.removeprefix('eval/'): value
+                            for key, value in perturbed.items() if key.startswith('eval/')})
+            (Path(path).parent/'final_gait_evaluation.json').write_text(json.dumps(quality, indent=2)+'\n')
+            if perturbed['eval/gait_accepted'] < 1:
+                raise RuntimeError(f'Student DR evaluation failed: {perturbed}')
+        return quality
+
+    if args.dry_run:
+        print(f'[FINAL] Teacher source: {teacher}; 30 s reference-fidelity gate required.')
+    else:
+        _write_manifest(manifest_path, manifest)
+        if args.teacher_stage1_checkpoint:
+            check_teacher()
+        if args.phase == 'stage2':
+            check_student(args.student_stage1_checkpoint)
+    for name in phases:
+        checkpoint = paths[name]/'model_final.pt'
+        phase = manifest['phases'].setdefault(name, {})
+        resume = checkpoint if checkpoint.is_file() else None
+        command = _phase_command(name, args, paths, resume_checkpoint=resume)
+        print(f'[FINAL] {name}: {shlex.join(command)}', flush=True)
+        if args.dry_run:
+            continue
+        if phase.get('status') != 'completed' or not checkpoint.is_file():
+            paths[name].mkdir(parents=True, exist_ok=True)
+            phase.update(status='running', command=command)
+            _write_manifest(manifest_path, manifest)
+            try:
+                subprocess.run(command, cwd=REPO_ROOT, check=True)
+                if not checkpoint.is_file():
+                    raise RuntimeError(f'{name} produced no final checkpoint.')
+                if name == 'teacher_stage1':
+                    teacher = _handoff_checkpoint(paths[name])
+                    # _phase_command subsequently picks exactly this source.
+                    args.teacher_stage1_checkpoint = teacher
+                    check_teacher()
+                else:
+                    phase['student_quality'] = check_student(checkpoint, robust=name == 'student_stage2')
+                phase.update(status='completed', checkpoint=str(checkpoint))
+            except BaseException as exc:
+                phase.update(status='interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed', error=str(exc))
+                _write_manifest(manifest_path, manifest)
+                raise
+            _write_manifest(manifest_path, manifest)
+        elif name == 'teacher_stage1':
+            teacher = _handoff_checkpoint(paths[name])
+            args.teacher_stage1_checkpoint = teacher
+            check_teacher()
+        else:
+            check_student(checkpoint, robust=name == 'student_stage2')
+    if not args.dry_run:
+        selected = paths['student_stage2' if args.phase in ('all', 'stage2') else 'student_stage1']/'model_final.pt'
+        from sensor_training.export_sensor_policy import export_checkpoint
+        output = selected.with_name('deployment.onnx')
+        export_checkpoint(selected, output, require_final=True)
+        manifest['deployment'] = {'checkpoint': str(selected), 'onnx': str(output),
+                                  'teacher_execution_probability': 0.}
+        _write_manifest(manifest_path, manifest)
+        print(f'[FINAL] Completed; pure-sensor ONNX: {output}')
+    else:
+        print('[FINAL] Dry run; no training, evaluation or artifacts created.')
+
+
 def main() -> None:
     args = parse_args()
+    if args.final_sensor_gait:
+        return run_final_pipeline(args)
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive.")
     if args.student_num_envs is not None and args.student_num_envs <= 0:

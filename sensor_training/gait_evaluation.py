@@ -24,17 +24,25 @@ from sensor_training.experiment_options import observation_config_from_metadata
 def evaluate_gait_checkpoint(checkpoint: str | Path, *, seconds: float = 20.,
                              force_loop: bool = False,
                              seed: int = 42,
-                             trace_path: Path | None = None) -> dict[str, float]:
+                             trace_path: Path | None = None,
+                             domain_randomization: bool = False,
+                             physical_overrides: dict | None = None) -> dict[str, float]:
     if seconds <= 0:
         raise ValueError('Gait evaluation duration must be positive.')
     path = Path(checkpoint).with_suffix('.onnx')
     metadata = load_onnx_metadata(path)
     allowed = {field.name for field in fields(LytRobotEnvCfg)}
     cfg = LytRobotEnvCfg(**{k: v for k, v in metadata['env_config'].items() if k in allowed})
+    for key, value in (physical_overrides or {}).items():
+        if key not in allowed:
+            raise ValueError(f'Unknown physical evaluation override: {key}')
+        setattr(cfg, key, value)
     cfg.num_envs = 1
     cfg.seed = seed
-    cfg.domain_randomization = False
-    cfg.reset_noise_scale = cfg.action_noise_std = 0.
+    cfg.domain_randomization = bool(domain_randomization)
+    cfg.domain_randomization_scale = 1. if domain_randomization else 0.
+    if not domain_randomization:
+        cfg.reset_noise_scale = cfg.action_noise_std = 0.
     cfg.randomize_episode_seed = False
     cfg.stand_start_prob = 1.
     cfg.motion_reset_prob = 0.
@@ -88,7 +96,12 @@ def evaluate_gait_checkpoint(checkpoint: str | Path, *, seconds: float = 20.,
                    'root_velocity_error_squared': float(np.mean((data.qvel[:3]-targets.root_lin_vel[0])**2)),
                    'right_contact': float(contact[0]), 'left_contact': float(contact[1]),
                    'reference_right_contact': float(contact_reference[0]),
-                   'reference_left_contact': float(contact_reference[1])}
+                   'reference_left_contact': float(contact_reference[1]),
+                   'pelvis_height_m': float(data.xpos[base.pelvis_body_id, 2]),
+                   'pelvis_height_error_squared': float((data.xpos[base.pelvis_body_id, 2]-targets.root_height[0])**2),
+                   'torso_orientation_error_rad': quaternion_error(data.xquat[base.pelvis_body_id], targets.root_quat[0]),
+                   'right_foot_world_x': float(np.mean(data.geom_xpos[reference.contact_geom_ids[:2], 0])),
+                   'left_foot_world_x': float(np.mean(data.geom_xpos[reference.contact_geom_ids[2:], 0]))}
             for i, name in enumerate(names):
                 row[name] = float(actual[i])
                 row['reference_'+name] = float(desired[i])
@@ -126,6 +139,9 @@ def evaluate_gait_checkpoint(checkpoint: str | Path, *, seconds: float = 20.,
             'eval/gait_knee_lock_fraction': lock_fraction,
         }
         metrics.update(reference_quality_metrics(steady, base.dt, fell, survived))
+        metrics['eval/teacher_execution_probability'] = 0.
+        metrics['eval/domain_randomization'] = float(domain_randomization)
+        metrics.update(reference_fidelity_metrics(metrics))
         if trace_path is not None:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             with trace_path.open('w', newline='') as file:
@@ -135,6 +151,42 @@ def evaluate_gait_checkpoint(checkpoint: str | Path, *, seconds: float = 20.,
         return metrics
     finally:
         env.close()
+
+
+def quaternion_error(actual, desired):
+    actual = np.asarray(actual) / max(np.linalg.norm(actual), 1e-8)
+    desired = np.asarray(desired) / max(np.linalg.norm(desired), 1e-8)
+    return float(2*np.arccos(np.clip(abs(np.dot(actual, desired)), 0., 1.)))
+
+
+FIDELITY_LIMITS = {
+    'eval/joint_position_rmse_rad': .20,
+    'eval/joint_velocity_rmse_rad_s': 2.0,
+    'eval/foot_local_position_rmse_m': .06,
+    'eval/root_velocity_rmse_m_s': .15,
+    'eval/contact_timing_error': .25,
+    'eval/pelvis_height_rmse_m': .05,
+    'eval/torso_orientation_rmse_rad': .15,
+}
+
+
+def gait_quality_failures(metrics):
+    failures = []
+    if metrics.get('eval/gait_accepted', 0.) < 1:
+        failures.append('continuous gait/speed/knee gate')
+    for key, maximum in FIDELITY_LIMITS.items():
+        value = metrics.get(key, float('inf'))
+        if not np.isfinite(value) or value > maximum:
+            failures.append(f'{key}={value:.4f} > {maximum:.4f}')
+    return failures
+
+
+def reference_fidelity_metrics(metrics):
+    accepted = not gait_quality_failures(metrics)
+    ratios = [metrics.get(key, float('inf'))/maximum for key, maximum in FIDELITY_LIMITS.items()]
+    score = float(np.exp(-np.mean(np.square(ratios)))) if np.isfinite(ratios).all() else 0.
+    return {'eval/reference_fidelity_accepted': float(accepted),
+            'eval/reference_fidelity_score': score * metrics.get('eval/episode_completion', 0.)}
 
 
 def reference_quality_metrics(rows, dt, fell, completed):
@@ -154,6 +206,17 @@ def reference_quality_metrics(rows, dt, fell, completed):
         metrics['eval/'+label+'step_frequency_hz'] = float(touchdowns / max((len(rows)-1)*dt, dt))
     for side, index in (('right', 0), ('left', 1)):
         metrics['eval/'+side+'_stance_ratio'] = float(np.mean(actual[:, index] >= .5)) if rows else 0.
+    strides = []
+    for side, index in (('right', 0), ('left', 1)):
+        metrics[f'eval/{side}_contact_timing_error'] = float(np.mean((actual[:, index] >= .5) != (desired[:, index] >= .5))) if rows else 1.
+        times = np.nonzero((actual[1:, index] >= .5) & (actual[:-1, index] < .5))[0] + 1
+        if len(times) > 1 and all(side+'_foot_world_x' in r for r in rows):
+            positions = np.asarray([rows[t][side+'_foot_world_x'] for t in times])
+            strides.extend(np.diff(positions).tolist())
+    metrics['eval/stride_length_m'] = float(np.mean(strides)) if strides else 0.
+    metrics['eval/pelvis_height_mean_m'] = float(np.mean([r.get('pelvis_height_m', 0.) for r in rows])) if rows else 0.
+    metrics['eval/pelvis_height_rmse_m'] = float(np.sqrt(np.mean([r.get('pelvis_height_error_squared', 0.) for r in rows]))) if rows else float('inf')
+    metrics['eval/torso_orientation_rmse_rad'] = float(np.sqrt(np.mean([r.get('torso_orientation_error_rad', 0.)**2 for r in rows]))) if rows else float('inf')
     return metrics
 
 
@@ -168,9 +231,11 @@ def comparison_metrics(teacher, student):
 
 
 @lru_cache(maxsize=8)
-def _cached_teacher_metrics(path, modification_time, seconds, seeds, force_loop=False):
+def _cached_teacher_metrics(path, modification_time, seconds, seeds, force_loop=False, domain_randomization=False, physical_overrides="{}"):
     return summarize_gait_evaluations([
-        evaluate_gait_checkpoint(path, seconds=seconds, seed=seed, force_loop=force_loop) for seed in seeds])
+        evaluate_gait_checkpoint(path, seconds=seconds, seed=seed, force_loop=force_loop,
+                                 domain_randomization=domain_randomization,
+                                 physical_overrides=json.loads(physical_overrides)) for seed in seeds])
 
 
 def summarize_gait_evaluations(results: list[dict[str, float]]) -> dict[str, float]:
@@ -180,18 +245,21 @@ def summarize_gait_evaluations(results: list[dict[str, float]]) -> dict[str, flo
     worst_high = {'eval/gait_knee_rmse_rad', 'eval/gait_foot_rmse_m',
                   'eval/gait_knee_lock_fraction', 'eval/joint_position_rmse_rad',
                   'eval/joint_velocity_rmse_rad_s', 'eval/foot_local_position_rmse_m',
-                  'eval/root_velocity_rmse_m_s', 'eval/contact_timing_error'}
+                  'eval/root_velocity_rmse_m_s', 'eval/contact_timing_error',
+                  'eval/right_contact_timing_error', 'eval/left_contact_timing_error',
+                  'eval/pelvis_height_rmse_m', 'eval/torso_orientation_rmse_rad'}
     aggregate = {}
     for name in results[0]:
         values = [result[name] for result in results]
-        aggregate[name] = (float(np.mean(values)) if name in {'eval/gait_forward_velocity', 'eval/step_frequency_hz', 'eval/left_stance_ratio', 'eval/right_stance_ratio', 'eval/reference_step_frequency_hz', 'eval/fall_rate', 'eval/episode_completion'}
+        aggregate[name] = (float(np.mean(values)) if name in {'eval/gait_forward_velocity', 'eval/step_frequency_hz', 'eval/left_stance_ratio', 'eval/right_stance_ratio', 'eval/reference_step_frequency_hz', 'eval/fall_rate', 'eval/episode_completion', 'eval/stride_length_m', 'eval/pelvis_height_mean_m'}
                            else max(values) if name in worst_high else min(values))
     aggregate['eval/gait_seed_count'] = float(len(results))
     return aggregate
 
 
-def evaluate_gait_suite(checkpoint, *, seconds=20., seeds=(42, 123, 2026), trace_path=None, teacher_checkpoint=None, force_loop=False):
+def evaluate_gait_suite(checkpoint, *, seconds=20., seeds=(42, 123, 2026), trace_path=None, teacher_checkpoint=None, force_loop=False, domain_randomization=False):
     results = [evaluate_gait_checkpoint(checkpoint, seconds=seconds, seed=seed, force_loop=force_loop,
+               domain_randomization=domain_randomization,
                trace_path=trace_path if index == 0 else None)
                for index, seed in enumerate(seeds)]
     aggregate = summarize_gait_evaluations(results)
@@ -201,10 +269,17 @@ def evaluate_gait_suite(checkpoint, *, seconds=20., seeds=(42, 123, 2026), trace
         teacher_path = Path(teacher_checkpoint).with_suffix('.onnx')
         teacher_metadata = load_onnx_metadata(teacher_path)
         for field in ('motion_file', 'decimation', 'reference_ctrl_blend'):
-            if metadata['env_config'].get(field) != teacher_metadata['env_config'].get(field):
+            left, right = metadata['env_config'].get(field), teacher_metadata['env_config'].get(field)
+            if field == 'motion_file':
+                left, right = Path(left).resolve(), Path(right).resolve()
+            if left != right:
                 raise ValueError(f'Teacher/Student comparison requires identical {field}.')
+        physics = {key: value for key, value in metadata['env_config'].items()
+                   if key.startswith(('body_mass_', 'payload_mass_', 'ground_friction_', 'gravity_',
+                                      'tendon_length_', 'actuator_strength_', 'action_delay_', 'push_'))
+                   or key in ('reset_noise_scale', 'action_noise_std', 'obs_noise_std')}
         teacher = _cached_teacher_metrics(str(teacher_path.resolve()), teacher_path.stat().st_mtime_ns,
-                                         seconds, tuple(seeds), force_loop)
+                                         seconds, tuple(seeds), force_loop, domain_randomization, json.dumps(physics, sort_keys=True))
         aggregate.update(comparison_metrics(teacher, aggregate))
     return aggregate
 
@@ -215,11 +290,13 @@ if __name__ == '__main__':
     parser.add_argument('--seconds', type=float, default=20.)
     parser.add_argument('--force-loop', action='store_true')
     parser.add_argument('--teacher-checkpoint')
+    parser.add_argument('--domain-randomization', action='store_true')
     parser.add_argument('--seeds', nargs='+', type=int, default=[42, 123, 2026])
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     result = evaluate_gait_suite(args.checkpoint, seconds=args.seconds, seeds=tuple(args.seeds),
                                 teacher_checkpoint=args.teacher_checkpoint, force_loop=args.force_loop,
+                                domain_randomization=args.domain_randomization,
                                 trace_path=args.output.with_suffix('.csv'))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2)+'\n')

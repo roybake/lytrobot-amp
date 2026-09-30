@@ -326,6 +326,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensor-knee-gait-reward-coef", type=float, default=0.0)
     parser.add_argument("--sensor-natural-gait-reward-coef", type=float, default=0.0)
     parser.add_argument("--reference-gait-style-reward-coef", type=float, default=0.0)
+    parser.add_argument('--reference-joint-position-reward-coef', type=float, default=1.4)
+    parser.add_argument('--reference-joint-velocity-reward-coef', type=float, default=.45)
+    parser.add_argument('--reference-root-velocity-reward-coef', type=float, default=.9)
+    parser.add_argument('--reference-foot-position-reward-coef', type=float, default=1.25)
     parser.add_argument("--sensor-gait-height-target", type=float, default=0.845)
     parser.add_argument("--sensor-gait-height-sigma", type=float, default=0.07)
     parser.add_argument("--sensor-upright-sigma", type=float, default=0.12)
@@ -440,6 +444,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--body-mass-scale-max", type=float, default=1.15)
     parser.add_argument("--tendon-length-scale-min", type=float, default=0.95)
     parser.add_argument("--tendon-length-scale-max", type=float, default=1.05)
+    parser.add_argument('--actuator-strength-scale-min', type=float, default=1.0)
+    parser.add_argument('--actuator-strength-scale-max', type=float, default=1.0)
+    parser.add_argument('--gait-fidelity-selection', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ground-friction-min", type=float, default=0.55)
     parser.add_argument("--ground-friction-max", type=float, default=1.40)
     parser.add_argument("--gravity-min", type=float, default=9.75)
@@ -542,7 +549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluate-gait", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gait-evaluation-seconds", type=float, default=20.0)
     parser.add_argument("--gait-evaluation-seeds", type=int, nargs='+', default=[42, 123, 2026])
-    parser.add_argument("--stop-on-gait-acceptance", action="store_true")
+    parser.add_argument("--stop-on-gait-acceptance", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--save-best-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -1453,6 +1460,10 @@ def main() -> None:
         sensor_knee_gait_reward_coef=args.sensor_knee_gait_reward_coef,
         sensor_natural_gait_reward_coef=args.sensor_natural_gait_reward_coef,
         reference_gait_style_reward_coef=args.reference_gait_style_reward_coef,
+        reference_joint_position_reward_coef=args.reference_joint_position_reward_coef,
+        reference_joint_velocity_reward_coef=args.reference_joint_velocity_reward_coef,
+        reference_root_velocity_reward_coef=args.reference_root_velocity_reward_coef,
+        reference_foot_position_reward_coef=args.reference_foot_position_reward_coef,
         sensor_gait_height_target=args.sensor_gait_height_target,
         sensor_gait_height_sigma=args.sensor_gait_height_sigma,
         sensor_upright_sigma=args.sensor_upright_sigma,
@@ -1512,6 +1523,8 @@ def main() -> None:
         body_mass_scale_max=args.body_mass_scale_max,
         tendon_length_scale_min=args.tendon_length_scale_min,
         tendon_length_scale_max=args.tendon_length_scale_max,
+        actuator_strength_scale_min=args.actuator_strength_scale_min,
+        actuator_strength_scale_max=args.actuator_strength_scale_max,
         ground_friction_min=args.ground_friction_min,
         ground_friction_max=args.ground_friction_max,
         gravity_min=args.gravity_min,
@@ -1527,6 +1540,8 @@ def main() -> None:
         action_delay_min_ms=args.action_delay_min_ms,
         action_delay_max_ms=args.action_delay_max_ms,
     )
+    if not 0 < args.actuator_strength_scale_min <= args.actuator_strength_scale_max:
+        raise ValueError('Actuator strength scales require 0 < min <= max.')
     ppo_defaults = PPOAMPConfig()
     supports_distillation = hasattr(ppo_defaults, "teacher_checkpoint")
     if teacher_checkpoint is not None and not supports_distillation:
@@ -1787,8 +1802,9 @@ def main() -> None:
                     log_dir / 'model_best.onnx', seconds=args.gait_evaluation_seconds,
                     seeds=args.gait_evaluation_seeds))
                 evaluation_quality_path.write_text(json.dumps(previous_evaluation, indent=2)+'\n')
-            best_checkpoint_quality = (previous_evaluation['eval/gait_accepted'],
-                                       previous_evaluation['eval/gait_score'])
+            prefix = 'reference_fidelity' if args.gait_fidelity_selection else 'gait'
+            best_checkpoint_quality = (previous_evaluation.get(f'eval/{prefix}_accepted', 0.),
+                                       previous_evaluation.get(f'eval/{prefix}_score', 0.))
     try:
         for iteration in range(start_iteration, args.max_iterations):
             current_course_random_start_prob = (
@@ -1934,6 +1950,11 @@ def main() -> None:
                     f"time={metrics['timing_iteration_s']:.2f}s",
                     iteration=iteration,
                 )
+            if 'state/joint_position_mae' in metrics:
+                names = ('joint_position_mae', 'joint_velocity_mae', 'root_velocity_mae',
+                         'contact_accuracy', 'contact_mae', 'foot_position_mae')
+                run_logger.emit('[STATE] ' + ' '.join(f'state/{name}={metrics["state/"+name]:.5f}'
+                                for name in names if 'state/'+name in metrics), iteration=iteration)
             if resource_metrics:
                 run_logger.emit(
                     "[RESOURCE] "
@@ -2017,7 +2038,8 @@ def main() -> None:
                         saved_onnx, seconds=args.gait_evaluation_seconds,
                         seeds=args.gait_evaluation_seeds,
                         trace_path=log_dir / 'gait_evaluation_latest.csv')
-                    checkpoint_quality = (evaluation['eval/gait_accepted'], evaluation['eval/gait_score'])
+                    prefix = 'reference_fidelity' if args.gait_fidelity_selection else 'gait'
+                    checkpoint_quality = (evaluation[f'eval/{prefix}_accepted'], evaluation[f'eval/{prefix}_score'])
                     evaluation_record = dict(evaluation, iteration=iteration, checkpoint=str(saved_pt))
                     with (log_dir / 'gait_evaluations.jsonl').open('a') as evaluation_file:
                         evaluation_file.write(json.dumps(evaluation_record)+'\n')
@@ -2061,7 +2083,7 @@ def main() -> None:
                         iteration=iteration,
                         force=True,
                     )
-                if args.stop_on_gait_acceptance and evaluation is not None and evaluation.get('eval/gait_accepted', 0) > 0:
+                if args.stop_on_gait_acceptance and evaluation is not None and evaluation.get('eval/reference_fidelity_accepted' if args.gait_fidelity_selection else 'eval/gait_accepted', 0) > 0:
                     run_logger.emit('[GAIT_ACCEPTED] Continuous walking and reference tracking passed; completing this phase.', force=True)
                     break
             if args.iteration_sleep_ms > 0.0:

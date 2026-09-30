@@ -23,7 +23,33 @@ class SensorObservationConfig:
     tendon_velocity_filter_alpha: float = 1.0  # causal one-pole filter
     tendon_tracking_error_scale: float = 0.05  # m
 
+    # Physical encoder model: metres. Baseline noise applies even without DR;
+    # other uncertainties ramp with the environment DR curriculum.
+    tendon_measurement_enabled: bool = False
+    tendon_measurement_noise_std: float = 0.0
+    tendon_measurement_dr_noise_std: float = 0.0
+    tendon_measurement_bias_m: float = 0.0
+    tendon_measurement_bias_range_m: float = 0.0
+    tendon_measurement_scale_error: float = 0.0
+    tendon_measurement_quantization_m: float = 0.0
+    tendon_measurement_delay_max_ticks: int = 0
+    tendon_measurement_clip_margin_m: float = 0.02
+    # IMU uncertainties use normalized accelerometer/gyroscope units.
+    imu_measurement_noise_std: float = 0.0
+    imu_measurement_dr_noise_std: float = 0.0
+    imu_measurement_bias_range: float = 0.0
+    imu_measurement_delay_max_ticks: int = 0
+
     def __post_init__(self) -> None:
+        for name in ('tendon_measurement_noise_std', 'tendon_measurement_dr_noise_std',
+                     'tendon_measurement_bias_range_m', 'tendon_measurement_scale_error',
+                     'tendon_measurement_quantization_m', 'tendon_measurement_clip_margin_m',
+                     'imu_measurement_noise_std', 'imu_measurement_dr_noise_std', 'imu_measurement_bias_range'):
+            if getattr(self, name) < 0:
+                raise ValueError(f'{name} must be non-negative.')
+        for name in ('tendon_measurement_delay_max_ticks', 'imu_measurement_delay_max_ticks'):
+            if not 0 <= getattr(self, name) <= 2:
+                raise ValueError(f'{name} must be 0, 1 or 2.')
         if self.tendon_velocity_scale <= 0 or self.tendon_tracking_error_scale <= 0:
             raise ValueError("Tendon feature scales must be positive.")
         if not 0 < self.tendon_velocity_filter_alpha <= 1:

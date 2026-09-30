@@ -2,6 +2,22 @@
 
 所有命令在仓库根目录执行。将 `<run>` 替换为实际运行目录，`<threshold>` 替换为选定的蒸馏验收阈值。
 
+## 推荐：最终纯传感器人体步态
+
+实机现有7组IMU和14条肌腱编码器；Teacher → Student Stage1 → Student Stage2 DR → ONNX。
+默认GRU256、45D状态估计、统一测量肌腱派生特征、BPTT96，关闭future prediction。
+
+```bash
+# Stage1：先建立合格Teacher，再训练Student
+.venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1
+
+# 或一次执行全部阶段
+.venv/bin/python sensor_training/train_final_sensor_gait.py
+```
+
+Stage2接续、导出和验收详见 [最终训练说明](sensor_training/STATE_ESTIMATION.md)。
+以下入口保留用于基础策略、专项任务或历史兼容。
+
 ## 基础行走 Stage1
 
 ```bash
@@ -72,9 +88,9 @@ uv run python sensor_training/play.py \
 # 训练自然步态；同时训练鲁棒阶段时增加 --include-robust-stage
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/train_serial_distillation.py \
-  --run-name imu_walk_100hz_v1
+  --final-sensor-gait
 
-# 测试：使用 logs/serial_distillation/imu_walk_100hz_v1/pipeline.json 中的 Student 权重路径
+# 测试：使用 logs/serial_distillation/<run>/pipeline.json 中的 Student 权重路径
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
   --checkpoint "<student-checkpoint.onnx>" --device cuda --viewer --steps 0

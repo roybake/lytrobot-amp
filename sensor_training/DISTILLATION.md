@@ -1,5 +1,18 @@
 # 传感器串行蒸馏
 
+## 推荐入口
+
+本次最终流程使用 `train_final_sensor_gait.py`，固定 GRU256、45D状态估计、共享
+encoder测量派生特征、BPTT96，并关闭 future prediction。完整说明和三组推荐命令
+见 [STATE_ESTIMATION.md](STATE_ESTIMATION.md)。
+
+```bash
+.venv/bin/python sensor_training/train_final_sensor_gait.py
+```
+
+以下为已有独立蒸馏入口的兼容说明；其48步/128D等旧默认不代表最终推荐配置。
+
+
 部署策略始终只使用 IMU 与肌肉长度；特权 Teacher 仅在训练期间读取
 仿真完整状态，并且不会写入导出的 ONNX Actor。
 

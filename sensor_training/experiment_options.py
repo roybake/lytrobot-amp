@@ -11,7 +11,9 @@ from .ppo_config import SensorPPOAMPConfig
 OPTIONAL_POLICY_OPTIONS = ('gamma', 'gae_lambda', 'init_std', 'amp_startup_gate')
 
 OBS_OPTIONS = ('include_tendon_velocity', 'include_tendon_tracking_error',
-               'tendon_velocity_scale', 'tendon_velocity_filter_alpha', 'tendon_tracking_error_scale')
+               'tendon_velocity_scale', 'tendon_velocity_filter_alpha', 'tendon_tracking_error_scale',
+               *tuple(field.name for field in fields(SensorObservationConfig)
+                      if field.name.startswith(('tendon_measurement_', 'imu_measurement_'))))
 POLICY_OPTIONS = ('recurrent_hidden_dim', 'state_estimator_enabled',
                   'state_estimator_include_foot_position', 'actor_use_estimated_state',
                   'state_joint_position_loss_weight', 'state_joint_velocity_loss_weight',

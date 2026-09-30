@@ -145,9 +145,9 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--reference-ctrl-blend"), "1.0")
         self.assertEqual(
             Path(_remove_option(sensor_args, "--motion-file")).name,
-            "walk1_mjcf.npz",
+            "walk1_omniretarget.npz",
         )
-        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "1.0")
+        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "0.87")
         self.assertEqual(_remove_option(sensor_args, "--learning-rate"), "3.0e-4")
         self.assertEqual(_remove_option(sensor_args, "--task-reward-lerp"), "0.5")
         self.assertEqual(_remove_option(sensor_args, "--amp-reward-coef"), "1.2")

@@ -1,4 +1,26 @@
-# IMU + 肌腱长度独立训练
+# 纯传感器人体步态训练
+
+## 推荐最终流程
+
+使用已有全部7组 IMU 和14条肌腱编码器，不增加硬件。默认入口是
+`train_final_sensor_gait.py`：高质量 privileged Teacher → Sensor Student Stage1
+→ 零 Teacher takeover 验收 → Student Stage2 渐进 DR → ONNX。
+
+```bash
+# 先训练/验收 Teacher，再训练 Student Stage1
+.venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1
+
+# 完整一键流程（包括 Student Stage2）
+.venv/bin/python sensor_training/train_final_sensor_gait.py
+```
+
+最终配置自动开启同一测量源的肌腱长度/速度/error、GRU256、45D状态估计和 Actor
+估计状态输入，默认 BPTT96，关闭 future prediction，保留板载 reference feedforward。
+单帧144维，6帧 observation 864维；ONNX只接收 observation/recurrent_state/episode_start。
+
+Stage2接续、导出、测量模型、loss、验收门槛和硬件规模见
+[最终实现说明](STATE_ESTIMATION.md)。无需运行 A–G。以下普通行走/楼梯入口保留为
+独立或历史兼容工具，不是本次平地人体步态的默认训练配方。
 
 ## 纯传感器上下楼梯 DeepMimic
 
@@ -197,9 +219,8 @@ uv run python sensor_training/play.py \
 ```
 
 
-## 可选状态估计与步态复现实验
+## 历史兼容配置
 
-新增功能默认关闭，保留旧 checkpoint 和训练默认配置。状态估计、因果肌腱
-速度/跟踪误差、Actor 接入估计状态、未来传感器预测、A–G 消融和 Teacher/Student
-统一评估见 [STATE_ESTIMATION.md](STATE_ESTIMATION.md)。部署输入仍只有现有
-传感器、上一动作和板载 gait command；MuJoCo 真值只用于训练标签。
+普通入口保留旧默认；最终入口自动使用上面的固定配置。`train_ablation.py` 仅保留
+为历史工具。新测量版本会拒绝把旧的理想派生特征 checkpoint 静默解释为 noisy
+measurement policy。MuJoCo 真值只用于训练标签、奖励和 Critic。

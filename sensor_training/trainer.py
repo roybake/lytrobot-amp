@@ -17,7 +17,7 @@ from lytrobot_amp.networks import AmpDiscriminator
 from .networks import RecurrentSensorActorExport, SensorActorCritic
 from .ppo_config import SensorPPOAMPConfig
 from .config import SensorObservationConfig
-from .state_estimation import state_layout, STATE_SCALES, state_estimation_loss, future_prediction_loss
+from .state_estimation import state_layout, STATE_SCALES, split_state, state_estimation_loss, future_prediction_loss
 
 
 def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
@@ -35,7 +35,8 @@ def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
             defaults = SensorObservationConfig()
             for key in ('include_tendon_velocity', 'include_tendon_tracking_error',
                         'tendon_velocity_scale', 'tendon_velocity_filter_alpha',
-                        'tendon_tracking_error_scale'):
+                        'tendon_tracking_error_scale',
+                        *tuple(key for key in vars(defaults) if key.startswith(('tendon_measurement_', 'imu_measurement_')))):
                 config.setdefault(key, getattr(defaults, key))
         gait = metadata.get("gait_command")
         if isinstance(gait, dict):
@@ -62,6 +63,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         # This initialization is intentionally local instead of changing the
         # shared lytrobot_amp trainer used by position-control training.
         self.env = env
+        if hasattr(env, 'configure_state_supervision'):
+            env.configure_state_supervision(cfg.state_estimator_include_foot_position)
         self.cfg = cfg
         self.device = torch.device(device)
         self.log_dir = Path(log_dir)
@@ -156,7 +159,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 # window.  This remains opt-in because recurrent backward
                 # graph compilation is expensive on mid-range CUDA GPUs.
                 self._compiled_evaluate_sequence = torch.compile(
-                    self.actor_critic.evaluate_sequence,
+                    self.actor_critic.evaluate_sequence_shared,
                     mode="reduce-overhead",
                     fullgraph=True,
                     dynamic=False,
@@ -199,7 +202,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
 
         compiled = self._compiled_evaluate_sequence
         if compiled is None:
-            return self.actor_critic.evaluate_sequence(
+            return self.actor_critic.evaluate_sequence_shared(
                obs,
                initial_hidden,
                episode_starts,
@@ -236,16 +239,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 )
                 hidden = chunk[4]
                 chunks.append(chunk)
-            return (
-                torch.cat([chunk[0] for chunk in chunks]),
-                torch.cat([chunk[1] for chunk in chunks]),
-                torch.cat([chunk[2] for chunk in chunks]),
-                torch.cat([chunk[3] for chunk in chunks]),
-                hidden,
-                torch.cat([chunk[5] for chunk in chunks]),
-                torch.cat([chunk[6] for chunk in chunks]),
-                torch.cat([chunk[7] for chunk in chunks]),
-            )
+            return tuple(hidden if index == 4 else torch.cat([chunk[index] for chunk in chunks])
+                         for index in range(len(chunks[0])))
         except Exception as exc:
             if not self._policy_compile_failed:
                 print(
@@ -254,7 +249,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 )
             self._policy_compile_failed = True
             self._compiled_evaluate_sequence = None
-            return self.actor_critic.evaluate_sequence(
+            return self.actor_critic.evaluate_sequence_shared(
                 obs,
                 initial_hidden,
                 episode_starts,
@@ -690,16 +685,19 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
         initial_hidden: torch.Tensor,
         episode_starts: torch.Tensor,
         env_indices: torch.Tensor,
+        action_means: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Extension point for isolated trainers; direct training adds nothing."""
 
-        del obs, initial_hidden, episode_starts, env_indices
+        del obs, initial_hidden, episode_starts, env_indices, action_means
         return None
 
-    def _state_and_future_loss(self, obs, initial_hidden, episode_starts, state_targets):
+    def _state_and_future_loss(self, obs, episode_starts, state_targets, state_predictions, future_predictions):
         if not (self.cfg.state_estimator_enabled or self.cfg.future_prediction_enabled):
             return obs.new_zeros(())
-        states, futures = self.actor_critic.auxiliary_sequence(obs, initial_hidden, episode_starts)
+        states = split_state(state_predictions, self.cfg.state_estimator_include_foot_position) if self.cfg.state_estimator_enabled else {}
+        futures = (future_predictions.split(self.actor_critic.future_prediction_dim, dim=-1)
+                   if self.cfg.future_prediction_enabled else ())
         loss = obs.new_zeros(())
         metrics = {}
         if self.cfg.state_estimator_enabled:
@@ -829,6 +827,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     gate_weights,
                     residual,
                     context_prediction,
+                    action_means,
+                    state_predictions,
+                    future_predictions,
                 ) = self._evaluate_policy_sequence(
                     obs[:, mb],
                     initial_hidden[mb],
@@ -949,6 +950,7 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     initial_hidden[mb],
                     episode_starts[:, mb],
                     mb,
+                    action_means=action_means,
                 )
 
                 loss = (
@@ -963,8 +965,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                     * privileged_context_loss
                 )
                 loss = loss + self._state_and_future_loss(
-                    obs[:, mb], initial_hidden[mb], episode_starts[:, mb],
-                    None if state_targets is None else state_targets[:, mb])
+                    obs[:, mb], episode_starts[:, mb],
+                    None if state_targets is None else state_targets[:, mb],
+                    state_predictions, future_predictions)
                 if auxiliary_actor_loss is not None:
                     loss = loss + auxiliary_actor_loss
                 stepped = self._optimizer_step_if_finite(
@@ -1104,7 +1107,9 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
                 self.cfg.state_estimator_include_foot_position
             ):
                 raise ValueError('Checkpoint state target layout differs; start a new run.')
-            if checkpoint.get('state_estimation', {}).get('target_scales') != STATE_SCALES:
+            expected_scales = {name: STATE_SCALES[name] for name in state_layout(self.cfg.state_estimator_include_foot_position)}
+            saved_scales = checkpoint.get('state_estimation', {}).get('target_scales', {})
+            if any(saved_scales.get(name) != value for name, value in expected_scales.items()):
                 raise ValueError('Checkpoint state normalization differs; start a new run.')
         next_iteration = super().load(path, load_optimizers=load_optimizers)
         self.recurrent_state.zero_()
@@ -1117,7 +1122,8 @@ class SensorHistoryPPOAMPTrainer(PPOAMPTrainer):
             "state_estimation": {
                 'enabled': self.cfg.state_estimator_enabled,
                 'target_layout': state_layout(self.cfg.state_estimator_include_foot_position),
-                'target_scales': STATE_SCALES,
+                'target_scales': {name: STATE_SCALES[name] for name in state_layout(self.cfg.state_estimator_include_foot_position)},
+                'target_dim': sum(state_layout(self.cfg.state_estimator_include_foot_position).values()),
                 'contact_order': ['right', 'left'], 'root_velocity_frame': 'world',
                 'foot_position_frame': 'pelvis_local',
                 'target_actor_input': False,

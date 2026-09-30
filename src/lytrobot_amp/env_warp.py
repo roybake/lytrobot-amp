@@ -248,6 +248,8 @@ class LytRobotWarpAmpEnv:
         # MJCF defaults geom margin to 0.001, so disable CCD for this backend.
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD.value
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD.value
+        self.base_actuator_gainprm_np = np.asarray(self.model.actuator_gainprm, dtype=np.float32).copy()
+        self.base_actuator_biasprm_np = np.asarray(self.model.actuator_biasprm, dtype=np.float32).copy()
         self.base_body_mass_np = np.asarray(self.model.body_mass, dtype=np.float32).copy()
         self.base_body_inertia_np = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
         self.base_geom_friction_np = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
@@ -811,6 +813,8 @@ class LytRobotWarpAmpEnv:
         self.wp_body_subtreemass = wp.to_torch(self.wp_model.body_subtreemass)
         self.wp_geom_friction = wp.to_torch(self.wp_model.geom_friction)
         self.wp_gravity = wp.to_torch(self.wp_model.opt.gravity)
+        self.wp_actuator_gainprm = wp.to_torch(self.wp_model.actuator_gainprm)
+        self.wp_actuator_biasprm = wp.to_torch(self.wp_model.actuator_biasprm)
         # Keep live Warp views.  Casting to int64 here copies the int32
         # buffers once, freezing contact identities/counts for every step.
         self.contact_geom = wp.to_torch(self.wp_data.contact.geom)
@@ -898,6 +902,8 @@ class LytRobotWarpAmpEnv:
         )
         self.base_geom_friction = torch.as_tensor(self.base_geom_friction_np, dtype=torch.float32, device=self.device)
         self.base_gravity = torch.as_tensor(self.base_gravity_np, dtype=torch.float32, device=self.device)
+        self.base_actuator_gainprm = torch.as_tensor(self.base_actuator_gainprm_np, device=self.device)
+        self.base_actuator_biasprm = torch.as_tensor(self.base_actuator_biasprm_np, device=self.device)
 
     def set_domain_randomization_scale(self, scale: float) -> None:
         """Set curriculum strength without changing ongoing global dynamics."""
@@ -1040,6 +1046,12 @@ class LytRobotWarpAmpEnv:
         if self.pelvis_body_id >= 0:
             payload_mass = float(self._uniform_np(payload_low, payload_high))
             body_mass[self.pelvis_body_id] += payload_mass
+        strength_low, strength_high = scaled_randomization_range(
+            1.0, self.cfg.actuator_strength_scale_min, self.cfg.actuator_strength_scale_max, scale)
+        strength = torch.as_tensor(self._uniform_np(strength_low, strength_high, (self.model.nu,)),
+                                   dtype=torch.float32, device=self.device)
+        self.wp_actuator_gainprm[0] = self.base_actuator_gainprm * strength[:, None]
+        self.wp_actuator_biasprm[0] = self.base_actuator_biasprm * strength[:, None]
         self.wp_body_mass[0] = body_mass
         self.wp_body_inertia[0] = self.base_body_inertia * body_scale[:, None]
         self.wp_body_inertia[0, 0] = self.base_body_inertia[0]
@@ -2626,16 +2638,16 @@ class LytRobotWarpAmpEnv:
 
         reward = (
             0.05
-            + 1.40 * pose_track
-            + 0.45 * vel_track
+            + self.cfg.reference_joint_position_reward_coef * pose_track
+            + self.cfg.reference_joint_velocity_reward_coef * vel_track
             + 0.75 * height
             + 0.90 * root_orientation
-            + 0.90 * root_vel
+            + self.cfg.reference_root_velocity_reward_coef * root_vel
             + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
             + self.cfg.forward_progress_reward_coef * stable_forward_progress
             - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
             - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
-            + 1.25 * foot_pos_track
+            + self.cfg.reference_foot_position_reward_coef * foot_pos_track
             + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
             + self.cfg.step_gap_coef * side_metrics["step_gap"]
             + self.cfg.swing_advance_coef * side_metrics["swing_advance"]

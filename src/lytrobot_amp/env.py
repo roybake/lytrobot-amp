@@ -307,6 +307,10 @@ class LytRobotEnvCfg:
     sensor_knee_gait_reward_coef: float = 0.0
     sensor_natural_gait_reward_coef: float = 0.0
     reference_gait_style_reward_coef: float = 0.0
+    reference_joint_position_reward_coef: float = 1.4
+    reference_joint_velocity_reward_coef: float = 0.45
+    reference_root_velocity_reward_coef: float = 0.9
+    reference_foot_position_reward_coef: float = 1.25
     sensor_gait_height_target: float = 0.845
     sensor_gait_height_sigma: float = 0.07
     sensor_upright_sigma: float = 0.12
@@ -373,6 +377,8 @@ class LytRobotEnvCfg:
     body_mass_scale_max: float = 1.15
     tendon_length_scale_min: float = 0.95
     tendon_length_scale_max: float = 1.05
+    actuator_strength_scale_min: float = 1.0
+    actuator_strength_scale_max: float = 1.0
     ground_friction_min: float = 0.55
     ground_friction_max: float = 1.40
     gravity_min: float = 9.75
@@ -565,6 +571,8 @@ class LytRobotAmpEnv:
             else float("inf")
         )
         self.rng = np.random.default_rng(cfg.seed)
+        self.base_actuator_gainprm = np.asarray(self.model.actuator_gainprm).copy()
+        self.base_actuator_biasprm = np.asarray(self.model.actuator_biasprm).copy()
         self.base_body_mass = np.asarray(self.model.body_mass, dtype=np.float32).copy()
         self.base_body_inertia = np.asarray(self.model.body_inertia, dtype=np.float32).copy()
         self.base_geom_friction = np.asarray(self.model.geom_friction, dtype=np.float32).copy()
@@ -945,6 +953,7 @@ class LytRobotAmpEnv:
         self.env_tendon_length_scale = np.ones((self.num_envs, self.position_action_dim), dtype=np.float32)
         self.env_body_mass_scale = np.ones((self.num_envs, self.model.nbody), dtype=np.float32)
         self.env_payload_mass = np.zeros(self.num_envs, dtype=np.float32)
+        self.env_actuator_strength = np.ones((self.num_envs, self.model.nu), dtype=np.float32)
         self.env_ground_friction = np.full(self.num_envs, float(self.base_geom_friction[self.floor_geom_id, 0]) if hasattr(self, "floor_geom_id") else 1.0, dtype=np.float32)
         self.env_gravity = np.full(self.num_envs, abs(float(self.base_gravity[2])), dtype=np.float32)
         self.push_force = np.zeros((self.num_envs, 6), dtype=np.float32)
@@ -988,6 +997,9 @@ class LytRobotAmpEnv:
         tendon_low, tendon_high = scaled_randomization_range(
             1.0, self.cfg.tendon_length_scale_min, self.cfg.tendon_length_scale_max, scale
         )
+        strength_low, strength_high = scaled_randomization_range(
+            1.0, self.cfg.actuator_strength_scale_min, self.cfg.actuator_strength_scale_max, scale)
+        self.env_actuator_strength[ids] = self._uniform(strength_low, strength_high, (len(ids), self.model.nu))
         nominal_friction = float(self.base_geom_friction[self.floor_geom_id, 0])
         friction_low, friction_high = scaled_randomization_range(
             nominal_friction, self.cfg.ground_friction_min, self.cfg.ground_friction_max, scale
@@ -1040,6 +1052,9 @@ class LytRobotAmpEnv:
     def _apply_model_randomization(self, env_id: int) -> None:
         if not self.domain_randomization:
             return
+        strength = self.env_actuator_strength[env_id, :, None]
+        self.model.actuator_gainprm[:] = self.base_actuator_gainprm * strength
+        self.model.actuator_biasprm[:] = self.base_actuator_biasprm * strength
         body_mass = self.base_body_mass * self.env_body_mass_scale[env_id]
         if self.pelvis_body_id >= 0:
             body_mass[self.pelvis_body_id] += self.env_payload_mass[env_id]
@@ -2234,16 +2249,16 @@ class LytRobotAmpEnv:
 
         reward = (
             0.05
-            + 1.40 * pose_track
-            + 0.45 * vel_track
+            + self.cfg.reference_joint_position_reward_coef * pose_track
+            + self.cfg.reference_joint_velocity_reward_coef * vel_track
             + 0.75 * height
             + 0.90 * root_orientation
-            + 0.90 * root_vel
+            + self.cfg.reference_root_velocity_reward_coef * root_vel
             + self.cfg.forward_velocity_reward_coef * stable_forward_velocity_track
             + self.cfg.forward_progress_reward_coef * stable_forward_progress
             - self.cfg.forward_velocity_deficit_penalty_coef * forward_velocity_deficit
             - self.cfg.forward_velocity_excess_penalty_coef * forward_velocity_excess
-            + 1.25 * foot_pos_track
+            + self.cfg.reference_foot_position_reward_coef * foot_pos_track
             + self.cfg.side_foot_pos_coef * side_metrics["side_foot_pos"]
             + self.cfg.step_gap_coef * side_metrics["step_gap"]
             + self.cfg.swing_advance_coef * side_metrics["swing_advance"]

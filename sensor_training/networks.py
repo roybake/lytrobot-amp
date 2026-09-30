@@ -210,10 +210,11 @@ class SensorActorCritic(nn.Module):
     def _actor_outputs(
         self,
         hidden_state: torch.Tensor,
+        state_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         actor_features = hidden_state
         if self.actor_use_estimated_state:
-            estimates = self.predict_state(hidden_state)
+            estimates = self.predict_state(hidden_state) if state_predictions is None else state_predictions
             state = [estimates[k].sigmoid() if k == 'foot_contact' else estimates[k]
                      for k in self.state_target_layout]
             actor_features = torch.cat((hidden_state, *state), dim=-1)
@@ -237,8 +238,9 @@ class SensorActorCritic(nn.Module):
     def _distribution_from_hidden(
         self,
         hidden_state: torch.Tensor,
+        state_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[Normal, torch.Tensor, torch.Tensor]:
-        mean, gate_weights, residual = self._actor_outputs(hidden_state)
+        mean, gate_weights, residual = self._actor_outputs(hidden_state, state_predictions)
         std = torch.exp(self._clamped_log_std()).expand_as(mean)
         return Normal(mean, std), gate_weights, residual
 
@@ -379,73 +381,39 @@ class SensorActorCritic(nn.Module):
         value = self.critic(critic_features).squeeze(-1)
         return action, log_prob, value, next_hidden
 
-    def evaluate_sequence(
-        self,
-        obs: torch.Tensor,
-        initial_hidden: torch.Tensor,
-        episode_starts: torch.Tensor,
-        actions: torch.Tensor,
-        privileged_context: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """Evaluate a time-major rollout with truncated BPTT."""
+    def evaluate_sequence_shared(self, obs, initial_hidden, episode_starts, actions,
+                                 privileged_context=None):
+        """One GRU/head pass per tick for PPO, state and action supervision.
 
+        All returned tensors share the same differentiable hidden trajectory.
+        Contact estimates remain logits here; Actor alone applies sigmoid.
+        """
         if obs.ndim != 3:
             raise ValueError(f"Expected time-major observations, got {tuple(obs.shape)}.")
         hidden = initial_hidden
-        log_probs: list[torch.Tensor] = []
-        entropies: list[torch.Tensor] = []
-        values: list[torch.Tensor] = []
-        median_values: list[torch.Tensor] = []
-        gate_weights: list[torch.Tensor] = []
-        residuals: list[torch.Tensor] = []
-        context_predictions: list[torch.Tensor] = []
+        outputs = [[] for _ in range(10)]
         for step in range(obs.shape[0]):
-            (
-                _action,
-                log_prob,
-                entropy,
-                value,
-                median_value,
-                hidden,
-                weights,
-                residual,
-            ) = self.recurrent_action_and_value(
-                obs[step],
-                hidden,
-                episode_starts[step],
-                action=actions[step],
-                privileged_context=(
-                    None
-                    if privileged_context is None
-                    else privileged_context[step]
-                ),
-            )
-            log_probs.append(log_prob)
-            entropies.append(entropy)
-            values.append(value)
-            median_values.append(median_value)
-            gate_weights.append(weights)
-            residuals.append(residual)
-            context_predictions.append(self.predict_context(hidden))
-        return (
-            torch.stack(log_probs),
-            torch.stack(entropies),
-            torch.stack(values),
-            torch.stack(median_values),
-            hidden,
-            torch.stack(gate_weights),
-            torch.stack(residuals),
-            torch.stack(context_predictions),
-        )
+            hidden = self._next_hidden(obs[step], hidden, episode_starts[step])
+            estimates = self.predict_state(hidden)
+            dist, weights, residual = self._distribution_from_hidden(hidden, estimates)
+            critic = self._critic_features(hidden, None if privileged_context is None else privileged_context[step])
+            state = (torch.cat(tuple(estimates.values()), dim=-1) if estimates
+                     else hidden.new_empty((hidden.shape[0], 0)))
+            future = (torch.cat(tuple(head(hidden) for head in self.future_heads), dim=-1)
+                      if self.future_prediction_enabled else hidden.new_empty((hidden.shape[0], 0)))
+            values = (dist.log_prob(actions[step]).sum(-1), dist.entropy().sum(-1),
+                      self.critic(critic).squeeze(-1), self.median_critic(critic).squeeze(-1),
+                      weights, residual, self.predict_context(hidden), dist.mean, state, future)
+            for collection, value in zip(outputs, values):
+                collection.append(value)
+        stacked = tuple(torch.stack(values) for values in outputs)
+        return (*stacked[:4], hidden, *stacked[4:])
+
+    def evaluate_sequence(self, obs, initial_hidden, episode_starts, actions,
+                          privileged_context=None):
+        """Legacy eight-output API; trainer uses the shared eleven-output API."""
+        return self.evaluate_sequence_shared(obs, initial_hidden, episode_starts,
+                                             actions, privileged_context)[:8]
 
     def action_mean_sequence(
         self,
