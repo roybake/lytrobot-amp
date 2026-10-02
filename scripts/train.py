@@ -1802,9 +1802,8 @@ def main() -> None:
                     log_dir / 'model_best.onnx', seconds=args.gait_evaluation_seconds,
                     seeds=args.gait_evaluation_seeds))
                 evaluation_quality_path.write_text(json.dumps(previous_evaluation, indent=2)+'\n')
-            prefix = 'reference_fidelity' if args.gait_fidelity_selection else 'gait'
-            best_checkpoint_quality = (previous_evaluation.get(f'eval/{prefix}_accepted', 0.),
-                                       previous_evaluation.get(f'eval/{prefix}_score', 0.))
+            from sensor_training.gait_evaluation import gait_checkpoint_quality
+            best_checkpoint_quality = gait_checkpoint_quality(previous_evaluation, fidelity=args.gait_fidelity_selection)
     try:
         for iteration in range(start_iteration, args.max_iterations):
             current_course_random_start_prob = (
@@ -2038,8 +2037,8 @@ def main() -> None:
                         saved_onnx, seconds=args.gait_evaluation_seconds,
                         seeds=args.gait_evaluation_seeds,
                         trace_path=log_dir / 'gait_evaluation_latest.csv')
-                    prefix = 'reference_fidelity' if args.gait_fidelity_selection else 'gait'
-                    checkpoint_quality = (evaluation[f'eval/{prefix}_accepted'], evaluation[f'eval/{prefix}_score'])
+                    from sensor_training.gait_evaluation import gait_checkpoint_quality
+                    checkpoint_quality = gait_checkpoint_quality(evaluation, fidelity=args.gait_fidelity_selection)
                     evaluation_record = dict(evaluation, iteration=iteration, checkpoint=str(saved_pt))
                     with (log_dir / 'gait_evaluations.jsonl').open('a') as evaluation_file:
                         evaluation_file.write(json.dumps(evaluation_record)+'\n')
@@ -2077,7 +2076,7 @@ def main() -> None:
                         f"iter={iteration:05d} "
                         f"{'gait_accepted' if args.evaluate_gait else 'route_success' if stair_route else 'imitation_reward' if args.deepmimic_ppo else 'rollout_success'}="
                         f"{checkpoint_quality[0]:.3f} "
-                        f"{'gait_score' if args.evaluate_gait else 'evaluated_progress' if fixed_route_evaluation else 'imitation_reward' if stair_route else 'episode_length'}={checkpoint_quality[1]:.3f} "
+                        f"{'reference_fidelity_score' if args.evaluate_gait and args.gait_fidelity_selection else 'gait_score' if args.evaluate_gait else 'evaluated_progress' if fixed_route_evaluation else 'imitation_reward' if stair_route else 'episode_length'}={checkpoint_quality[-1]:.3f} "
                         f"knee_flexion_track={knee_flexion_track:.3f} "
                         f"saved {best_path}",
                         iteration=iteration,

@@ -5,6 +5,7 @@
 使用已有全部7组 IMU 和14条肌腱编码器，不增加硬件。默认入口是
 `train_final_sensor_gait.py`：高质量 privileged Teacher → Sensor Student Stage1
 → 零 Teacher takeover 验收 → Student Stage2 渐进 DR → ONNX。
+Teacher默认复用基础 `scripts/train_stage1.py` 的1024环境配方，不叠加Student奖励/优化参数。
 
 ```bash
 # 先训练/验收 Teacher，再训练 Student Stage1

@@ -186,7 +186,22 @@ def reference_fidelity_metrics(metrics):
     ratios = [metrics.get(key, float('inf'))/maximum for key, maximum in FIDELITY_LIMITS.items()]
     score = float(np.exp(-np.mean(np.square(ratios)))) if np.isfinite(ratios).all() else 0.
     return {'eval/reference_fidelity_accepted': float(accepted),
-            'eval/reference_fidelity_score': score * metrics.get('eval/episode_completion', 0.)}
+            'eval/reference_fidelity_score': score}
+
+
+def gait_checkpoint_quality(metrics, *, fidelity=False):
+    """Keep failed but improving models distinguishable without accepting them.
+
+    Full acceptance wins, then continuous survival and duration, then tracking.
+    A short clean standing prefix cannot outrank a longer walking trajectory.
+    """
+    if not fidelity:
+        return (float(metrics.get('eval/gait_accepted', 0.)),
+                float(metrics.get('eval/gait_score', 0.)))
+    return (float(metrics.get('eval/reference_fidelity_accepted', 0.)),
+            float(metrics.get('eval/gait_survived', 0.)),
+            float(metrics.get('eval/gait_duration_s', 0.)),
+            float(metrics.get('eval/reference_fidelity_score', 0.)))
 
 
 def reference_quality_metrics(rows, dt, fell, completed):

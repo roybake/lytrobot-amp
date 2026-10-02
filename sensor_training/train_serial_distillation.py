@@ -53,7 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--final-sensor-gait', action='store_true', help='Recommended GRU256/45D measured-sensor gait pipeline.')
     parser.add_argument('--phase', choices=('all', 'stage1', 'stage2'), default='all',
                         help='Final workflow stage; stage2 requires a completed Student Stage1 checkpoint.')
-    parser.add_argument("--num-envs", type=int, default=4096)
+    parser.add_argument("--num-envs", type=int, default=None,
+                        help="Teacher worlds: 1024 for the final baseline recipe; 4096 for legacy mode.")
     parser.add_argument(
         "--student-num-envs",
         type=int,
@@ -99,6 +100,8 @@ def parse_args() -> argparse.Namespace:
     if args.final_sensor_gait:
         from sensor_training.final_profile import apply_final_profile
         apply_final_profile(args)
+    elif args.num_envs is None:
+        args.num_envs = 4096
     return args
 
 
@@ -120,6 +123,17 @@ def _handoff_checkpoint(directory: Path) -> Path:
 
     best = directory / "model_best.pt"
     return best if best.is_file() else directory / "model_final.pt"
+
+
+def select_teacher_handoff(directory: Path):
+    """Re-evaluate best/final so legacy stale-best artifacts cannot win blindly."""
+    from sensor_training.gait_evaluation import evaluate_gait_suite, gait_checkpoint_quality
+    candidates = [directory/name for name in ('model_best.pt', 'model_final.pt')
+                  if (directory/name).is_file() and (directory/name).with_suffix('.onnx').is_file()]
+    if not candidates:
+        raise FileNotFoundError(f'No exported Teacher checkpoint in {directory}.')
+    results = [(path, evaluate_gait_suite(path, seconds=30.)) for path in candidates]
+    return max(results, key=lambda item: gait_checkpoint_quality(item[1], fidelity=True))
 
 
 def _load_manifest(path: Path, *, run_name: str, phases: dict[str, Path], args: argparse.Namespace) -> dict[str, Any]:
@@ -252,13 +266,19 @@ def _phase_command(
 
     if name == "teacher_stage1":
         script = REPO_ROOT / "scripts" / "train_stage1.py"
-        command = [sys.executable, str(script)] + _common_train_args(
-            args, paths[name], getattr(args, 'teacher_stage1_iterations', None) or args.stage1_iterations
-        )
+        iterations = getattr(args, 'teacher_stage1_iterations', None) or args.stage1_iterations
         if final:
-            from sensor_training.final_profile import final_training_flags
-            command.extend(final_training_flags(iterations=getattr(args, 'teacher_stage1_iterations', None) or args.stage1_iterations))
+            # Reproduce the user's successful basic Stage1 command. Only
+            # logging and evaluation are added; no training recipe overrides.
+            from sensor_training.final_profile import final_teacher_evaluation_flags
+            command = [sys.executable, str(script), '--device', args.device,
+                       '--sim-backend', args.sim_backend, '--num-envs', str(args.num_envs),
+                       '--max-iterations', str(iterations), '--log-dir', str(paths[name]),
+                       '--wandb-log-interval', str(getattr(args, 'wandb_log_interval', 10)),
+                       '--no-wandb' if args.no_wandb else '--wandb']
+            command.extend(final_teacher_evaluation_flags())
         else:
+            command = [sys.executable, str(script)] + _common_train_args(args, paths[name], iterations)
             command.append('--stop-on-gait-acceptance')
         if resume_checkpoint is not None:
             command.extend(("--resume-checkpoint", str(resume_checkpoint)))
@@ -349,13 +369,19 @@ def run_final_pipeline(args):
     manifest['enabled_phases'] = phases
 
     def check_teacher():
+        nonlocal teacher
+        selected_quality = None
+        if teacher.parent.resolve() == paths['teacher_stage1'].resolve():
+            teacher, selected_quality = select_teacher_handoff(paths['teacher_stage1'])
+            args.teacher_stage1_checkpoint = teacher
         payload = torch.load(teacher, map_location='cpu', weights_only=False)
         if payload.get('sensor_policy_architecture'):
             raise ValueError('Teacher must be a privileged full-state policy.')
         cfg = payload['env_config']
         if Path(cfg['motion_file']).resolve() != REFERENCE.resolve() or cfg['decimation'] != 2 or cfg['reference_ctrl_blend'] != 1.:
             raise ValueError('Teacher reference, 100 Hz control and tendon feedforward must match the final recipe.')
-        quality = evaluate_gait_suite(teacher, seconds=30.)
+        quality = selected_quality if selected_quality is not None else evaluate_gait_suite(teacher, seconds=30.)
+        manifest['teacher_checkpoint'] = str(teacher)
         manifest['teacher_quality'] = quality
         _write_manifest(manifest_path, manifest)
         failures = gait_quality_failures(quality)

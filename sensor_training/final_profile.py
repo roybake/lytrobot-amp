@@ -38,6 +38,11 @@ FINAL_SENSOR_OPTIONS = {
 
 
 def apply_final_profile(args):
+    if args.num_envs is None:
+        args.num_envs = 1024
+    if args.student_num_envs is None:
+        # Student rollout capacity is independent of the basic Teacher batch.
+        args.student_num_envs = 1024
     for key, value in FINAL_SENSOR_OPTIONS.items():
         setattr(args, key, value)
     args.student_root_imu_only = False
@@ -47,6 +52,13 @@ def apply_final_profile(args):
         args.student_num_steps = 96
     if args.student_num_steps not in (96, 128):
         raise ValueError('Final sensor gait uses BPTT 96 (default) or 128.')
+
+
+def final_teacher_evaluation_flags():
+    """Evaluation does not alter the basic scripts/train_stage1.py recipe."""
+    return ['--evaluate-gait', '--gait-fidelity-selection',
+            '--gait-evaluation-seconds', '30', '--gait-evaluation-seeds', '42', '123', '2026',
+            '--no-stop-on-gait-acceptance']
 
 
 def final_training_flags(*, student=False, robust=False, iterations=30000):

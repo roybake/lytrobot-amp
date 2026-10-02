@@ -12,7 +12,8 @@ Privileged Teacher Stage1
 ```
 
 不要求 A–G 实验。`train_ablation.py` 仅作为历史工具保留，不是推荐入口。
-默认完整流程自动训练 Teacher；也可以提供一个通过严格验收的现有 Teacher。
+默认完整流程使用基础 `scripts/train_stage1.py` 配方训练 Teacher，默认1024个环境；
+也可以提供一个通过严格验收的现有 Teacher。
 不会把“短时间不倒”当成人体轨迹复现已经完成。
 
 ## 硬件与固定部署结构
@@ -126,9 +127,10 @@ Teacher 动作 remapping、startup ramp 和 episode takeover 机制保留。最�
 0.8→0；Stage2 lambda_action 从 2→0.5，takeover 从 0.2→0。正常预算下 takeover
 分别在前 4000 / 2000 轮降到零。缩短预算时也会缩短 schedule；质量门槛保持不变。
 
-AMP 保留为 style prior，最终配方 coefficient=0.3、task_reward_lerp=0.9；主要
-监督仍是 Teacher action、逐相位 reference reward 和 state labels。最终参考奖励的
-q/qdot/root velocity/foot coefficients 为4.0/1.5/1.5/2.5（兼容入口旧默认不变）。原本的 AMP
+Student 的 AMP 保留为 style prior，coefficient=0.3、task_reward_lerp=0.9；主要
+监督仍是 Teacher action、逐相位 reference reward 和 state labels。Student 的参考奖励
+q/qdot/root velocity/foot coefficients 为4.0/1.5/1.5/2.5。Teacher完整沿用基础Stage1：
+AMP=1.2、task_reward_lerp=0.5，参考奖励为1.4/0.45/0.9/1.25；不加Student训练配方。原本的 AMP
 discriminator 不变。Future prediction 默认关闭，代码保留但不进入最终配置。
 
 每个 minibatch 的 `evaluate_sequence_shared` **只执行一次 GRU trajectory**，并
@@ -163,7 +165,9 @@ pelvis/root 姿态相对参考的 quaternion angle。
 | torso orientation RMSE | 0.15 rad |
 
 还必须通过原有连续不倒、速度和 knee ROM/lock 检查。最终配方的最佳 Teacher
-按 `reference_fidelity_accepted/score` 排序，Student handoff 使用 **model_final.pt**，
+按“完整验收、持续存活、最短行走时长、跟踪分数”的顺序排序。未通过验收的
+模型仍有可比较的跟踪分数，不会把全部失败模型压成0并永久保留最早快照。
+Teacher交接时再次比较best/final；Student handoff 使用 **model_final.pt**，
 防止使用 takeover 尚未归零的早期 best checkpoint。最终配方不在首次过短 gait gate
 后停训。未通过 gate 的 Teacher 会阻止 Student 开始，错误信息明确指向 Teacher。
 
@@ -310,3 +314,25 @@ Teacher takeover=0、action remapping、拒绝旧架构、reference RMSE与Teach
 
 该 smoke 模型仅用于实现验证，不是训练完成的策略；未进行新的30000轮正式训练，
 也未进行 Orin 上的时延或实机控制测试。
+
+
+## 2026-10-02 教师配方纠正
+
+`09-30-17:33:59` 的30k轮教师没有通过质量门槛，Student没有开始。它使用过加大
+reference奖励/降低AMP/固定较小学习率的修改配方；这不是基础Stage1默认配方，
+训练结果没有支持这些修改。新流程复用用户提供的成功训练命令：
+
+```bash
+uv run python scripts/train_stage1.py --device cuda --sim-backend warp \
+  --num-envs 1024 --max-iterations 30000
+```
+
+只额外增加日志位置和30秒验收，不改变奖励、优化器、reset、episode或control默认。
+Student仍使用1024个环境和96步GRU rollout，独立于Teacher的batch设置。
+
+修复了best选择错误：此前所有未完成回合的fidelity score乘以0，使第500轮1.61秒
+的模型一直被称为best，甚至优先于最终24.81秒的模型。新排序不会把起步前缀的低
+RMSE当成长时间步态成功；不放宽验收门槛，不删除或覆盖旧运行的模型。
+
+新增回归测试逐项比较基础命令与最终Teacher入口解析后的全部训练参数，仅允许
+日志/评估字段不同；另验证失败模型排序与历史stale-best交接。
