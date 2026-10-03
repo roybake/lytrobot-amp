@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REFERENCE = ROOT/'robot/reference_data/walk1_omniretarget.npz'
+REFERENCE = ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'
 
 FINAL_SENSOR_OPTIONS = {
     'include_tendon_velocity': True,
@@ -134,7 +134,7 @@ def final_checkpoint_errors(checkpoint, *, require_no_takeover=True):
         if env.get(key, False if isinstance(value, bool) else None) != value:
             errors.append(f'env {key} must be {value}')
     if Path(env.get('motion_file', '')).resolve() != REFERENCE.resolve():
-        errors.append('checkpoint reference must be walk1_omniretarget.npz')
+        errors.append('checkpoint reference must be walk1_mjcf_repaired.npz')
     if require_no_takeover and checkpoint.get('distillation', {}).get('teacher_behavior_probability', 1.) != 0.:
         errors.append('Teacher takeover has not reached zero')
     return errors

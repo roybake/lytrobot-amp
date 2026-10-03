@@ -104,6 +104,10 @@ def exact_train_args() -> list[str]:
     """Return the fixed contract for stairs.npz + stairs.xml."""
 
     return [
+        # IMPORTANT: sensor_training/experiment_options.py now uses allow_abbrev=False
+        # to prevent --no-amp being matched as a prefix of --no-amp-startup-gate
+        "--deepmimic-reward",
+        "--no-amp",
         "--model-xml", str(EXACT_STAIR_MODEL),
         "--motion-files", str(EXACT_STAIR_REFERENCE),
         "--motion-names", "stairs",
@@ -120,9 +124,9 @@ def exact_train_args() -> list[str]:
         "--deepmimic-track-root-xy",
         "--deepmimic-root-xy-penalty", "0.0",
         "--deepmimic-route-tracking",
-        "--deepmimic-route-xy-sigma", "0.35",
-        "--deepmimic-route-velocity-sigma", "0.25",
-        "--deepmimic-route-max-xy-error", "0.60",
+        "--deepmimic-route-xy-sigma", "0.80",
+        "--deepmimic-route-velocity-sigma", "1.20",
+        "--deepmimic-route-max-xy-error", "1.50",
         "--no-trajectory-feedback",
         "--no-sensor-gait-command",
         # The phase scalar is part of the original DeepMimic policy state.  It
@@ -189,7 +193,7 @@ def build_train_args(
         if any(arg == option or arg.startswith(option + "=") for arg in user_args):
             raise SystemExit(f"纯传感器 DeepMimic 楼梯入口不接受 {option} 覆盖。")
     args += [
-        "--deepmimic-reward", "--no-amp", "--task-reward-lerp", "1.0",
+        "--task-reward-lerp", "1.0",
         # Match the demonstrated root velocity throughout the clip.
         "--lcp-weight", "0.0", "--deepmimic-ppo", "--stage", "stage1",
         "--max-iterations", str(STAIR_MAX_ITERATIONS),

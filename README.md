@@ -2,6 +2,8 @@
 
 所有命令在仓库根目录执行。将 `<run>` 替换为实际运行目录，`<threshold>` 替换为选定的蒸馏验收阈值。
 
+平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf_repaired.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含 45 帧，采样频率 40 Hz，周期为 1.125 秒；默认目标速度为 `0.87 m/s`。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
+
 ## 推荐：最终纯传感器人体步态
 
 实机现有7组IMU和14条肌腱编码器；Teacher → Student Stage1 → Student Stage2 DR → ONNX。
@@ -30,7 +32,7 @@ uv run python scripts/train_stage1.py \
 # 测试
 cd /home/yeah/code/lytrobot-amp
 uv run python scripts/play.py \
-  --checkpoint "logs/stage1/<run>/model_final.onnx" \
+  --checkpoint "logs/stage1/10-02-20:39:54/model_1500.onnx" \
   --device cuda --viewer --steps 0 --seed 42
 ```
 
@@ -271,7 +273,7 @@ uv run python sensor_training/train_stairs_deepmimic.py \
 # 测试
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
-  --checkpoint "logs/stairs/<run>/model_best.onnx" --viewer --steps 0
+  --checkpoint "logs/stairs/09-30-10:47:29/model_final.onnx" --viewer --steps 0
 ```
 
 ## 蹲起传感器策略 Stage1

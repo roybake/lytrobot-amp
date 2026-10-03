@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GAIT_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+DEFAULT_GAIT_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
 
 
 def _has_arg(name: str) -> bool:
@@ -27,9 +27,7 @@ if __name__ == "__main__":
     if not _has_arg("--sim-backend"):
         sys.argv.extend(["--sim-backend", "warp"])
 
-    # Train the privileged gait teacher against the closed OmniRetarget cycle.
-    # The legacy walk1_mjcf archive has static MTP joints and admits a locked-
-    # knee gait, so it must not be used as a natural-walking teacher.
+    # Train the privileged gait teacher against the shared walking reference.
     stage1_defaults = {
         "--num-envs": "4096",
         "--task-reward-mode": "stage1_reference",

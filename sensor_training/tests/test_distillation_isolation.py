@@ -29,7 +29,7 @@ class _DummyDistillationEnv(_DummySensorEnv):
             reference_ctrl_blend=0.0,
             action_residual_scale=0.5,
             distal_action_scale=1.0,
-            motion_file="walk1_omniretarget.npz",
+            motion_file="walk1_mjcf_repaired.npz",
         )
         self._labeler = None
         self._labels: list[torch.Tensor] = []
@@ -83,7 +83,7 @@ def _save_teacher(path: Path) -> None:
                 "distal_action_scale": 1.0,
                 "decimation": 2,
                 "startup_action_ramp_steps": 0,
-                "motion_file": "walk1_omniretarget.npz",
+                "motion_file": "walk1_mjcf_repaired.npz",
             },
         },
         path,

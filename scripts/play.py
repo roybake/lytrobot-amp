@@ -195,7 +195,7 @@ def make_env_cfg(
         if isinstance(checkpoint_env_cfg, dict) else None
     )
     motion_file = args.motion_file or saved_motion_file or str(
-        REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
+        REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
     )
     cfg = LytRobotEnvCfg(
         model_xml=model_xml,
@@ -204,7 +204,7 @@ def make_env_cfg(
         target_velocity=(
             float(args.target_velocity)
             if args.target_velocity is not None
-            else float(checkpoint.get("env_config", {}).get("target_velocity", 1.0))
+            else float(checkpoint.get("env_config", {}).get("target_velocity", 0.87))
         ),
         reset_noise_scale=0.0,
         stand_start_prob=0.0,

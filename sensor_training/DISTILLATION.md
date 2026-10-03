@@ -25,9 +25,8 @@ Teacher 和传感器 Student 必须保持相同的 `--decimation`。新训练默
 `reference_ctrl_blend=1.0`：控制器按同一参考腱长表输出前馈，Actor 学习反馈残差。
 蒸馏器仍会把 Teacher 动作换算成绝对腱长目标，再映射为 Student 动作；相同的控制基准
 可以减少目标动作被裁剪。该参考表由控制器时钟读取，不需要额外硬件传感器。
-所有入口固定使用 `walk1_omniretarget.npz` 和其平均速度 `0.87 m/s`。不要复用由旧
-`walk1_mjcf.npz` 训练的 Teacher；该数据脚趾关节静止且允许完全伸膝，会把直腿踮脚
-步态原样蒸馏给 Student。
+所有行走入口统一使用 `walk1_mjcf_repaired.npz`，目标速度配置保持 `0.87 m/s`。
+Teacher 和 Student 必须使用相同参考数据；使用其他参考训练的 Teacher 需要重新训练。
 
 ## 1. 训练特权 Teacher
 

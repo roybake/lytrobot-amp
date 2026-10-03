@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class MjlabAmpBackendTests(unittest.TestCase):
     def test_matches_direct_warp_and_trains_amp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with np.load(ROOT / "robot/reference_data/walk1_mjcf.npz", allow_pickle=True) as archive:
+            with np.load(ROOT / "robot/reference_data/walk1_mjcf_repaired.npz", allow_pickle=True) as archive:
                 payload = {
                     key: archive[key][:80] if key in ("qpos", "qvel") else archive[key]
                     for key in archive.files

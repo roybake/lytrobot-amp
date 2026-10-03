@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 DISTILLATION_LOG_ROOT = REPO_ROOT / "logs" / "sensor_policy" / "distillation"
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
 )
 
 

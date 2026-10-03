@@ -76,7 +76,7 @@ DISTILLATION_CLI_ENABLED = False
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train LYT biped locomotion with BPO-AMP.")
     parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
-    parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"))
+    parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"))
     parser.add_argument(
         "--motion-files",
         nargs="+",
@@ -290,7 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp-nconmax", type=int, default=32)
     parser.add_argument("--warp-njmax", type=int, default=128)
     parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--target-velocity", type=float, default=1.0)
+    parser.add_argument("--target-velocity", type=float, default=0.87)
     parser.add_argument("--forward-velocity-tracking-sigma", type=float, default=0.25)
     parser.add_argument("--forward-velocity-reward-coef", type=float, default=0.0)
     parser.add_argument("--forward-progress-reward-coef", type=float, default=0.0)

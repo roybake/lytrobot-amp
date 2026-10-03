@@ -37,7 +37,7 @@ def observation_config(**overrides):
 
 def base_config(**overrides):
     values = dict(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
-                  motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+                  motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
                   motion_loop=(True,), num_envs=2, reset_noise_scale=0.,
                   action_noise_std=0., obs_noise_std=0., domain_randomization=False,
                   sensor_root_imu_only=False, episode_steps=12, episode_timeout_jitter_steps=0)
@@ -289,7 +289,7 @@ def test_compiled_shared_chunk_outputs_and_gradients(tmp_path):
 def test_final_pipeline_blocks_bad_teacher_before_student_execution(tmp_path, monkeypatch):
     from sensor_training import train_serial_distillation as serial
     teacher = tmp_path/'teacher.pt'
-    torch.save({'env_config': dict(motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+    torch.save({'env_config': dict(motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
                                   decimation=2, reference_ctrl_blend=1.)}, teacher)
     with mock.patch('sys.argv', ['final', '--final-sensor-gait', '--phase', 'stage1',
                                 '--teacher-stage1-checkpoint', str(teacher), '--no-wandb']):

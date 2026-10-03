@@ -21,7 +21,7 @@ from sensor_training.training_defaults import (
 # checkpoint, so the reference clip, control rate and action interface may not
 # change between the two stages.
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
 )
 
 

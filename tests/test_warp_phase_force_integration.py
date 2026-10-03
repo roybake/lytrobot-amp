@@ -15,7 +15,7 @@ def test_real_cuda_mujoco_warp_contact_force_integration():
         pytest.skip('CUDA is unavailable; GPU Warp integration must not fall back to CPU')
     cfg = LytRobotEnvCfg(
         model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
-        motion_file=str(ROOT/'robot/reference_data/walk1_mjcf.npz'),
+        motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
         num_envs=4,
         seed=123,
         reference_ctrl_blend=0.0,

@@ -46,7 +46,7 @@ class SensorStabilityRewardTests(unittest.TestCase):
             LytRobotEnvCfg(
                 model_xml=str(repo_root / "robot" / "MJCFmodelposition.xml"),
                 motion_file=str(
-                    repo_root / "robot" / "reference_data" / "walk1_mjcf.npz"
+                    repo_root / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),
                 num_envs=1,
                 sensor_stability_reward=True,

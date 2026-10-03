@@ -29,7 +29,7 @@ def test_failed_start_prevents_a_multi_seed_gait_pass():
 
 
 def test_walking_cycle_boundary_does_not_reset_the_robot():
-    cfg = LytRobotEnvCfg(motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+    cfg = LytRobotEnvCfg(motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
                          motion_loop=(True,), num_envs=1, stand_start_prob=0,
                          motion_reset_prob=0, reset_noise_scale=0,
                          action_noise_std=0, domain_randomization=False)
@@ -72,7 +72,7 @@ def test_teacher_rollin_is_supervised_and_excluded_from_policy_likelihood_loss(t
     teacher = ROOT/'logs/teachers/stage1_gait/20260929_sensor_walk_v2/model_best.pt'
     if not teacher.is_file():
         pytest.skip('Local privileged fixture is unavailable')
-    cfg = LytRobotEnvCfg(motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+    cfg = LytRobotEnvCfg(motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
                          motion_loop=(True,), num_envs=4, stand_start_prob=1,
                          reset_noise_scale=0, action_noise_std=0, domain_randomization=False)
     env = SensorDistillationWarpAmpEnv(cfg, device='cuda')

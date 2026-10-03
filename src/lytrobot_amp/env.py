@@ -185,7 +185,7 @@ def sensor_stability_reward_enabled(cfg: "LytRobotEnvCfg") -> bool:
 @dataclass
 class LytRobotEnvCfg:
     model_xml: str = "robot/MJCFmodelposition.xml"
-    motion_file: str = "robot/reference_data/walk1_mjcf.npz"
+    motion_file: str = "robot/reference_data/walk1_mjcf_repaired.npz"
     motion_files: tuple[str, ...] = ()
     motion_names: tuple[str, ...] = ()
     motion_weights: tuple[float, ...] = ()
@@ -279,7 +279,7 @@ class LytRobotEnvCfg:
     warp_cuda_graph: bool = True
     episode_steps: int = 1000
     episode_timeout_jitter_steps: int = 240
-    target_velocity: float = 1.0
+    target_velocity: float = 0.87
     forward_velocity_tracking_sigma: float = 0.25
     forward_velocity_reward_coef: float = 0.0
     forward_progress_reward_coef: float = 0.0

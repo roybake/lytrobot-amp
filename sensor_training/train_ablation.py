@@ -26,7 +26,7 @@ def training_command(experiment, seed, bptt, iterations, teacher=None, device='c
                '--num-envs', str(stage_policy_rollout_envs(bptt, 2)),
                '--decimation', '2', '--max-iterations', str(iterations),
                '--log-dir', str(ROOT/'logs'/'sensor_ablation'/f'{experiment}_s{seed}_bptt{bptt}'),
-               '--motion-file', str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+               '--motion-file', str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
                '--motion-loop', 'true', '--reference-ctrl-blend', '1.0',
                '--action-residual-scale', '.5', '--target-velocity', '.87',
                '--task-reward-mode', 'stage1_reference', '--no-sensor-stability-reward',

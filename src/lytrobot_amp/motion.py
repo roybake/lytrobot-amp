@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -142,6 +143,7 @@ def _repair_loop_root_translation_velocity(
     qpos: np.ndarray,
     qvel: np.ndarray,
     frequency: float,
+    cycle_translation: np.ndarray | None = None,
 ) -> np.ndarray:
     """Repair the horizontal root velocity at a translating loop seam.
 
@@ -162,9 +164,10 @@ def _repair_loop_root_translation_velocity(
     # differentiating fixed positions would erase it.
     if np.max(np.abs(root_steps)) < 1.0e-5:
         return repaired
-    cycle_translation = (
-        positions[-1, :2] - positions[0, :2] + np.median(root_steps, axis=0)
-    )
+    if cycle_translation is None:
+        cycle_translation = (
+            positions[-1, :2] - positions[0, :2] + np.median(root_steps, axis=0)
+        )
     scale = 0.5 * float(frequency)
     repaired[0, :2] = (
         positions[1, :2] - (positions[-1, :2] - cycle_translation)
@@ -200,6 +203,9 @@ class MotionReference:
             raise FileNotFoundError(f"Motion file not found: {self.motion_file}")
 
         archive = np.load(self.motion_file, allow_pickle=True)
+        metadata_value = archive["metadata"].item() if "metadata" in archive.files else None
+        metadata = json.loads(metadata_value) if isinstance(metadata_value, str) else metadata_value or {}
+        self.enforce_passive_joint_constraints = bool(metadata.get("enforce_passive_joint_constraints", False))
         self.source_qpos = np.asarray(archive["qpos"], dtype=np.float32)
         self.source_qvel = np.asarray(archive["qvel"], dtype=np.float32)
         self.frequency = float(np.asarray(archive["frequency"]).item())
@@ -215,6 +221,8 @@ class MotionReference:
                 self.source_qpos,
                 self.source_qvel,
                 self.frequency,
+                np.asarray(archive["cycle_translation"], dtype=np.float64)
+                if "cycle_translation" in archive.files else None,
             )
         self.frame_count = int(self.source_qpos.shape[0])
         self.zero_root_xy = zero_root_xy
@@ -298,6 +306,22 @@ class MotionReference:
         qpos[self.robot_qpos_adrs] = self.source_qpos[index, self.source_qpos_cols]
         qvel[self.robot_qvel_adrs] = self.source_qvel[index, self.source_qvel_cols]
         self._clip_joint_ranges(qpos, qvel)
+        if self.enforce_passive_joint_constraints:
+            # The repaired export includes passive patella joints. Match the
+            # model's polynomial equality in both position and velocity;
+            # otherwise the legacy 14-joint mapping would reset them to qpos0.
+            for eq in range(self.model.neq):
+                if self.model.eq_type[eq] != mujoco.mjtEq.mjEQ_JOINT:
+                    continue
+                first, second = int(self.model.eq_obj1id[eq]), int(self.model.eq_obj2id[eq])
+                if second < 0:
+                    continue
+                a, b = int(self.model.jnt_qposadr[first]), int(self.model.jnt_qposadr[second])
+                va, vb = int(self.model.jnt_dofadr[first]), int(self.model.jnt_dofadr[second])
+                x = float(qpos[b] - self.model.qpos0[b])
+                polynomial = self.model.eq_data[eq, :5]
+                qpos[a] = self.model.qpos0[a] + sum(polynomial[k] * x**k for k in range(5))
+                qvel[va] = sum(k * polynomial[k] * x**(k-1) for k in range(1, 5)) * qvel[vb]
         return qpos.astype(np.float32), qvel.astype(np.float32)
 
     def _clip_joint_ranges(self, qpos: np.ndarray, qvel: np.ndarray | None = None) -> None:
@@ -339,6 +363,8 @@ class MotionReference:
 
         dt = 1.0 / max(self.frequency, 1.0e-6)
         foot_vel = np.gradient(foot_pos, dt, axis=0, edge_order=1).astype(np.float32)
+        if self.source_loop and self.enforce_passive_joint_constraints:
+            foot_vel = ((np.roll(foot_pos, -1, axis=0) - np.roll(foot_pos, 1, axis=0)) / (2*dt)).astype(np.float32)
         right_side_z = np.min(foot_world_z[:, 0:2], axis=1)
         left_side_z = np.min(foot_world_z[:, 2:4], axis=1)
         right_threshold = np.percentile(right_side_z, CONTACT_REFERENCE_PERCENTILE)

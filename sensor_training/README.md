@@ -55,7 +55,7 @@ uv run python scripts/prepare_stair_support.py
 
 楼梯专项复用仿真动力学，使用 DeepMimic 奖励和 recurrent PPO，关闭 AMP；下面的普通行走训练仍可使用 AMP 或教师蒸馏。所有训练统一使用纯位置控制。
 
-sensor stage1 默认使用独立 PPO+BPO+AMP 训练，不启用教师蒸馏。参考动作使用含完整脚跟—脚掌—脚趾滚动的 `walk1_omniretarget.npz`，目标速度为 `0.87 m/s`。Actor 获得可在实机控制器生成的 gait command，执行器同时使用该参考表作为板载前馈肌腱目标；Actor 只学习 IMU/肌腱反馈残差。任务奖励同时跟踪参考动作、前向速度和实测步态质量，AMP 作为辅助风格先验。训练回合中70%从站立开始，固定选择参考动作第15帧的双支撑相位：先站立0.2秒，再用0.8～1.0秒 smoothstep 渐入步态。其余30%从随机参考相位及其对应物理状态开始，只用于覆盖完整步态周期。Stage2 保留同一起步分布并加入领域随机化；实机和默认播放始终100%从站立开始。
+sensor stage1 默认使用独立 PPO+BPO+AMP 训练，不启用教师蒸馏。参考动作统一使用 `walk1_mjcf_repaired.npz`，目标速度为 `0.87 m/s`。Actor 获得可在实机控制器生成的 gait command，执行器同时使用该参考表作为板载前馈肌腱目标；Actor 只学习 IMU/肌腱反馈残差。任务奖励同时跟踪参考动作、前向速度和实测步态质量，AMP 作为辅助风格先验。训练回合中70%从站立开始，固定选择参考动作第15帧的双支撑相位：先站立0.2秒，再用0.8～1.0秒 smoothstep 渐入步态。其余30%从随机参考相位及其对应物理状态开始，只用于覆盖完整步态周期。Stage2 保留同一起步分布并加入领域随机化；实机和默认播放始终100%从站立开始。
 
 Stage1/Stage2 的接触奖励直接读取地面接触点，记录每只脚的脚跟→脚掌→脚趾状态、左右触地顺序、步幅和支撑时间。先碰脚趾、长期仅脚趾支撑、双脚同时腾空或同时向前蹦都受到惩罚；左右步幅、接触占比、足部横向位置和前后摆动则用于镜像对称评分。Warp 接触缓冲只读取当步 `nacon` 个活跃接触，避免把旧接触当成着地；脚跟和脚趾同时受地面支撑时，将中间脚掌视为已加载，以补偿 Warp 对网格中央接触点的漏检。单动作 Stage1/Stage2 显式循环播放闭合行走参考，避免训练回合在加速结束前就被截断。上述奖励没有把参考相位或教师动作送进 Actor。
 
@@ -103,7 +103,9 @@ soft MoE 根据本体反馈产生；动作 rate 和 gate 变化正则负责抑�
 上下文字段、限制和验证方法见
 [`docs/proprioceptive_terrain_transition.md`](../docs/proprioceptive_terrain_transition.md)。
 
-传感器 stage1 默认使用100 Hz（`decimation=2`）、64步 BPTT、3072个环境，关闭 domain randomization 并开启 wandb。PPO 预算与已验收的特权 Stage1 步态保持一致：自适应学习率 `3e-4`（下限 `1e-5`）、`clip_coef=0.2`、`target_kl=0.025`（`target_kl_stop_multiplier=2.0`）、`entropy_coef=0.002`、`min/max_action_std=0.05/0.6`、`task_reward_lerp=0.5`、`amp_reward_coef=1.2`、`fall_penalty=2.0`。参考动作使用 `walk1_mjcf.npz`（产生已验收步态视频的同一个 clip），目标速度 `1.0 m/s`。执行器基准是与 gait command 同源的板载参考肌腱长度（`--reference-ctrl-blend 1.0`），Actor 输出叠加其上的反馈残差（`--action-residual-scale 0.5`）；参考表来自板载查表，因此该控制语义可以直接部署。回合长 1200 步（12 秒），其中 50% 从站立平滑渐入步态、50% 从随机参考相位开始；速度不足终止检查在启动 4 秒后开始。
+传感器 stage1 默认使用100 Hz（`decimation=2`）、64步 BPTT、3072个环境，关闭 domain randomization 并开启 wandb。PPO 预算与已验收的特权 Stage1 步态保持一致：自适应学习率 `3e-4`（下限 `1e-5`）、`clip_coef=0.2`、`target_kl=0.025`（`target_kl_stop_multiplier=2.0`）、`entropy_coef=0.002`、`min/max_action_std=0.05/0.6`、`task_reward_lerp=0.5`、`amp_reward_coef=1.2`、`fall_penalty=2.0`。参考动作使用 `walk1_mjcf_repaired.npz`（45 帧、40 Hz、周期 1.125 秒），目标速度 `0.87 m/s`。执行器基准是与 gait command 同源的板载参考肌腱长度（`--reference-ctrl-blend 1.0`），Actor 输出叠加其上的反馈残差（`--action-residual-scale 0.5`）；参考表来自板载查表，因此该控制语义可以直接部署。回合长 1200 步（12 秒），其中 50% 从站立平滑渐入步态、50% 从随机参考相位开始；速度不足终止检查在启动 4 秒后开始。
+
+下列收敛曲线和耗时来自原版参考动作的历史训练记录；修复版参考动作的训练效果需重新验证。
 
 该配方与特权 Stage1 每次 PPO 更新模拟相同的物理步数（`3072 × 64 × decimation 2 = 4096 × 24 × decimation 4 = 393,216`），也就是每轮梯度更新对应的数据量与已验证曲线一致，收敛节奏可以直接对照：`task_forward_velocity` 约 1200 轮达到 `0.3 m/s`、约 4700 轮达到 `0.5 m/s`、约 20000 轮达到 `0.8 m/s`，回合长度同期从约 120 步升到 800 步以上。RTX 3060 上单轮约 6 秒，因此 1200 轮约 2 小时、30000 轮约 50 小时，`--save-interval 500` 便于中途取 checkpoint 做回放评测。前 400 轮只需确认回合长度、跌倒率与参考跟踪是否单调改善；用几百轮的外观判断步态质量会得出错误结论。训练日志重点查看 `task_forward_velocity`、`task_pose_track`、`task_foot_pos`、`task_termination` 和回合长度；仅回合长度上升而速度不升不能视为成功。
 

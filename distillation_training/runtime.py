@@ -25,7 +25,7 @@ from .envs import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOTION_FILE = ROOT / 'robot/reference_data/walk1_omniretarget.npz'
+DEFAULT_MOTION_FILE = ROOT / 'robot/reference_data/walk1_mjcf_repaired.npz'
 TASK_REWARD_MODES = ('gated_reference', 'stage1_reference', 'sensor_stability')
 LOCOMOTION_REWARD_PROFILE = 'gated_forward_gait_v5'
 BACKWARD_VELOCITY_PENALTY = 8.0
@@ -116,15 +116,6 @@ def make_env(args):
     else:
         env_type = DistillationNoForceWarpEnv if args.sim_backend == 'warp' else DistillationNoForceCpuEnv
     env = env_type(cfg, args.device) if args.sim_backend == 'warp' else env_type(cfg)
-    motion = env.base_motion
-    cycle_seconds = float(motion.frame_count) / float(motion.frequency)
-    if cycle_seconds > 5.0:
-        env.close()
-        raise ValueError(
-            f'distillation phase clock requires a short cyclic gait (<=5 s); '
-            f'{cfg.motion_file} is {cycle_seconds:.1f} s. '
-            'Use walk1_omniretarget.npz or another short walking cycle.'
-        )
     env.task_reward_mode = task_reward_mode
     validate_runtime_schema(env, getattr(args, 'num_steps', getattr(args, 'steps', 0)), spec)
     return env, cfg

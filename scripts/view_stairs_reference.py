@@ -400,6 +400,7 @@ def run_playback(
                     args.contact_points
                 )
                 place_camera(viewer.cam, model, data, args, bounds, aspect)
+            loop_offset = np.zeros(2, dtype=np.float64)
             while True:
                 wall_start = time.perf_counter()
                 for index in range(frames):
@@ -408,6 +409,8 @@ def run_playback(
                         + index / args.fps * playback.frequency * args.speed
                     )
                     pose, velocity = sample_state(playback, source)
+                    pose = pose.copy()
+                    pose[:2] += loop_offset
                     data.qpos[:] = pose
                     data.qvel[:] = velocity
                     mujoco.mj_forward(model, data)
@@ -427,6 +430,7 @@ def run_playback(
                         return
                 if viewer is None or not args.loop:
                     break
+                loop_offset += getattr(args, 'loop_translation', np.zeros(2))
             if viewer is not None:
                 print("播放结束，窗口停在最后一帧，关闭窗口即退出。")
                 while viewer.is_running():

@@ -1,6 +1,6 @@
 # 足力 / 内部 phase 消融实验
 
-四个入口共享 reward、reset、动作语义、AMP/PPO、seed、`walk1_mjcf.npz` 与 100 Hz 控制；Actor 不接收 reference tendon 或 simulator truth：
+四个入口共享 reward、reset、动作语义、AMP/PPO、seed、`walk1_mjcf_repaired.npz` 与 100 Hz 控制；Actor 不接收 reference tendon 或 simulator truth：
 
 | 实验 | 入口 | 固定 observation 顺序 |
 |---|---|---|

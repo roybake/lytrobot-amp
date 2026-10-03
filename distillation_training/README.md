@@ -13,9 +13,9 @@ Teacher 的 training-only privileged vector 对两条路线完全相同：body-f
 
 Teacher 和 Student RL 共用 `AMPTrainingModule`、expert motion、AMP reward、discriminator、gradient penalty 和 optimizer。AMP feature 只用于 discriminator/reward，不进入 actor observation 或 ONNX。Student RL 优先恢复 Student checkpoint 中的 discriminator，否则使用 Teacher checkpoint；默认继续训练，`--freeze-amp-discriminator` 仅供诊断。
 
-正式任务默认使用 `--task-reward-mode gated_reference`、`walk1_omniretarget.npz` 和 `target_velocity=0.87`。该模式在基础环境 Stage1 参考奖励之上，按躯干直立及高度缩放正向跟踪奖励，并单独惩罚后退；终止时给予固定跌倒代价。`--task-reward-mode stage1_reference` 保留原始参考奖励作对照，`--task-reward-mode sensor_stability` 保留为显式消融。三种模式都保持 `reference_ctrl_blend=0.0`，reference tendon 只能作为 reward target，不能进入 Actor 或控制前馈。
+正式任务默认使用 `--task-reward-mode gated_reference`、`walk1_mjcf_repaired.npz` 和 `target_velocity=0.87`。该模式在基础环境 Stage1 参考奖励之上，按躯干直立及高度缩放正向跟踪奖励，并单独惩罚后退；终止时给予固定跌倒代价。`--task-reward-mode stage1_reference` 保留原始参考奖励作对照，`--task-reward-mode sensor_stability` 保留为显式消融。三种模式都保持 `reference_ctrl_blend=0.0`，reference tendon 只能作为 reward target，不能进入 Actor 或控制前馈。
 
-`gated_forward_gait_v5` 配置额外强调速度跟踪、向前位移和速度不足，后退速度惩罚系数为 8，并设置较高的跌倒/停滞代价；AMP 默认权重为 task 1.0、style 0.2。Teacher 动作探索从标准差 0.35 开始，限制在 0.05–0.60；学习率默认 `1e-4`，用 `target_kl=0.025` 控制 PPO 更新，rollout 默认 96 步。蒸馏 phase 时钟只接受周期不超过 5 秒的参考步态；旧 `walk1_mjcf.npz` 有 35,200 帧、40 Hz，周期约 880 秒，不能作为短周期相位输入。旧 `logs/distillation/teacher_phase_no_force.pt` 是此前 `sensor_stability` + 长参考训练出的权重，修改配置不会修复它，需要重新训练。
+`gated_forward_gait_v5` 配置额外强调速度跟踪、向前位移和速度不足，后退速度惩罚系数为 8，并设置较高的跌倒/停滞代价；AMP 默认权重为 task 1.0、style 0.2。Teacher 动作探索从标准差 0.35 开始，限制在 0.05–0.60；学习率默认 `1e-4`，用 `target_kl=0.025` 控制 PPO 更新，rollout 默认 96 步。行走参考统一使用 `walk1_mjcf_repaired.npz`（45 帧、40 Hz，周期 1.125 秒，每周期前进 0.97875 米）；phase 时钟按该步态周期归一化，速度目标为 0.87 m/s。旧 `logs/distillation/teacher_phase_no_force.pt` 是此前 `sensor_stability` + 长参考训练出的权重，修改配置不会修复它，需要重新训练。
 
 重新训练 58D Teacher：
 

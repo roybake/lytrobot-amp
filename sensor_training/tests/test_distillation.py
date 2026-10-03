@@ -17,7 +17,7 @@ def _teacher_checkpoint(
     path: Path,
     *,
     reference_ctrl_blend: float = 0.0,
-    motion_file: str = "walk1_omniretarget.npz",
+    motion_file: str = "walk1_mjcf_repaired.npz",
 ) -> None:
     policy = ActorCritic(
         obs_dim=6,
@@ -106,7 +106,7 @@ class PrivilegedTeacherTests(unittest.TestCase):
                     "action_residual_scale": 0.5,
                     "distal_action_scale": 1.0,
                     "decimation": 2,
-                    "motion_file": "walk1_omniretarget.npz",
+                    "motion_file": "walk1_mjcf_repaired.npz",
                 },
                 device="cpu",
             )
@@ -130,16 +130,16 @@ class PrivilegedTeacherTests(unittest.TestCase):
                     "action_residual_scale": 0.5,
                     "distal_action_scale": 1.0,
                     "decimation": 2,
-                    "motion_file": "walk1_omniretarget.npz",
+                    "motion_file": "walk1_mjcf_repaired.npz",
                 },
                 device="cpu",
             )
             self.assertEqual(teacher.metadata.reference_ctrl_blend, 1.0)
 
-    def test_legacy_motion_teacher_is_rejected(self) -> None:
+    def test_different_motion_teacher_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "teacher.pt"
-            _teacher_checkpoint(checkpoint, motion_file="walk1_mjcf.npz")
+            _teacher_checkpoint(checkpoint, motion_file="different_walk.npz")
             with self.assertRaisesRegex(ValueError, "motion reference does not match"):
                 PrivilegedTeacher(
                     checkpoint,
@@ -150,7 +150,7 @@ class PrivilegedTeacherTests(unittest.TestCase):
                         "action_residual_scale": 0.5,
                         "distal_action_scale": 1.0,
                         "decimation": 2,
-                        "motion_file": "walk1_omniretarget.npz",
+                        "motion_file": "walk1_mjcf_repaired.npz",
                     },
                     device="cpu",
                 )

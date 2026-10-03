@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def make_env(features=False, **overrides):
     cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
-        motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+        motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
         motion_loop=(True,), num_envs=2, sensor_root_imu_only=True,
         episode_steps=12, episode_timeout_jitter_steps=0, reset_noise_scale=0.,
         domain_randomization=False, **overrides)
@@ -242,7 +242,7 @@ class WarpStateEstimationTests(unittest.TestCase):
         if not teacher.is_file():
             self.skipTest('Local teacher integration fixture unavailable')
         cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
-            motion_file=str(ROOT/'robot/reference_data/walk1_omniretarget.npz'),
+            motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
             motion_loop=(True,), num_envs=4, sensor_root_imu_only=True,
             stand_start_prob=1., motion_reset_prob=0., reset_noise_scale=0.,
             domain_randomization=False, episode_steps=8, episode_timeout_jitter_steps=0)

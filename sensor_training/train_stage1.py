@@ -22,7 +22,7 @@ from sensor_training.training_defaults import (
 # aligned makes comparisons isolate the deployable sensor observation and
 # recurrent policy instead of silently changing the task.
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
 )
 
 

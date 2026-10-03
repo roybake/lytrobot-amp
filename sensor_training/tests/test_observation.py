@@ -128,7 +128,7 @@ class SensorObservationTests(unittest.TestCase):
             LytRobotEnvCfg(
                 model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
                 motion_file=str(
-                    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+                    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),
                 num_envs=1,
                 target_velocity=1.0,
@@ -258,7 +258,7 @@ class SensorObservationTests(unittest.TestCase):
             LytRobotEnvCfg(
                 model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
                 motion_file=str(
-                    REPO_ROOT / "robot" / "reference_data" / "walk1_omniretarget.npz"
+                    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),
                 num_envs=4,
                 stand_start_prob=0.0,

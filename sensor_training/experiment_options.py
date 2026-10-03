@@ -8,9 +8,9 @@ import sys
 from .config import SensorObservationConfig
 from .ppo_config import SensorPPOAMPConfig
 
-OPTIONAL_POLICY_OPTIONS = ('gamma', 'gae_lambda', 'init_std', 'amp_startup_gate')
+OPTIONAL_POLICY_OPTIONS = ('gamma', 'gae_lambda', 'init_std', 'entropy_coef', 'amp_startup_gate')
 
-OBS_OPTIONS = ('include_tendon_velocity', 'include_tendon_tracking_error',
+OBS_OPTIONS = ('history_steps', 'include_tendon_velocity', 'include_tendon_tracking_error',
                'tendon_velocity_scale', 'tendon_velocity_filter_alpha', 'tendon_tracking_error_scale',
                *tuple(field.name for field in fields(SensorObservationConfig)
                       if field.name.startswith(('tendon_measurement_', 'imu_measurement_'))))
@@ -22,8 +22,15 @@ POLICY_OPTIONS = ('recurrent_hidden_dim', 'state_estimator_enabled',
                   'future_prediction_steps', 'future_prediction_coef', 'privileged_context_loss_coef')
 
 
+def _history_steps_from_frame_count(value: str) -> int:
+    frame_count = int(value)
+    if frame_count < 1:
+        raise argparse.ArgumentTypeError('frame-count must be at least one')
+    return frame_count - 1
+
+
 def option_parser():
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     defaults = {**asdict(SensorObservationConfig()), **asdict(SensorPPOAMPConfig())}
     for name in OBS_OPTIONS + POLICY_OPTIONS:
         value = defaults[name]
@@ -34,7 +41,15 @@ def option_parser():
             kwargs.update(type=int, nargs='+')
         else:
             kwargs['type'] = type(value)
-        parser.add_argument('--' + name.replace('_', '-'), **kwargs)
+        if name == 'history_steps':
+            history = parser.add_mutually_exclusive_group()
+            history.add_argument('--history-steps', **{**kwargs, 'default': None})
+            history.add_argument('--frame-count', dest='history_steps',
+                                 type=_history_steps_from_frame_count,
+                                 default=None,
+                                 help='Total sensor frames, including the current frame.')
+        else:
+            parser.add_argument('--' + name.replace('_', '-'), **kwargs)
     for name in OPTIONAL_POLICY_OPTIONS:
         parser.add_argument('--'+name.replace('_', '-'), default=None,
                             **({'action': argparse.BooleanOptionalAction} if name == 'amp_startup_gate'
@@ -49,6 +64,8 @@ def install_training_options(base_train):
         print('Sensor state estimation and observation options:')
         parser.print_help()
     options, remaining = parser.parse_known_args(sys.argv[1:])
+    if options.history_steps is None:
+        options.history_steps = SensorObservationConfig().history_steps
     if options.recurrent_hidden_dim < 1:
         parser.error('recurrent-hidden-dim must be positive')
     options.future_prediction_steps = tuple(options.future_prediction_steps)

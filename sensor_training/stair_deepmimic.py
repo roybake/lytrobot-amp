@@ -24,6 +24,11 @@ class SensorStairDeepMimicConfig(SensorPPOAMPConfig):
     stair_rsi_final_probability: float = 0.20
     stair_rsi_warmup_iterations: int = 2000
     stair_rsi_ramp_iterations: int = 10000
+    # Route tracking curriculum: start loose, tighten gradually
+    route_xy_sigma_initial: float = 0.80
+    route_xy_sigma_final: float = 0.35
+    route_velocity_sigma_initial: float = 1.20
+    route_velocity_sigma_final: float = 0.50
 
 
 class SensorStairDeepMimicTrainer(SensorHistoryPPOAMPTrainer):
@@ -35,11 +40,24 @@ class SensorStairDeepMimicTrainer(SensorHistoryPPOAMPTrainer):
             fraction = min(1.0, max(0.0,
                 (iteration - self.cfg.stair_rsi_warmup_iterations)
                 / max(self.cfg.stair_rsi_ramp_iterations, 1)))
+            # Curriculum: RSI probability decreases over training
             probability = ((1-fraction) * self.cfg.stair_rsi_initial_probability
                            + fraction * self.cfg.stair_rsi_final_probability)
             self.env.cfg.stair_phase_reset_prob = probability
+            # Curriculum: Route tracking tolerance tightens over training
+            self.env.cfg.deepmimic_route_xy_sigma = (
+                (1-fraction) * self.cfg.route_xy_sigma_initial
+                + fraction * self.cfg.route_xy_sigma_final
+            )
+            self.env.cfg.deepmimic_route_velocity_sigma = (
+                (1-fraction) * self.cfg.route_velocity_sigma_initial
+                + fraction * self.cfg.route_velocity_sigma_final
+            )
         metrics = super().train_iteration()
         metrics["stair_phase_reset_probability"] = self.env.cfg.stair_phase_reset_prob
+        if self.env.cfg.deepmimic_route_tracking:
+            metrics["route_xy_sigma"] = self.env.cfg.deepmimic_route_xy_sigma
+            metrics["route_velocity_sigma"] = self.env.cfg.deepmimic_route_velocity_sigma
         return metrics
 
     def evaluate_fixed_route(self) -> dict[str, float]:
@@ -52,8 +70,9 @@ class SensorStairDeepMimicTrainer(SensorHistoryPPOAMPTrainer):
         initial_hidden: torch.Tensor,
         episode_starts: torch.Tensor,
         env_indices: torch.Tensor,
+        action_means: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        del env_indices
+        del env_indices, action_means
         if self.cfg.lcp_weight <= 0.0:
             return None
         # One recurrent step is enough to regularize the actor's local
