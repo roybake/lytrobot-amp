@@ -59,7 +59,7 @@ python3 sensor_training/train_distill_stage1.py \
   --teacher-checkpoint logs/teachers/stage1_gait/<run>/model_final.pt
 
 python3 sensor_training/train_distill_stage2.py \
-  --student-checkpoint logs/sensor_policy/distillation/stage1_gait/<run>/model_final.pt \
+  --student-checkpoint logs/sensor_policy/distillation/<run>/student/model_final.pt \
   --teacher-checkpoint logs/teachers/stage2_robust/<run>/model_final.pt
 ```
 
@@ -89,14 +89,11 @@ transition。串行总控会根据 Teacher
 ## 日志目录
 
 ```text
-logs/
-├── teachers/
-│   ├── stage1_gait/<run>/
-│   └── stage2_robust/<run>/
-└── sensor_policy/
-    └── distillation/
-        ├── stage1_gait/<run>/
-        └── stage2_robust/<run>/
+logs/sensor_policy/distillation/<MM-DD-HH:MM:SS>/
+├── teacher/
+│   └── stage2/  # 可选第二阶段
+└── student/
+    └── stage2/  # 可选第二阶段
 ```
 
 `metrics.csv` 中记录：`teacher_action_loss`、`teacher_action_mae`、

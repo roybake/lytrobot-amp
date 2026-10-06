@@ -663,6 +663,10 @@ def make_log_dir(
     run_name: str | None,
     log_group: str | None = None,
 ) -> Path:
+    if DISTILLATION_CLI_ENABLED:
+        directory = new_run_dir(REPO_ROOT / "logs" / "sensor_policy" / "distillation", run_name) / "student"
+        directory.mkdir()
+        return directory
     group = log_group or stage
     if Path(group).name != group or group in ("", ".", ".."):
         raise ValueError(f"--log-group must be one directory name, got: {group!r}")
@@ -672,13 +676,23 @@ def make_log_dir(
 
 def resolve_log_dir(args: argparse.Namespace) -> Path:
     if args.log_dir is None:
-        return make_log_dir(args.log_root, args.stage, args.run_name, args.log_group)
+        log_dir = make_log_dir(args.log_root, args.stage, args.run_name, args.log_group)
+        if DISTILLATION_CLI_ENABLED:
+            from training_paths import snapshot_teacher
+            snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
+        return log_dir
 
     log_dir = Path(args.log_dir).expanduser().resolve()
     if not log_dir.exists():
         raise FileNotFoundError(f"--log-dir does not exist: {log_dir}")
     if not log_dir.is_dir():
         raise NotADirectoryError(f"--log-dir is not a directory: {log_dir}")
+    if DISTILLATION_CLI_ENABLED:
+        from training_paths import snapshot_teacher
+        teacher_dir = log_dir.parent / "teacher"
+        if log_dir.name == "stage2" and log_dir.parent.name == "student":
+            teacher_dir = log_dir.parent.parent / "teacher" / "stage2"
+        snapshot_teacher(args.teacher_checkpoint, teacher_dir)
     return log_dir
 
 

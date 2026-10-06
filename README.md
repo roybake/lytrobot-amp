@@ -273,7 +273,7 @@ uv run python sensor_training/train_stairs_deepmimic.py \
 # 测试
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
-  --checkpoint "logs/stairs/09-30-10:47:29/model_final.onnx" --viewer --steps 0
+  --checkpoint "logs/stairs/10-03-10:58:18/model_best.onnx" --viewer --steps 0
 ```
 
 ## 蹲起传感器策略 Stage1

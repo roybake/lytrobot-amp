@@ -104,7 +104,6 @@ def run_stage1() -> None:
             "--task-reward-lerp": "0.75",
             "--save-interval": "500",
             "--log-root": str(DISTILLATION_LOG_ROOT),
-            "--log-group": "stage1_gait",
             "--wandb-tags": "lytrobot,sensor-only,distillation,stage1-gait,privileged-teacher",
         }
     )
@@ -199,7 +198,6 @@ def run_stage2() -> None:
             "--task-reward-lerp": "0.75",
             "--save-interval": "500",
             "--log-root": str(DISTILLATION_LOG_ROOT),
-            "--log-group": "stage2_robust",
             "--wandb-tags": "lytrobot,sensor-only,distillation,stage2-robust,privileged-teacher",
         }
     )

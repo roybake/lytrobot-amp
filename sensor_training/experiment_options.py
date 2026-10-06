@@ -9,6 +9,7 @@ from .config import SensorObservationConfig
 from .ppo_config import SensorPPOAMPConfig
 
 OPTIONAL_POLICY_OPTIONS = ('gamma', 'gae_lambda', 'init_std', 'entropy_coef', 'amp_startup_gate')
+STAIR_CURRICULUM_OPTIONS = ('stair_rsi_warmup_iterations', 'stair_rsi_ramp_iterations')
 
 OBS_OPTIONS = ('history_steps', 'include_tendon_velocity', 'include_tendon_tracking_error',
                'tendon_velocity_scale', 'tendon_velocity_filter_alpha', 'tendon_tracking_error_scale',
@@ -29,9 +30,16 @@ def _history_steps_from_frame_count(value: str) -> int:
     return frame_count - 1
 
 
-def option_parser():
+def _nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError('must be non-negative')
+    return result
+
+
+def option_parser(ppo_config_type=SensorPPOAMPConfig):
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    defaults = {**asdict(SensorObservationConfig()), **asdict(SensorPPOAMPConfig())}
+    defaults = {**asdict(SensorObservationConfig()), **asdict(ppo_config_type())}
     for name in OBS_OPTIONS + POLICY_OPTIONS:
         value = defaults[name]
         kwargs = {'default': value}
@@ -54,12 +62,18 @@ def option_parser():
         parser.add_argument('--'+name.replace('_', '-'), default=None,
                             **({'action': argparse.BooleanOptionalAction} if name == 'amp_startup_gate'
                                else {'type': float}))
+    # Keep stair-only flags scoped to the stair trainer's configuration.
+    for name in STAIR_CURRICULUM_OPTIONS:
+        if name in defaults:
+            parser.add_argument('--'+name.replace('_', '-'), type=_nonnegative_int,
+                                default=None,
+                                help=f'Stair curriculum iterations (default: {defaults[name]}).')
     return parser
 
 
 def install_training_options(base_train):
     """Attach explicit observation config and preserve config/argv recording."""
-    parser = option_parser()
+    parser = option_parser(base_train.PPOAMPConfig)
     if '--help' in sys.argv or '-h' in sys.argv:
         print('Sensor state estimation and observation options:')
         parser.print_help()
@@ -82,8 +96,8 @@ def install_training_options(base_train):
         cfg = original_config(**kwargs)
         for key in POLICY_OPTIONS:
             setattr(cfg, key, getattr(options, key))
-        for key in OPTIONAL_POLICY_OPTIONS:
-            if getattr(options, key) is not None:
+        for key in OPTIONAL_POLICY_OPTIONS + STAIR_CURRICULUM_OPTIONS:
+            if getattr(options, key, None) is not None:
                 setattr(cfg, key, getattr(options, key))
         return cfg
     base_train.PPOAMPConfig = config

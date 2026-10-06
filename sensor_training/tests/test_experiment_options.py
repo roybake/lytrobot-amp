@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts import train as base_train
 from sensor_training import distillation_entrypoints
+from sensor_training import train as sensor_train
+from sensor_training import train_stairs_deepmimic as stair_train
 from sensor_training.config import SensorObservationConfig
 from sensor_training.distillation_config import SensorDistillationPPOAMPConfig
 from sensor_training.distillation_recipes.run_improved import TRAINING_ARGS
 from sensor_training.experiment_options import install_training_options, option_parser
+from sensor_training.stair_deepmimic import SensorStairDeepMimicConfig
+from lytrobot_amp.env import LytRobotEnvCfg
 
 
 class ExperimentOptionsTests(unittest.TestCase):
@@ -93,6 +100,72 @@ class ExperimentOptionsTests(unittest.TestCase):
             self.assertEqual(cfg.init_std, 0.15)
             self.assertEqual(cfg.gamma, 0.995)
             self.assertEqual(cfg.gae_lambda, 0.97)
+
+    def test_stair_entrypoint_records_curriculum_in_args_and_ppo_config(self) -> None:
+        for arguments, expected in (
+            (['--stair-rsi-warmup-iterations', '5000',
+              '--stair-rsi-ramp-iterations', '20000'], (5000, 20000)),
+            (['--stair-rsi-warmup-iterations=5000',
+              '--stair-rsi-ramp-iterations=20000'], (5000, 20000)),
+            (['--stair-rsi-warmup-iterations', '0',
+              '--stair-rsi-ramp-iterations', '0'], (0, 0)),
+            ([], (2000, 10000)),
+        ):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                def configure_training() -> None:
+                    args = base_train.parse_args()
+                    cfg = base_train.PPOAMPConfig(num_steps=args.num_steps)
+                    self.assertIsInstance(cfg, SensorStairDeepMimicConfig)
+                    self.assertEqual(args.num_envs, 4096)
+                    self.assertEqual(args.max_iterations, 40000)
+                    self.assertEqual(cfg.privileged_context_loss_coef, 0.0)
+                    base_train.save_config(Path(directory), args, LytRobotEnvCfg(), cfg)
+                    saved = json.loads((Path(directory) / 'params' / 'config.json').read_text())
+                    for name, value in zip(
+                        ('stair_rsi_warmup_iterations', 'stair_rsi_ramp_iterations'), expected,
+                    ):
+                        self.assertEqual(saved['ppo_amp'][name], value)
+                        if arguments:
+                            self.assertEqual(saved['args'][name], value)
+
+                with (
+                    patch.object(sys, 'argv', ['train_stairs_deepmimic.py', *arguments,
+                                              '--max-iterations', '40000', '--num-envs', '4096']),
+                    patch.multiple(
+                        sensor_train,
+                        SensorPPOAMPConfig=sensor_train.SensorPPOAMPConfig,
+                        SensorHistoryPPOAMPTrainer=sensor_train.SensorHistoryPPOAMPTrainer,
+                    ),
+                    patch.multiple(
+                        base_train,
+                        parse_args=base_train.parse_args,
+                        PPOAMPConfig=base_train.PPOAMPConfig,
+                        PPOAMPTrainer=base_train.PPOAMPTrainer,
+                        LytRobotAmpEnv=base_train.LytRobotAmpEnv,
+                        LytRobotWarpAmpEnv=base_train.LytRobotWarpAmpEnv,
+                        LytRobotMjlabAmpEnv=base_train.LytRobotMjlabAmpEnv,
+                        main=configure_training,
+                    ),
+                    patch('scripts.audit_stair_reference.audit_reference',
+                          return_value={'alignment_pass': True, 'contact_geometry_pass': True}),
+                ):
+                    stair_train.main()
+
+    def test_invalid_stair_curriculum_iterations_are_rejected(self) -> None:
+        for name in ('--stair-rsi-warmup-iterations', '--stair-rsi-ramp-iterations'):
+            for value in ('-1', '1.5', '5000l'):
+                with self.subTest(name=name, value=value), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        option_parser(SensorStairDeepMimicConfig).parse_args([name, value])
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_stair_curriculum_options_remain_isolated_from_other_sensor_training(self) -> None:
+        for config in (sensor_train.SensorPPOAMPConfig, SensorDistillationPPOAMPConfig):
+            arguments = ['--stair-rsi-warmup-iterations', '5000']
+            with self.subTest(config=config):
+                options, remaining = option_parser(config).parse_known_args(arguments)
+                self.assertEqual(remaining, arguments)
+                self.assertFalse(hasattr(options, 'stair_rsi_warmup_iterations'))
 
 
 if __name__ == '__main__':

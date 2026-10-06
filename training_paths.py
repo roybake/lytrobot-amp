@@ -30,3 +30,16 @@ def new_run_dir(root: Path, name: str | None = None) -> Path:
         except FileExistsError:
             candidate = root / f"{stem}_{suffix}"
             suffix += 1
+
+
+def snapshot_teacher(checkpoint: str | Path | None, directory: Path) -> None:
+    """Keep the teacher weights used by a distillation run beside its student."""
+    import shutil
+    if not checkpoint:
+        return
+    source = Path(checkpoint).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    for artifact in (source, source.with_suffix(".onnx")):
+        target = directory / artifact.name
+        if artifact.is_file() and artifact != target.resolve():
+            shutil.copy2(artifact, target)

@@ -57,10 +57,17 @@ def resolve_training_output(args, stage: str) -> None:
     """Place default checkpoints in a timestamp run; validate explicit outputs."""
     from training_paths import new_run_dir, validate_run_name
     output = Path(args.output or f"{stage}.pt").expanduser()
+    role = "student" if stage.startswith("student") else "teacher"
     if output.parent == Path("."):
-        output = new_run_dir(ROOT / "logs" / "distillation" / stage) / output.name
+        run = new_run_dir(ROOT / "logs" / "sensor_policy" / "distillation")
+        output = run / role / output.name
     else:
-        validate_run_name(output.parent.name)
+        run = output.parent.parent if output.parent.name in ("teacher", "student") else output.parent
+        validate_run_name(run.name)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if role == "student":
+        from training_paths import snapshot_teacher
+        snapshot_teacher(getattr(args, "teacher_checkpoint", None), run / "teacher")
     args.output = str(output.resolve())
     print(f"[INFO] training output={args.output}")
 

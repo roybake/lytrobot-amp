@@ -21,13 +21,15 @@ class SerialDistillationPlanTests(unittest.TestCase):
             stage1_iterations=30000,
             stage2_iterations=30000,
         )
-        self.paths = _phase_paths("serial-test")
+        self.paths = _phase_paths("10-06-12:00:00")
 
     def test_all_phase_paths_are_role_and_stage_specific(self) -> None:
-        self.assertIn("teachers/stage1_gait", str(self.paths["teacher_stage1"]))
-        self.assertIn("teachers/stage2_robust", str(self.paths["teacher_stage2"]))
-        self.assertIn("sensor_policy/distillation/stage1_gait", str(self.paths["student_stage1"]))
-        self.assertIn("sensor_policy/distillation/stage2_robust", str(self.paths["student_stage2"]))
+        self.assertIn("distillation/10-06-12:00:00/teacher", str(self.paths["teacher_stage1"]))
+        self.assertIn("distillation/10-06-12:00:00/teacher/stage2", str(self.paths["teacher_stage2"]))
+        self.assertIn("distillation/10-06-12:00:00/student", str(self.paths["student_stage1"]))
+        self.assertIn("distillation/10-06-12:00:00/student", str(self.paths["student_stage2"]))
+
+        self.assertNotEqual(self.paths["student_stage1"], self.paths["student_stage2"])
 
     def test_fresh_stage2_commands_chain_the_prior_phase_checkpoints(self) -> None:
         teacher = _phase_command("teacher_stage2", self.args, self.paths, resume_checkpoint=None)

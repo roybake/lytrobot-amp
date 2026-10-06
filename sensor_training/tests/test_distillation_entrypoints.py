@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import sys
 import unittest
 
@@ -25,15 +27,15 @@ class DistillationEntrypointTests(unittest.TestCase):
         self.captured_path = path
         self.captured = list(sys.argv[1:])
 
-    def test_stage1_uses_a_dedicated_gait_log_group(self) -> None:
+    def test_stage1_uses_student_log_root(self) -> None:
         sys.argv = ["train_distill_stage1.py", "--teacher-checkpoint", "/tmp/teacher.pt"]
         distillation_entrypoints.run_stage1()
 
         assert self.captured is not None
         assert self.captured_path is not None
         self.assertTrue(self.captured_path.endswith("train_distill.py"))
-        self.assertIn("--log-group", self.captured)
-        self.assertEqual(self.captured[self.captured.index("--log-group") + 1], "stage1_gait")
+        self.assertNotIn("--log-group", self.captured)
+        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "sensor_policy" / "distillation")
         self.assertEqual(self.captured[self.captured.index("--max-iterations") + 1], "30000")
         self.assertEqual(self.captured[self.captured.index("--decimation") + 1], "2")
         self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "2048")
@@ -56,7 +58,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         )
         self.assertIn("--no-domain-randomization", self.captured)
 
-    def test_stage2_resumes_student_and_uses_a_robust_log_group(self) -> None:
+    def test_stage2_resumes_student_and_uses_student_log_root(self) -> None:
         sys.argv = [
             "train_distill_stage2.py",
             "--student-checkpoint", "/tmp/student.pt",
@@ -73,7 +75,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         self.assertIn("--resume-reset-progress", self.captured)
         self.assertIn("--distillation-reset-schedule", self.captured)
         self.assertIn("--domain-randomization", self.captured)
-        self.assertEqual(self.captured[self.captured.index("--log-group") + 1], "stage2_robust")
+        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "sensor_policy" / "distillation")
         self.assertEqual(self.captured[self.captured.index("--max-iterations") + 1], "30000")
         self.assertEqual(self.captured[self.captured.index("--decimation") + 1], "2")
         self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "2048")

@@ -106,15 +106,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def _phase_paths(run_name: str) -> dict[str, Path]:
+    root = REPO_ROOT / "logs" / "sensor_policy" / "distillation" / run_name
     return {
-        "teacher_stage1": REPO_ROOT / "logs" / "teachers" / "stage1_gait" / run_name,
-        "teacher_stage2": REPO_ROOT / "logs" / "teachers" / "stage2_robust" / run_name,
-        "student_stage1": (
-            REPO_ROOT / "logs" / "sensor_policy" / "distillation" / "stage1_gait" / run_name
-        ),
-        "student_stage2": (
-            REPO_ROOT / "logs" / "sensor_policy" / "distillation" / "stage2_robust" / run_name
-        ),
+        "teacher_stage1": root / "teacher",
+        "teacher_stage2": root / "teacher" / "stage2",
+        "student_stage1": root / "student",
+        "student_stage2": root / "student" / "stage2",
     }
 
 
