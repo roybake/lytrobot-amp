@@ -54,9 +54,9 @@ def evaluate_gait_checkpoint(checkpoint: str | Path, *, seconds: float = 20.,
     env = SensorHistoryCpuAmpEnv(cfg, observation_config_from_metadata(metadata)) if sensor else LytRobotAmpEnv(cfg)
     base = env.base_env if sensor else env
     reference = base.motion.motions[0] if hasattr(base.motion, 'motions') else base.motion
-    if not reference.source_loop:
-        env.close()
-        raise ValueError('Continuous gait evaluation requires a looping reference.')
+    # A non-looping mocap recording can cover the full evaluation duration.
+    # Check for premature resets during playback instead of requiring a loop
+    # flag, which would reject long recordings such as walk1_mjcf.npz.
     policy = OnnxPolicy(path)
     policy.validate_dimensions(env.obs_dim, env.action_dim)
     obs = env.reset()

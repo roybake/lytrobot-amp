@@ -216,6 +216,16 @@ def default_train_args(direction: str) -> list[str]:
         "0.10",
         "--amp-mirror-ref-prob",
         "0.5",
+        # Strengthen gait fidelity: drive precise joint and foot trajectories so
+        # the policy lifts its legs on schedule before reaching the stairs.
+        "--side-foot-pos-coef",
+        "0.3",
+        "--step-gap-coef",
+        "0.3",
+        "--swing-advance-coef",
+        "0.5",
+        "--reference-gait-style-reward-coef",
+        "4.0",
     ]
 
 

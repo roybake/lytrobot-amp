@@ -11,9 +11,9 @@ from .training_defaults import distillation_cli_defaults
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
-DISTILLATION_LOG_ROOT = REPO_ROOT / "logs" / "sensor_policy" / "distillation"
+DISTILLATION_LOG_ROOT = REPO_ROOT / "logs" / "distillation"
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
 )
 
 
@@ -60,7 +60,7 @@ def run_stage1() -> None:
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
             "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "true",
+            "--motion-loop": "false",
             "--episode-steps": "2000",
             "--episode-timeout-jitter-steps": "0",
             "--task-reward-mode": "stage1_reference",
@@ -72,7 +72,7 @@ def run_stage1() -> None:
             "--sensor-sync-forward-penalty-coef": "1.0",
             "--forward-velocity-reward-coef": "2.0",
             "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "0.87",
+            "--target-velocity": "1.28",
             # Teacher supervision adds another rollout graph.  Eight recurrent
             # steps per backward graph benchmarks faster than the generic
             # 16-step sensor default for this mixed Student/Teacher workload.
@@ -157,7 +157,7 @@ def run_stage2() -> None:
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
             "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "true",
+            "--motion-loop": "false",
             "--episode-steps": "2000",
             "--episode-timeout-jitter-steps": "0",
             "--task-reward-mode": "stage1_reference",
@@ -169,7 +169,7 @@ def run_stage2() -> None:
             "--sensor-sync-forward-penalty-coef": "1.0",
             "--forward-velocity-reward-coef": "2.0",
             "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "0.87",
+            "--target-velocity": "1.28",
             "--compile-policy-chunk-steps": "8",
             "--max-iterations": "30000",
             "--reference-ctrl-blend": "1.0",

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GAIT_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
+DEFAULT_GAIT_REFERENCE = REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
 
 
 def _has_arg(name: str) -> bool:
@@ -32,8 +32,8 @@ if __name__ == "__main__":
         "--num-envs": "4096",
         "--task-reward-mode": "stage1_reference",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-        "--motion-loop": "true",
-        "--target-velocity": "0.87",
+        "--motion-loop": "false",
+        "--target-velocity": "1.28",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",
         "--side-foot-pos-coef": "0.0",

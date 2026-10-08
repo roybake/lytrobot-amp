@@ -22,8 +22,7 @@ RUN_DIR = None
 def train_better_teacher():
     global RUN_DIR
     if RUN_DIR is None:
-        RUN_DIR = new_run_dir(REPO_ROOT / "logs/sensor_policy/distillation")
-    (RUN_DIR / "teacher").mkdir(exist_ok=True)
+        RUN_DIR = new_run_dir(REPO_ROOT / "logs/distillation")
     """阶段1：训练更好的教师"""
     print("=" * 70)
     print("阶段1: 训练更好的Stage1教师（35000步，~12小时）")
@@ -72,7 +71,7 @@ def train_better_teacher():
         "--target-kl", "0.015",
 
         # 日志
-        "--log-dir", str(RUN_DIR / "teacher"),
+        "--log-dir", str(RUN_DIR / "stage1" / "teacher"),
         "--wandb-tags", "lytrobot,stage1,improved-teacher,auto-pipeline",
         "--wandb",
     ]
@@ -88,7 +87,7 @@ def train_better_teacher():
         sys.exit(result.returncode)
 
     # 找到最佳checkpoint
-    teacher_checkpoints = list((RUN_DIR / "teacher").glob("model_best.pt"))
+    teacher_checkpoints = list((RUN_DIR / "stage1" / "teacher").glob("model_best.pt"))
     if not teacher_checkpoints:
         print("\n❌ 找不到教师checkpoint")
         sys.exit(1)
@@ -140,10 +139,9 @@ def distill_with_teacher(teacher_checkpoint):
     print("  • 降低RL权重: task_reward_lerp=0.60")
     print()
 
-    (RUN_DIR / "student").mkdir(exist_ok=True)
     args = [
         "sensor_training/train_distill_stage1.py",
-        "--log-dir", str(RUN_DIR / "student"),
+        "--log-dir", str(RUN_DIR / "stage1" / "student"),
         "--teacher-checkpoint", str(teacher_checkpoint),
 
         # 环境配置
@@ -204,7 +202,7 @@ def distill_with_teacher(teacher_checkpoint):
         "--compile-policy-chunk-steps", "8",
 
         # 日志
-        "--log-root", "logs/sensor_policy/distillation",
+        "--log-root", "logs/distillation",
         "--log-group", "with_better_teacher_auto",
         "--wandb-tags", "lytrobot,sensor-distillation,better-teacher,auto-pipeline",
         "--wandb",
@@ -254,13 +252,14 @@ def main():
         print("=" * 70)
         print()
         print("最终模型:")
-        student_checkpoints = list((RUN_DIR / "student").glob("model_best.pt"))
+        student_checkpoints = list((RUN_DIR / "stage1" / "student").glob("model_best.pt"))
         if student_checkpoints:
             student_best = max(student_checkpoints, key=lambda p: p.stat().st_mtime)
             print(f"  学生: {student_best}")
             print()
             print("测试模型:")
-            print(f"  uv run python scripts/play.py --checkpoint {student_best} --num-envs 1")
+            print(f'  uv run python scripts/play.py --checkpoint "{teacher_checkpoint}" --device cuda --viewer --steps 0')
+            print(f'  uv run python sensor_training/play.py --checkpoint "{student_best}" --device cuda --viewer --steps 0')
 
     except KeyboardInterrupt:
         print("\n用户中断")

@@ -191,7 +191,7 @@ reference/control 与物理扰动参数，输出 `teacher/*`、`student/*`、`st
 
 ```bash
 .venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1 \
-  --teacher-checkpoint logs/teachers/stage1_gait/<teacher-run>/model_best.pt
+  --teacher-checkpoint "logs/distillation/<teacher-run>/stage1/teacher/model_best.pt"
 ```
 
 Teacher checkpoint 旁必须有对应 ONNX。默认 `--run-name` 自动生成时间戳；用同一个
@@ -201,8 +201,8 @@ Teacher checkpoint 旁必须有对应 ONNX。默认 `--run-name` 自动生成时
 
 ```bash
 .venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage2 \
-  --teacher-checkpoint logs/teachers/stage1_gait/<teacher-run>/model_best.pt \
-  --student-checkpoint logs/sensor_policy/distillation/stage1_gait/<student-run>/model_final.pt
+  --teacher-checkpoint "logs/distillation/<teacher-run>/stage1/teacher/model_best.pt" \
+  --student-checkpoint "logs/distillation/<student-run>/stage1/student/model_final.pt"
 ```
 
 Stage2 沿用已验收的 privileged Stage1 Teacher 作为当前 Student 状态上的 DAgger
@@ -230,7 +230,7 @@ Warp/mjlab 的 mass/friction/gravity/actuator strength 属于批次共享模型�
 
 ```bash
 .venv/bin/python sensor_training/export_sensor_policy.py \
-  --checkpoint logs/sensor_policy/distillation/stage2_robust/<run>/model_final.pt \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.pt" \
   --output deployment/final_sensor_gait.onnx
 
 .venv/bin/python sensor_training/play.py \

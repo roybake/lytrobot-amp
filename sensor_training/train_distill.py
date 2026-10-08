@@ -39,7 +39,7 @@ def main() -> None:
     )
     if not _has_arg("--log-root"):
         sys.argv.extend(
-            ["--log-root", str(REPO_ROOT / "logs" / "sensor_policy" / "distillation")]
+            ["--log-root", str(REPO_ROOT / "logs" / "distillation")]
         )
     if not _has_arg("--wandb-tags"):
         sys.argv.extend(

@@ -106,7 +106,7 @@ uv run python sensor_training/distillation_recipes/run_stronger_supervision.py
 监控关键指标：
 ```bash
 # 另开终端
-tail -f logs/sensor_policy/distillation/stage1_stronger_supervision/*/train.log | grep teacher_action_mae
+tail -f logs/distillation/*/stage1/student/train.log | grep teacher_action_mae
 ```
 
 **成功标准**：

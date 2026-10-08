@@ -98,9 +98,9 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--reference-ctrl-blend"), "1.0")
         self.assertEqual(
             Path(_remove_option(sensor_args, "--motion-file")).name,
-            "walk1_mjcf_repaired.npz",
+            "walk1_mjcf.npz",
         )
-        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "0.87")
+        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "1.28")
         self.assertEqual(_remove_option(sensor_args, "--symmetry-reward-coef"), "1.2")
         self.assertEqual(_remove_option(sensor_args, "--symmetry-foot-pos-sigma"), "0.08")
         self.assertEqual(_remove_option(sensor_args, "--side-foot-pos-coef"), "0.0")
@@ -145,9 +145,9 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--reference-ctrl-blend"), "1.0")
         self.assertEqual(
             Path(_remove_option(sensor_args, "--motion-file")).name,
-            "walk1_mjcf_repaired.npz",
+            "walk1_mjcf.npz",
         )
-        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "0.87")
+        self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "1.28")
         self.assertEqual(_remove_option(sensor_args, "--learning-rate"), "3.0e-4")
         self.assertEqual(_remove_option(sensor_args, "--task-reward-lerp"), "0.5")
         self.assertEqual(_remove_option(sensor_args, "--amp-reward-coef"), "1.2")
@@ -191,7 +191,11 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
                 if option == "--motion-file":
                     teacher_value = Path(teacher_value).name
                     sensor_value = Path(sensor_value).name
-                self.assertEqual(sensor_value, teacher_value)
+                    self.assertEqual(sensor_value, teacher_value)
+                elif option == "--target-velocity":
+                    self.assertAlmostEqual(float(sensor_value), float(teacher_value), places=2)
+                else:
+                    self.assertEqual(sensor_value, teacher_value)
 
     def test_sensor_entrypoints_require_100_hz(self) -> None:
         for entrypoint in ("train_stage1.py", "train_stage2.py"):

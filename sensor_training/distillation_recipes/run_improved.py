@@ -84,7 +84,7 @@ TRAINING_ARGS = [
     "--compile-policy-chunk-steps", "8",
 
     # === 日志 ===
-    "--log-root", "logs/sensor_policy/distillation",
+    "--log-root", "logs/distillation",
     "--log-group", "stage1_gait_improved",
     "--wandb-tags", "lytrobot,sensor-distillation,state-estimator,improved",
     "--wandb",
@@ -137,7 +137,7 @@ def main():
             print("=" * 60)
             print()
             print("检查结果:")
-            print("  cd logs/sensor_policy/distillation/stage1_gait_improved")
+            print("  cd logs/distillation/<run>/stage1/student")
             print("  tail -100 */train.log")
         else:
             print()

@@ -25,13 +25,13 @@ Teacher 和传感器 Student 必须保持相同的 `--decimation`。新训练默
 `reference_ctrl_blend=1.0`：控制器按同一参考腱长表输出前馈，Actor 学习反馈残差。
 蒸馏器仍会把 Teacher 动作换算成绝对腱长目标，再映射为 Student 动作；相同的控制基准
 可以减少目标动作被裁剪。该参考表由控制器时钟读取，不需要额外硬件传感器。
-所有行走入口统一使用 `walk1_mjcf_repaired.npz`，目标速度配置保持 `0.87 m/s`。
+所有行走入口统一使用 `walk1_mjcf.npz`（原始人体 mocap，前进速度 1.28 m/s），目标速度配置为 `1.28 m/s`。
 Teacher 和 Student 必须使用相同参考数据；使用其他参考训练的 Teacher 需要重新训练。
 
 ## 1. 训练特权 Teacher
 
 Teacher 采用任务一 `scripts/train_stage1.py` 的全状态 PPO/BPO+AMP 配置为基础。
-固定步行参考显式设置 `--motion-loop true`，避免一个步态周期结束后立即重置。
+固定步行参考无需设置 `--motion-loop`（原始 npz 无循环字段，35200 帧序列足够任意回合长度）。
 总控配方使用 20 秒回合，并增加相位对齐的关节/足端跟踪与抑制跳跃、踮脚、滑步的奖励。
 这些训练真值不会进入 Student Actor。教师必须先通过连续回放，再用于蒸馏。
 
@@ -40,14 +40,14 @@ python3 scripts/train_stage1.py \
   --reference-ctrl-blend 1.0 \
   --motion-loop true --episode-steps 2000 --evaluate-gait \
   --max-iterations 30000 \
-  --log-root logs/teachers --log-group stage1_gait
+  --log-dir "logs/distillation/<run>/stage1/teacher"
 
 python3 scripts/train_stage2.py \
-  --stage1-checkpoint logs/teachers/stage1_gait/<run>/model_final.pt \
+  --stage1-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
   --reference-ctrl-blend 1.0 \
   --motion-loop true --episode-steps 2000 --evaluate-gait \
   --max-iterations 30000 \
-  --log-root logs/teachers --log-group stage2_robust
+  --log-dir "logs/distillation/<run>/stage2/teacher"
 ```
 
 stage2 的任务奖励与 stage1 相同；它只增加域随机化来学习恢复行为。
@@ -56,11 +56,13 @@ stage2 的任务奖励与 stage1 相同；它只增加域随机化来学习恢�
 
 ```bash
 python3 sensor_training/train_distill_stage1.py \
-  --teacher-checkpoint logs/teachers/stage1_gait/<run>/model_final.pt
+  --teacher-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
+  --log-dir "logs/distillation/<run>/stage1/student"
 
 python3 sensor_training/train_distill_stage2.py \
-  --student-checkpoint logs/sensor_policy/distillation/<run>/student/model_final.pt \
-  --teacher-checkpoint logs/teachers/stage2_robust/<run>/model_final.pt
+  --student-checkpoint "logs/distillation/<run>/stage1/student/model_final.pt" \
+  --teacher-checkpoint "logs/distillation/<run>/stage2/teacher/model_final.pt" \
+  --log-dir "logs/distillation/<run>/stage2/student"
 ```
 
 每一阶段默认最多训练 30000 轮。第一阶段的 Teacher 动作 Huber 损失系数从
@@ -89,12 +91,19 @@ transition。串行总控会根据 Teacher
 ## 日志目录
 
 ```text
-logs/sensor_policy/distillation/<MM-DD-HH:MM:SS>/
-├── teacher/
-│   └── stage2/  # 可选第二阶段
-└── student/
-    └── stage2/  # 可选第二阶段
+logs/distillation/<MM-DD-HH:MM:SS>/
+├── stage1/
+│   ├── teacher/
+│   └── student/
+└── stage2/
+    ├── teacher/
+    └── student/
 ```
+
+训练启动时自动创建目录。同一阶段的教师和学生放在一起；独立蒸馏入口会将
+使用的教师权重复制到同阶段的 `teacher/`。新布局从下次启动新训练时生效，
+已有训练目录不迁移。显式指定 `--log-dir` 时使用传入的路径，例如
+`logs/distillation/<run>/stage1/student`。
 
 `metrics.csv` 中记录：`teacher_action_loss`、`teacher_action_mae`、
 `teacher_action_loss_coef`、`teacher_behavior_probability` 与 `student_on_policy_fraction`。
@@ -127,6 +136,8 @@ logs/serial_distillation/imu_walk_100hz_v1/pipeline.json
 
 `--evaluate-gait` 会在每次保存 checkpoint 时用三个种子（42、123、2026）分别从站立起点
 确定性回放 20 秒，禁止周期结束重置，所有种子都须通过验收。
+非循环参考也可评估，只要剩余序列足够覆盖评估时长；`walk1_mjcf.npz` 包含 880 秒数据，
+无需修改训练的 `--motion-loop false`。若参考提前结束触发重置，评估仍会报错。
 合格条件为：全程无跌倒、平均速度与命令相差不超过 0.15 m/s、膝关节相位误差 RMS 不超过
 0.20 rad、足端局部位置 RMS 不超过 0.06 m、膝屈伸幅度至少达到参考的 70%，锁膝采样比例
 不超过 10%。`model_best` 按验收结果和连续跟踪评分选择；仅增加回合长度不算合格。
@@ -135,8 +146,36 @@ logs/serial_distillation/imu_walk_100hz_v1/pipeline.json
 
 ```bash
 uv run python sensor_training/gait_evaluation.py \
-  --checkpoint logs/teachers/stage1_gait/<run>/model_best.onnx \
+  --checkpoint "logs/distillation/<run>/stage1/teacher/model_best.onnx" \
   --output recording/distillation/teacher_gait_evaluation.json
 ```
 
 旧权重缺少循环标记时，诊断可加 `--force-loop`；它用于揭示跨周期问题，不会修改旧模型。
+
+## 可视化测试师生模型
+
+将 `<run>` 替换为训练时间戳。第一阶段权重位于 `stage1/teacher/`、`stage1/student/`；第二阶段位于 `stage2/teacher/`、`stage2/student/`。
+
+```bash
+# 第一阶段教师
+uv run python scripts/play.py \
+  --checkpoint "logs/distillation/<run>/stage1/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 第一阶段学生
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage1/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 第二阶段教师
+uv run python scripts/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 第二阶段学生
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
+```
+
+测试最佳权重时将 `model_final.onnx` 换成 `model_best.onnx`。

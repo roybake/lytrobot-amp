@@ -92,10 +92,10 @@ sensor_training/distillation_recipes/
 
 ```bash
 # 查看日志
-tail -f logs/sensor_policy/distillation/*/train.log
+tail -f logs/distillation/*/stage*/student/train.log
 
 # 关键指标
-watch -n 10 'tail logs/sensor_policy/distillation/*/train.log | grep -E "(teacher_action_mae|episode_length)"'
+watch -n 10 'tail logs/distillation/*/stage*/student/train.log | grep -E "(teacher_action_mae|episode_length)"'
 ```
 
 ## 🐛 故障排查
@@ -174,7 +174,7 @@ uv run python sensor_training/distillation_recipes/quick_validate.py
 训练完成后测试模型：
 
 ```bash
-uv run python scripts/play.py \
-  --checkpoint logs/sensor_policy/distillation/stage1_gait_improved/*/model_best.pt \
-  --num-envs 1
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage1/student/model_best.pt" \
+  --device cuda --viewer --steps 0
 ```

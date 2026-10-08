@@ -35,7 +35,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         assert self.captured_path is not None
         self.assertTrue(self.captured_path.endswith("train_distill.py"))
         self.assertNotIn("--log-group", self.captured)
-        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "sensor_policy" / "distillation")
+        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "distillation")
         self.assertEqual(self.captured[self.captured.index("--max-iterations") + 1], "30000")
         self.assertEqual(self.captured[self.captured.index("--decimation") + 1], "2")
         self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "2048")
@@ -50,7 +50,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             self.captured[self.captured.index("--motion-file") + 1].split("/")[-1],
-            "walk1_mjcf_repaired.npz",
+            "walk1_mjcf.npz",
         )
         self.assertEqual(
             self.captured[self.captured.index("--sensor-knee-gait-reward-coef") + 1],
@@ -75,7 +75,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         self.assertIn("--resume-reset-progress", self.captured)
         self.assertIn("--distillation-reset-schedule", self.captured)
         self.assertIn("--domain-randomization", self.captured)
-        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "sensor_policy" / "distillation")
+        self.assertEqual(Path(self.captured[self.captured.index("--log-root") + 1]), distillation_entrypoints.REPO_ROOT / "logs" / "distillation")
         self.assertEqual(self.captured[self.captured.index("--max-iterations") + 1], "30000")
         self.assertEqual(self.captured[self.captured.index("--decimation") + 1], "2")
         self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "2048")

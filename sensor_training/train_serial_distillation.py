@@ -106,12 +106,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def _phase_paths(run_name: str) -> dict[str, Path]:
-    root = REPO_ROOT / "logs" / "sensor_policy" / "distillation" / run_name
+    root = REPO_ROOT / "logs" / "distillation" / run_name
     return {
-        "teacher_stage1": root / "teacher",
-        "teacher_stage2": root / "teacher" / "stage2",
-        "student_stage1": root / "student",
-        "student_stage2": root / "student" / "stage2",
+        "teacher_stage1": root / "stage1" / "teacher",
+        "teacher_stage2": root / "stage2" / "teacher",
+        "student_stage1": root / "stage1" / "student",
+        "student_stage2": root / "stage2" / "student",
     }
 
 
@@ -200,7 +200,7 @@ def _common_train_args(
         "--max-iterations", str(iterations),
         "--save-interval", "500",
         "--wandb-log-interval", str(getattr(args, 'wandb_log_interval', 10)),
-        "--motion-loop", "true",
+        "--motion-loop", "false",
         "--episode-steps", "2000",
         "--episode-timeout-jitter-steps", "0",
         "--stand-start-prob", "0.70" if sensor_student else "0.50",

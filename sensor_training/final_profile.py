@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REFERENCE = ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'
+REFERENCE = ROOT/'robot/reference_data/walk1_mjcf.npz'
 
 FINAL_SENSOR_OPTIONS = {
     'include_tendon_velocity': True,
@@ -62,7 +62,7 @@ def final_teacher_evaluation_flags():
 
 
 def final_training_flags(*, student=False, robust=False, iterations=30000):
-    flags = ['--motion-file', str(REFERENCE), '--target-velocity', '.87',
+    flags = ['--motion-file', str(REFERENCE), '--target-velocity', '1.28',
              '--task-reward-mode', 'stage1_reference', '--action-residual-scale', '.5',
              '--amp-reward-coef', '.3', '--task-reward-lerp', '.9',
              '--sensor-natural-gait-reward-coef', '.5', '--reference-gait-style-reward-coef', '4.',
@@ -134,7 +134,7 @@ def final_checkpoint_errors(checkpoint, *, require_no_takeover=True):
         if env.get(key, False if isinstance(value, bool) else None) != value:
             errors.append(f'env {key} must be {value}')
     if Path(env.get('motion_file', '')).resolve() != REFERENCE.resolve():
-        errors.append('checkpoint reference must be walk1_mjcf_repaired.npz')
+        errors.append('checkpoint reference must be walk1_mjcf.npz')
     if require_no_takeover and checkpoint.get('distillation', {}).get('teacher_behavior_probability', 1.) != 0.:
         errors.append('Teacher takeover has not reached zero')
     return errors

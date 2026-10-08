@@ -85,7 +85,7 @@ TRAINING_ARGS = [
     "--compile-policy-chunk-steps", "8",
 
     # === 日志 ===
-    "--log-root", "logs/sensor_policy/distillation",
+    "--log-root", "logs/distillation",
     "--log-group", "stage1_stronger_supervision",
     "--wandb-tags", "lytrobot,sensor-distillation,stronger-supervision",
     "--wandb",

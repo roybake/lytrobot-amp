@@ -21,7 +21,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEACHER_CHECKPOINT = REPO_ROOT / "logs/stage1/10-02-20:39:54/model_best.pt"
-LOG_ROOT = REPO_ROOT / "logs/sensor_policy/distillation_two_stage"
+LOG_ROOT = REPO_ROOT / "logs/distillation"
 
 def run_phase1():
     """阶段1: 预训练状态估计器"""

@@ -2,7 +2,7 @@
 
 所有命令在仓库根目录执行。将 `<run>` 替换为实际运行目录，`<threshold>` 替换为选定的蒸馏验收阈值。
 
-平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf_repaired.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含 45 帧，采样频率 40 Hz，周期为 1.125 秒；默认目标速度为 `0.87 m/s`。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
+平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含完整 mocap 序列，采样频率 40 Hz；默认目标速度为 `1.28 m/s`（原始人体步速）。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
 
 ## 推荐：最终纯传感器人体步态
 
@@ -92,51 +92,70 @@ cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/train_serial_distillation.py \
   --final-sensor-gait
 
-# 测试：使用 logs/serial_distillation/<run>/pipeline.json 中的 Student 权重路径
-cd /home/yeah/code/lytrobot-amp
+# 测试第一阶段教师（将 <run> 替换为训练时间戳）
+uv run python scripts/play.py \
+  --checkpoint "logs/distillation/<run>/stage1/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 测试第一阶段学生
 uv run python sensor_training/play.py \
-  --checkpoint "<student-checkpoint.onnx>" --device cuda --viewer --steps 0
+  --checkpoint "logs/distillation/<run>/stage1/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 测试第二阶段教师
+uv run python scripts/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 测试第二阶段学生
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
 ```
 
 ## 传感器串行蒸馏（分阶段）
+
+以下命令的 `<run>` 使用同一个训练时间戳，各阶段目录会自动创建。
 
 ```bash
 # Teacher Stage1
 cd /home/yeah/code/lytrobot-amp
 uv run python scripts/train_stage1.py \
   --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
-  --max-iterations 30000 --log-root logs/teachers --log-group stage1_gait
+  --max-iterations 30000 --log-dir "logs/distillation/<run>/stage1/teacher"
 
 # Teacher Stage2
 cd /home/yeah/code/lytrobot-amp
 uv run python scripts/train_stage2.py \
-  --stage1-checkpoint "logs/teachers/stage1_gait/<run>/model_final.pt" \
+  --stage1-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
   --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
-  --max-iterations 30000 --log-root logs/teachers --log-group stage2_robust
+  --max-iterations 30000 --log-dir "logs/distillation/<run>/stage2/teacher"
 
 # Student Stage1
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/train_distill_stage1.py \
-  --teacher-checkpoint "logs/teachers/stage1_gait/<run>/model_final.pt" \
-  --device cuda --sim-backend warp --max-iterations 30000
+  --teacher-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
+  --device cuda --sim-backend warp --max-iterations 30000 \
+  --log-dir "logs/distillation/<run>/stage1/student"
 
 # Student Stage2
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/train_distill_stage2.py \
-  --student-checkpoint "logs/sensor_policy/distillation/stage1_gait/<run>/model_final.pt" \
-  --teacher-checkpoint "logs/teachers/stage2_robust/<run>/model_final.pt" \
-  --device cuda --sim-backend warp --max-iterations 30000
+  --student-checkpoint "logs/distillation/<run>/stage1/student/model_final.pt" \
+  --teacher-checkpoint "logs/distillation/<run>/stage2/teacher/model_final.pt" \
+  --device cuda --sim-backend warp --max-iterations 30000 \
+  --log-dir "logs/distillation/<run>/stage2/student"
 
 # 测试 Teacher
 cd /home/yeah/code/lytrobot-amp
 uv run python scripts/play.py \
-  --checkpoint "logs/teachers/stage2_robust/<run>/model_final.onnx" \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.onnx" \
   --device cuda --viewer --steps 0
 
 # 测试 Student
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
-  --checkpoint "logs/sensor_policy/distillation/stage2_robust/<run>/model_final.onnx" \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
   --device cuda --viewer --steps 0
 ```
 
@@ -273,7 +292,7 @@ uv run python sensor_training/train_stairs_deepmimic.py \
 # 测试
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
-  --checkpoint "logs/stairs/10-03-10:58:18/model_best.onnx" --viewer --steps 0
+  --checkpoint "logs/stairs/10-06-13:01:44/model_best.onnx" --viewer --steps 0
 ```
 
 ## 蹲起传感器策略 Stage1

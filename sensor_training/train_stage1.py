@@ -22,7 +22,7 @@ from sensor_training.training_defaults import (
 # aligned makes comparisons isolate the deployable sensor observation and
 # recurrent policy instead of silently changing the task.
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
 )
 
 
@@ -61,8 +61,8 @@ if __name__ == "__main__":
         # Match scripts/train_stage1.py so observation architecture is the
         # principal experimental variable in privileged-vs-sensor runs.
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-        "--motion-loop": "true",
-        "--target-velocity": "0.87",
+        "--motion-loop": "false",
+        "--target-velocity": "1.28",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",
         "--side-foot-pos-coef": "0.0",

@@ -21,7 +21,7 @@ from sensor_training.training_defaults import (
 # checkpoint, so the reference clip, control rate and action interface may not
 # change between the two stages.
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
 )
 
 
@@ -66,8 +66,8 @@ if __name__ == "__main__":
         "--num-steps": str(default_num_steps),
         "--max-iterations": "30000",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-        "--motion-loop": "true",
-        "--target-velocity": "0.87",
+        "--motion-loop": "false",
+        "--target-velocity": "1.28",
         # Must match Stage1: the residual is added on top of the onboard
         # reference tendon targets, exactly like the accepted privileged gait.
         "--reference-ctrl-blend": "1.0",

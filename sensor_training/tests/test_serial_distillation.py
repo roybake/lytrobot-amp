@@ -24,10 +24,10 @@ class SerialDistillationPlanTests(unittest.TestCase):
         self.paths = _phase_paths("10-06-12:00:00")
 
     def test_all_phase_paths_are_role_and_stage_specific(self) -> None:
-        self.assertIn("distillation/10-06-12:00:00/teacher", str(self.paths["teacher_stage1"]))
-        self.assertIn("distillation/10-06-12:00:00/teacher/stage2", str(self.paths["teacher_stage2"]))
-        self.assertIn("distillation/10-06-12:00:00/student", str(self.paths["student_stage1"]))
-        self.assertIn("distillation/10-06-12:00:00/student", str(self.paths["student_stage2"]))
+        self.assertIn("logs/distillation/10-06-12:00:00/stage1/teacher", str(self.paths["teacher_stage1"]))
+        self.assertIn("logs/distillation/10-06-12:00:00/stage2/teacher", str(self.paths["teacher_stage2"]))
+        self.assertIn("logs/distillation/10-06-12:00:00/stage1/student", str(self.paths["student_stage1"]))
+        self.assertIn("logs/distillation/10-06-12:00:00/stage2/student", str(self.paths["student_stage2"]))
 
         self.assertNotEqual(self.paths["student_stage1"], self.paths["student_stage2"])
 

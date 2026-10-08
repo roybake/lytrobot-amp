@@ -253,7 +253,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-dir",
         default=None,
-        help="Existing run directory to append logs/checkpoints into when resuming.",
+        help="Training log/checkpoint directory; created automatically if missing.",
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--stage", default="stage1", choices=("stage1", "stage2"))
@@ -664,8 +664,8 @@ def make_log_dir(
     log_group: str | None = None,
 ) -> Path:
     if DISTILLATION_CLI_ENABLED:
-        directory = new_run_dir(REPO_ROOT / "logs" / "sensor_policy" / "distillation", run_name) / "student"
-        directory.mkdir()
+        directory = new_run_dir(Path(log_root), run_name) / stage / "student"
+        directory.mkdir(parents=True)
         return directory
     group = log_group or stage
     if Path(group).name != group or group in ("", ".", ".."):
@@ -683,16 +683,10 @@ def resolve_log_dir(args: argparse.Namespace) -> Path:
         return log_dir
 
     log_dir = Path(args.log_dir).expanduser().resolve()
-    if not log_dir.exists():
-        raise FileNotFoundError(f"--log-dir does not exist: {log_dir}")
-    if not log_dir.is_dir():
-        raise NotADirectoryError(f"--log-dir is not a directory: {log_dir}")
+    log_dir.mkdir(parents=True, exist_ok=True)
     if DISTILLATION_CLI_ENABLED:
         from training_paths import snapshot_teacher
-        teacher_dir = log_dir.parent / "teacher"
-        if log_dir.name == "stage2" and log_dir.parent.name == "student":
-            teacher_dir = log_dir.parent.parent / "teacher" / "stage2"
-        snapshot_teacher(args.teacher_checkpoint, teacher_dir)
+        snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
     return log_dir
 
 
