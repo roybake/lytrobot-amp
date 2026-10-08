@@ -94,12 +94,12 @@ uv run python sensor_training/train_serial_distillation.py \
 
 # 测试第一阶段教师（将 <run> 替换为训练时间戳）
 uv run python scripts/play.py \
-  --checkpoint "logs/distillation/<run>/stage1/teacher/model_final.onnx" \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.pt" \
   --device cuda --viewer --steps 0
 
 # 测试第一阶段学生
 uv run python sensor_training/play.py \
-  --checkpoint "logs/distillation/<run>/stage1/student/model_final.onnx" \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/student/model_27000.onnx" \
   --device cuda --viewer --steps 0
 
 # 测试第二阶段教师

@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from training_paths import new_run_dir
+from lytrobot_amp.training_paths import new_run_dir
 RUN_DIR = None
 
 def train_better_teacher():

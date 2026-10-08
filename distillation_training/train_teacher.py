@@ -37,7 +37,7 @@ def _init_wandb(args, spec):
     except ImportError:
         print('[WARN] wandb is not installed; continuing without online logging.')
         return None
-    run_name=args.wandb_run_name or f'teacher-{spec.name}'
+    run_name=args.wandb_run_name
     return wandb.init(project=args.wandb_project,entity=args.wandb_entity,name=run_name,
       tags=[tag.strip() for tag in args.wandb_tags.split(',') if tag.strip()],
       config={**vars(args),'sensor_dim':spec.sensor_dim,'estimator_input_dim':spec.estimator_input_dim},

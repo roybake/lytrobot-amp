@@ -179,3 +179,8 @@ uv run python sensor_training/play.py \
 ```
 
 测试最佳权重时将 `model_final.onnx` 换成 `model_best.onnx`。
+
+开启 `--viewer` 时，师生录屏分别保存到
+`recording/distillation/<stage>/<run>-teacher/` 和
+`recording/distillation/<stage>/<run>-student/`。`<stage>` 为 `stage1` 或 `stage2`，
+`<run>` 使用训练目录的时间戳，例如 `10-08-13:12:25`。

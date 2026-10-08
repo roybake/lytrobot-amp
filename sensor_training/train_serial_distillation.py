@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from training_paths import timestamp_name, validate_run_name
+from lytrobot_amp.training_paths import timestamp_name, validate_run_name
 
 from sensor_training.training_defaults import (
     distillation_rollout_shape,

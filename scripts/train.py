@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
-from training_paths import new_run_dir
+from lytrobot_amp.training_paths import new_run_dir
 
 from lytrobot_amp import __version__
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
@@ -678,14 +678,14 @@ def resolve_log_dir(args: argparse.Namespace) -> Path:
     if args.log_dir is None:
         log_dir = make_log_dir(args.log_root, args.stage, args.run_name, args.log_group)
         if DISTILLATION_CLI_ENABLED:
-            from training_paths import snapshot_teacher
+            from lytrobot_amp.training_paths import snapshot_teacher
             snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
         return log_dir
 
     log_dir = Path(args.log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     if DISTILLATION_CLI_ENABLED:
-        from training_paths import snapshot_teacher
+        from lytrobot_amp.training_paths import snapshot_teacher
         snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
     return log_dir
 
@@ -763,13 +763,16 @@ def maybe_init_wandb(args: argparse.Namespace, log_dir: Path):
         print(f"[INFO] rewinding/resuming wandb from {resume_from}")
     if run_id is not None:
         print(f"[INFO] resuming wandb run id={run_id}")
+    run_name = log_dir.name
+    if run_name in ("teacher", "student"):
+        run_name = f"{log_dir.parent.parent.name}-{run_name}"
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         id=None if resume_from is not None else run_id,
         resume=None if resume_from is not None else ("allow" if run_id is not None else None),
         resume_from=resume_from,
-        name=log_dir.name,
+        name=run_name,
         tags=tags,
         dir=str(log_dir),
         config=vars(args),

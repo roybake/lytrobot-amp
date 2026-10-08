@@ -322,7 +322,13 @@ def checkpoint_recording_path(
     else:
         iteration = checkpoint_path.stem
 
-    output_dir = Path(record_dir).expanduser().resolve() / stage
+    output_dir = Path(record_dir).expanduser().resolve()
+    role = checkpoint_path.parent.name
+    if role in ("teacher", "student") and "distillation" in checkpoint_path.parts:
+        run_dir = next(parent for parent in checkpoint_path.parents if parent.parent.name == "distillation")
+        output_dir = output_dir / "distillation" / stage / f"{run_dir.name}-{role}"
+    else:
+        output_dir = output_dir / stage
     output_dir.mkdir(parents=True, exist_ok=True)
     base_path = output_dir / f"{run_name}-{iteration}.mp4"
     if not base_path.exists():

@@ -55,7 +55,7 @@ def add_runtime_args(parser, *, steps=96, sensor_variant_default=None):
 
 def resolve_training_output(args, stage: str) -> None:
     """Place flat-gait checkpoints in Stage1; validate explicit outputs."""
-    from training_paths import new_run_dir, validate_run_name
+    from lytrobot_amp.training_paths import new_run_dir, validate_run_name
     output = Path(args.output or f"{stage}.pt").expanduser()
     role = "student" if stage.startswith("student") else "teacher"
     if output.parent == Path("."):
@@ -66,9 +66,10 @@ def resolve_training_output(args, stage: str) -> None:
         validate_run_name(run.name)
     output.parent.mkdir(parents=True, exist_ok=True)
     if role == "student":
-        from training_paths import snapshot_teacher
+        from lytrobot_amp.training_paths import snapshot_teacher
         snapshot_teacher(getattr(args, "teacher_checkpoint", None), run / "stage1" / "teacher")
     args.output = str(output.resolve())
+    args.wandb_run_name = args.wandb_run_name or f"{run.name}-{role}"
     print(f"[INFO] training output={args.output}")
 
 

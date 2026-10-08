@@ -13,7 +13,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from distillation_training.runtime import checkpoint_variant,validate_checkpoint
-from training_paths import new_run_dir, validate_run_name
+from lytrobot_amp.training_paths import new_run_dir, validate_run_name
 
 def run(command: list[str]) -> None:
     print("[PIPELINE]", " ".join(command), flush=True)
@@ -36,7 +36,7 @@ def main() -> None:
     validate_run_name(out.name)
     out.mkdir(parents=True,exist_ok=True)
     student = out / 'stage1' / 'student'; student.mkdir(parents=True,exist_ok=True)
-    from training_paths import snapshot_teacher
+    from lytrobot_amp.training_paths import snapshot_teacher
     snapshot_teacher(teacher, out / 'stage1' / 'teacher')
     bc=student/'student_bc.pt'; dagger=student/'student_dagger.pt'; final=student/'student_rl.pt'
     teacher_payload=validate_checkpoint(teacher,'teacher');variant=checkpoint_variant(teacher_payload,'teacher');common=['--num-envs',str(a.num_envs),'--num-steps','96','--max-iterations',str(a.max_iterations),'--device',a.device,'--sim-backend',a.sim_backend,'--task-reward-mode',teacher_payload['task_reward_mode'],'--motion-file',teacher_payload['motion_file'],'--target-velocity',str(teacher_payload['target_velocity']),'--no-wandb']
