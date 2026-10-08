@@ -187,7 +187,7 @@ reference/control 与物理扰动参数，输出 `teacher/*`、`student/*`、`st
 .venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1
 ```
 
-默认各 30000 轮。已有合格 Teacher 时可以用：
+Teacher、Student Stage1 和 Student Stage2 默认各 50000 轮。已有合格 Teacher 时可以用：
 
 ```bash
 .venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1 \

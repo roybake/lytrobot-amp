@@ -3,11 +3,11 @@
 全自动方案B - 训练更好的教师 + 自动蒸馏
 
 流程：
-1. 训练新教师（35000步，~12小时）
+1. 训练新教师（50000轮）
 2. 自动找到最佳checkpoint
-3. 用新教师蒸馏学生（25000步，~10小时）
+3. 用新教师蒸馏学生（50000轮）
 
-总时间：~22小时，无需人工干预
+教师和学生各训练50000轮，无需人工干预
 """
 
 import subprocess
@@ -25,7 +25,7 @@ def train_better_teacher():
         RUN_DIR = new_run_dir(REPO_ROOT / "logs/distillation")
     """阶段1：训练更好的教师"""
     print("=" * 70)
-    print("阶段1: 训练更好的Stage1教师（35000步，~12小时）")
+    print("阶段1: 训练更好的Stage1教师（50000轮）")
     print("=" * 70)
     print()
     print("改进点:")
@@ -64,7 +64,7 @@ def train_better_teacher():
         "--action-rate-penalty-coef", "0.10",
 
         # 训练配置
-        "--max-iterations", "35000",
+        "--max-iterations", "50000",
         "--save-interval", "500",
         "--episode-steps", "2000",
         "--learning-rate", "3e-4",
@@ -128,7 +128,7 @@ for m in metrics:
 def distill_with_teacher(teacher_checkpoint):
     """阶段2：用新教师蒸馏学生"""
     print("=" * 70)
-    print("阶段2: 传感器策略蒸馏（25000步，~10小时）")
+    print("阶段2: 传感器策略蒸馏（50000轮）")
     print("=" * 70)
     print()
     print(f"使用教师: {teacher_checkpoint.name}")
@@ -197,7 +197,7 @@ def distill_with_teacher(teacher_checkpoint):
         "--target-kl-stop-multiplier", "2.0",
 
         # 训练配置
-        "--max-iterations", "25000",
+        "--max-iterations", "50000",
         "--save-interval", "500",
         "--compile-policy-chunk-steps", "8",
 
@@ -230,10 +230,10 @@ def main():
     print("=" * 70)
     print()
     print("流程:")
-    print("  阶段1: 训练更好的教师（35000步，~12小时）")
-    print("  阶段2: 用新教师蒸馏学生（25000步，~10小时）")
+    print("  阶段1: 训练更好的教师（50000轮）")
+    print("  阶段2: 用新教师蒸馏学生（50000轮）")
     print()
-    print("总时间: ~22小时")
+    print("教师和学生各训练50000轮")
     print("完全自动，无需人工干预")
     print()
     print("=" * 70)

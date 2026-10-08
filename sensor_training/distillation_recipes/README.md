@@ -31,7 +31,7 @@ cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/distillation_recipes/run_improved.py
 ```
 
-- 20000步，约8小时
+- 50000轮
 - 一键自动执行
 - 包含所有核心改进
 
@@ -52,9 +52,9 @@ cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/distillation_recipes/run_two_stage.py
 ```
 
-- 阶段1: 预训练状态估计器（3000步）
-- 阶段2: 策略蒸馏（15000步）
-- 总计约8小时
+- 阶段1: 预训练状态估计器（50000轮）
+- 阶段2: 策略蒸馏（50000轮）
+- 每阶段50000轮
 
 ## 📊 核心改进
 
@@ -81,8 +81,8 @@ success_rate            0.0  →  0.65    > 0.60
 ```
 sensor_training/distillation_recipes/
 ├── quick_validate.py    # 快速验证（30分钟）
-├── run_improved.py      # 单阶段完整训练（8小时）
-├── run_two_stage.py     # 两阶段训练（8小时，最稳健）
+├── run_improved.py      # 单阶段完整训练（50000轮）
+├── run_two_stage.py     # 两阶段训练（每阶段50000轮，最稳健）
 └── README.md            # 本文件
 ```
 
@@ -130,17 +130,17 @@ watch -n 10 'tail logs/distillation/*/stage*/student/train.log | grep -E "(teach
 - "Learning to Walk in Minutes Using Massively Parallel Deep RL"
 - "RMA: Rapid Motor Adaptation for Legged Robots"
 
-## ⏱️ 时间规划
+## ⏱️ 训练轮次
 
 ### 单阶段（run_improved.py）
 ```
-00:00 - 08:00  完整训练（20000步）
+完整训练（50000轮）
 ```
 
 ### 两阶段（run_two_stage.py）
 ```
-00:00 - 01:30  阶段1: 预训练估计器（3000步）
-01:30 - 08:00  阶段2: 策略蒸馏（15000步）
+阶段1: 预训练估计器（50000轮）
+阶段2: 策略蒸馏（50000轮）
 ```
 
 ## 📝 详细参数

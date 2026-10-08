@@ -61,7 +61,7 @@ def final_teacher_evaluation_flags():
             '--no-stop-on-gait-acceptance']
 
 
-def final_training_flags(*, student=False, robust=False, iterations=30000):
+def final_training_flags(*, student=False, robust=False, iterations=50000):
     flags = ['--motion-file', str(REFERENCE), '--target-velocity', '1.28',
              '--task-reward-mode', 'stage1_reference', '--action-residual-scale', '.5',
              '--amp-reward-coef', '.3', '--task-reward-lerp', '.9',

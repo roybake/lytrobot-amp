@@ -73,8 +73,8 @@ def parse_args() -> argparse.Namespace:
             "Default: 48 at the required 100 Hz control rate."
         ),
     )
-    parser.add_argument("--stage1-iterations", type=int, default=30000)
-    parser.add_argument("--stage2-iterations", type=int, default=30000)
+    parser.add_argument("--stage1-iterations", type=int, default=50000)
+    parser.add_argument("--stage2-iterations", type=int, default=50000)
     parser.add_argument("--teacher-stage1-iterations", type=int, default=None)
     parser.add_argument("--teacher-stage2-iterations", type=int, default=None)
     parser.add_argument("--teacher-stage1-checkpoint", type=Path, default=None)

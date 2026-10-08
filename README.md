@@ -4,6 +4,35 @@
 
 平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含完整 mocap 序列，采样频率 40 Hz；默认目标速度为 `1.28 m/s`（原始人体步速）。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
 
+## 最佳：传感器串行蒸馏 Stage1（GRU128，696D，BPTT96）
+
+沿用 `logs/sensor_policy/distillation/10-06-13:24:19` 的配置和目录布局，Teacher、Student 各训练 50000 轮。默认保存到 `logs/sensor_policy/distillation/<run>/teacher` 和 `<run>/student`。Teacher 启动时自动生成时间戳（`MM-DD-HH:MM:SS`），Student 根据教师权重路径复用该时间戳；将后续命令中的 `<run>` 替换为 Teacher 输出的时间戳。
+W&B 名称为 `<训练时间戳>-teacher`、`<训练时间戳>-student`。
+
+```bash
+cd /home/yeah/code/lytrobot-amp
+
+# 训练 Teacher
+.venv/bin/python scripts/train_stage1.py \
+  --num-envs 1024 --max-iterations 50000 \
+  --evaluate-gait --gait-fidelity-selection --gait-evaluation-seconds 30
+
+# 测试 Teacher
+.venv/bin/python scripts/play.py \
+  --checkpoint "logs/sensor_policy/distillation/<run>/teacher/model_final.pt" \
+  --device cuda --viewer --steps 0
+
+# 训练 Student
+.venv/bin/python sensor_training/train_distill_stage1.py \
+  --teacher-checkpoint "logs/sensor_policy/distillation/<run>/teacher/model_final.pt" \
+  --num-envs 1024 --num-steps 96
+
+# 测试 Student（最佳权重）
+.venv/bin/python sensor_training/play.py \
+  --checkpoint "logs/sensor_policy/distillation/<run>/student/model_best.pt" \
+  --device cuda --viewer --steps 0
+```
+
 ## 推荐：最终纯传感器人体步态
 
 实机现有7组IMU和14条肌腱编码器；Teacher → Student Stage1 → Student Stage2 DR → ONNX。
@@ -84,202 +113,6 @@ uv run python sensor_training/play.py \
   --device cuda --viewer --steps 0
 ```
 
-## 传感器串行蒸馏（一键）
-
-```bash
-# 训练自然步态；同时训练鲁棒阶段时增加 --include-robust-stage
-cd /home/yeah/code/lytrobot-amp
-uv run python sensor_training/train_serial_distillation.py \
-  --final-sensor-gait
-
-# 测试第一阶段教师（将 <run> 替换为训练时间戳）
-uv run python scripts/play.py \
-  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.pt" \
-  --device cuda --viewer --steps 0
-
-# 测试第一阶段学生
-uv run python sensor_training/play.py \
-  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/student/model_27000.onnx" \
-  --device cuda --viewer --steps 0
-
-# 测试第二阶段教师
-uv run python scripts/play.py \
-  --checkpoint "logs/distillation/<run>/stage2/teacher/model_final.onnx" \
-  --device cuda --viewer --steps 0
-
-# 测试第二阶段学生
-uv run python sensor_training/play.py \
-  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
-  --device cuda --viewer --steps 0
-```
-
-## 传感器串行蒸馏（分阶段）
-
-以下命令的 `<run>` 使用同一个训练时间戳，各阶段目录会自动创建。
-
-```bash
-# Teacher Stage1
-cd /home/yeah/code/lytrobot-amp
-uv run python scripts/train_stage1.py \
-  --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
-  --max-iterations 30000 --log-dir "logs/distillation/<run>/stage1/teacher"
-
-# Teacher Stage2
-cd /home/yeah/code/lytrobot-amp
-uv run python scripts/train_stage2.py \
-  --stage1-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
-  --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
-  --max-iterations 30000 --log-dir "logs/distillation/<run>/stage2/teacher"
-
-# Student Stage1
-cd /home/yeah/code/lytrobot-amp
-uv run python sensor_training/train_distill_stage1.py \
-  --teacher-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
-  --device cuda --sim-backend warp --max-iterations 30000 \
-  --log-dir "logs/distillation/<run>/stage1/student"
-
-# Student Stage2
-cd /home/yeah/code/lytrobot-amp
-uv run python sensor_training/train_distill_stage2.py \
-  --student-checkpoint "logs/distillation/<run>/stage1/student/model_final.pt" \
-  --teacher-checkpoint "logs/distillation/<run>/stage2/teacher/model_final.pt" \
-  --device cuda --sim-backend warp --max-iterations 30000 \
-  --log-dir "logs/distillation/<run>/stage2/student"
-
-# 测试 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python scripts/play.py \
-  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.onnx" \
-  --device cuda --viewer --steps 0
-
-# 测试 Student
-cd /home/yeah/code/lytrobot-amp
-uv run python sensor_training/play.py \
-  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
-  --device cuda --viewer --steps 0
-```
-
-## Teacher → Student 蒸馏（无足底力，58D）
-
-```bash
-# 训练 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_teacher.py \
-  --sensor-variant phase_no_force --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 \
-  --output logs/distillation/teacher_phase_no_force.pt
-
-# 测试 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play_teacher.py \
-  --checkpoint logs/distillation/teacher_phase_no_force.pt \
-  --steps 1000 --seed 42 --camera-mode fixed
-
-# 依次训练 BC、DAgger、Student RL
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint logs/distillation/teacher_phase_no_force.pt \
-  --run-dir logs/distillation/phase_no_force \
-  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 1000 \
-  --max-validation-normalized-action-mse "<threshold>"
-
-# 测试 Student
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play.py \
-  --checkpoint logs/distillation/phase_no_force/student_rl.pt \
-  --device cuda --sim-backend warp --steps 1000 --seed 42
-```
-
-## Teacher → Student 蒸馏（有足底力，64D）
-
-```bash
-# 训练 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_teacher.py \
-  --sensor-variant phase_force --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 \
-  --output logs/distillation/teacher_phase_force.pt
-
-# 测试 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play_teacher.py \
-  --checkpoint logs/distillation/teacher_phase_force.pt \
-  --steps 1000 --seed 42 --camera-mode fixed
-
-# 依次训练 BC、DAgger、Student RL
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint logs/distillation/teacher_phase_force.pt \
-  --run-dir logs/distillation/phase_force \
-  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 1000 \
-  --max-validation-normalized-action-mse "<threshold>"
-
-# 测试 Student
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play.py \
-  --checkpoint logs/distillation/phase_force/student_rl.pt \
-  --device cuda --sim-backend warp --steps 1000 --seed 42
-```
-
-## 传感器直接训练（无足底力，56D）
-
-```bash
-# 训练
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/train_no_force_stage1.py \
-  --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 --max-iterations 30000
-
-# 测试
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/play.py \
-  --checkpoint "logs/foot_sensor_no_force/stage1/<run>/model_final.pt" --viewer --steps 0
-```
-
-## 传感器直接训练（有足底力，62D）
-
-```bash
-# 训练
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/train_stage1.py \
-  --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 --max-iterations 30000
-
-# 测试
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/play.py \
-  --checkpoint "logs/foot_sensor/stage1/<run>/model_final.pt" --viewer --steps 0
-```
-
-## 传感器直接训练（相位＋无足底力，58D）
-
-```bash
-# 训练
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/train_phase_no_force_stage1.py \
-  --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 --max-iterations 30000
-
-# 测试
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/play.py \
-  --checkpoint "logs/foot_sensor_phase/stage1/<run>/model_final.pt" --viewer --steps 0
-```
-
-## 传感器直接训练（相位＋足底力，64D）
-
-```bash
-# 训练
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/train_phase_force_stage1.py \
-  --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 --max-iterations 30000
-
-# 测试
-cd /home/yeah/code/lytrobot-amp
-uv run python foot_sensor_training/play.py \
-  --checkpoint "logs/foot_sensor_phase_force/stage1/<run>/model_final.pt" --viewer --steps 0
-```
 
 ## DeepMimic 连续上下楼
 
@@ -292,7 +125,7 @@ uv run python sensor_training/train_stairs_deepmimic.py \
 # 测试
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
-  --checkpoint "logs/stairs/10-06-13:01:44/model_best.onnx" --viewer --steps 0
+  --checkpoint "logs/stairs/10-06-13:01:44/model_final.onnx" --viewer --steps 0
 ```
 
 ## 蹲起传感器策略 Stage1
@@ -379,4 +212,203 @@ cd /home/yeah/code/lytrobot-amp
 uv run python scripts/play.py \
   --checkpoint "logs/stage1/<run>/model_final.onnx" \
   --device cuda --no-viewer --steps 1000 --seed 42
+```
+
+#  以下内容忽略
+
+## 传感器串行蒸馏（一键）
+
+```bash
+# 训练自然步态；同时训练鲁棒阶段时增加 --include-robust-stage
+cd /home/yeah/code/lytrobot-amp
+uv run python sensor_training/train_serial_distillation.py \
+  --final-sensor-gait
+
+# 测试第一阶段教师（将 <run> 替换为训练时间戳）
+uv run python scripts/play.py \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.pt" \
+  --device cuda --viewer --steps 0
+
+# 测试第一阶段学生
+uv run python sensor_training/play.py \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/student/model_best.pt" \
+  --device cuda --viewer --steps 0
+
+# 测试第二阶段教师
+uv run python scripts/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 测试第二阶段学生
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
+```
+
+## 传感器串行蒸馏（分阶段）
+
+以下命令的 `<run>` 使用同一个训练时间戳，各阶段目录会自动创建。
+
+```bash
+# Teacher Stage1
+cd /home/yeah/code/lytrobot-amp
+uv run python scripts/train_stage1.py \
+  --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
+  --max-iterations 50000 --log-dir "logs/distillation/<run>/stage1/teacher"
+
+# Teacher Stage2
+cd /home/yeah/code/lytrobot-amp
+uv run python scripts/train_stage2.py \
+  --stage1-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
+  --device cuda --sim-backend warp --reference-ctrl-blend 1.0 \
+  --max-iterations 50000 --log-dir "logs/distillation/<run>/stage2/teacher"
+
+# Student Stage1
+cd /home/yeah/code/lytrobot-amp
+uv run python sensor_training/train_distill_stage1.py \
+  --teacher-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
+  --device cuda --sim-backend warp --max-iterations 50000 \
+  --log-dir "logs/distillation/<run>/stage1/student"
+
+# Student Stage2
+cd /home/yeah/code/lytrobot-amp
+uv run python sensor_training/train_distill_stage2.py \
+  --student-checkpoint "logs/distillation/<run>/stage1/student/model_final.pt" \
+  --teacher-checkpoint "logs/distillation/<run>/stage2/teacher/model_final.pt" \
+  --device cuda --sim-backend warp --max-iterations 50000 \
+  --log-dir "logs/distillation/<run>/stage2/student"
+
+# 测试 Teacher
+cd /home/yeah/code/lytrobot-amp
+uv run python scripts/play.py \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/teacher/model_final.onnx" \
+  --device cuda --viewer --steps 0
+
+# 测试 Student
+cd /home/yeah/code/lytrobot-amp
+uv run python sensor_training/play.py \
+  --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
+  --device cuda --viewer --steps 0
+```
+
+## Teacher → Student 蒸馏（无足底力，58D）
+
+```bash
+# 训练 Teacher
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/train_teacher.py \
+  --sensor-variant phase_no_force --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 \
+  --output logs/distillation/teacher_phase_no_force.pt
+
+# 测试 Teacher
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/play_teacher.py \
+  --checkpoint logs/distillation/teacher_phase_no_force.pt \
+  --steps 1000 --seed 42 --camera-mode fixed
+
+# 依次训练 BC、DAgger、Student RL
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/train_pipeline.py \
+  --teacher-checkpoint logs/distillation/teacher_phase_no_force.pt \
+  --run-dir logs/distillation/phase_no_force \
+  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 50000 \
+  --max-validation-normalized-action-mse "<threshold>"
+
+# 测试 Student
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/play.py \
+  --checkpoint logs/distillation/phase_no_force/student_rl.pt \
+  --device cuda --sim-backend warp --steps 1000 --seed 42
+```
+
+## Teacher → Student 蒸馏（有足底力，64D）
+
+```bash
+# 训练 Teacher
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/train_teacher.py \
+  --sensor-variant phase_force --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 \
+  --output logs/distillation/teacher_phase_force.pt
+
+# 测试 Teacher
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/play_teacher.py \
+  --checkpoint logs/distillation/teacher_phase_force.pt \
+  --steps 1000 --seed 42 --camera-mode fixed
+
+# 依次训练 BC、DAgger、Student RL
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/train_pipeline.py \
+  --teacher-checkpoint logs/distillation/teacher_phase_force.pt \
+  --run-dir logs/distillation/phase_force \
+  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 50000 \
+  --max-validation-normalized-action-mse "<threshold>"
+
+# 测试 Student
+cd /home/yeah/code/lytrobot-amp
+uv run python distillation_training/play.py \
+  --checkpoint logs/distillation/phase_force/student_rl.pt \
+  --device cuda --sim-backend warp --steps 1000 --seed 42
+```
+
+## 传感器直接训练（无足底力，56D）
+
+```bash
+# 训练
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/train_no_force_stage1.py \
+  --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 --max-iterations 30000
+
+# 测试
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/play.py \
+  --checkpoint "logs/foot_sensor_no_force/stage1/<run>/model_final.pt" --viewer --steps 0
+```
+
+## 传感器直接训练（有足底力，62D）
+
+```bash
+# 训练
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/train_stage1.py \
+  --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 --max-iterations 30000
+
+# 测试
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/play.py \
+  --checkpoint "logs/foot_sensor/stage1/<run>/model_final.pt" --viewer --steps 0
+```
+
+## 传感器直接训练（相位＋无足底力，58D）
+
+```bash
+# 训练
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/train_phase_no_force_stage1.py \
+  --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 --max-iterations 30000
+
+# 测试
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/play.py \
+  --checkpoint "logs/foot_sensor_phase/stage1/<run>/model_final.pt" --viewer --steps 0
+```
+
+## 传感器直接训练（相位＋足底力，64D）
+
+```bash
+# 训练
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/train_phase_force_stage1.py \
+  --device cuda --sim-backend warp \
+  --num-envs 1024 --num-steps 96 --max-iterations 30000
+
+# 测试
+cd /home/yeah/code/lytrobot-amp
+uv run python foot_sensor_training/play.py \
+  --checkpoint "logs/foot_sensor_phase_force/stage1/<run>/model_final.pt" --viewer --steps 0
 ```

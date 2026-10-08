@@ -9,7 +9,7 @@
 4. 温和监督 - teacher_action_loss_coef 0.25→0.05
 5. 强化RL - task_reward_lerp=0.85
 
-预计时间：20000步，约8小时
+训练轮次：50000轮
 """
 
 import sys
@@ -79,7 +79,7 @@ TRAINING_ARGS = [
     "--target-kl-stop-multiplier", "1.8",
 
     # === 训练配置 ===
-    "--max-iterations", "20000",
+    "--max-iterations", "50000",
     "--save-interval", "500",
     "--compile-policy-chunk-steps", "8",
 
@@ -116,7 +116,7 @@ def main():
     print("  • RL权重: 85%（原来75%）")
     print()
 
-    print("预计时间: ~8小时")
+    print("训练轮次: 50000轮")
     print("按 Ctrl+C 可随时中断")
     print()
     print("=" * 60)

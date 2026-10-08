@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
-from lytrobot_amp.training_paths import new_run_dir
+from lytrobot_amp.training_paths import new_run_dir, validate_run_name
 
 from lytrobot_amp import __version__
 from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
@@ -254,6 +254,12 @@ def parse_args() -> argparse.Namespace:
         "--log-dir",
         default=None,
         help="Training log/checkpoint directory; created automatically if missing.",
+    )
+    parser.add_argument(
+        "--log-role",
+        choices=("teacher", "student"),
+        default=None,
+        help="Save under a teacher/student subdirectory of the timestamped run.",
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--stage", default="stage1", choices=("stage1", "stage2"))
@@ -662,7 +668,12 @@ def make_log_dir(
     stage: str,
     run_name: str | None,
     log_group: str | None = None,
+    log_role: str | None = None,
 ) -> Path:
+    if log_role is not None:
+        directory = new_run_dir(Path(log_root), run_name) / log_role
+        directory.mkdir()
+        return directory
     if DISTILLATION_CLI_ENABLED:
         directory = new_run_dir(Path(log_root), run_name) / stage / "student"
         directory.mkdir(parents=True)
@@ -676,14 +687,23 @@ def make_log_dir(
 
 def resolve_log_dir(args: argparse.Namespace) -> Path:
     if args.log_dir is None:
-        log_dir = make_log_dir(args.log_root, args.stage, args.run_name, args.log_group)
-        if DISTILLATION_CLI_ENABLED:
-            from lytrobot_amp.training_paths import snapshot_teacher
-            snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
-        return log_dir
-
-    log_dir = Path(args.log_dir).expanduser().resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
+        if DISTILLATION_CLI_ENABLED and args.log_role == "student":
+            teacher_dir = Path(args.teacher_checkpoint).expanduser().resolve().parent
+            if args.run_name is None and teacher_dir.name != "teacher":
+                raise ValueError(
+                    "Default Student logs require a checkpoint in <run>/teacher; "
+                    "specify --log-dir for a different checkpoint layout."
+                )
+            run_name = validate_run_name(args.run_name or teacher_dir.parent.name)
+            log_dir = Path(args.log_root).expanduser().resolve() / run_name / "student"
+            log_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            log_dir = make_log_dir(
+                args.log_root, args.stage, args.run_name, args.log_group, args.log_role
+            )
+    else:
+        log_dir = Path(args.log_dir).expanduser().resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
     if DISTILLATION_CLI_ENABLED:
         from lytrobot_amp.training_paths import snapshot_teacher
         snapshot_teacher(args.teacher_checkpoint, log_dir.parent / "teacher")
@@ -765,7 +785,10 @@ def maybe_init_wandb(args: argparse.Namespace, log_dir: Path):
         print(f"[INFO] resuming wandb run id={run_id}")
     run_name = log_dir.name
     if run_name in ("teacher", "student"):
-        run_name = f"{log_dir.parent.parent.name}-{run_name}"
+        run_dir = log_dir.parent
+        if run_dir.name in ("stage1", "stage2"):
+            run_dir = run_dir.parent
+        run_name = f"{run_dir.name}-{run_name}"
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,

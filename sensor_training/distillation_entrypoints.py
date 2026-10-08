@@ -77,7 +77,7 @@ def run_stage1() -> None:
             # steps per backward graph benchmarks faster than the generic
             # 16-step sensor default for this mixed Student/Teacher workload.
             "--compile-policy-chunk-steps": "8",
-            "--max-iterations": "30000",
+            "--max-iterations": "50000",
             "--reference-ctrl-blend": "1.0",
             "--teacher-action-loss-coef": "1.0",
             "--teacher-action-loss-final-coef": "0.30",
@@ -103,7 +103,8 @@ def run_stage1() -> None:
             "--target-kl-stop-multiplier": "1.5",
             "--task-reward-lerp": "0.75",
             "--save-interval": "500",
-            "--log-root": str(DISTILLATION_LOG_ROOT),
+            "--log-root": str(REPO_ROOT / "logs" / "sensor_policy" / "distillation"),
+            "--log-role": "student",
             "--wandb-tags": "lytrobot,sensor-only,distillation,stage1-gait,privileged-teacher",
         }
     )
@@ -171,7 +172,7 @@ def run_stage2() -> None:
             "--forward-velocity-deficit-penalty-coef": "2.5",
             "--target-velocity": "1.28",
             "--compile-policy-chunk-steps": "8",
-            "--max-iterations": "30000",
+            "--max-iterations": "50000",
             "--reference-ctrl-blend": "1.0",
             "--teacher-action-loss-coef": "0.50",
             "--teacher-action-loss-final-coef": "0.30",

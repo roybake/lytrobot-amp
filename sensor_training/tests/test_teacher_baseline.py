@@ -27,7 +27,7 @@ def test_final_teacher_training_arguments_match_basic_stage1():
     assert args.num_envs == 1024 and args.student_num_envs == 1024
     command = serial._phase_command('teacher_stage1', args, serial._phase_paths('10-02-10:00:00'), resume_checkpoint=None)
     baseline = [sys.executable, str(ROOT/'scripts/train_stage1.py'), '--device', 'cuda', '--sim-backend', 'warp',
-                '--num-envs', '1024', '--max-iterations', '30000']
+                '--num-envs', '1024', '--max-iterations', '50000']
     actual, expected = effective_args(command), effective_args(baseline)
     evaluation_logging = {'log_dir', 'wandb_log_interval', 'evaluate_gait', 'gait_fidelity_selection',
                           'gait_evaluation_seconds', 'gait_evaluation_seeds'}

@@ -50,7 +50,7 @@ uv run python sensor_training/distillation_recipes/run_stronger_supervision.py
 
 **预期**：teacher_action_mae应该下降而不是上升
 
-**时间**：~10小时
+**训练轮次**：50000轮
 
 ---
 
@@ -67,7 +67,7 @@ uv run python sensor_training/distillation_recipes/train_better_teacher.py
 - 提高姿态跟踪权重（joint_position, foot_position）
 - 增加步态风格奖励
 - 降低速度要求到0.75（专注质量而非速度）
-- 训练35000步（原来~20000）
+- 训练50000轮
 
 **目标指标**：
 - episode_length > 800
@@ -75,7 +75,7 @@ uv run python sensor_training/distillation_recipes/train_better_teacher.py
 - forward_velocity > 0.70
 - success_rate > 0.85
 
-**时间**：~12小时
+**训练轮次**：50000轮
 
 训练完成后再用新教师蒸馏：
 ```bash
@@ -88,16 +88,16 @@ uv run python sensor_training/distillation_recipes/train_better_teacher.py
 
 ## 📊 两个方案对比
 
-| 方案 | 时间 | 难度 | 效果预期 | 适用场景 |
+| 方案 | 训练轮次 | 难度 | 效果预期 | 适用场景 |
 |------|------|------|---------|----------|
-| **方案A** | 10小时 | 低 | 中等改善 | 快速验证，时间紧 |
-| **方案B** | 12+10=22小时 | 中 | 根本改善 | 追求质量，长期方案 |
+| **方案A** | Student 50000轮 | 低 | 中等改善 | 快速验证，时间紧 |
+| **方案B** | Teacher、Student各50000轮 | 中 | 根本改善 | 追求质量，长期方案 |
 
 ## 🚀 立即行动
 
 ### 推荐路径：先A后B
 
-**第1步**：试试加强监督（10小时）
+**第1步**：试试加强监督（50000轮）
 ```bash
 cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/distillation_recipes/run_stronger_supervision.py

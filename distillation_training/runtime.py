@@ -34,7 +34,7 @@ BACKWARD_VELOCITY_PENALTY = 8.0
 def add_runtime_args(parser, *, steps=96, sensor_variant_default=None):
     parser.add_argument('--num-envs', type=int, default=1024)
     parser.add_argument('--num-steps', type=int, default=steps)
-    parser.add_argument('--max-iterations', type=int, default=1000)
+    parser.add_argument('--max-iterations', type=int, default=50000)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--sim-backend', choices=('cpu', 'warp'), default='warp')
     parser.add_argument('--sensor-variant', choices=tuple(SENSOR_VARIANTS), default=sensor_variant_default)

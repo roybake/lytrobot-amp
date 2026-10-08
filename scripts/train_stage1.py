@@ -29,6 +29,8 @@ if __name__ == "__main__":
 
     # Train the privileged gait teacher against the shared walking reference.
     stage1_defaults = {
+        "--log-root": str(REPO_ROOT / "logs" / "sensor_policy" / "distillation"),
+        "--log-role": "teacher",
         "--num-envs": "4096",
         "--task-reward-mode": "stage1_reference",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),

@@ -25,7 +25,7 @@ def main() -> None:
     p.add_argument('--run-dir', default=None, help='Existing timestamp directory to reuse; defaults to logs/distillation/MM-DD-HH:MM:SS')
     p.add_argument('--skip-dagger', action='store_true')
     p.add_argument('--skip-rl', action='store_true')
-    p.add_argument('--num-envs',type=int,default=1024);p.add_argument('--max-iterations',type=int,default=1000)
+    p.add_argument('--num-envs',type=int,default=1024);p.add_argument('--max-iterations',type=int,default=50000)
     p.add_argument('--device',choices=('cpu','cuda'),default='cuda');p.add_argument('--sim-backend',choices=('cpu','warp'),default='warp')
     p.add_argument('--max-validation-action-mse',type=float)
     p.add_argument('--max-validation-normalized-action-mse',type=float)

@@ -48,7 +48,7 @@ TRAINING_ARGS = [
     "--action-rate-penalty-coef", "0.10",
 
     # 训练配置
-    "--max-iterations", "35000",                      # 增加训练时间
+    "--max-iterations", "50000",                      # 增加训练时间
     "--save-interval", "500",
     "--episode-steps", "2000",
 
@@ -73,9 +73,9 @@ def main():
     print("  • 增加足部位置跟踪")
     print("  • 增加步态风格奖励")
     print("  • 降低速度要求到0.75（专注质量）")
-    print("  • 训练35000步（原来~20000）")
+    print("  • 训练50000轮")
     print()
-    print("预计时间: ~12小时")
+    print("训练轮次: 50000轮")
     print()
     print("=" * 60)
     print()

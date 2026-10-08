@@ -39,14 +39,14 @@ Teacher 采用任务一 `scripts/train_stage1.py` 的全状态 PPO/BPO+AMP 配�
 python3 scripts/train_stage1.py \
   --reference-ctrl-blend 1.0 \
   --motion-loop true --episode-steps 2000 --evaluate-gait \
-  --max-iterations 30000 \
+  --max-iterations 50000 \
   --log-dir "logs/distillation/<run>/stage1/teacher"
 
 python3 scripts/train_stage2.py \
   --stage1-checkpoint "logs/distillation/<run>/stage1/teacher/model_final.pt" \
   --reference-ctrl-blend 1.0 \
   --motion-loop true --episode-steps 2000 --evaluate-gait \
-  --max-iterations 30000 \
+  --max-iterations 50000 \
   --log-dir "logs/distillation/<run>/stage2/teacher"
 ```
 
@@ -65,7 +65,7 @@ python3 sensor_training/train_distill_stage2.py \
   --log-dir "logs/distillation/<run>/stage2/student"
 ```
 
-每一阶段默认最多训练 30000 轮。第一阶段的 Teacher 动作 Huber 损失系数从
+每一阶段默认最多训练 50000 轮。第一阶段的 Teacher 动作 Huber 损失系数从
 `1.0` 退火到 `0.3`，第二阶段从 `0.5` 退火到 `0.3`。动作误差先除以 `0.1` 再求 Huber
 损失，使细小但会改变肌腱控制的偏差获得足够监督。标签描述 Student 渐入之前的 Actor
 输出，修正了教师与学生启动渐入被重复相乘的问题。

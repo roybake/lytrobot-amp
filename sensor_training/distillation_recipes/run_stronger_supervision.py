@@ -80,7 +80,7 @@ TRAINING_ARGS = [
     "--target-kl-stop-multiplier", "2.0",
 
     # === 训练配置 ===
-    "--max-iterations", "25000",                      # 增加时间
+    "--max-iterations", "50000",                      # 增加时间
     "--save-interval", "500",
     "--compile-policy-chunk-steps", "8",
 
@@ -114,7 +114,7 @@ def main():
     print("  • teacher_action_mae应该下降而不是上升")
     print("  • episode_length应该>600")
     print()
-    print("预计时间: ~10小时")
+    print("训练轮次: 50000轮")
     print()
     print("=" * 60)
     print()

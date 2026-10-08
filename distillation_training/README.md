@@ -38,6 +38,8 @@ uv run python distillation_training/play_teacher.py \
 
 Teacher 显式选择 variant；BC、DAgger、Student RL 从 checkpoint 自动继承并验证 variant，禁止 silent mismatch。
 
+Teacher、BC、DAgger、Student RL 每个阶段默认训练 50000 轮；`train_pipeline.py` 的默认预算也是每个 Student 阶段 50000 轮。
+
 ```bash
 # Route A: no force
 uv run python distillation_training/train_teacher.py --sensor-variant phase_no_force --device cuda --sim-backend warp

@@ -2,17 +2,17 @@
 """
 传感器策略蒸馏 - 两阶段训练（最稳健）
 
-阶段1: 预训练状态估计器（3000步，~1.5小时）
+阶段1: 预训练状态估计器（50000轮）
   - 高权重状态loss
   - 不监督教师动作
   - 让GRU学会从传感器重建状态
 
-阶段2: 策略蒸馏（15000步，~6小时）
+阶段2: 策略蒸馏（50000轮）
   - 基于预训练的状态估计器
   - 启用温和的教师监督
   - 完成策略蒸馏
 
-总时间：~8小时
+每阶段50000轮
 """
 
 import sys
@@ -26,7 +26,7 @@ LOG_ROOT = REPO_ROOT / "logs/distillation"
 def run_phase1():
     """阶段1: 预训练状态估计器"""
     print("=" * 60)
-    print("阶段1: 预训练状态估计器（3000步）")
+    print("阶段1: 预训练状态估计器（50000轮）")
     print("=" * 60)
     print()
     print("目标: 让GRU从传感器历史重建关节、速度、接触状态")
@@ -79,7 +79,7 @@ def run_phase1():
         "--target-kl", "0.015",
 
         # 训练配置
-        "--max-iterations", "3000",
+        "--max-iterations", "50000",
         "--save-interval", "500",
 
         # 日志
@@ -122,7 +122,7 @@ def run_phase1():
 def run_phase2(phase1_checkpoint):
     """阶段2: 策略蒸馏"""
     print("=" * 60)
-    print("阶段2: 策略蒸馏（15000步）")
+    print("阶段2: 策略蒸馏（50000轮）")
     print("=" * 60)
     print()
     print("目标: 基于良好的状态估计，模仿教师策略")
@@ -184,7 +184,7 @@ def run_phase2(phase1_checkpoint):
         "--target-kl-stop-multiplier", "1.6",
 
         # 训练配置
-        "--max-iterations", "15000",
+        "--max-iterations", "50000",
         "--save-interval", "500",
         "--compile-policy-chunk-steps", "8",
 
@@ -225,9 +225,9 @@ def main():
     print(f"✓ 教师: {TEACHER_CHECKPOINT.name}")
     print()
     print("流程:")
-    print("  阶段1: 预训练状态估计器（3000步，~1.5小时）")
-    print("  阶段2: 策略蒸馏（15000步，~6小时）")
-    print("  总计: ~8小时")
+    print("  阶段1: 预训练状态估计器（50000轮）")
+    print("  阶段2: 策略蒸馏（50000轮）")
+    print("  每阶段50000轮")
     print()
     print("=" * 60)
     print()

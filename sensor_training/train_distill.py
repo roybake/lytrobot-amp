@@ -34,6 +34,8 @@ def _has_arg(name: str) -> bool:
 def main() -> None:
     if not _has_arg("--teacher-checkpoint"):
         raise SystemExit("Distillation requires --teacher-checkpoint PATH.")
+    if not _has_arg("--max-iterations"):
+        sys.argv.extend(["--max-iterations", "50000"])
     validate_sensor_decimation(
         cli_int(sys.argv[1:], "--decimation", DEFAULT_SENSOR_DECIMATION)
     )
