@@ -25,7 +25,7 @@ from .envs import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOTION_FILE = ROOT / 'robot/reference_data/walk1_mjcf.npz'
+DEFAULT_MOTION_FILE = ROOT / 'robot/reference_data/walk1_mjcf_repaired.npz'
 TASK_REWARD_MODES = ('gated_reference', 'stage1_reference', 'sensor_stability')
 LOCOMOTION_REWARD_PROFILE = 'gated_forward_gait_v5'
 BACKWARD_VELOCITY_PENALTY = 8.0
@@ -42,7 +42,7 @@ def add_runtime_args(parser, *, steps=96, sensor_variant_default=None):
     parser.add_argument('--learning-rate', type=float, default=3e-4)
     parser.add_argument('--task-reward-mode', choices=TASK_REWARD_MODES, default='gated_reference')
     parser.add_argument('--motion-file', default=str(DEFAULT_MOTION_FILE))
-    parser.add_argument('--target-velocity', type=float, default=1.28)
+    parser.add_argument('--target-velocity', type=float, default=0.87)
     parser.add_argument('--allow-legacy-reward-checkpoint', action='store_true')
     parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--wandb-project', default='lytrobot-distillation')
