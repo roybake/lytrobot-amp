@@ -101,6 +101,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
             "walk1_mjcf_repaired.npz",
         )
         self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "0.87")
+        self.assertEqual(_remove_option(sensor_args, "--motion-loop"), "true")
         self.assertEqual(_remove_option(sensor_args, "--symmetry-reward-coef"), "1.2")
         self.assertEqual(_remove_option(sensor_args, "--symmetry-foot-pos-sigma"), "0.08")
         self.assertEqual(_remove_option(sensor_args, "--side-foot-pos-coef"), "0.0")
@@ -148,6 +149,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
             "walk1_mjcf_repaired.npz",
         )
         self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "0.87")
+        self.assertEqual(_remove_option(sensor_args, "--motion-loop"), "true")
         self.assertEqual(_remove_option(sensor_args, "--learning-rate"), "3.0e-4")
         self.assertEqual(_remove_option(sensor_args, "--task-reward-lerp"), "0.5")
         self.assertEqual(_remove_option(sensor_args, "--amp-reward-coef"), "1.2")
@@ -178,6 +180,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         shared_options = (
             "--motion-file",
             "--target-velocity",
+            "--motion-loop",
             "--symmetry-reward-coef",
             "--symmetry-foot-pos-sigma",
             "--side-foot-pos-coef",
