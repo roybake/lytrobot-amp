@@ -25,7 +25,7 @@ Teacher 和传感器 Student 必须保持相同的 `--decimation`。新训练默
 `reference_ctrl_blend=1.0`：控制器按同一参考腱长表输出前馈，Actor 学习反馈残差。
 蒸馏器仍会把 Teacher 动作换算成绝对腱长目标，再映射为 Student 动作；相同的控制基准
 可以减少目标动作被裁剪。该参考表由控制器时钟读取，不需要额外硬件传感器。
-所有行走入口统一使用 `walk1_mjcf.npz`（原始人体 mocap，前进速度 1.28 m/s），目标速度配置为 `1.28 m/s`。
+所有行走入口统一使用 `walk1_mjcf_repaired.npz`（原始人体 mocap，前进速度 0.87 m/s），目标速度配置为 `0.87 m/s`。
 Teacher 和 Student 必须使用相同参考数据；使用其他参考训练的 Teacher 需要重新训练。
 
 ## 1. 训练特权 Teacher
@@ -136,8 +136,8 @@ logs/serial_distillation/imu_walk_100hz_v1/pipeline.json
 
 `--evaluate-gait` 会在每次保存 checkpoint 时用三个种子（42、123、2026）分别从站立起点
 确定性回放 20 秒，禁止周期结束重置，所有种子都须通过验收。
-非循环参考也可评估，只要剩余序列足够覆盖评估时长；`walk1_mjcf.npz` 包含 880 秒数据，
-无需修改训练的 `--motion-loop false`。若参考提前结束触发重置，评估仍会报错。
+非循环参考也可评估，只要剩余序列足够覆盖评估时长；`walk1_mjcf_repaired.npz` 包含 1.125 秒、45 帧的可循环数据，
+训练应启用 `--motion-loop true`。若参考提前结束触发重置，评估仍会报错。
 合格条件为：全程无跌倒、平均速度与命令相差不超过 0.15 m/s、膝关节相位误差 RMS 不超过
 0.20 rad、足端局部位置 RMS 不超过 0.06 m、膝屈伸幅度至少达到参考的 70%，锁膝采样比例
 不超过 10%。`model_best` 按验收结果和连续跟踪评分选择；仅增加回合长度不算合格。
