@@ -7,44 +7,33 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_walk_reference():
-    """测试平地行走参考数据。"""
-    print("=" * 60)
-    print("测试平地行走参考数据")
-    print("=" * 60)
+    """Audit mesh-based physical contact instead of inferring success from speed."""
+    import sys
+    import mujoco
+    sys.path.insert(0, str(REPO_ROOT))
+    from scripts.audit_walk_contact import audit_reference, check_quality
 
-    old_ref = REPO_ROOT / "robot/reference_data/walk1_mjcf.npz"
-    new_ref = REPO_ROOT / "robot/reference_data/walk1_mjcf_repaired.npz"
-
-    # 检查原始数据
-    if old_ref.exists():
-        with np.load(old_ref) as data:
-            qpos = data['qpos']
-            travel = qpos[-1, 0] - qpos[0, 0]
-            print(f"\n原始数据 (walk1_mjcf.npz):")
-            print(f"  帧数: {qpos.shape[0]}")
-            print(f"  前进距离: {travel:.3f}m")
-            if abs(travel) < 0.01:
-                print("  ✗ 问题：机器人原地踏步，无法向前走")
-
-    # 检查修复数据
-    if new_ref.exists():
-        with np.load(new_ref) as data:
-            qpos = data['qpos']
-            freq = data['frequency']
-            trans = data['cycle_translation']
-            speed = trans[0] / (qpos.shape[0] / freq)
-            print(f"\n修复数据 (walk1_mjcf_repaired.npz):")
-            print(f"  帧数: {qpos.shape[0]} @ {freq}Hz")
-            print(f"  周期时长: {qpos.shape[0]/freq:.3f}s")
-            print(f"  周期平移: {trans[0]:.3f}m")
-            print(f"  目标速度: {speed:.3f}m/s")
-            print(f"  ✓ 修复成功：机器人可以向前走")
-    else:
-        print(f"\n✗ 修复数据不存在：{new_ref}")
-        print("  请运行: uv run python scripts/repair_walk_reference.py")
+    reference = REPO_ROOT / "robot/reference_data/walk1_mjcf_repaired.npz"
+    model_path = REPO_ROOT / "robot/MJCFmodelposition.xml"
+    if not reference.exists():
+        print(f"缺少已修复轨迹：{reference}")
+        print("运行: uv run python scripts/repair_walk_reference.py")
+        return False
+    try:
+        model = mujoco.MjModel.from_xml_path(str(model_path))
+        result = audit_reference(model, reference)
+        check_quality(result)
+    except (ValueError, RuntimeError) as exc:
+        print(f"参考轨迹与地面接触检查失败：{exc}")
         return False
 
+    print("平地参考轨迹几何检查通过")
+    print(f"  最大支撑间隙: {result['maximum_support_gap_m']:.6f} m")
+    print(f"  最小足部间隙: {result['minimum_foot_clearance_m']:.6f} m")
+    print(f"  速度目标: {result['mean_forward_speed_mps']:.3f} m/s")
+    print("  注意：该检查不证明自由基座动力学稳定性。")
     return True
+
 
 def test_stairs_reference():
     """测试楼梯参考数据。"""
