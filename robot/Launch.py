@@ -13,23 +13,7 @@ import numpy as np
 
 ROBOT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROBOT_DIR / "MJCFmodelposition.xml"
-DEFAULT_REFERENCE = ROBOT_DIR / "reference_data" / "walk1.npz"
-COMMON_JOINTS = (
-    "hip_flexion_r",
-    "hip_adduction_r",
-    "hip_rotation_r",
-    "knee_angle_r",
-    "ankle_angle_r",
-    "subtalar_angle_r",
-    "mtp_angle_r",
-    "hip_flexion_l",
-    "hip_adduction_l",
-    "hip_rotation_l",
-    "knee_angle_l",
-    "ankle_angle_l",
-    "subtalar_angle_l",
-    "mtp_angle_l",
-)
+DEFAULT_REFERENCE = ROBOT_DIR / "reference_data" / "walk1_mjcf_repaired.npz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,36 +27,58 @@ def parse_args() -> argparse.Namespace:
 
 
 def set_reference_pose(model: mujoco.MjModel, data: mujoco.MjData, reference_path: Path) -> None:
+    """Load an actual model state; reject joint-order or dimension mismatches.
+
+    The original walk1.npz is retained as source data.  The repaired archive
+    carries the full MJCF joint layout, including passive patella joints, and
+    has been fitted to the robot's mesh-based sole contact constraints.
+    """
     if not reference_path.exists():
-        print(f"[WARN] reference not found, using MJCF default pose: {reference_path}")
-        return
+        raise FileNotFoundError(f"Reference not found: {reference_path}")
 
-    archive = np.load(reference_path, allow_pickle=True)
-    source_qpos = np.asarray(archive["qpos"], dtype=np.float64)
-    source_qvel = np.asarray(archive["qvel"], dtype=np.float64)
-    source_joint_names = [str(name) for name in archive["joint_names"]]
-    source_joint_to_index = {name: i for i, name in enumerate(source_joint_names)}
+    with np.load(reference_path, allow_pickle=False) as archive:
+        source_qpos = np.asarray(archive["qpos"], dtype=np.float64)
+        source_qvel = np.asarray(archive["qvel"], dtype=np.float64)
+        source_names = [str(name) for name in archive["joint_names"]]
 
-    data.qpos[:] = model.qpos0
-    data.qvel[:] = 0.0
-    data.qpos[:7] = source_qpos[0, :7]
-    data.qpos[0:2] = 0.0
-    data.qvel[:6] = source_qvel[0, :6]
+    expected_names = [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        for j in range(model.njnt)
+    ]
+    if source_names != expected_names:
+        raise ValueError(
+            "Reference joint names/order do not match the MJCF model; "
+            "use walk1_mjcf_repaired.npz or retarget the source first."
+        )
+    if source_qpos.ndim != 2 or source_qpos.shape[1] != model.nq:
+        raise ValueError(f"Reference qpos must have shape (frames, {model.nq}).")
+    if source_qvel.shape != (len(source_qpos), model.nv):
+        raise ValueError(f"Reference qvel must have shape (frames, {model.nv}).")
+    if not len(source_qpos) or not (
+        np.isfinite(source_qpos).all() and np.isfinite(source_qvel).all()
+    ):
+        raise ValueError("Reference contains no frames or non-finite states.")
 
-    if data.qpos[3] < 0.0:
-        data.qpos[3:7] *= -1.0
-
-    for name in COMMON_JOINTS:
-        source_index = source_joint_to_index.get(name)
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if source_index is None or joint_id < 0:
-            continue
-        qpos_adr = int(model.jnt_qposadr[joint_id])
-        qvel_adr = int(model.jnt_dofadr[joint_id])
-        data.qpos[qpos_adr] = source_qpos[0, 7 + source_index - 1]
-        data.qvel[qvel_adr] = source_qvel[0, 6 + source_index - 1]
-
+    data.qpos[:] = source_qpos[0]
+    data.qvel[:] = source_qvel[0]
+    data.qpos[:2] = 0.0
     mujoco.mj_forward(model, data)
+
+    # Require physical ground support when loading the repaired reference.
+    # This checks actual mesh contacts, not foot-body center heights.
+    if reference_path.name == DEFAULT_REFERENCE.name:
+        floor = model.geom("floor").id
+        feet = {model.geom(name).id for name in ("foot_r", "toe_r", "foot_l", "toe_l")}
+        signed = [
+            float(contact.dist)
+            for contact in data.contact
+            if (contact.geom1 == floor and contact.geom2 in feet)
+            or (contact.geom2 == floor and contact.geom1 in feet)
+        ]
+        if not signed or min(signed) < -0.0005 or min(signed) > 0.002:
+            raise ValueError(
+                f"Repaired reference has invalid initial ground contact: {signed}."
+            )
 
 
 def set_stable_tendon_controls(model: mujoco.MjModel, data: mujoco.MjData) -> None:
