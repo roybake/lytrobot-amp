@@ -2,7 +2,26 @@
 
 所有命令在仓库根目录执行。将 `<run>` 替换为实际运行目录，`<threshold>` 替换为选定的蒸馏验收阈值。
 
-平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含完整 mocap 序列，采样频率 40 Hz；默认目标速度为 `1.28 m/s`（原始人体步速）。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
+平地单动作行走默认使用 `robot/reference_data/walk1_mjcf_repaired.npz`：45 帧、40 Hz、周期 1.125 秒，循环位移 0.97875 米，配套的目标速度为 `0.87 m/s`，且 `--motion-loop true`。该文件按 `robot/MJCFmodelposition.xml` 的实际关节布局修正了被动髌骨、足底网格接触、关节限位和周期速度。原始人体录制 `walk1.npz` 及长序列 `walk1_mjcf.npz` 保留作来源与对照；如显式使用长序列，需同时显式指定匹配的速度、循环方式并重新审核足底接触。Teacher、Student、Stage1、Stage2 应使用同一参考版本，已按旧序列训练的权重不能直接视为新参考的已验收结果。
+
+## 行走参考与地面接触验收
+
+```bash
+# 用 MuJoCo 的实际碰撞网格逐帧检查几何接触、关节限位、髌骨约束和周期速度
+uv run python scripts/audit_walk_contact.py --output logs/walk_ground_contact_audit.json
+
+# 静态参考姿态与完整步态回放
+uv run python robot/Launch.py --headless --steps 1
+uv run python scripts/view_reference.py --motion-file robot/reference_data/walk1_mjcf_repaired.npz --loop
+
+# 自由基座、受力受限的动力学回放，单独检查跌倒、持续支撑与前进能力
+uv run python scripts/test_reference_dynamics.py \
+  --motion-file robot/reference_data/walk1_mjcf_repaired.npz \
+  --source training --seconds 10 --trials 8 \
+  --output logs/walk_reference_dynamics.json
+```
+
+当前仓库已有修复轨迹对应的运动学审计结果，最大支撑间隙约 0.82 毫米、最小足底间隙约 -0.095 毫米，但动力学稳定性需要通过上述独立实验及最终策略评估确认，几何接触合格并不意味着电机驱动下能够长期保持平衡。
 
 ## 最佳：传感器串行蒸馏 Stage1（GRU128，696D，BPTT96）
 
