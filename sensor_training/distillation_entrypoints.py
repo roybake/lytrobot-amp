@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 DISTILLATION_LOG_ROOT = REPO_ROOT / "logs" / "distillation"
 DEFAULT_GAIT_REFERENCE = (
-    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
+    REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
 )
 
 
@@ -60,7 +60,7 @@ def run_stage1() -> None:
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
             "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "false",
+            "--motion-loop": "true",
             "--episode-steps": "2000",
             "--episode-timeout-jitter-steps": "0",
             "--task-reward-mode": "stage1_reference",
@@ -72,7 +72,7 @@ def run_stage1() -> None:
             "--sensor-sync-forward-penalty-coef": "1.0",
             "--forward-velocity-reward-coef": "2.0",
             "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "1.28",
+            "--target-velocity": "0.87",
             # Teacher supervision adds another rollout graph.  Eight recurrent
             # steps per backward graph benchmarks faster than the generic
             # 16-step sensor default for this mixed Student/Teacher workload.
@@ -158,7 +158,7 @@ def run_stage2() -> None:
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
             "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "false",
+            "--motion-loop": "true",
             "--episode-steps": "2000",
             "--episode-timeout-jitter-steps": "0",
             "--task-reward-mode": "stage1_reference",
@@ -170,7 +170,7 @@ def run_stage2() -> None:
             "--sensor-sync-forward-penalty-coef": "1.0",
             "--forward-velocity-reward-coef": "2.0",
             "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "1.28",
+            "--target-velocity": "0.87",
             "--compile-policy-chunk-steps": "8",
             "--max-iterations": "50000",
             "--reference-ctrl-blend": "1.0",
