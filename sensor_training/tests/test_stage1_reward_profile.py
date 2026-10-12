@@ -200,6 +200,17 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
                 else:
                     self.assertEqual(sensor_value, teacher_value)
 
+    def test_privileged_stage2_uses_the_same_repaired_cycle(self) -> None:
+        stage2_args = _default_entrypoint_argv(
+            REPO_ROOT / "scripts" / "train_stage2.py"
+        )
+        self.assertEqual(
+            Path(_remove_option(stage2_args, "--motion-file")).name,
+            "walk1_mjcf_repaired.npz",
+        )
+        self.assertEqual(_remove_option(stage2_args, "--target-velocity"), "0.87")
+        self.assertEqual(_remove_option(stage2_args, "--motion-loop"), "true")
+
     def test_sensor_entrypoints_require_100_hz(self) -> None:
         for entrypoint in ("train_stage1.py", "train_stage2.py"):
             with self.subTest(entrypoint=entrypoint, control_hz=100):
