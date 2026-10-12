@@ -60,9 +60,9 @@ if __name__ == "__main__":
     if not any(arg == "--motion-file" or arg.startswith("--motion-file=") for arg in sys.argv):
         sys.argv.extend(["--motion-file", str(DEFAULT_GAIT_REFERENCE)])
     if not any(arg == "--target-velocity" or arg.startswith("--target-velocity=") for arg in sys.argv):
-        sys.argv.extend(["--target-velocity", "1.28"])
+        sys.argv.extend(["--target-velocity", "0.87"])
     if not any(arg == "--motion-loop" or arg.startswith("--motion-loop=") for arg in sys.argv):
-        sys.argv.extend(["--motion-loop", "false"])
+        sys.argv.extend(["--motion-loop", "true"])
     # 4096 envs generate four times as many samples per iteration as stage1.
     # 7500 iterations therefore preserve the stage1 sample budget instead of
     # accidentally running a 4x larger 2.95-billion-transition job.
