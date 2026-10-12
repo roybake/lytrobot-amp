@@ -53,6 +53,8 @@ class DistillationEntrypointTests(unittest.TestCase):
             self.captured[self.captured.index("--motion-file") + 1].split("/")[-1],
             "walk1_mjcf_repaired.npz",
         )
+        self.assertEqual(self.captured[self.captured.index("--motion-loop") + 1], "true")
+        self.assertEqual(self.captured[self.captured.index("--target-velocity") + 1], "0.87")
         self.assertEqual(
             self.captured[self.captured.index("--sensor-knee-gait-reward-coef") + 1],
             "1.0",
