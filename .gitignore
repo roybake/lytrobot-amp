@@ -1,0 +1,29 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.venv
+
+# Training outputs; keep source and documentation under logs visible to Git.
+/logs/**/*
+!/logs/**/
+!/logs/**/*.py
+!/logs/**/*.sh
+!/logs/**/*.md
+/wandb/
+/recording/
+/runs/
+/outputs/
+/checkpoints/
+*.pt
+*.onnx
+*.mp4
+MUJOCO_LOG.TXT
+
+# Local tool and editor preferences
+.claude/settings.local.json
+.vscode/*.log
