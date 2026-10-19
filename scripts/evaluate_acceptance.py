@@ -7,6 +7,7 @@ import argparse
 from dataclasses import fields
 import json
 from pathlib import Path
+import secrets
 import sys
 
 import numpy as np
@@ -19,7 +20,6 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
 
 from lytrobot_amp.benchmark import (  # noqa: E402
     AcceptanceResult,
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MAX_SLOPE_DEG,
     MIN_WALKING_SPEED_KMH,
     MIN_WALKING_SPEED_MPS,
@@ -29,7 +29,7 @@ from lytrobot_amp.benchmark import (  # noqa: E402
     STAIR_TREAD_RANGE_M,
 )
 from lytrobot_amp.env import LytRobotEnvCfg  # noqa: E402
-from lytrobot_amp.terrain import course_stage_scenarios  # noqa: E402
+from lytrobot_amp.terrain import MAX_ROUGH_HEIGHT_DIFFERENCE_M, course_stage_scenarios  # noqa: E402
 from sensor_training.envs import SensorHistoryCpuAmpEnv  # noqa: E402
 from sensor_training.networks import SensorActorCritic  # noqa: E402
 
@@ -40,7 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--flat-steps", type=int, default=2000)
     parser.add_argument("--course-steps", type=int, default=6000)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=secrets.randbits(32),
+                        help="Evaluation RNG seed; randomly generated for each run by default.")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -196,9 +197,8 @@ def evaluate_flat(
         knee_qpos_adrs = env.base_motion.robot_qpos_adrs[knee_indices]
         knee_flexion_sum = np.zeros(2, dtype=np.float64)
         knee_track_sum = 0.0
-        locked_knee_samples = 0
+        knee_range_violation_samples = 0
         gait_samples = 0
-        knee_target = max(float(env.cfg.sensor_knee_flexion_target), 1.0e-6)
         for _ in range(max(int(steps), 1)):
             action, recurrent_state = policy_action(
                 policy,
@@ -217,17 +217,15 @@ def evaluate_flat(
                     -np.asarray(env.base_env.datas[0].qpos[knee_qpos_adrs]),
                     0.0,
                 )
-                knee_track = float(
-                    np.clip(np.min(knee_flexion) / knee_target, 0.0, 1.0)
-                )
+                knee_track = float(info["knee_flexion_track"][0])
                 knee_flexion_sum += knee_flexion
                 knee_track_sum += knee_track
-                locked_knee_samples += int(knee_track < 0.60)
+                knee_range_violation_samples += int(knee_track < 1.0 - 1.0e-6)
                 gait_samples += 1
         mean_speed = velocity_sum / max(int(steps), 1)
         mean_knee_flexion = knee_flexion_sum / max(gait_samples, 1)
         mean_knee_track = knee_track_sum / max(gait_samples, 1)
-        locked_knee_fraction = locked_knee_samples / max(gait_samples, 1)
+        knee_range_violation_fraction = knee_range_violation_samples / max(gait_samples, 1)
         return {
             "steps": int(steps),
             "duration_s": float(max(int(steps), 1) * env.dt),
@@ -238,9 +236,9 @@ def evaluate_flat(
             "mean_right_knee_flexion_rad": float(mean_knee_flexion[0]),
             "mean_left_knee_flexion_rad": float(mean_knee_flexion[1]),
             "mean_knee_flexion_track": float(mean_knee_track),
-            "locked_knee_fraction": float(locked_knee_fraction),
+            "knee_range_violation_fraction": float(knee_range_violation_fraction),
             "natural_knee_gait": bool(
-                mean_knee_track >= 0.90 and locked_knee_fraction <= 0.10
+                mean_knee_track >= 0.90 and knee_range_violation_fraction <= 0.10
             ),
         }
     finally:
@@ -356,7 +354,7 @@ def main() -> None:
     if not natural_gait_passed:
         failures.append(
             "locked-knee gait exceeds the natural-walking limit "
-            f"({float(flat['locked_knee_fraction']):.1%} locked samples)"
+            f"({float(flat['knee_range_violation_fraction']):.1%} out-of-reference-range samples)"
         )
     report = {
         "passed": bool(result.passed and natural_gait_passed),
@@ -372,7 +370,7 @@ def main() -> None:
             "stair_assessment_cases": STAIR_ASSESSMENT_CASES,
             "required_scenarios": REQUIRED_SCENARIOS,
             "minimum_mean_knee_flexion_track": 0.90,
-            "maximum_locked_knee_fraction": 0.10,
+            "maximum_knee_range_violation_fraction": 0.10,
         },
         "flat": flat,
         "course": worst_case_course,

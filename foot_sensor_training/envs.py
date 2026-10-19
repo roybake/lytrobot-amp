@@ -42,7 +42,8 @@ class FootForceEnv(SensorHistoryEnv):
             self._last_force_raw=np.zeros_like(self._force_sensor_output)
             self._last_force_normalized=np.zeros_like(self._force_sensor_output)
         self._force_updated_this_tick=False
-        super().__init__(base_env, SensorObservationConfig(history_steps=0, gait_command_enabled=False))
+        super().__init__(base_env, SensorObservationConfig(history_steps=0, gait_command_enabled=False,
+                                                       include_tendon_velocity=False))
         self._update_foot_force_sensor()
         self._fill_history(self._all_env_ids())
 
@@ -214,7 +215,8 @@ class FootForceWarpAmpEnv(FootForceEnv):
 class NoForceEnv(SensorHistoryEnv):
     """Strict 56D control for the force ablation (all else is identical)."""
     def __init__(self,base_env):
-        super().__init__(base_env,SensorObservationConfig(history_steps=0,gait_command_enabled=False))
+        super().__init__(base_env,SensorObservationConfig(history_steps=0,gait_command_enabled=False,
+                                                       include_tendon_velocity=False))
     @property
     def sensor_frame_dim(self): return 56
     @property

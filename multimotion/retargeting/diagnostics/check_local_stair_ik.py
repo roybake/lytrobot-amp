@@ -24,7 +24,7 @@ def inspect(frame: int, attempts: int, root_x: float | None = None) -> None:
     with np.load(Path(__file__).parent / "stair_up_down_candidate.npz") as archive:
         pose = np.asarray(archive["qpos"][frame], dtype=np.float64)
         target = np.asarray(archive["target_landmarks"][frame], dtype=np.float64)
-    model = load_model(REPO / "robot/MJCFmodelposition.xml", TRAIN_STAIR_CFG)
+    model = load_model(REPO / "robot/MJCFmodelfinal.xml", TRAIN_STAIR_CFG)
     data = mujoco.MjData(model)
     _, bodies, points = sole_landmarks(model)
     terrain = terrain_geom_ids(model)

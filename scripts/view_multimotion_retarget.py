@@ -36,7 +36,7 @@ from lytrobot_amp.terrain import (
 )
 
 
-MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 DEFAULT_OUTPUT = (
     REPO_ROOT / "recording" / "reference" / "multimotion_more_terrain_test.mp4"

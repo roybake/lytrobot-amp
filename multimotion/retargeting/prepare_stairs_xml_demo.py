@@ -220,7 +220,7 @@ def build(terrain_xml: Path, output: Path, fps: float, step_duration: float,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--terrain-xml", type=Path,
-                        default=ROOT / "robot/terrains/more_discolrl/stairs.xml")
+                        default=ROOT / "robot/terrains/stairs.xml")
     parser.add_argument("--output", type=Path, default=HERE / "prepared/stairs_xml_human.npz")
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--step-duration", type=float, default=1.5)

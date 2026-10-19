@@ -1,53 +1,104 @@
 # LYTrobot 训练与测试
 
-所有命令在仓库根目录执行。将 `<run>` 替换为实际运行目录，`<threshold>` 替换为选定的蒸馏验收阈值。
+## 师生蒸馏：转身与变速行走（0.6–1.28 m/s）
 
-平地单动作行走训练统一默认使用 `robot/reference_data/walk1_mjcf.npz`，包括 Stage1、Stage2、传感器、足底力实验和蒸馏入口。该参考包含完整 mocap 序列，采样频率 40 Hz；默认目标速度为 `1.28 m/s`（原始人体步速）。Teacher 与 Student、Stage1 与 Stage2 应使用相同参考数据。
+### 1. 训练 Teacher
+
+```bash
+cd /home/yeah/code/lytrobot-amp
+.venv/bin/python scripts/train_stage1.py \
+  --command-walking \
+  --velocity-range 0.6 1.28 \
+  --target-velocity 1.28 \
+  --yaw-rate-range -0.8 0.8 \
+  --num-envs 2048
+```
+
+此模式从头训练带速度和转向指令的策略，每个环境每 4–8 秒切换目标，包含直行、左右转、速度区间内部和两个端点；速度以 0.30 m/s²、转向角速度以 0.80 rad/s² 平滑变化。策略跟踪当前指令，步态节奏随速度变化；前进速度、姿态和 AMP 特征使用与朝向无关的表示，转身后仍能继续前进。训练结果位于 `logs/command_walking/<训练时间>/teacher/`。
+
+### 2. 蒸馏 Student
+
+Teacher 训练完成后，将 `<训练时间>` 替换为实际目录；蒸馏使用 `.pt` 教师权重：
+
+```bash
+.venv/bin/python sensor_training/train_distill_stage1.py \
+  --teacher-checkpoint "logs/command_walking/<训练时间>/teacher/model_final.pt" \
+  --command-walking \
+  --num-envs 2048
+```
+
+Student 继承 Teacher 的速度闭区间、转向角速度范围和任务奖励。Teacher 在 Student 实际访问的状态下，用相同的速度／转向指令生成监督动作；Student 的输入为 IMU、肌腱、动作历史及可部署的步态／速度／转向指令。Student 的预瞄步态和 AMP 历史节奏同步随速度变化。输出位于同一训练目录的 `student/`，导出的 Student ONNX 独立推理。
+
+### 3. 在 MuJoCo 中键盘控制 Student
+
+```bash
+.venv/bin/python sensor_training/play.py \
+  --checkpoint "logs/command_walking/<训练时间>/student/model_final.onnx" \
+  --keyboard --viewer --steps 0 \
+  --target-velocity 0.6 \
+  --device cpu
+```
+
+点击 MuJoCo 窗口使其获得键盘焦点：
+
+| 按键 | 操作 |
+| --- | --- |
+| ↑ | 单击提速 0.05 m/s；长按持续加速，最大 1.28 m/s |
+| ↓ | 单击降速 0.05 m/s；长按持续减速，最小 0.6 m/s |
+| ← / → | 向左／右转身；长按持续转向并增大转向角速度，最大绝对值 0.8 rad/s |
+| 松开方向键 | 保持当前速度，转向角速度指令归零，沿当前朝向前进 |
+| Esc | 退出 |
+
+上下与左右键可以组合使用。窗口显示指令速度和实测速度。闭区间约束作用于行走速度指令；从静止起步以及加减速时，实际速度存在动力学跟踪误差。此功能需要本模式训练并蒸馏得到的模型。
+
+## 重定向动作测试：
+
+cd /home/yeah/code/lytrobot-amp
+.venv/bin/python scripts/view_reference.py \
+  --motion-file robot/reference_data/stairs.npz \
+  --loop
+
+cd /home/yeah/code/lytrobot-amp
+.venv/bin/python scripts/view_stairs_reference.py \
+  --reference robot/reference_data/multimotion/stairs.npz \
+  --viewer --loop
 
 ## 最佳：传感器串行蒸馏 Stage1（GRU128，696D，BPTT96）
 
-沿用 `logs/sensor_policy/distillation/10-06-13:24:19` 的配置和目录布局，Teacher、Student 各训练 50000 轮。默认保存到 `logs/sensor_policy/distillation/<run>/teacher` 和 `<run>/student`。Teacher 启动时自动生成时间戳（`MM-DD-HH:MM:SS`），Student 根据教师权重路径复用该时间戳；将后续命令中的 `<run>` 替换为 Teacher 输出的时间戳。
-W&B 名称为 `<训练时间戳>-teacher`、`<训练时间戳>-student`。
+蒸馏训练的 `--teacher-checkpoint` 必须指向包含教师权重和训练元数据的 `.pt` 文件；`.onnx` 用于推理播放。
 
 ```bash
 cd /home/yeah/code/lytrobot-amp
 
-# 训练 Teacher
+# 训练 Teacher（定速）
+cd /home/yeah/code/lytrobot-amp
 .venv/bin/python scripts/train_stage1.py \
-  --num-envs 1024 --max-iterations 50000 \
-  --evaluate-gait --gait-fidelity-selection --gait-evaluation-seconds 30
+  --target-velocity 1.28 --num-envs 2048
 
 # 测试 Teacher
 .venv/bin/python scripts/play.py \
-  --checkpoint "logs/sensor_policy/distillation/<run>/teacher/model_final.pt" \
+  --checkpoint "logs/sensor_policy/distillation/10-19-09:47:59/teacher/model_best.onnx" \
   --device cuda --viewer --steps 0
+  --model-xml robot/terrains/rough.xml 
+  --no-domain-randomization
 
-# 训练 Student
+# 训练 Student（定速）
+cd /home/yeah/code/lytrobot-amp
 .venv/bin/python sensor_training/train_distill_stage1.py \
-  --teacher-checkpoint "logs/sensor_policy/distillation/<run>/teacher/model_final.pt" \
-  --num-envs 1024 --num-steps 96
+  --teacher-checkpoint "logs/sensor_policy/distillation/10-15-09:04:28/teacher/model_best.pt" \
+  --target-velocity 1.28 \
+  --teacher-action-probability-decay-iterations 10000 \
+  --num-envs 2048
 
 # 测试 Student（最佳权重）
 .venv/bin/python sensor_training/play.py \
-  --checkpoint "logs/sensor_policy/distillation/<run>/student/model_best.pt" \
+  --checkpoint "logs/sensor_policy/distillation/10-06-13:24:19/student_best_plus30000/model_best.onnx" \
   --device cuda --viewer --steps 0
+  --model-xml robot/terrains/rough.xml 
+  --no-domain-randomization
+
 ```
 
-## 推荐：最终纯传感器人体步态
-
-实机现有7组IMU和14条肌腱编码器；Teacher → Student Stage1 → Student Stage2 DR → ONNX。
-默认GRU256、45D状态估计、统一测量肌腱派生特征、BPTT96，关闭future prediction。
-
-```bash
-# Stage1：先建立合格Teacher，再训练Student
-.venv/bin/python sensor_training/train_final_sensor_gait.py --phase stage1
-
-# 或一次执行全部阶段
-.venv/bin/python sensor_training/train_final_sensor_gait.py
-```
-
-Stage2接续、导出和验收详见 [最终训练说明](sensor_training/STATE_ESTIMATION.md)。
-以下入口保留用于基础策略、专项任务或历史兼容。
 
 ## 基础行走 Stage1
 
@@ -289,68 +340,6 @@ cd /home/yeah/code/lytrobot-amp
 uv run python sensor_training/play.py \
   --checkpoint "logs/distillation/<run>/stage2/student/model_final.onnx" \
   --device cuda --viewer --steps 0
-```
-
-## Teacher → Student 蒸馏（无足底力，58D）
-
-```bash
-# 训练 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_teacher.py \
-  --sensor-variant phase_no_force --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 \
-  --output logs/distillation/teacher_phase_no_force.pt
-
-# 测试 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play_teacher.py \
-  --checkpoint logs/distillation/teacher_phase_no_force.pt \
-  --steps 1000 --seed 42 --camera-mode fixed
-
-# 依次训练 BC、DAgger、Student RL
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint logs/distillation/teacher_phase_no_force.pt \
-  --run-dir logs/distillation/phase_no_force \
-  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 50000 \
-  --max-validation-normalized-action-mse "<threshold>"
-
-# 测试 Student
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play.py \
-  --checkpoint logs/distillation/phase_no_force/student_rl.pt \
-  --device cuda --sim-backend warp --steps 1000 --seed 42
-```
-
-## Teacher → Student 蒸馏（有足底力，64D）
-
-```bash
-# 训练 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_teacher.py \
-  --sensor-variant phase_force --device cuda --sim-backend warp \
-  --num-envs 1024 --num-steps 96 \
-  --output logs/distillation/teacher_phase_force.pt
-
-# 测试 Teacher
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play_teacher.py \
-  --checkpoint logs/distillation/teacher_phase_force.pt \
-  --steps 1000 --seed 42 --camera-mode fixed
-
-# 依次训练 BC、DAgger、Student RL
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/train_pipeline.py \
-  --teacher-checkpoint logs/distillation/teacher_phase_force.pt \
-  --run-dir logs/distillation/phase_force \
-  --device cuda --sim-backend warp --num-envs 1024 --max-iterations 50000 \
-  --max-validation-normalized-action-mse "<threshold>"
-
-# 测试 Student
-cd /home/yeah/code/lytrobot-amp
-uv run python distillation_training/play.py \
-  --checkpoint logs/distillation/phase_force/student_rl.pt \
-  --device cuda --sim-backend warp --steps 1000 --seed 42
 ```
 
 ## 传感器直接训练（无足底力，56D）

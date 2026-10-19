@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class StairRouteRegressions(unittest.TestCase):
     def test_route_deviation_terminates_cpu_and_warp_without_timeout_bootstrap(self):
         cfg = LytRobotEnvCfg(
-            model_xml=str(ROOT / 'robot/terrains/stairs.xml'),
+            model_xml=str(ROOT / 'robot/MJCFmodel_stair.xml'),
             motion_files=(str(ROOT / 'robot/reference_data/multimotion/stairs_supported.npz'),),
             motion_names=('stairs',), motion_loop=(False,), skill_conditioning=False,
             deepmimic_reward=True, deepmimic_track_root_xy=True,

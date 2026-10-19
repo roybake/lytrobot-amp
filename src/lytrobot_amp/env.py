@@ -19,8 +19,13 @@ from .motion import (
     resolve_contact_geom_ids,
 )
 from .gait_constraints import natural_gait_bonus, sensor_gait_scores_numpy
+from .step_symmetry import StepLengthTracker, step_symmetry_reward
+from .walking_commands import (
+    WalkingCommands, heading_angular_velocity, heading_velocity, without_heading, world_yaw_rate,
+)
 from .mimickit_deepmimic import deepmimic_reward
 from .terrain import (
+    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
     MoreTerrainCfg,
     StairTerrainCfg,
     course_end_x,
@@ -182,15 +187,63 @@ def sensor_stability_reward_enabled(cfg: "LytRobotEnvCfg") -> bool:
     return mode == "sensor_stability"
 
 
+def validate_velocity_range(
+    velocity_range: tuple[float, float] | list[float] | None,
+    target_velocity: float,
+    use_reference_velocity: bool,
+) -> None:
+    if velocity_range is None:
+        return
+    if (
+        len(velocity_range) != 2
+        or not np.isfinite(velocity_range).all()
+        or not 0.0 < velocity_range[0] <= velocity_range[1]
+    ):
+        raise ValueError("--velocity-range requires finite bounds with 0 < MIN <= MAX.")
+    if not np.isfinite(target_velocity) or target_velocity <= 0.0:
+        raise ValueError("--velocity-range requires a positive finite --target-velocity for the startup command.")
+    if use_reference_velocity:
+        raise ValueError("--velocity-range cannot be combined with --use-reference-velocity.")
+
+
+def forward_velocity_bounds(
+    cfg: "LytRobotEnvCfg",
+    target_forward_velocity: float | torch.Tensor,
+    gait_progress: float | torch.Tensor,
+) -> tuple[float | torch.Tensor, float | torch.Tensor]:
+    """Use the point target or a closed interval with the same startup ramp."""
+    if cfg.velocity_range is None or cfg.command_walking:
+        return target_forward_velocity, target_forward_velocity
+    lower, upper = cfg.velocity_range
+    return lower * gait_progress, upper * gait_progress
+
+
+def sample_action_delay(
+    rng: np.random.Generator,
+    cfg: "LytRobotEnvCfg",
+    scale: float,
+    size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample milliseconds, retaining the arrival time within a physics step."""
+    low = scale * max(0.0, float(cfg.action_delay_min_ms))
+    high = max(low, scale * max(0.0, float(cfg.action_delay_max_ms)))
+    delay_ms = np.clip(
+        rng.uniform(low, np.nextafter(high, np.inf), size=size), low, high,
+    ).astype(np.float32)
+    ticks, remainder_ms = np.divmod(delay_ms.astype(np.float64), float(cfg.timestep) * 1000.0)
+    return ticks.astype(np.int64), (remainder_ms / 1000.0).astype(np.float32)
+
+
 @dataclass
 class LytRobotEnvCfg:
-    model_xml: str = "robot/MJCFmodelposition.xml"
+    model_xml: str = "robot/MJCFmodelfinal.xml"
     motion_file: str = "robot/reference_data/walk1_mjcf_repaired.npz"
     motion_files: tuple[str, ...] = ()
     motion_names: tuple[str, ...] = ()
     motion_weights: tuple[float, ...] = ()
     motion_loop: tuple[bool, ...] = ()
     skill_conditioning: bool = True
+    observe_tendon_velocity: bool = True
     use_reference_velocity: bool = False
     deepmimic_reward: bool = False
     deepmimic_track_root_xy: bool = False
@@ -250,7 +303,7 @@ class LytRobotEnvCfg:
     pit_lane_y: float = 9.0
     gap_lane_y: float = 12.0
     terrain_lane_width: float = 2.0
-    rough_terrain_height: float = 0.05
+    rough_terrain_height: float = MAX_ROUGH_HEIGHT_DIFFERENCE_M
     slope_angle_deg: float = 6.0
     gap_terrain_width: float = 0.20
     serial_terrain_course: bool = False
@@ -279,7 +332,12 @@ class LytRobotEnvCfg:
     warp_cuda_graph: bool = True
     episode_steps: int = 1000
     episode_timeout_jitter_steps: int = 240
+    # task: task completion/time limit; fall: posture thresholds.
+    termination_mode: str = "task"
     target_velocity: float = 0.87
+    velocity_range: tuple[float, float] | None = None
+    command_walking: bool = False
+    yaw_rate_range: tuple[float, float] = (-0.8, 0.8)
     forward_velocity_tracking_sigma: float = 0.25
     forward_velocity_reward_coef: float = 0.0
     forward_progress_reward_coef: float = 0.0
@@ -347,6 +405,8 @@ class LytRobotEnvCfg:
     swing_advance_coef: float = 0.0
     distal_joint_vel_sigma: float = 2.0
     symmetry_reward_coef: float = 1.20
+    step_symmetry_tolerance: float = 0.05
+    symmetric_gait_reference: bool = False
     symmetry_foot_pos_sigma: float = 0.08
     symmetry_balance_sigma: float = 0.25
     symmetry_ema_decay: float = 0.99
@@ -364,9 +424,9 @@ class LytRobotEnvCfg:
     stand_start_transition_min_steps: int = 80
     stand_start_transition_max_steps: int = 160
     stand_start_push_delay_steps: int = 100
-    ctrl_penalty_coef: float = 0.040
+    # Mean squared joint torque in (N m)^2; 10 N m RMS costs 0.04.
+    torque_penalty_coef: float = 0.0004
     action_rate_penalty_coef: float = 0.100
-    distal_action_penalty_coef: float = 0.030
     distal_action_rate_penalty_coef: float = 0.120
     domain_randomization: bool = False
     domain_randomization_scale: float = 1.0
@@ -393,6 +453,27 @@ class LytRobotEnvCfg:
     action_noise_std: float = 0.01
     action_delay_min_ms: float = 2.0
     action_delay_max_ms: float = 5.0
+
+    def __post_init__(self) -> None:
+        validate_velocity_range(self.velocity_range, self.target_velocity, self.use_reference_velocity)
+        if self.command_walking:
+            if self.velocity_range is None or not self.velocity_range[0] <= self.target_velocity <= self.velocity_range[1]:
+                raise ValueError("--command-walking requires --velocity-range and a target velocity inside it.")
+            if (len(self.yaw_rate_range) != 2 or not np.isfinite(self.yaw_rate_range).all()
+                    or not self.yaw_rate_range[0] < 0 < self.yaw_rate_range[1]):
+                raise ValueError("--yaw-rate-range requires finite MIN < 0 < MAX in rad/s.")
+            if (len(self.motion_files) > 1 or self.terrain_types or self.stair_terrain
+                    or self.serial_terrain_course or self.deepmimic_reward
+                    or sensor_stability_reward_enabled(self) or self.min_forward_progress_speed > 0):
+                raise ValueError("Command walking uses one flat walking reference and the stage1 reference reward.")
+        if not np.isfinite(self.step_symmetry_tolerance) or not 0 < self.step_symmetry_tolerance < 1:
+            raise ValueError("step_symmetry_tolerance must be between 0 and 1.")
+        if self.termination_mode not in {"task", "fall"}:
+            raise ValueError(f"Unknown termination mode: {self.termination_mode}")
+        if self.termination_mode == "fall":
+            self.episode_steps = 0
+            self.episode_timeout_jitter_steps = 0
+            self.motion_loop = (True,) * len(self.motion_files or (self.motion_file,))
 
 
 class LytRobotAmpEnv:
@@ -489,6 +570,8 @@ class LytRobotAmpEnv:
             motion_loop=cfg.motion_loop or None,
             zero_root_xy=not preserve_stair_world_xy,
             root_x_offset=cfg.reference_root_x_offset,
+            symmetric_gait_velocity=cfg.target_velocity if cfg.symmetric_gait_reference else None,
+            heading_invariant=cfg.command_walking,
         )
         self.motion_count = (
             self.motion.motion_count if isinstance(self.motion, MotionLibrary) else 1
@@ -649,11 +732,7 @@ class LytRobotAmpEnv:
         self.motion_transition_steps_left = np.zeros(self.num_envs, dtype=np.int32)
         self.last_foot_pos = np.zeros((self.num_envs, len(CONTACT_GEOM_NAMES), 3), dtype=np.float32)
         self.last_foot_world_pos = np.zeros_like(self.last_foot_pos)
-        self.foot_stride_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
-        self.foot_x_min = np.zeros((self.num_envs, 2), dtype=np.float32)
-        self.foot_x_max = np.zeros((self.num_envs, 2), dtype=np.float32)
-        self.contact_balance_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
-        self.action_activity_ema = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self.step_lengths = StepLengthTracker(self.num_envs, self.dt)
         self.sensor_foot_body_ids = tuple(
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
             for name in ("foot_r", "foot_l")
@@ -676,6 +755,7 @@ class LytRobotAmpEnv:
         self.last_obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         self.stand_start = np.zeros(self.num_envs, dtype=bool)
         self.stand_start_transition_steps = np.ones(self.num_envs, dtype=np.int32)
+        self.walking_commands = WalkingCommands(cfg, self.num_envs) if cfg.command_walking else None
         self._init_domain_randomization()
         self.reset()
 
@@ -686,6 +766,8 @@ class LytRobotAmpEnv:
     @property
     def obs_dim(self) -> int:
         current_state_dim = 1 + 4 + 6 + 2 * len(self.nonroot_qpos_adrs) + self.action_dim + 3
+        if self.cfg.observe_tendon_velocity:
+            current_state_dim += self.position_action_dim
         tracking_dim = (
             1
             + 4
@@ -696,7 +778,7 @@ class LytRobotAmpEnv:
             + self.motion.contact_dim
         )
         skill_dim = self.motion_count if self.cfg.skill_conditioning and self.motion_count > 1 else 0
-        return int(current_state_dim + tracking_dim + skill_dim)
+        return int(current_state_dim + tracking_dim + skill_dim + (2 if self.cfg.command_walking else 0))
 
     @property
     def amp_obs_dim(self) -> int:
@@ -925,6 +1007,20 @@ class LytRobotAmpEnv:
             foot_contact=targets.foot_contact,
         )
         targets = self._blend_start_targets(targets)
+        if self.cfg.command_walking:
+            values = self.walking_commands.values.numpy()
+            ratio = values[:, 0] / self.cfg.target_velocity
+            progress = self._stand_start_progress()
+            # Geometry is root-local; only time derivatives change with cadence.
+            targets.joint_vel[:] *= ratio[:, None]
+            targets.foot_vel[:] *= ratio[:, None, None]
+            targets.root_ang_vel[:] = heading_angular_velocity(targets.root_quat, targets.root_ang_vel)
+            targets.root_quat[:] = without_heading(targets.root_quat)
+            targets.root_lin_vel[:] *= ratio[:, None]
+            targets.root_lin_vel[:, 0] = values[:, 0] * progress
+            targets.root_lin_vel[:, 1] = 0.0
+            targets.root_ang_vel[:] *= ratio[:, None]
+            targets.root_ang_vel[:, 2] = values[:, 1] * progress
         if not self.more_terrain_cfg.serial_course:
             return targets
         return MotionTargets(
@@ -946,10 +1042,11 @@ class LytRobotAmpEnv:
         self.domain_randomization_scale = float(np.clip(self.cfg.domain_randomization_scale, 0.0, 1.0))
         max_delay_s = max(float(self.cfg.action_delay_min_ms), float(self.cfg.action_delay_max_ms), 0.0) / 1000.0
         self.max_action_delay_ticks = int(np.ceil(max_delay_s / max(float(self.cfg.timestep), 1.0e-9)))
-        history_len = max(1, self.max_action_delay_ticks + 1)
+        history_len = max(2, self.max_action_delay_ticks + 2)
         self.action_delay_history = np.zeros((self.num_envs, history_len, self.action_dim), dtype=np.float32)
         self.action_delay_cursor = np.zeros(self.num_envs, dtype=np.int32)
         self.action_delay_ticks = np.zeros(self.num_envs, dtype=np.int32)
+        self.action_delay_remainder = np.zeros(self.num_envs, dtype=np.float32)
         self.env_tendon_length_scale = np.ones((self.num_envs, self.position_action_dim), dtype=np.float32)
         self.env_body_mass_scale = np.ones((self.num_envs, self.model.nbody), dtype=np.float32)
         self.env_payload_mass = np.zeros(self.num_envs, dtype=np.float32)
@@ -1027,12 +1124,9 @@ class LytRobotAmpEnv:
         )
         self.env_gravity[ids] = self._uniform(gravity_low, gravity_high, len(ids))
 
-        min_delay = scale * max(0.0, float(self.cfg.action_delay_min_ms)) / 1000.0
-        max_delay = scale * max(0.0, float(self.cfg.action_delay_max_ms)) / 1000.0
-        max_delay = max(min_delay, max_delay)
-        delay_seconds = self.rng.uniform(min_delay, max_delay, size=len(ids))
-        delay_ticks = np.ceil(delay_seconds / max(float(self.cfg.timestep), 1.0e-9)).astype(np.int32)
-        self.action_delay_ticks[ids] = np.clip(delay_ticks, 0, self.max_action_delay_ticks)
+        delay_ticks, remainder = sample_action_delay(self.rng, self.cfg, scale, len(ids))
+        self.action_delay_ticks[ids] = delay_ticks
+        self.action_delay_remainder[ids] = remainder
         self.action_delay_history[ids] = 0.0
         self.action_delay_cursor[ids] = 0
         self.push_force[ids] = 0.0
@@ -1093,15 +1187,27 @@ class LytRobotAmpEnv:
             return 1.0
         return float(np.clip((int(self.episode_step[env_id]) + 1) / ramp_steps, 0.0, 1.0))
 
-    def _delayed_action(self, env_id: int, action: np.ndarray) -> np.ndarray:
-        if not self.domain_randomization or self.max_action_delay_ticks <= 0:
-            return action
+    def _step_delayed_ctrl(self, env_id: int, ctrl: np.ndarray) -> None:
+        """Hold queued controls until their sampled arrival time, then switch."""
+        data = self.datas[env_id]
         cursor = int(self.action_delay_cursor[env_id])
-        self.action_delay_history[env_id, cursor] = action
+        self.action_delay_history[env_id, cursor] = ctrl
         delay = int(self.action_delay_ticks[env_id])
-        delayed = self.action_delay_history[env_id, (cursor - delay) % self.action_delay_history.shape[1]]
-        self.action_delay_cursor[env_id] = (cursor + 1) % self.action_delay_history.shape[1]
-        return delayed.copy()
+        history = self.action_delay_history[env_id]
+        after = history[(cursor - delay) % len(history)]
+        remainder = float(self.action_delay_remainder[env_id])
+        timestep = float(self.cfg.timestep)
+        try:
+            if remainder > 0.0:
+                data.ctrl[:] = history[(cursor - delay - 1) % len(history)]
+                self.model.opt.timestep = remainder
+                mujoco.mj_step(self.model, data)
+            data.ctrl[:] = after
+            self.model.opt.timestep = timestep - remainder
+            mujoco.mj_step(self.model, data)
+        finally:
+            self.model.opt.timestep = timestep
+        self.action_delay_cursor[env_id] = (cursor + 1) % len(history)
 
     def _update_push_force(self, env_id: int) -> None:
         if not self.domain_randomization:
@@ -1261,6 +1367,8 @@ class LytRobotAmpEnv:
         else:
             ids = np.asarray(env_ids, dtype=np.int32)
         self._refresh_episode_rng(ids)
+        if self.walking_commands is not None:
+            self.walking_commands.reset(ids, self.rng)
 
         serial_course = self.more_terrain_cfg.serial_course
         if serial_course:
@@ -1467,23 +1575,12 @@ class LytRobotAmpEnv:
                 env_id=int(env_id),
             )
             self.last_action[int(env_id)] = 0.0
-            self.action_delay_history[int(env_id)] = 0.0
+            self.action_delay_history[int(env_id)] = data.ctrl
             self.action_delay_cursor[int(env_id)] = 0
             foot_pos = self._foot_positions_local(data)
             self.last_foot_pos[int(env_id)] = foot_pos
             self.last_foot_world_pos[int(env_id)] = self._foot_positions_world(data)
-            side_x = np.asarray(
-                [
-                    np.mean(foot_pos[0:2, 0]),
-                    np.mean(foot_pos[2:4, 0]),
-                ],
-                dtype=np.float32,
-            )
-            self.foot_x_min[int(env_id)] = side_x
-            self.foot_x_max[int(env_id)] = side_x
-            self.foot_stride_ema[int(env_id)] = 0.0
-            self.contact_balance_ema[int(env_id)] = 0.0
-            self.action_activity_ema[int(env_id)] = 0.0
+            self.step_lengths.reset(slice(int(env_id), int(env_id) + 1))
             self.sensor_last_foot_contact[int(env_id)] = False
             self.sensor_foot_roll_stage[int(env_id)] = 0
             self.sensor_toe_only_steps[int(env_id)] = 0
@@ -1527,6 +1624,8 @@ class LytRobotAmpEnv:
 
     def _sample_timeout_step(self) -> int:
         base_steps = int(self.cfg.episode_steps)
+        if base_steps == 0:
+            return 0
         jitter = int(max(self.cfg.episode_timeout_jitter_steps, 0))
         if jitter <= 0:
             return base_steps
@@ -1565,27 +1664,37 @@ class LytRobotAmpEnv:
             root_vel_target = np.concatenate(
                 (reference_targets.root_lin_vel[env_id], reference_targets.root_ang_vel[env_id])
             ).astype(np.float32)
-            if not self.cfg.use_reference_velocity:
+            root_velocity = np.asarray(data.qvel[:6], dtype=np.float32).copy()
+            if self.cfg.command_walking:
+                quat = without_heading(quat)
+                root_velocity[:3] = heading_velocity(data.qpos[3:7], root_velocity[:3])
+                root_velocity[3:6] = heading_angular_velocity(data.qpos[3:7], root_velocity[3:6])
+            elif not self.cfg.use_reference_velocity:
                 root_vel_target[0] = float(self.cfg.target_velocity) * float(
                     stand_start_progress[env_id]
                 )
             parts = [
                     np.asarray([data.qpos[2]], dtype=np.float32),
                     quat,
-                    np.asarray(data.qvel[:6], dtype=np.float32),
+                    root_velocity,
                     np.asarray(data.qpos[self.nonroot_qpos_adrs], dtype=np.float32),
                     np.asarray(data.qvel[self.nonroot_qvel_adrs], dtype=np.float32),
                     self.last_action[env_id],
                     np.asarray([up_z, np.sin(phase), np.cos(phase)], dtype=np.float32),
                     np.asarray([data.qpos[2] - reference_targets.root_height[env_id]], dtype=np.float32),
                     reference_targets.root_quat[env_id],
-                    np.asarray(data.qvel[:6], dtype=np.float32) - root_vel_target,
+                    root_velocity - root_vel_target,
                     joint_pos - reference_targets.joint_pos[env_id],
                     joint_vel - reference_targets.joint_vel[env_id],
                     ref_ctrl_action,
                     foot_pos - ref_foot_pos,
                     reference_targets.foot_contact[env_id],
             ]
+            if self.cfg.observe_tendon_velocity:
+                # Tendon position actuators have unit gear: velocity is in m/s.
+                parts.append(np.asarray(data.actuator_velocity[self.position_actuator_ids], dtype=np.float32))
+            if self.cfg.command_walking:
+                parts.append(self.walking_commands.values[env_id].numpy())
             if self.cfg.skill_conditioning and self.motion_count > 1:
                 skill = np.zeros(self.motion_count, dtype=np.float32)
                 skill[self.motion_ids[env_id]] = 1.0
@@ -1605,6 +1714,10 @@ class LytRobotAmpEnv:
         qvel = np.stack([np.asarray(data.qvel, dtype=np.float32) for data in self.datas], axis=0)
         foot_pos = np.stack([self._foot_positions_local(data) for data in self.datas], axis=0)
         qpos = qpos.copy()
+        if self.cfg.command_walking:
+            # AMP scores gait shape independently of commanded cadence and heading.
+            ratio = self.walking_commands.values[:, 0].numpy() / self.cfg.target_velocity
+            qvel[:, self.motion.robot_qvel_adrs] /= ratio[:, None]
         if self.more_terrain_cfg.serial_course:
             qpos[:, 2] -= self._course_height_offsets()
         stair_anchor = self.motion_stair_height_anchor[self.motion_ids]
@@ -1650,19 +1763,13 @@ class LytRobotAmpEnv:
             "missed_contact": [],
             "distal_vel": [],
             "symmetry": [],
-            "foot_symmetry": [],
-            "stride_symmetry": [],
-            "phase_symmetry": [],
-            "lateral_symmetry": [],
-            "contact_balance": [],
-            "action_balance": [],
-            "ctrl_track": [],
-            "ctrl_penalty": [],
+            "torque_penalty": [],
             "action_rate": [],
-            "distal_action": [],
             "distal_action_rate": [],
         }
         phase_scale = self._stand_start_progress()
+        if self.cfg.command_walking:
+            phase_scale = phase_scale * self.walking_commands.values[:, 0].numpy() / self.cfg.target_velocity
         course_complete = np.zeros(self.num_envs, dtype=bool)
         course_suffix_complete = np.zeros(self.num_envs, dtype=bool)
         course_stage_advance = np.zeros(self.num_envs, dtype=bool)
@@ -1798,11 +1905,13 @@ class LytRobotAmpEnv:
             base_ctrl = self._reference_base_ctrl(transitioned_reference_ctrl, data)
             data.xfrc_applied[:] = 0.0
             data.xfrc_applied[self.pelvis_body_id] = self.push_force[env_id]
-            applied_action = commanded_action
+            commanded_ctrl = self.action_to_ctrl(commanded_action, base_ctrl=base_ctrl, env_id=env_id)
             for _ in range(self.cfg.decimation):
-                applied_action = self._delayed_action(env_id, commanded_action)
-                data.ctrl[:] = self.action_to_ctrl(applied_action, base_ctrl=base_ctrl, env_id=env_id)
-                mujoco.mj_step(self.model, data)
+                if self.domain_randomization and self.max_action_delay_ticks > 0:
+                    self._step_delayed_ctrl(env_id, commanded_ctrl)
+                else:
+                    data.ctrl[:] = commanded_ctrl
+                    mujoco.mj_step(self.model, data)
 
             self.episode_step[env_id] += 1
             foot_pos = self._foot_positions_local(data)
@@ -1818,7 +1927,7 @@ class LytRobotAmpEnv:
                 env_id,
                 (
                     float(reference_targets.root_lin_vel[env_id, 0])
-                    if self.cfg.use_reference_velocity
+                    if self.cfg.use_reference_velocity or self.cfg.command_walking
                     else float(self.cfg.target_velocity) * float(phase_scale[env_id])
                 ),
                 reference_targets,
@@ -1830,12 +1939,14 @@ class LytRobotAmpEnv:
             )
             invalid_step = bool(reward_parts.get("invalid_state", 0.0) > 0.5)
             if invalid_step:
+                fallen = reward_parts["fallen"]
                 reward = -2.0
                 done = True
                 timed_out = False
                 reward_parts = {key: 0.0 for key in reward_parts}
                 reward_parts["invalid_state"] = 1.0
                 reward_parts["termination"] = 1.0
+                reward_parts["fallen"] = fallen
             # A non-looping stair reference defines both the action sequence and
             # its required root displacement.  Gate terminal success on that
             # displacement so stopping on a lower tread cannot count as a win.
@@ -1970,6 +2081,11 @@ class LytRobotAmpEnv:
         components["forward_progress_window_speed"] = progress_speed.tolist()
         components["insufficient_progress"] = insufficient_progress.astype(np.float32).tolist()
 
+        if self.cfg.termination_mode == "fall":
+            dones[:] = np.asarray(components["fallen"]) > 0.5
+            time_outs[:] = False
+            components["termination"] = dones.astype(np.float32).tolist()
+
         reported_course_stage = self.course_stage_ids.copy()
         reported_course_start_stage = self.course_start_stage_ids.copy()
         done_ids = np.nonzero(dones)[0].astype(np.int32)
@@ -1980,6 +2096,8 @@ class LytRobotAmpEnv:
             # Capture the terminal state before autoreset so recurrent
             # trainers can bootstrap time-limit transitions correctly.
             terminal_payload = terminal_observer(bootstrap_ids)
+        if self.walking_commands is not None:
+            self.walking_commands.advance(self.dt, self.rng)
         if len(done_ids) > 0:
             self.reset(done_ids)
         else:
@@ -2027,6 +2145,8 @@ class LytRobotAmpEnv:
         root_height = float(data.qpos[2])
         up_z = float(data.xmat[self.pelvis_body_id, 8])
         root_quat = _canonical_quat(data.qpos[3:7])
+        if self.cfg.command_walking:
+            root_quat = without_heading(root_quat)
         ref_root_quat = _canonical_quat(reference_targets.root_quat[env_id])
         ref_root_height = float(reference_targets.root_height[env_id])
 
@@ -2034,28 +2154,51 @@ class LytRobotAmpEnv:
         orient_error = 2.0 * np.arccos(quat_dot)
         root_orientation = float(np.exp(-(orient_error**2) / (0.35**2)))
 
+        target_velocity_scale = max(abs(float(self.cfg.target_velocity)), 1.0e-6)
+        gait_progress = float(
+            np.clip(abs(target_forward_velocity) / target_velocity_scale, 0.0, 1.0)
+        )
+        if self.cfg.command_walking:
+            gait_progress = float(self._stand_start_progress()[env_id])
+        velocity_lower, velocity_upper = forward_velocity_bounds(
+            self.cfg, target_forward_velocity, gait_progress,
+        )
+        root_velocity = np.asarray(data.qvel[:3], dtype=np.float32)
+        if self.cfg.command_walking:
+            root_velocity = heading_velocity(data.qpos[3:7], root_velocity)
+        forward_velocity = float(root_velocity[0])
+        tracked_forward_velocity = float(np.clip(forward_velocity, velocity_lower, velocity_upper))
         root_lin_vel_target = reference_targets.root_lin_vel[env_id].copy()
-        root_lin_vel_target[0] = target_forward_velocity
-        lin_vel_error = np.asarray(data.qvel[:3], dtype=np.float32) - root_lin_vel_target
-        ang_vel_error = np.asarray(data.qvel[3:6], dtype=np.float32) - reference_targets.root_ang_vel[env_id]
+        root_lin_vel_target[0] = tracked_forward_velocity
+        lin_vel_error = root_velocity - root_lin_vel_target
+        angular_velocity = np.asarray(data.qvel[3:6], dtype=np.float32)
+        if self.cfg.command_walking:
+            angular_velocity = heading_angular_velocity(data.qpos[3:7], angular_velocity)
+        ang_vel_error = angular_velocity - reference_targets.root_ang_vel[env_id]
         lin_vel_track = np.exp(-float(np.mean(np.square(lin_vel_error))) / (0.75**2))
         ang_vel_track = np.exp(-float(np.mean(np.square(ang_vel_error))) / (1.50**2))
         root_vel = float(0.65 * lin_vel_track + 0.35 * ang_vel_track)
-        forward_velocity = float(data.qvel[0])
-        forward_velocity_error = forward_velocity - target_forward_velocity
+        forward_velocity_error = forward_velocity - tracked_forward_velocity
         forward_velocity_track = float(
             np.exp(
                 -(forward_velocity_error**2)
                 / (max(float(self.cfg.forward_velocity_tracking_sigma), 1.0e-6) ** 2)
             )
         )
-        target_velocity_scale = max(abs(float(self.cfg.target_velocity)), 1.0e-6)
-        forward_progress = float(np.clip(forward_velocity / target_velocity_scale, -1.0, 1.0))
+        yaw_rate_track = 0.0
+        if self.cfg.command_walking:
+            forward_velocity_track *= float(np.exp(-(root_velocity[1] / self.cfg.forward_velocity_tracking_sigma) ** 2))
+            yaw_error = float(world_yaw_rate(data.qpos[3:7], data.qvel[3:6])) - float(reference_targets.root_ang_vel[env_id, 2])
+            yaw_rate_track = float(np.exp(-(yaw_error / 0.35) ** 2))
+        progress_velocity_scale = (
+            self.cfg.velocity_range[0] if self.cfg.velocity_range is not None else target_velocity_scale
+        )
+        forward_progress = float(np.clip(forward_velocity / progress_velocity_scale, -1.0, 1.0))
         forward_velocity_deficit = float(
-            np.clip((target_forward_velocity - forward_velocity) / target_velocity_scale, 0.0, 2.0)
+            np.clip((velocity_lower - forward_velocity) / target_velocity_scale, 0.0, 2.0)
         )
         forward_velocity_excess = float(
-            np.clip((forward_velocity - target_forward_velocity) / target_velocity_scale, 0.0, 2.0)
+            np.clip((forward_velocity - velocity_upper) / target_velocity_scale, 0.0, 2.0)
         )
 
         height = float(np.exp(-((root_height - ref_root_height) ** 2) / (0.09**2)))
@@ -2116,9 +2259,6 @@ class LytRobotAmpEnv:
             )
             if len(self.knee_joint_indices) > 0
             else 1.0
-        )
-        gait_progress = float(
-            np.clip(abs(target_forward_velocity) / target_velocity_scale, 0.0, 1.0)
         )
         sensor_gait_metrics = {}
         if any(
@@ -2197,13 +2337,10 @@ class LytRobotAmpEnv:
         )
         position_action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         prev_position_action = np.clip(np.asarray(prev_action, dtype=np.float32), -1.0, 1.0)
-        ctrl_delta = (
-            np.asarray(data.ctrl[self.position_actuator_ids], dtype=np.float32)
-            - reference_targets.tendon_ctrl[env_id]
-        ) / self.ctrl_half_range
-        ctrl_error = float(np.mean(np.square(ctrl_delta)))
-        ctrl_track = float(np.exp(-ctrl_error / (0.45**2)))
-        ctrl_penalty = float(np.mean(np.square(position_action)))
+        # Tendon command offsets are needed to produce supporting forces;
+        # penalize joint torque, not deviation from geometric tendon targets.
+        joint_torque = np.asarray(data.qfrc_actuator[self.motion.robot_qvel_adrs], dtype=np.float32)
+        torque_penalty = float(np.mean(np.square(joint_torque)))
         action_rate = float(np.mean(np.square(position_action - prev_position_action)))
         if len(self.distal_joint_indices) > 0:
             distal_vel_error = float(
@@ -2220,7 +2357,6 @@ class LytRobotAmpEnv:
             np.exp(-distal_vel_error / (max(self.cfg.distal_joint_vel_sigma, 1.0e-6) ** 2))
         )
         if self.has_distal_action:
-            distal_action = float(np.mean(np.square(position_action[self.distal_position_action_mask])))
             distal_action_rate = float(
                 np.mean(
                     np.square(
@@ -2230,22 +2366,22 @@ class LytRobotAmpEnv:
                 )
             )
         else:
-            distal_action = ctrl_penalty
             distal_action_rate = action_rate
-        (
-            symmetry_track,
-            foot_symmetry_track,
-            stride_symmetry_track,
-            phase_symmetry_track,
-            lateral_symmetry_track,
-            contact_balance_track,
-            action_balance_track,
-        ) = self._symmetry_track(
-            env_id,
-            foot_pos,
-            foot_contact,
-            position_action,
-        )
+        step_metrics = {
+            name: float(value[0]) for name, value in self.step_lengths.update(
+                foot_contact[None, :],
+                (foot_pos if self.cfg.command_walking else self._foot_positions_world(data))[:, 0].reshape(1, 2, 2).mean(axis=2),
+                slice(env_id, env_id + 1),
+                active=self._stand_start_progress()[env_id:env_id + 1] >= 1.,
+            ).items()
+        }
+        symmetry_track = float(step_symmetry_reward(
+            step_metrics, gait_progress, forward_velocity_track, locomotion_stability,
+        ))
+        if self.cfg.command_walking:
+            # Turning naturally needs unequal inner/outer steps.
+            yaw_limit = max(abs(value) for value in self.cfg.yaw_rate_range)
+            symmetry_track *= max(0.0, 1.0 - abs(float(reference_targets.root_ang_vel[env_id, 2])) / yaw_limit)
 
         reward = (
             0.05
@@ -2266,11 +2402,8 @@ class LytRobotAmpEnv:
             + self.cfg.stance_foot_reward_coef * stance_foot_track
             + self.cfg.contact_reward_coef * contact_track
             + 0.45 * distal_vel_track
-            + self.cfg.symmetry_reward_coef * symmetry_track
-            + 0.35 * ctrl_track
-            - self.cfg.ctrl_penalty_coef * ctrl_penalty
+            - self.cfg.torque_penalty_coef * torque_penalty
             - self.cfg.action_rate_penalty_coef * action_rate
-            - self.cfg.distal_action_penalty_coef * distal_action
             - self.cfg.distal_action_rate_penalty_coef * distal_action_rate
             - self.cfg.missed_contact_penalty_coef * missed_contact
         )
@@ -2288,7 +2421,10 @@ class LytRobotAmpEnv:
                 key_pos_root_local=tensor(foot_pos),
                 target_root_height=tensor(ref_root_height),
                 target_root_quat=tensor(ref_root_quat),
-                target_root_lin_vel=tensor(reference_targets.root_lin_vel[env_id]),
+                target_root_lin_vel=tensor(
+                    root_lin_vel_target if self.cfg.velocity_range is not None
+                    else reference_targets.root_lin_vel[env_id]
+                ),
                 target_root_ang_vel=tensor(reference_targets.root_ang_vel[env_id]),
                 target_joint_pos=tensor(reference_targets.joint_pos[env_id]),
                 target_joint_vel=tensor(reference_targets.joint_vel[env_id]),
@@ -2301,6 +2437,9 @@ class LytRobotAmpEnv:
                 route_velocity_sigma=self.cfg.deepmimic_route_velocity_sigma,
             )
             reward = float(dm_reward.item())
+        reward += self.cfg.symmetry_reward_coef * symmetry_track
+        if self.cfg.command_walking:
+            reward += 1.5 * yaw_rate_track * locomotion_stability
         if sensor_gait_metrics and not sensor_stability_reward_enabled(self.cfg):
             reward += float(natural_gait_bonus(
                 sensor_gait_metrics, gait_progress, forward_velocity_track,
@@ -2335,6 +2474,9 @@ class LytRobotAmpEnv:
             or up_z < self.cfg.min_upright_z
         )
         components = {
+            **({"command_speed": float(target_forward_velocity),
+                "command_yaw_rate": float(reference_targets.root_ang_vel[env_id, 2]),
+                "yaw_rate_track": yaw_rate_track} if self.cfg.command_walking else {}),
             "root_height_value": root_height,
             "reference_root_height_value": ref_root_height,
             "sensor_root_clearance": root_clearance,
@@ -2379,16 +2521,9 @@ class LytRobotAmpEnv:
             "missed_contact": missed_contact,
             "distal_vel": distal_vel_track,
             "symmetry": symmetry_track,
-            "foot_symmetry": foot_symmetry_track,
-            "stride_symmetry": stride_symmetry_track,
-            "phase_symmetry": phase_symmetry_track,
-            "lateral_symmetry": lateral_symmetry_track,
-            "contact_balance": contact_balance_track,
-            "action_balance": action_balance_track,
-            "ctrl_track": ctrl_track,
-            "ctrl_penalty": ctrl_penalty,
+            **step_metrics,
+            "torque_penalty": torque_penalty,
             "action_rate": action_rate,
-            "distal_action": distal_action,
             "distal_action_rate": distal_action_rate,
         }
         if self.cfg.deepmimic_reward:
@@ -2403,7 +2538,11 @@ class LytRobotAmpEnv:
             components,
             fall_penalty=self.cfg.fall_penalty,
         )
-        timed_out = self.episode_step[env_id] >= self.episode_timeout_step[env_id]
+        components["fallen"] = float(fallen)
+        timed_out = (
+            self.cfg.episode_steps > 0
+            and self.episode_step[env_id] >= self.episode_timeout_step[env_id]
+        )
         route_failure = bool(
             self.cfg.deepmimic_route_tracking
             and components.get("deepmimic_root_xy_error", 0.0)
@@ -2524,82 +2663,6 @@ class LytRobotAmpEnv:
             else 0.0
         )
         return stance_track, stance_speed
-
-    def _symmetry_track(
-        self,
-        env_id: int,
-        foot_pos: np.ndarray,
-        foot_contact: np.ndarray,
-        action: np.ndarray,
-    ) -> tuple[float, float, float, float, float, float, float]:
-        decay = float(np.clip(self.cfg.symmetry_ema_decay, 0.0, 0.9999))
-        side_x = np.asarray(
-            [
-                np.mean(foot_pos[0:2, 0]),
-                np.mean(foot_pos[2:4, 0]),
-            ],
-            dtype=np.float32,
-        )
-        self.foot_x_min[env_id] = np.minimum(self.foot_x_min[env_id], side_x)
-        self.foot_x_max[env_id] = np.maximum(self.foot_x_max[env_id], side_x)
-        side_stride = self.foot_x_max[env_id] - self.foot_x_min[env_id]
-        self.foot_stride_ema[env_id] = decay * self.foot_stride_ema[env_id] + (1.0 - decay) * side_stride
-        stride_diff = float(self.foot_stride_ema[env_id, 0] - self.foot_stride_ema[env_id, 1])
-        sigma = max(self.cfg.symmetry_foot_pos_sigma, 1.0e-6)
-        stride_symmetry = float(np.exp(-(stride_diff**2) / (sigma**2)))
-        # With foot positions expressed in the pelvis frame, a symmetric gait
-        # should keep the two side centers roughly mirrored front/back.
-        phase_diff = float(side_x[0] + side_x[1])
-        phase_symmetry = float(np.exp(-(phase_diff**2) / (sigma**2)))
-        right_y = float(np.mean(foot_pos[0:2, 1]))
-        left_y = float(np.mean(foot_pos[2:4, 1]))
-        lateral_symmetry = float(
-            np.exp(-((right_y + left_y) ** 2) / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2))
-        )
-        foot_symmetry = 0.85 * min(stride_symmetry, phase_symmetry) + 0.15 * lateral_symmetry
-
-        self.contact_balance_ema[env_id] = (
-            decay * self.contact_balance_ema[env_id] + (1.0 - decay) * np.asarray(foot_contact, dtype=np.float32)
-        )
-        contact_diff = float(self.contact_balance_ema[env_id, 0] - self.contact_balance_ema[env_id, 1])
-        contact_balance = float(
-            np.exp(-(contact_diff**2) / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2))
-        )
-
-        if len(self.right_action_indices) > 0 and len(self.left_action_indices) > 0:
-            side_activity = np.asarray(
-                [
-                    np.mean(np.square(action[self.right_action_indices])),
-                    np.mean(np.square(action[self.left_action_indices])),
-                ],
-                dtype=np.float32,
-            )
-            self.action_activity_ema[env_id] = decay * self.action_activity_ema[env_id] + (1.0 - decay) * side_activity
-            action_diff = float(self.action_activity_ema[env_id, 0] - self.action_activity_ema[env_id, 1])
-            action_balance = float(
-                np.exp(-(action_diff**2) / (max(self.cfg.symmetry_balance_sigma, 1.0e-6) ** 2))
-            )
-        else:
-            action_balance = 1.0
-
-        foot_weight = max(float(self.cfg.symmetry_foot_weight), 0.0)
-        contact_weight = max(float(self.cfg.symmetry_contact_weight), 0.0)
-        action_weight = max(float(self.cfg.symmetry_action_weight), 0.0)
-        weight_sum = max(foot_weight + contact_weight + action_weight, 1.0e-6)
-        symmetry = (
-            foot_weight * foot_symmetry
-            + contact_weight * contact_balance
-            + action_weight * action_balance
-        ) / weight_sum
-        return (
-            float(symmetry),
-            float(foot_symmetry),
-            float(stride_symmetry),
-            float(phase_symmetry),
-            float(lateral_symmetry),
-            float(contact_balance),
-            float(action_balance),
-        )
 
     def close(self) -> None:
         self.datas.clear()

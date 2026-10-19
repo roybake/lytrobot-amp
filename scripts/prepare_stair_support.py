@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import itertools
 import json
 from pathlib import Path
 import sys
@@ -29,21 +28,30 @@ def prepare(source: Path, output: Path, model_xml: Path, root_x_offset: float) -
     ref = MotionReference(source, model, zero_root_xy=False, loop_override=False,
                           root_x_offset=root_x_offset)
     data = mujoco.MjData(model)
-    feet = [model.geom(name).id for name in ("foot_r", "foot_l")]
+    feet = [
+        [model.geom(f"{part}_{side}").id for part in ("foot", "toe")]
+        for side in ("r", "l")
+    ]
+    mesh_vertices = {}
+    for foot in (geom_id for side in feet for geom_id in side):
+        mesh_id = int(model.geom_dataid[foot])
+        start = int(model.mesh_vertadr[mesh_id])
+        mesh_vertices[foot] = model.mesh_vert[start:start + int(model.mesh_vertnum[mesh_id])]
     boxes = [i for i in range(model.ngeom) if model.geom_bodyid[i] == 0
              and model.geom_type[i] == mujoco.mjtGeom.mjGEOM_BOX
              and model.geom_contype[i] != 0]
-    signs = np.asarray(list(itertools.product((-1, 1), repeat=3)))
     clearances = []
     side_clearances = []
     for qpos in ref.reference_qpos:
         data.qpos[:] = qpos
         mujoco.mj_forward(model, data)
         side = []
-        for foot in feet:
-            vertices = (data.geom_xpos[foot]
-                        + (signs * model.geom_size[foot])
-                        @ data.geom_xmat[foot].reshape(3, 3).T)
+        for foot_ids in feet:
+            vertices = np.concatenate([
+                data.geom_xpos[foot]
+                + mesh_vertices[foot] @ data.geom_xmat[foot].reshape(3, 3).T
+                for foot in foot_ids
+            ])
             heights = np.zeros(len(vertices))
             for box in boxes:
                 inside = np.all(np.abs(vertices[:, :2] - model.geom_pos[box, :2])
@@ -101,7 +109,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=ROOT / "robot/reference_data/multimotion/stairs.npz")
     parser.add_argument("--output", type=Path, default=ROOT / "robot/reference_data/multimotion/stairs_supported.npz")
-    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/terrains/stairs.xml")
+    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodel_stair.xml")
     parser.add_argument("--root-x-offset", type=float, default=-0.39)
     args = parser.parse_args()
     print(json.dumps(prepare(args.source, args.output, args.model_xml, args.root_x_offset), indent=2))

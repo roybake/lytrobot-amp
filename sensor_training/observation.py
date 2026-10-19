@@ -66,12 +66,16 @@ def resolve_imu_sensor_layout(
 class HistoryMotionReference:
     """Expose time-stacked AMP reference features without changing MotionReference."""
 
-    def __init__(self, source: Any, *, frame_count: int, policy_dt: float) -> None:
+    def __init__(
+        self, source: Any, *, frame_count: int, policy_dt: float,
+        cadence_range: tuple[float, float] | None = None,
+    ) -> None:
         if frame_count < 1:
             raise ValueError("frame_count must be at least one.")
         self.source = source
         self.history_frame_count = int(frame_count)
         self.policy_dt = float(policy_dt)
+        self.cadence_range = cadence_range
         self.feature_dim = int(source.feature_dim * self.history_frame_count)
         self.common_joint_names = source.common_joint_names
 
@@ -113,6 +117,12 @@ class HistoryMotionReference:
             dtype=np.float64,
         )[None, :]
         reference_stride = float(self.source.frequency) * self.policy_dt
+        if self.cadence_range is not None:
+            cadence = rng.uniform(*self.cadence_range, size=(batch_size, 1))
+            endpoint = rng.random((batch_size, 1))
+            cadence[endpoint < 0.15] = self.cadence_range[0]
+            cadence[endpoint > 0.85] = self.cadence_range[1]
+            reference_stride = reference_stride * cadence
         phases = current_phase + frame_offsets * reference_stride
 
         regular = self._interpolate_table(self.source.reference_features, phases)

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
 import json
 import re
 import secrets
@@ -114,23 +113,23 @@ def parse_args() -> argparse.Namespace:
         help="Playback reference; defaults to the one saved in the checkpoint.",
     )
     parser.add_argument("--steps", type=int, default=1000, help="Number of policy steps to run. Use 0 for no limit.")
+    parser.add_argument(
+        "--episode-steps", type=int, default=None,
+        help="Override the checkpoint's episode time limit in control steps. Use 0 for no time limit.",
+    )
     parser.add_argument("--target-velocity", type=float, default=None)
+    parser.add_argument(
+        "--keyboard", action="store_true",
+        help="Control a command-walking policy in MuJoCo: up/down speed, left/right turn; hold to accelerate.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
-        help="Playback RNG seed. Omit it to randomize each run; set it to reproduce one play test.",
+        default=secrets.randbits(32),
+        help="Playback RNG seed; randomly generated for each run by default.",
     )
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument(
-        "--training-aligned",
-        action="store_true",
-        help=(
-            "Preserve reset noise and per-episode RNG behavior saved in the checkpoint. "
-            "Use for distributional evaluation; the default viewer mode is deterministic."
-        ),
-    )
     parser.add_argument("--viewer", action=argparse.BooleanOptionalAction, default=True,
                         help="Open the local MuJoCo viewer by default; use --no-viewer for headless playback.")
     parser.add_argument(
@@ -143,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         "--serial-terrain-course",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Use randomized all-terrain serial courses (enabled by default for multimotion).",
+        help="Override the checkpoint's serial terrain course setting.",
     )
     parser.add_argument(
         "--terrain-test",
@@ -186,38 +185,19 @@ def make_env_cfg(
     checkpoint: dict,
     stage: str | None = None,
 ) -> LytRobotEnvCfg:
-    checkpoint_env_cfg = checkpoint.get("env_config", {})
-    model_xml = args.model_xml or checkpoint_env_cfg.get("model_xml") or str(
-        REPO_ROOT / "robot" / "MJCFmodelposition.xml"
-    )
-    saved_motion_file = (
-        checkpoint_env_cfg.get("motion_file")
-        if isinstance(checkpoint_env_cfg, dict) else None
-    )
-    motion_file = args.motion_file or saved_motion_file or str(
-        REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
-    )
-    cfg = LytRobotEnvCfg(
-        model_xml=model_xml,
-        motion_file=motion_file,
-        num_envs=1,
-        target_velocity=(
-            float(args.target_velocity)
-            if args.target_velocity is not None
-            else float(checkpoint.get("env_config", {}).get("target_velocity", 0.87))
-        ),
-        reset_noise_scale=0.0,
-        stand_start_prob=0.0,
-    )
-    if isinstance(checkpoint_env_cfg, dict):
-        valid_fields = {field.name for field in fields(LytRobotEnvCfg)}
-        for key, value in checkpoint_env_cfg.items():
-            if key in valid_fields and key not in {"model_xml", "motion_file", "num_envs", "seed", "target_velocity"}:
-                setattr(cfg, key, value)
-    cfg.model_xml = model_xml
-    cfg.motion_file = motion_file
-    if not args.training_aligned:
-        cfg.stair_phase_reset_prob = 0.0
+    saved_cfg = dict(checkpoint["env_config"])
+    # Playback reconstructs the observation layout used to train the policy.
+    saved_cfg.setdefault("observe_tendon_velocity", False)
+    # These reward-only fields were removed; they do not affect policy inputs.
+    saved_cfg.pop("ctrl_penalty_coef", None)
+    saved_cfg.pop("distal_action_penalty_coef", None)
+    cfg = LytRobotEnvCfg(**saved_cfg)
+    if args.episode_steps is not None:
+        cfg.episode_steps = int(args.episode_steps)
+    if args.model_xml is not None:
+        cfg.model_xml = args.model_xml
+    if args.motion_file is not None:
+        cfg.motion_file = args.motion_file
     resolved_stage = stage or infer_stage(args.checkpoint, checkpoint, args.stage)
     robot_count = args.num_robots
     if robot_count is None:
@@ -225,20 +205,12 @@ def make_env_cfg(
     if robot_count < 1:
         raise ValueError("--num-robots must be positive.")
     cfg.num_envs = int(robot_count)
-    cfg.seed = int(args.seed)
-    if args.target_velocity is not None:
+    if args.seed is not None:
+        cfg.seed = int(args.seed)
+    if args.target_velocity is not None and not cfg.command_walking:
         cfg.target_velocity = float(args.target_velocity)
-    if not getattr(args, "training_aligned", False):
-        cfg.reset_noise_scale = 0.0
-    use_serial_course = (
-        resolved_stage == "multimotion"
-        if args.serial_terrain_course is None
-        else bool(args.serial_terrain_course)
-    )
-    # Honor an explicit --no-serial-terrain-course even when the checkpoint
-    # was trained with a serial course.  Previously the copied checkpoint
-    # value stayed True because only the enabling branch assigned this field.
-    cfg.serial_terrain_course = use_serial_course
+    if args.serial_terrain_course is not None:
+        cfg.serial_terrain_course = bool(args.serial_terrain_course)
     terrain_test = getattr(args, "terrain_test", None)
     if terrain_test is not None:
         terrain = terrain_test.replace("-", "_")
@@ -253,14 +225,6 @@ def make_env_cfg(
         cfg.terrain_course_variants = max(int(robot_count), 1)
         cfg.terrain_course_random_assignment = False
         cfg.terrain_course_random_start_prob = 0.0
-        cfg.stand_start_prob = 0.0
-    if use_serial_course:
-        cfg.terrain_course_variants = max(int(robot_count), 1)
-        cfg.terrain_course_random_assignment = False
-        # Playback is a strict full-route evaluation, never a curriculum reset.
-        cfg.terrain_course_random_start_prob = 0.0
-    if use_serial_course:
-        cfg.stand_start_prob = 0.0
     if args.stand_start_prob is not None:
         cfg.stand_start_prob = float(args.stand_start_prob)
     stand_start_motion_phase = getattr(args, "stand_start_motion_phase", None)
@@ -278,8 +242,6 @@ def make_env_cfg(
         cfg.domain_randomization = bool(args.domain_randomization)
     if args.episode_random_seed is not None:
         cfg.randomize_episode_seed = bool(args.episode_random_seed)
-    elif getattr(args, "seed_was_provided", False) and not getattr(args, "training_aligned", False):
-        cfg.randomize_episode_seed = False
     return cfg
 
 
@@ -423,6 +385,7 @@ def sync_multi_robot_state(
     for env_id, source in enumerate(env.datas):
         start = env_id * block
         display_data.qpos[start : start + block] = source.qpos
+    display_data.time = max(source.time for source in env.datas)
     mujoco.mj_forward(display_model, display_data)
 
 
@@ -519,14 +482,8 @@ class MujocoVideoRecorder:
             raise RuntimeError(f"ffmpeg failed while writing {self.output_path}")
 
 
-def main() -> None:
+def main(*, sensor_observations: bool = False) -> None:
     args = parse_args()
-    args.seed_was_provided = args.seed is not None
-    if args.seed is None:
-        args.seed = secrets.randbits(32)
-    torch.manual_seed(int(args.seed))
-    if str(args.device).startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(args.seed))
     checkpoint_path = Path(args.checkpoint).expanduser()
     is_onnx = checkpoint_path.suffix.lower() == ".onnx"
     if is_onnx:
@@ -535,11 +492,34 @@ def main() -> None:
         checkpoint = torch.load(checkpoint_path, map_location=args.device)
     else:
         raise ValueError("--checkpoint must be a .pt or .onnx model file.")
+    torch.manual_seed(int(args.seed))
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     ppo_cfg = checkpoint.get("ppo_amp_config", {})
     stage = infer_stage(args.checkpoint, checkpoint, args.stage)
 
     env_cfg = make_env_cfg(args, checkpoint, stage)
-    env = LytRobotAmpEnv(env_cfg)
+    if args.keyboard and (not env_cfg.command_walking or not args.viewer):
+        raise ValueError("--keyboard requires a command-walking policy and --viewer.")
+    if env_cfg.command_walking and args.target_velocity is not None:
+        if not np.isfinite(args.target_velocity) or not env_cfg.velocity_range[0] <= args.target_velocity <= env_cfg.velocity_range[1]:
+            raise ValueError("--target-velocity must be inside the checkpoint's walking velocity range.")
+    env_type = LytRobotAmpEnv
+    if not sensor_observations and "config" in checkpoint.get("sensor_observation", {}):
+        from sensor_training.envs import SensorHistoryCpuAmpEnv
+
+        env_type = SensorHistoryCpuAmpEnv
+        sensor_observations = True
+    if sensor_observations:
+        from sensor_training.experiment_options import observation_config_from_metadata
+
+        env = env_type(
+            env_cfg, observation_cfg=observation_config_from_metadata(checkpoint)
+        )
+    else:
+        env = env_type(env_cfg)
+    if env.cfg.command_walking and args.target_velocity is not None:
+        env.walking_commands.set_manual(args.target_velocity, 0.0)
     sensor_architecture = checkpoint.get("sensor_policy_architecture", {})
     recurrent_sensor_policy = bool(sensor_architecture.get("recurrent", False))
     if is_onnx:
@@ -593,7 +573,9 @@ def main() -> None:
     print(
         f"[PLAY] seed={int(args.seed)} domain_randomization={env.domain_randomization} "
         f"episode_random_seed={env.cfg.randomize_episode_seed} camera_mode={args.camera_mode} "
-        f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course}"
+        f"robots={env.num_envs} serial_course={env.cfg.serial_terrain_course} "
+        f"stand_start_prob={env.cfg.stand_start_prob} motion_reset_prob={env.cfg.motion_reset_prob} "
+        f"termination_mode={env.cfg.termination_mode} reset_noise_scale={env.cfg.reset_noise_scale}"
     )
     if env.cfg.serial_terrain_course:
         for index, order in enumerate(env.more_terrain_cfg.normalized_course_orders):
@@ -617,7 +599,17 @@ def main() -> None:
     if args.viewer:
         from mujoco import viewer as mujoco_viewer
 
-        viewer = mujoco_viewer.launch_passive(display_model, display_data)
+        if args.keyboard:
+            from lytrobot_amp.keyboard_viewer import KeyboardWalkingViewer
+
+            viewer = KeyboardWalkingViewer(
+                display_model, display_data, env,
+                env.cfg.target_velocity if args.target_velocity is None else args.target_velocity)
+            obs = env.refresh_walking_command_observation() if sensor_observations else env.observe()
+            print("[KEYBOARD] ↑/↓: speed ±0.05 m/s; hold to accelerate/decelerate at 0.30 m/s². "
+                  "←/→: turn; release to walk straight. ESC: exit.")
+        else:
+            viewer = mujoco_viewer.launch_passive(display_model, display_data)
         record_path = checkpoint_recording_path(args.checkpoint, checkpoint, args.record_dir, stage)
         record_fps = args.record_fps if args.record_fps > 0.0 else 1.0 / max(env.dt, 1.0e-6)
         recorder = MujocoVideoRecorder(
@@ -641,6 +633,13 @@ def main() -> None:
     try:
         step_count = 0
         while args.steps <= 0 or step_count < args.steps:
+            step_started = time.perf_counter()
+            if args.keyboard:
+                viewer.update_commands()
+                if not viewer.is_running():
+                    break
+                # Refresh before inference so the action uses this frame's command.
+                obs = env.refresh_walking_command_observation() if sensor_observations else env.observe()
             if is_onnx:
                 action = policy.act_inference(obs, episode_start=episode_start)
             else:
@@ -705,10 +704,22 @@ def main() -> None:
                 if env.num_envs > 1:
                     sync_multi_robot_state(display_model, display_data, env)
                 update_follow_camera(display_model, viewer.cam, display_data, mode=args.camera_mode)
+                time_before_sync = display_data.time
                 viewer.sync()
+                # The native Reset button only resets MjData during sync.
+                # Restart the environment and policy together before inference.
+                if display_data.time < time_before_sync:
+                    obs = env.reset()
+                    episode_start = np.ones(env.num_envs, dtype=np.float32)
+                    if env.num_envs > 1:
+                        sync_multi_robot_state(display_model, display_data, env)
+                    update_follow_camera(
+                        display_model, viewer.cam, display_data, mode=args.camera_mode,
+                    )
                 if recorder is not None:
                     recorder.write_frame(getattr(viewer, "cam", None))
-                time.sleep(env.dt)
+                delay = max(0.0, env.dt - (time.perf_counter() - step_started)) if args.keyboard else env.dt
+                time.sleep(delay)
     finally:
         if recorder is not None:
             recorder.close()

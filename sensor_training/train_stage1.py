@@ -17,10 +17,8 @@ from sensor_training.training_defaults import (
 )
 
 
-# Use exactly the same natural-gait reference as the privileged Stage1
-# entrypoint.  Keeping the motion, target speed and explicit reward overrides
-# aligned makes comparisons isolate the deployable sensor observation and
-# recurrent policy instead of silently changing the task.
+# Train the sensor natural-gait reference with the privileged Stage1 reward
+# weights recorded in distillation/10-10-10:10:17/teacher.
 DEFAULT_GAIT_REFERENCE = (
     REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
 )
@@ -49,9 +47,7 @@ if __name__ == "__main__":
     # only deployable IMU/tendon/action history plus an onboard gait command;
     # reference phase and tendon targets are therefore known at deployment.
     #
-    # Motion, target speed and explicit gait-reward overrides intentionally
-    # match scripts/train_stage1.py.  Sensor history, recurrent optimization
-    # and the deployable actor interface remain the experimental differences.
+    # Target speed and explicit gait-reward overrides match scripts/train_stage1.py.
     stage1_defaults = {
         # Keep a 0.64 s recurrent gradient window at the required 100 Hz
         # control rate while matching the privileged recipe's physics budget
@@ -61,8 +57,14 @@ if __name__ == "__main__":
         # Match scripts/train_stage1.py so observation architecture is the
         # principal experimental variable in privileged-vs-sensor runs.
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-        "--motion-loop": "false",
+        "--task-reward-mode": "stage1_reference",
+        "--termination-mode": "fall",
+        "--motion-loop": "true",
         "--target-velocity": "1.28",
+        "--forward-velocity-reward-coef": "2.0",
+        "--forward-progress-reward-coef": "0.0",
+        "--forward-velocity-deficit-penalty-coef": "0.0",
+        "--forward-velocity-tracking-sigma": "0.25",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",
         "--side-foot-pos-coef": "0.0",
@@ -78,17 +80,14 @@ if __name__ == "__main__":
         "--startup-action-ramp-steps": "50",
         "--save-interval": "500",
         "--fall-penalty": "2.0",
-        # Half of the episodes reproduce the deployment transition from a
-        # standing start; the rest start inside the reference gait so that the
-        # policy learns the whole cycle instead of only the startup ramp.
-        "--stand-start-prob": "0.5",
-        "--motion-reset-prob": "0.5",
+        "--stand-start-prob": "1.0",
+        "--stand-start-motion-phase": "31",
+        "--motion-reset-prob": "0.0",
         "--stand-start-phase-delay-steps": "25",
         "--stand-start-transition-min-steps": "100",
         "--stand-start-transition-max-steps": "200",
-        # 12 s +/- 2.4 s episodes: ~8-15 gait cycles per episode, so a fall is
-        # never cheaper than walking and the value function sees steady gait.
-        "--episode-steps": "1200",
+        "--episode-steps": "0",
+        "--episode-timeout-jitter-steps": "0",
         # Same PPO budget per update as the privileged Stage1 policy.  The
         # previous 1e-5 fixed rate disabled the adaptive schedule and made
         # every update 30x smaller than the recipe that works.
@@ -106,9 +105,7 @@ if __name__ == "__main__":
         "--max-action-std": "0.6",
         "--task-reward-lerp": "0.5",
         "--amp-reward-coef": "1.2",
-        # Only stop an episode for standing still; the reference clock keeps
-        # moving, so a stationary policy already scores far below a walking
-        # one and needs no extra shaping term.
+        # Progress remains a reward diagnostic; only a fall ends an episode.
         "--min-forward-progress-speed": "0.1",
         "--forward-progress-grace-steps": "400",
         "--forward-progress-window-steps": "100",
@@ -119,4 +116,6 @@ if __name__ == "__main__":
             sys.argv.extend([name, value])
     if not (_has_arg("--sensor-stability-reward") or _has_arg("--no-sensor-stability-reward")):
         sys.argv.append("--no-sensor-stability-reward")
+    if not (_has_arg("--symmetric-gait-reference") or _has_arg("--no-symmetric-gait-reference")):
+        sys.argv.append("--symmetric-gait-reference")
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")

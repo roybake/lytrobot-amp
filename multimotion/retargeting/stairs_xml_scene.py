@@ -20,8 +20,8 @@ import mujoco
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "robot/MJCFmodelposition.xml"
-DEFAULT_TERRAIN = ROOT / "robot/terrains/more_discolrl/stairs.xml"
+DEFAULT_MODEL = ROOT / "robot/MJCFmodel_stair.xml"
+DEFAULT_TERRAIN = ROOT / "robot/terrains/stairs.xml"
 FOOT_NAMES = ("foot_r", "toe_r", "foot_l", "toe_l")
 
 
@@ -49,7 +49,12 @@ def scene_xml(model_xml: str | Path = DEFAULT_MODEL,
               terrain_xml: str | Path = DEFAULT_TERRAIN) -> str:
     """Return the exact robot and source terrain as a self-contained XML string."""
     robot = _expanded_xml(Path(model_xml).expanduser().resolve())
-    terrain = _expanded_xml(Path(terrain_xml).expanduser().resolve())
+    terrain_path = Path(terrain_xml).expanduser().resolve()
+    # Terrain XML attaches the robot for direct viewing. Merge only its
+    # own assets and world geometry so the robot is included exactly once.
+    terrain = ET.parse(terrain_path).getroot()
+    compiler = terrain.find("compiler")
+    mesh_dir = terrain_path.parent / compiler.get("meshdir", "")
     # Existing static geometries belong to the robot's display scene.
     # Keep all robot bodies, including their joints, tendons and actuators.
     for world in robot.findall("worldbody"):
@@ -60,7 +65,12 @@ def scene_xml(model_xml: str | Path = DEFAULT_MODEL,
     asset_names: dict[str, str] = {}
     for source in terrain.findall("asset"):
         for item in source:
+            if item.tag == "model":
+                continue
             copied = deepcopy(item)
+            if "file" in copied.attrib:
+                asset_dir = mesh_dir if item.tag in ("mesh", "hfield") else terrain_path.parent
+                copied.set("file", str((asset_dir / copied.attrib["file"]).resolve()))
             if "name" in copied.attrib:
                 name = copied.attrib["name"]
                 asset_names[name] = "stairs_xml_" + name
@@ -73,6 +83,8 @@ def scene_xml(model_xml: str | Path = DEFAULT_MODEL,
     world = ET.SubElement(robot, "worldbody")
     for source in terrain.findall("worldbody"):
         for item in source:
+            if item.tag == "attach":
+                continue
             copied = deepcopy(item)
             for node in copied.iter():
                 for key in ("texture", "material", "mesh", "hfield"):

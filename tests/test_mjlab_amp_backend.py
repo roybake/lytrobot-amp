@@ -28,7 +28,7 @@ class MjlabAmpBackendTests(unittest.TestCase):
             motion_file = Path(tmp) / "motion.npz"
             np.savez(motion_file, **payload)
             cfg = LytRobotEnvCfg(
-                model_xml=str(ROOT / "robot/MJCFmodelposition.xml"),
+                model_xml=str(ROOT / "robot/MJCFmodelfinal.xml"),
                 motion_file=str(motion_file),
                 num_envs=2,
                 seed=11,

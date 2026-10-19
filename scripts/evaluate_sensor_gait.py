@@ -49,12 +49,6 @@ def main() -> None:
         raise ValueError("Gait evaluation requires an exported .onnx sensor checkpoint.")
     if args.steps <= 0:
         raise ValueError("--steps must be positive for gait evaluation.")
-    if args.seed is None:
-        args.seed = 42
-    # Deployment starts from standing; random motion resets can conceal a
-    # policy that falls during its stand-to-walk transition.
-    if args.stand_start_prob is None:
-        args.stand_start_prob = 1.0
     checkpoint = playback.load_onnx_metadata(checkpoint_path)
     stage = playback.infer_stage(args.checkpoint, checkpoint, args.stage)
     env_cfg = playback.make_env_cfg(args, checkpoint, stage)

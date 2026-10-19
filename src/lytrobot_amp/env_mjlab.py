@@ -42,6 +42,10 @@ class LytRobotMjlabAmpEnv(LytRobotWarpAmpEnv):
         self.wp_device = self.sim.wp_device
         self.wp_model = self.sim.wp_model
         self.wp_data = self.sim.wp_data
+        self.wp_model.opt.timestep = wp.full(
+            self.num_envs, float(self.cfg.timestep), dtype=wp.float32, device=self.wp_device,
+        )
+        self.sim.create_graph()
         self.sim.forward()
         self._init_warp_views()
 

@@ -31,7 +31,7 @@ def main() -> None:
         if not _has_arg(name):
             sys.argv.extend([name, value])
     base_play.LytRobotAmpEnv = SquatSensorHistoryCpuAmpEnv
-    base_play.main()
+    base_play.main(sensor_observations=True)
 
 
 if __name__ == "__main__":

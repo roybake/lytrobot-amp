@@ -7,9 +7,11 @@ import argparse
 import csv
 import ctypes
 import gc
+import itertools
 import json
 import os
 import re
+import secrets
 import signal
 import shutil
 import subprocess
@@ -33,8 +35,9 @@ import torch
 from lytrobot_amp.training_paths import new_run_dir, validate_run_name
 
 from lytrobot_amp import __version__
-from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
+from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg, validate_velocity_range
 from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
+from lytrobot_amp.terrain import MAX_ROUGH_HEIGHT_DIFFERENCE_M
 
 try:
     from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
@@ -75,7 +78,7 @@ DISTILLATION_CLI_ENABLED = False
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train LYT biped locomotion with BPO-AMP.")
-    parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
+    parser.add_argument("--model-xml", default=str(REPO_ROOT / "robot" / "MJCFmodelfinal.xml"))
     parser.add_argument("--motion-file", default=str(REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"))
     parser.add_argument(
         "--motion-files",
@@ -112,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--terrain-asset-dir",
-        default=str(REPO_ROOT / "robot" / "terrains" / "more_discolrl"),
+        default=str(REPO_ROOT / "robot" / "terrains"),
     )
     parser.add_argument(
         "--terrain-embedded-in-model",
@@ -192,7 +195,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pit-lane-y", type=float, default=9.0)
     parser.add_argument("--gap-lane-y", type=float, default=12.0)
     parser.add_argument("--terrain-lane-width", type=float, default=2.0)
-    parser.add_argument("--rough-terrain-height", type=float, default=0.05)
+    parser.add_argument(
+        "--rough-terrain-height", type=float, default=MAX_ROUGH_HEIGHT_DIFFERENCE_M,
+        help=f"粗糙地形最高点相对平地的高度，单位 m，最大 {MAX_ROUGH_HEIGHT_DIFFERENCE_M:g}。",
+    )
     parser.add_argument("--slope-angle-deg", type=float, default=6.0)
     parser.add_argument("--gap-terrain-width", type=float, default=0.20)
     parser.add_argument(
@@ -270,7 +276,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load checkpoint weights but restart iteration/global_step from zero.",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=secrets.randbits(32),
+                        help="Training RNG seed; randomly generated for each run by default.")
     parser.add_argument("--episode-random-seed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--sim-backend", default="warp", choices=("warp", "mjlab", "cpu"))
@@ -278,9 +285,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=0)
 
     parser.add_argument("--num-envs", type=int, default=4096)
-    parser.add_argument("--max-iterations", type=int, default=None)
+    parser.add_argument("--max-iterations", type=int, default=None,
+                        help="Total update limit; 0 trains until gait acceptance.")
     parser.add_argument("--num-steps", type=int, default=24)
-    parser.add_argument("--episode-steps", type=int, default=1000)
+    parser.add_argument("--termination-mode", choices=("task", "fall"), default="task",
+                        help="fall runs continuous episodes ending only at the training fall thresholds.")
+    parser.add_argument("--episode-steps", type=int, default=1000,
+                        help="Episode time limit in control steps; 0 disables the time limit.")
     parser.add_argument("--episode-timeout-jitter-steps", type=int, default=240)
     parser.add_argument(
         "--decimation",
@@ -297,6 +308,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp-njmax", type=int, default=128)
     parser.add_argument("--warp-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-velocity", type=float, default=0.87)
+    parser.add_argument(
+        "--command-walking", action=argparse.BooleanOptionalAction, default=False,
+        help="Train changing forward-speed and yaw-rate commands with a heading-relative policy.",
+    )
+    parser.add_argument(
+        "--yaw-rate-range", nargs=2, type=float, default=(-0.8, 0.8), metavar=("MIN", "MAX"),
+        help="Commanded yaw-rate bounds in rad/s for --command-walking.",
+    )
+    parser.add_argument(
+        "--velocity-range", nargs=2, type=float, metavar=("MIN", "MAX"), default=None,
+        help=("Train forward speed in the closed interval [MIN, MAX] m/s. "
+              "With --command-walking, sample and track individual speed commands. "
+              "Without a range, track --target-velocity. Without --command-walking, "
+              "the whole interval is rewarded and the reference keeps its existing schedule."),
+    )
     parser.add_argument("--forward-velocity-tracking-sigma", type=float, default=0.25)
     parser.add_argument("--forward-velocity-reward-coef", type=float, default=0.0)
     parser.add_argument("--forward-progress-reward-coef", type=float, default=0.0)
@@ -355,7 +381,7 @@ def parse_args() -> argparse.Namespace:
         help="Terminate a non-looping serial-course stage that ends before its spatial boundary.",
     )
     parser.add_argument("--reset-noise-scale", type=float, default=0.01)
-    parser.add_argument("--motion-reset-prob", type=float, default=0.5)
+    parser.add_argument("--motion-reset-prob", type=float, default=LytRobotEnvCfg.motion_reset_prob)
     parser.add_argument("--action-residual-scale", type=float, default=0.5)
     parser.add_argument("--distal-action-scale", type=float, default=1.0)
     parser.add_argument("--reference-ctrl-blend", type=float, default=1.0)
@@ -379,6 +405,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swing-advance-coef", type=float, default=0.0)
     parser.add_argument("--distal-joint-vel-sigma", type=float, default=2.0)
     parser.add_argument("--symmetry-reward-coef", type=float, default=1.20)
+    parser.add_argument("--step-symmetry-tolerance", type=float, default=0.05,
+                        help="Maximum relative difference of consecutive left/right landing steps.")
+    parser.add_argument("--symmetric-gait-reference", action=argparse.BooleanOptionalAction, default=False,
+                        help="Build a half-cycle mirrored walking reference before deriving targets and controls.")
     parser.add_argument("--symmetry-foot-pos-sigma", type=float, default=0.08)
     parser.add_argument("--symmetry-balance-sigma", type=float, default=0.25)
     parser.add_argument("--symmetry-ema-decay", type=float, default=0.99)
@@ -400,9 +430,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stand-start-transition-min-steps", type=int, default=80)
     parser.add_argument("--stand-start-transition-max-steps", type=int, default=160)
     parser.add_argument("--stand-start-push-delay-steps", type=int, default=100)
-    parser.add_argument("--ctrl-penalty-coef", type=float, default=0.040)
+    parser.add_argument(
+        "--torque-penalty-coef", type=float, default=LytRobotEnvCfg.torque_penalty_coef,
+        help="Weight of mean squared actuator-generated joint torque in (N m)^2; default costs 0.04 at 10 N m RMS.",
+    )
     parser.add_argument("--action-rate-penalty-coef", type=float, default=0.100)
-    parser.add_argument("--distal-action-penalty-coef", type=float, default=0.030)
     parser.add_argument("--distal-action-rate-penalty-coef", type=float, default=0.120)
     parser.add_argument("--domain-randomization", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
@@ -532,7 +564,7 @@ def parse_args() -> argparse.Namespace:
             "--teacher-checkpoint",
             required=True,
             help=(
-                "Privileged full-state Teacher checkpoint used only by the "
+                "Privileged full-state Teacher training checkpoint (.pt) used only by the "
                 "dedicated sensor-distillation entry point."
             ),
         )
@@ -554,7 +586,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--evaluate-gait", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gait-evaluation-seconds", type=float, default=20.0)
-    parser.add_argument("--gait-evaluation-seeds", type=int, nargs='+', default=[42, 123, 2026])
+    parser.add_argument("--gait-evaluation-seeds", type=int, nargs='+',
+                        default=[secrets.randbits(32) for _ in range(3)],
+                        help="Gait evaluation seeds; three random seeds per run by default.")
     parser.add_argument("--stop-on-gait-acceptance", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--save-best-checkpoint",
@@ -1238,6 +1272,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
     args = parse_args()
+    validate_velocity_range(args.velocity_range, args.target_velocity, args.use_reference_velocity)
+    if args.termination_mode == "fall":
+        args.episode_steps = 0
+        args.episode_timeout_jitter_steps = 0
+        args.motion_loop = ["true"] * len(args.motion_files or [args.motion_file])
+        args.global_dr_resample_interval = 0
+    if args.episode_steps < 0:
+        raise ValueError("--episode-steps must be non-negative.")
     if args.deepmimic_ppo and not hasattr(PPOAMPTrainer, "_evaluate_policy_sequence"):
         raise ValueError("--deepmimic-ppo requires the recurrent sensor training entry point.")
     if args.deepmimic_ppo and (not args.deepmimic_reward or args.amp):
@@ -1339,6 +1381,10 @@ def main() -> None:
         raise ValueError('Gait evaluation duration must be positive.')
     if args.stop_on_gait_acceptance and not args.evaluate_gait:
         raise ValueError('Stopping on gait acceptance requires --evaluate-gait.')
+    if args.max_iterations is not None and args.max_iterations < 0:
+        raise ValueError('--max-iterations must be non-negative.')
+    if args.max_iterations == 0 and not (args.evaluate_gait and args.stop_on_gait_acceptance):
+        raise ValueError('--max-iterations 0 requires --evaluate-gait and --stop-on-gait-acceptance.')
     if DISTILLATION_CLI_ENABLED:
         if args.teacher_action_loss_scale <= 0:
             raise ValueError('Teacher action loss scale must be positive.')
@@ -1369,6 +1415,12 @@ def main() -> None:
     # model_final.pt during graceful shutdown.
     args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint)
     teacher_checkpoint = resolve_resume_checkpoint(teacher_checkpoint)
+    if teacher_checkpoint is not None and Path(teacher_checkpoint).suffix.lower() != ".pt":
+        raise ValueError(
+            "--teacher-checkpoint requires a privileged PyTorch training checkpoint (.pt) "
+            "containing actor_critic weights and env_config metadata. "
+            "Use the .pt checkpoint saved alongside the ONNX export."
+        )
     if DISTILLATION_CLI_ENABLED:
         args.teacher_checkpoint = teacher_checkpoint
     if args.domain_randomization is None:
@@ -1403,7 +1455,10 @@ def main() -> None:
             f"[INFO] stage={args.stage}, device={device}, sim_backend={sim_backend}, "
             f"seed={args.seed}, control=position, "
             f"domain_randomization={args.domain_randomization}, "
-            f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb}"
+            f"episode_random_seed={args.episode_random_seed}, wandb_default={args.wandb} "
+            f"termination_mode={args.termination_mode} episode_steps={args.episode_steps} "
+            f"target_velocity={args.target_velocity} velocity_range={args.velocity_range} "
+            f"stand_start_prob={args.stand_start_prob} motion_reset_prob={args.motion_reset_prob}"
         )
 
     env_cfg = LytRobotEnvCfg(
@@ -1471,12 +1526,16 @@ def main() -> None:
         decimation=args.decimation,
         episode_steps=args.episode_steps,
         episode_timeout_jitter_steps=args.episode_timeout_jitter_steps,
+        termination_mode=args.termination_mode,
         solver_iterations=args.solver_iterations,
         solver_ls_iterations=args.solver_ls_iterations,
         warp_nconmax=args.warp_nconmax,
         warp_njmax=args.warp_njmax,
         warp_cuda_graph=args.warp_cuda_graph,
         target_velocity=args.target_velocity,
+        velocity_range=tuple(args.velocity_range) if args.velocity_range is not None else None,
+        command_walking=bool(args.command_walking),
+        yaw_rate_range=tuple(args.yaw_rate_range),
         forward_velocity_tracking_sigma=args.forward_velocity_tracking_sigma,
         forward_velocity_reward_coef=args.forward_velocity_reward_coef,
         forward_progress_reward_coef=args.forward_progress_reward_coef,
@@ -1531,6 +1590,8 @@ def main() -> None:
         swing_advance_coef=args.swing_advance_coef,
         distal_joint_vel_sigma=args.distal_joint_vel_sigma,
         symmetry_reward_coef=args.symmetry_reward_coef,
+        step_symmetry_tolerance=args.step_symmetry_tolerance,
+        symmetric_gait_reference=args.symmetric_gait_reference,
         symmetry_foot_pos_sigma=args.symmetry_foot_pos_sigma,
         symmetry_balance_sigma=args.symmetry_balance_sigma,
         symmetry_ema_decay=args.symmetry_ema_decay,
@@ -1544,9 +1605,8 @@ def main() -> None:
         stand_start_transition_min_steps=args.stand_start_transition_min_steps,
         stand_start_transition_max_steps=args.stand_start_transition_max_steps,
         stand_start_push_delay_steps=args.stand_start_push_delay_steps,
-        ctrl_penalty_coef=args.ctrl_penalty_coef,
+        torque_penalty_coef=args.torque_penalty_coef,
         action_rate_penalty_coef=args.action_rate_penalty_coef,
-        distal_action_penalty_coef=args.distal_action_penalty_coef,
         distal_action_rate_penalty_coef=args.distal_action_rate_penalty_coef,
         domain_randomization=bool(args.domain_randomization),
         domain_randomization_scale=initial_dr_scale,
@@ -1717,7 +1777,7 @@ def main() -> None:
             f"[INFO] resumed {args.resume_checkpoint} "
             f"at {progress_state} optimizer={optimizer_state}"
         )
-    if start_iteration >= args.max_iterations:
+    if args.max_iterations > 0 and start_iteration >= args.max_iterations:
         raise RuntimeError(
             f"Nothing to train: start_iteration={start_iteration} >= max_iterations={args.max_iterations}."
         )
@@ -1830,16 +1890,19 @@ def main() -> None:
         best_checkpoint_quality = (-1.0, -1.0)
         if evaluation_quality_path.is_file():
             previous_evaluation = json.loads(evaluation_quality_path.read_text())
-            if previous_evaluation.get('eval/gait_seed_count') != len(args.gait_evaluation_seeds):
-                from sensor_training.gait_evaluation import evaluate_gait_suite
-                previous_evaluation.update(evaluate_gait_suite(
-                    log_dir / 'model_best.onnx', seconds=args.gait_evaluation_seconds,
-                    seeds=args.gait_evaluation_seeds))
-                evaluation_quality_path.write_text(json.dumps(previous_evaluation, indent=2)+'\n')
+            from sensor_training.gait_evaluation import evaluate_gait_suite
+            previous_evaluation.update(evaluate_gait_suite(
+                log_dir / 'model_best.onnx', seconds=args.gait_evaluation_seconds,
+                seeds=args.gait_evaluation_seeds))
+            evaluation_quality_path.write_text(json.dumps(previous_evaluation, indent=2)+'\n')
             from sensor_training.gait_evaluation import gait_checkpoint_quality
             best_checkpoint_quality = gait_checkpoint_quality(previous_evaluation, fidelity=args.gait_fidelity_selection)
     try:
-        for iteration in range(start_iteration, args.max_iterations):
+        training_iterations = (
+            itertools.count(start_iteration) if args.max_iterations == 0
+            else range(start_iteration, args.max_iterations)
+        )
+        for iteration in training_iterations:
             current_course_random_start_prob = (
                 terrain_course_random_start_prob_at_iteration(
                     iteration,
@@ -1955,6 +2018,9 @@ def main() -> None:
                     f"step={int(metrics['global_step'])} "
                     f"ep_reward={metrics['mean_episode_reward']:.4f} "
                     f"task={metrics['mean_task_reward']:.4f} "
+                    f"vx={metrics.get('task_forward_velocity', 0.0):.3f} "
+                    f"vxerr={metrics.get('task_forward_velocity_error', 0.0):.3f} "
+                    f"roottrack={metrics.get('task_root_vel', 0.0):.3f} "
                     f"amp={metrics['mean_amp_reward']:.4f} "
                     f"ep_len={metrics['mean_episode_length']:.2f} "
                     f"done={metrics['done_fraction']:.3f} "

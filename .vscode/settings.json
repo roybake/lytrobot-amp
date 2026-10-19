@@ -39,5 +39,7 @@
   "files.exclude": {
     "**/__pycache__": true,
     "**/*.egg-info": true
-  }
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

@@ -1,6 +1,6 @@
 """MoRE-discoRL complex terrains adapted to the LYT MuJoCo model.
 
-The copied upstream files live in ``robot/terrains/more_discolrl``.  This
+The terrain scene files live in ``robot/terrains``.  This
 module turns their gap, pit, rough-heightfield, and stair parameters into one
 multi-lane MuJoCo scene so a single batched policy can sample every terrain.
 """
@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import itertools
 from pathlib import Path
 from typing import Sequence
+import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
@@ -24,6 +25,8 @@ MORE_TERRAIN_TYPES = (
     "slope_down",
     "stairs",
 )
+# Maximum surface height above the adjacent flat ground; excludes base depth.
+MAX_ROUGH_HEIGHT_DIFFERENCE_M = 0.01
 # 专项楼梯课程的固定几何。``step_depth`` 是机器人前进方向的踏步宽度；
 # ``StairTerrainCfg.width`` 仍表示横向净宽（为双脚提供足够支撑空间）。
 # 五级上下连通楼梯：每侧总爬升 0.65 m。顶部保留两级踏步宽度的短过渡平台，
@@ -52,11 +55,6 @@ COURSE_TERRAIN_LENGTHS = {
 MORE_XML_TERRAIN_RGBA = (0.8, 0.9, 0.8, 1.0)
 MORE_TERRAIN_MATERIAL = "more_terrain_material"
 MORE_TERRAIN_CHECKER_TEXTURE = "more_terrain_checker"
-# The source rough heightmap has non-zero samples at both X edges.  A serial
-# course places it directly against a flat platform, so those samples otherwise
-# form a small but abrupt lip at each seam.  Reserve this much of the existing
-# rough segment for a smooth fade from/to the common course datum.
-SERIAL_ROUGH_TRANSITION_LENGTH = 0.30
 
 
 @dataclass(frozen=True)
@@ -101,9 +99,8 @@ class StairTerrainCfg:
 class MoreTerrainCfg:
     """Parallel training lanes derived from the MoRE-discoRL scene files.
 
-    ``gap`` and ``pit`` retain the upstream 0.30 m platform top.  The copied
-    128x128 rough heightmap is spatially scaled to a robot-sized lane while
-    preserving its normalized height samples.
+    ``gap`` and ``pit`` retain the upstream 0.30 m platform top. The rough
+    surface rises smoothly from the local flat ground to ``rough_height``.
     """
 
     enabled: bool = False
@@ -137,9 +134,9 @@ class MoreTerrainCfg:
     slope_half_length: float = 1.90
     lane_width: float = 2.0
 
-    rough_center_x: float = 2.0
+    rough_center_x: float = 3.5
     rough_half_length: float = 2.5
-    rough_height: float = 0.05
+    rough_height: float = MAX_ROUGH_HEIGHT_DIFFERENCE_M
     rough_base_depth: float = 0.05
     rough_spawn_x: float = 0.30
     slope_angle_deg: float = 6.0
@@ -428,6 +425,11 @@ def _validate_more(cfg: MoreTerrainCfg) -> None:
     invalid = [name for name, value in positive.items() if value <= 0.0]
     if invalid or cfg.gap_width <= 0.0 or cfg.gap_count < 2:
         raise ValueError(f"Invalid MoRE terrain configuration: {invalid} must be positive.")
+    if "rough" in cfg.terrain_types and cfg.rough_height > MAX_ROUGH_HEIGHT_DIFFERENCE_M:
+        raise ValueError(
+            f"rough_height must not exceed {MAX_ROUGH_HEIGHT_DIFFERENCE_M:g} m "
+            "above the local flat ground."
+        )
     if cfg.serial_course:
         if not 0.0 < float(cfg.slope_angle_deg) <= 6.0:
             raise ValueError("assessment slope_angle_deg must be in (0, 6].")
@@ -758,7 +760,7 @@ def serial_course_ramps(
 
 
 def _default_asset_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "robot" / "terrains" / "more_discolrl"
+    return Path(__file__).resolve().parents[2] / "robot" / "terrains"
 
 
 def _add_terrain_material(spec: mujoco.MjSpec) -> str:
@@ -876,21 +878,37 @@ def _attach_terrain(
                 _add_ramp(spec, name, center, half_size, quat, terrain_material)
 
         if "rough" in more.terrain_types:
+            rough_material = spec.add_material()
+            rough_material.name = "more_rough_material"
+            rough_material.rgba = (0.4, 0.4, 0.4, 1.0)
+            rough_material.reflectance = 0.0
+            rough_material.specular = 0.0
             asset_dir = (
                 Path(more.asset_dir).expanduser().resolve()
                 if more.asset_dir
                 else _default_asset_dir()
             )
-            heightmap = asset_dir / "height_field_lyt.png"
-            if not heightmap.exists():
+            terrain_xml = asset_dir / "rough.xml"
+            if not terrain_xml.exists():
                 raise FileNotFoundError(
-                    f"Adapted MoRE-discoRL rough heightmap not found: {heightmap}"
+                    f"Rough terrain XML not found: {terrain_xml}"
                 )
-            hfield = spec.add_hfield()
+            source_hfield = ET.parse(terrain_xml).getroot().find(
+                "asset/hfield[@name='perlin_hfield']"
+            )
+            rows = int(source_hfield.attrib["nrow"])
+            columns = int(source_hfield.attrib["ncol"])
+            # MJCF elevation is written top-to-bottom; native heightfield
+            # userdata is stored in the opposite row order.
+            elevation = np.fromstring(source_hfield.attrib["elevation"], sep=" ")
+            hfield = spec.add_hfield(
+                nrow=rows,
+                ncol=columns,
+                userdata=elevation.reshape(rows, columns)[::-1].ravel().tolist(),
+            )
             hfield.name = (
                 "course_rough_hfield" if serial_course else "more_rough_hfield"
             )
-            hfield.file = str(heightmap)
             hfield.size = (
                 (
                     0.5 * COURSE_TERRAIN_LENGTHS["rough"]
@@ -929,56 +947,12 @@ def _attach_terrain(
                 geom.type = mujoco.mjtGeom.mjGEOM_HFIELD
                 geom.hfieldname = hfield.name
                 geom.pos = (center_x, center_y, center_z)
-                geom.rgba = MORE_XML_TERRAIN_RGBA
-                geom.material = terrain_material
+                geom.rgba = (0.4, 0.4, 0.4, 1.0)
+                geom.material = rough_material.name
                 geom.friction = (1.0, 0.005, 0.0001)
                 geom.group = 2
                 geom.contype = 1
                 geom.conaffinity = 1
-
-
-def _taper_serial_rough_heightfield_edges(model: mujoco.MjModel) -> None:
-    """Fade the serial rough heightfield to the flat-course datum at both ends.
-
-    MuJoCo stores heightfields as mutable, normalized samples on the compiled
-    model.  Applying the envelope here keeps the copied MoRE asset intact and
-    affects only the serial course, where rough terrain is physically joined to
-    flat platforms.  The cubic smoothstep has zero slope at both ends, avoiding
-    a replacement step at the end of the transition zone.
-    """
-
-    hfield_id = mujoco.mj_name2id(
-        model,
-        mujoco.mjtObj.mjOBJ_HFIELD,
-        "course_rough_hfield",
-    )
-    if hfield_id < 0:
-        return
-    row_count = int(model.hfield_nrow[hfield_id])
-    column_count = int(model.hfield_ncol[hfield_id])
-    if row_count < 1 or column_count < 2:
-        return
-
-    # Hfield columns run along its local X direction.  The samples include both
-    # endpoints, hence ``column_count - 1`` spatial intervals.
-    length = 2.0 * float(model.hfield_size[hfield_id, 0])
-    cell_length = length / float(column_count - 1)
-    transition_columns = min(
-        column_count // 2,
-        max(1, int(np.ceil(SERIAL_ROUGH_TRANSITION_LENGTH / cell_length))),
-    )
-    normalized_distance = np.linspace(0.0, 1.0, transition_columns + 1)
-    smoothstep = normalized_distance**2 * (3.0 - 2.0 * normalized_distance)
-    envelope = np.ones(column_count, dtype=model.hfield_data.dtype)
-    envelope[: transition_columns + 1] = smoothstep
-    envelope[-(transition_columns + 1) :] = smoothstep[::-1]
-
-    offset = int(model.hfield_adr[hfield_id])
-    sample_count = row_count * column_count
-    samples = model.hfield_data[offset : offset + sample_count].reshape(
-        row_count, column_count
-    )
-    samples *= envelope[np.newaxis, :]
 
 
 def load_model(
@@ -996,10 +970,7 @@ def load_model(
 
     spec = mujoco.MjSpec.from_file(str(model_path))
     _attach_terrain(spec, stairs, more)
-    model = spec.compile()
-    if more is not None and more.serial_course and "rough" in more.terrain_types:
-        _taper_serial_rough_heightfield_edges(model)
-    return model
+    return spec.compile()
 
 
 def load_multi_robot_model(
@@ -1025,8 +996,6 @@ def load_multi_robot_model(
         scene.attach(robot, prefix=f"robot_{index}_", frame=frame)
     _attach_terrain(scene, stairs, more)
     model = scene.compile()
-    if more is not None and more.serial_course and "rough" in more.terrain_types:
-        _taper_serial_rough_heightfield_edges(model)
     # Attaching full robot specs also attaches one copy of their scene lights.
     # Keep a single MoRE-strength key light so multi-robot terrain playback is
     # not overexposed by N identical lights.

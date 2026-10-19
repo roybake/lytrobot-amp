@@ -1,5 +1,37 @@
 # 纯传感器人体步态训练
 
+## 左右落脚步长一致
+
+Stage1 Teacher 和直接训练的 Sensor 策略默认开启 `--symmetric-gait-reference`。
+加载人体动作后，选取一个完整的左右交替周期，将两侧对应半周期对齐并镜像平均，
+按模型关节范围和被动关节约束生成新姿态；再从同一份姿态计算关节速度、足部目标和
+肌腱控制基准。根部前进速度使用 `--target-velocity`，周期由左右两步总距离除以
+目标速度确定，足底高度按物理碰撞网格修正到地面。原始 NPZ 文件不会被改写。
+蒸馏 Student 从选定 Teacher 继承该设置；ONNX 元数据和板载肌腱目标表使用相同参考。
+
+每次有效落脚记录落地脚相对另一只脚的前向距离，顺序为右脚、左脚。离地和接触
+均需持续至少 50 ms，记录的是首次接触时的位置，确认接触后再评分；另一脚需在
+落地时承重。比较相邻异侧落脚，双脚同时落地或重复同侧落脚会中断已有有效步对。
+
+```text
+e = abs(右步长 - 左步长) / max((abs(右步长) + abs(左步长)) / 2, 1e-6)
+R_step = symmetry_reward_coef × gait_progress × stability × fresh
+         × (speed_track × positive - e²)
+```
+
+`--symmetry-reward-coef` 默认 `1.2`。`positive` 要求步对两侧均向前迈步，
+`fresh` 要求最近的有效步对未超过其两个落脚间隔；没有有效步对时不授予对称奖励。
+不再使用回合最大/最小足位、平均动作强度或接触时间代替落脚步长。
+CPU、Warp、mjlab 和评估使用同一个事件统计实现；环境重置时清空记录。
+站立和命令渐入期间清空步长记录，不把启动过渡中的落脚混入稳态步对。
+
+训练日志及评估 CSV 记录 `right_step_length_m`、`left_step_length_m`、
+`step_pair_event`、`step_length_relative_error`、`step_pair_positive` 和
+`step_pair_fresh`。评估同时报告逐对误差的 RMSE、最大值和有效步对数量，
+并将对称得分用于 `model_best` 选择。通过验收要求至少两个有效相邻步对、
+两侧均向前迈步，且每对相对误差不超过 `--step-symmetry-tolerance`（默认 `0.05`），
+同时满足原有连续行走、速度和动作跟踪要求。
+
 ## 推荐最终流程
 
 使用已有全部7组 IMU 和14条肌腱编码器，不增加硬件。默认入口是
@@ -23,9 +55,69 @@ Stage2接续、导出、测量模型、loss、验收门槛和硬件规模见
 [最终实现说明](STATE_ESTIMATION.md)。无需运行 A–G。以下普通行走/楼梯入口保留为
 独立或历史兼容工具，不是本次平地人体步态的默认训练配方。
 
+## 10-06 Stage1 蒸馏配置
+
+基础 Teacher/Student 入口以 `logs/sensor_policy/distillation/10-06-13:24:19`
+保存的配置为基础，按当前要求改为循环参考、仅跌倒结束回合、100% 站立渐进起步。
+参考人体数据为 `robot/reference_data/walk1_mjcf.npz`，目标速度为
+`1.28 m/s`，100 Hz 控制，两阶段各训练 30000 轮。
+
+Teacher 与直接训练的 Sensor 策略在 Stage1/Stage2 均默认开启前向速度跟踪奖励，
+权重为 `2.0`，误差尺度为 `0.25 m/s`，通过 `--forward-velocity-reward-coef`
+和 `--forward-velocity-tracking-sigma` 调整。该项按站立起步进度渐入目标速度，
+并由躯干姿态和高度评分共同约束。
+
+训练、回放与验收默认在每次启动时随机生成种子；训练中的步态评估默认使用该次启动时
+随机生成的三个种子，独立步态评估每次调用随机生成三个种子。Teacher/Student 对比及
+Teacher 候选模型对比使用同一组随机种子。训练与回放实际使用的种子会写入现有日志；
+需要指定种子时使用 `--seed`，步态评估使用 `--seeds`，训练内评估使用
+`--gait-evaluation-seeds`。
+
+Teacher 使用 1024 环境、24 步 rollout；步态评估为 30 秒，开启保真度模型选择。
+Student 使用 1024 环境、96 步 rollout、GRU128、696D 观测；
+步态评估为 20 秒，关闭保真度模型选择。
+两者均关闭回合时限和超时抖动，站立起步比例为 1.0，参考动作重置比例为 0.0。
+每次回合从模型站立姿态开始，先等待 25 个控制步（0.25 秒），再用 smoothstep
+在 80～160 个控制步（0.8～1.6 秒）内渐入正常行走；参考相位推进速度、目标速度
+和肌腱前馈目标使用相同的起步进度。Stage2 Teacher/Student 同样从站立渐进起步。
+蒸馏损失在 12000 轮内从 1.0 降至 0.3，尺度为 0.1；Teacher 接管概率在
+4000 轮内从 0.8 降至 0。两阶段关闭领域随机化和达标提前停止；串行入口使用
+Teacher 的 `model_final.pt` 进入 Student，默认关闭质量门禁。
+Student 奖励统一读取 `--teacher-checkpoint` 中的配置，Teacher 保持不变。
+继承范围包含任务奖励模式、全部奖励/惩罚系数与尺度、速度目标、屈膝目标、
+接触和对称性参数，以及 AMP 开关、权重、任务混合比例和总奖励缩放。
+Student 不再额外启用自然步态、屈膝或参考风格奖励，也不额外对 AMP 做启动门控。
+蒸馏入口、Stage1/Stage2 和接续训练均使用同一规则；命令行中指定的奖励参数
+以 Teacher 保存值为准，实际生效值写入配置和 PT/ONNX。动作蒸馏损失独立保留。
+步态评分和模型选择恢复历史规则。
+
+## 显式速度区间行走
+
+普通行走训练入口支持 `--velocity-range MIN MAX`，例如
+`--velocity-range 0.6 1.28`。该参数约束实际前向速度，不采样区间内的指定速度。
+省略时仍使用原有 `--target-velocity` 定速训练。
+
+区间模式将速度跟踪、根部前向速度误差、低速/超速惩罚及步态奖励中的速度因子
+统一为区间目标。区间内的速度项相同，原有步态和稳定性目标继续生效；前进奖励
+在达到下界后饱和。上下界随既定起步进度渐入。`--target-velocity` 仍用于原有
+命令输入和归一化，接续旧权重时保持其原值。区间模式与 `--use-reference-velocity`
+不能同时使用。
+
+`--forward-velocity-deficit-penalty-coef` 对应低于下界的惩罚，
+`--forward-velocity-excess-penalty-coef` 对应超过上界的惩罚；其余训练参数照常显式
+设置。区间参数随环境配置保存到 PT/ONNX，播放和模型选优读取同一配置。
+区间模型的速度验收要求起步渐入完成后的逐帧速度均在闭区间内，并记录
+`eval/gait_velocity_in_range_fraction` 和 `eval/gait_velocity_range_rmse_m_s`；
+三个 seed 分别取最低占比和最高越界 RMSE。原有定速模型仍按既有均速误差评分。
+
+蒸馏 Student 的速度区间也继承 Teacher。Teacher 没有配置区间时，Student
+沿用 Teacher 的定速目标，不能单独指定区间或增加超速惩罚。
+从 `10-15-09:04:28/student/model_best.pt` 接续的命令见
+[仓库训练说明](../README.md#按教师奖励续训学生)。
+
 ## 纯传感器上下楼梯 DeepMimic
 
-`sensor_training/train_stairs_deepmimic.py` 使用 GRU Actor。楼梯专项每帧输入为机身一个 IMU 的三轴加速度与三轴角速度、14 条肌腱实际长度、上一时刻 14 维动作，以及一个归一化相位标量；6 帧历史共 210 维。相位由控制器单调时钟产生；参考动作、目标速度、世界坐标和脚端接触均不进入 Actor。仿真全状态只参与训练奖励或 critic。默认训练匹配 `robot/reference_data/multimotion/stairs_supported.npz` 与 `robot/terrains/stairs.xml`，连续完成上楼—平台—下楼。
+`sensor_training/train_stairs_deepmimic.py` 使用 GRU Actor。楼梯专项每帧输入为机身一个 IMU 的三轴加速度与三轴角速度、14 条肌腱实际长度、14 维肌腱速度、上一时刻 14 维动作，以及一个归一化相位标量；6 帧历史共 294 维。相位由控制器单调时钟产生；参考动作、目标速度、世界坐标和脚端接触均不进入 Actor。仿真全状态只参与训练奖励或 critic。默认训练匹配 `robot/reference_data/multimotion/stairs_supported.npz` 与 `robot/MJCFmodel_stair.xml`，连续完成上楼—平台—下楼。
 
 训练使用 DeepMimic 的五项模仿奖励和 clipped PPO，关闭 AMP、LCP、教师蒸馏。固定路线版本把模仿奖励乘以根部 XY 和速度跟踪因子（尺度分别为 0.35 m、0.25 m/s），偏离参考 XY 超过 0.60 m 时提前终止，使静止姿态无法持续获取模仿分。`gamma=0.999`、`gae_lambda=0.97`。前 2000 轮 RSI 比例为 90%，随后 10000 轮逐渐降到 20%，让完整起点回合增加到 80%。逐帧参考用于训练奖励和板载肌腱前馈，不作为 Actor 姿态输入。
 
@@ -66,7 +158,15 @@ Stage1/Stage2 的接触奖励直接读取地面接触点，记录每只脚的脚
 - 7个三轴加速度计：21维，除以 `9.81`
 - 7个三轴陀螺仪：21维，除以 `10 rad/s`
 - 14条受控肌腱实际长度：14维，按执行器控制范围中心和半宽归一化
+- 14条肌腱速度：14维，按相邻控制时刻的实测长度差除以控制周期计算，默认以 1 m/s 归一化
 - 控制器最近一次发出的14维动作，保持精确值，不叠加传感器噪声
+
+肌腱速度默认开启，沿用 `CausalTendonFeatures` 的更新和复位逻辑：每个控制 tick
+更新一次，复位时速度清零。速度历史通过共享 GRU 同时进入 Actor、Critic 和 median critic。
+普通配置每帧为 130 维，6 帧共 780 维；额外特征仍按配置增加。
+播放从 checkpoint 恢复 `include_tendon_velocity`、速度尺度和滤波参数；缺失该字段的
+旧模型按未启用速度处理，保持原网络维度。特权策略的 Actor/Critic 则在共享全状态观测中
+增加 14 维执行器速度（m/s），通过 `env_config.observe_tendon_velocity` 记录布局。
 
 此外，每帧包含由控制器单调时钟和本地参考表产生的46维 gait command：相位
 `sin/cos`、启动进度、归一化目标速度，以及当前/未来0.1秒/未来0.2秒的3组14维
@@ -98,6 +198,15 @@ MoE 额外使用 gate 变化、专家负载均衡和 residual L2 正则抑制路
 
 单步 Stage1/Stage2 固定 `--reference-ctrl-blend 1`：执行器基准是与 Actor gait command
 同源的板载参考肌腱长度，Actor 输出是叠加其上的反馈残差，不依赖额外传感器或仿真状态。
+任务奖励中的控制幅度代价统一为 `-torque_penalty_coef * mean(tau**2)`，其中 `tau`
+取自 `qfrc_actuator` 的机器人转动关节，单位 N·m。`--torque-penalty-coef` 默认
+`0.0004`，即关节力矩均方根为 10 N·m 时扣 0.04 分；该值是初始权重，尚未经过训练验证。
+奖励不再约束肌腱指令贴近几何参考长度，也不再惩罚全局或踝部动作幅度；动作变化率项负责平滑。
+日志中的 `task_torque_penalty` 是乘权重前的力矩平方均值。纯 DeepMimic 奖励分支仍使用其自身奖励。
+旧 checkpoint 中的 `ctrl_penalty_coef`、`distal_action_penalty_coef` 已不属于当前配置，
+不能直接用于训练加载或续训；`play` 会忽略这两个旧奖励字段以播放旧网络，
+新训练使用上述关节力矩配置。
+
 多地形入口仍可使用自己的控制语义；地形过渡由 GRU +
 soft MoE 根据本体反馈产生；动作 rate 和 gate 变化正则负责抑制接缝抖动。论文依据、
 上下文字段、限制和验证方法见

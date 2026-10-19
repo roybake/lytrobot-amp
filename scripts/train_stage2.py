@@ -61,8 +61,24 @@ if __name__ == "__main__":
         sys.argv.extend(["--motion-file", str(DEFAULT_GAIT_REFERENCE)])
     if not any(arg == "--target-velocity" or arg.startswith("--target-velocity=") for arg in sys.argv):
         sys.argv.extend(["--target-velocity", "1.28"])
+    if not any(arg == "--forward-velocity-reward-coef" or arg.startswith("--forward-velocity-reward-coef=") for arg in sys.argv):
+        sys.argv.extend(["--forward-velocity-reward-coef", "2.0"])
+    if not any(arg == "--swing-advance-coef" or arg.startswith("--swing-advance-coef=") for arg in sys.argv):
+        sys.argv.extend(["--swing-advance-coef", "0.0"])
+    if not any(arg == "--stand-start-motion-phase" or arg.startswith("--stand-start-motion-phase=") for arg in sys.argv):
+        sys.argv.extend(["--stand-start-motion-phase", "31"])
+    if not any(arg == "--stand-start-prob" or arg.startswith("--stand-start-prob=") for arg in sys.argv):
+        sys.argv.extend(["--stand-start-prob", "1.0"])
+    if not any(arg == "--motion-reset-prob" or arg.startswith("--motion-reset-prob=") for arg in sys.argv):
+        sys.argv.extend(["--motion-reset-prob", "0.0"])
     if not any(arg == "--motion-loop" or arg.startswith("--motion-loop=") for arg in sys.argv):
-        sys.argv.extend(["--motion-loop", "false"])
+        sys.argv.extend(["--motion-loop", "true"])
+    if not any(arg == "--termination-mode" or arg.startswith("--termination-mode=") for arg in sys.argv):
+        sys.argv.extend(["--termination-mode", "fall"])
+    if not any(arg == "--episode-steps" or arg.startswith("--episode-steps=") for arg in sys.argv):
+        sys.argv.extend(["--episode-steps", "0"])
+    if not any(arg == "--episode-timeout-jitter-steps" or arg.startswith("--episode-timeout-jitter-steps=") for arg in sys.argv):
+        sys.argv.extend(["--episode-timeout-jitter-steps", "0"])
     # 4096 envs generate four times as many samples per iteration as stage1.
     # 7500 iterations therefore preserve the stage1 sample budget instead of
     # accidentally running a 4x larger 2.95-billion-transition job.

@@ -12,6 +12,7 @@ from lytrobot_amp.env import LytRobotAmpEnv, LytRobotEnvCfg
 from lytrobot_amp.env_mjlab import LytRobotMjlabAmpEnv
 from lytrobot_amp.env_warp import LytRobotWarpAmpEnv
 from lytrobot_amp.motion import MotionLibrary
+from lytrobot_amp.walking_commands import heading_velocity
 
 from .config import DEFAULT_SENSOR_OBSERVATION_CONFIG, SensorObservationConfig
 from .tendon_features import CausalTendonFeatures
@@ -49,6 +50,7 @@ def sensor_stability_task_reward(
     *,
     fall_penalty: float,
     stall_penalty: float,
+    torque_penalty_coef: float = LytRobotEnvCfg.torque_penalty_coef,
     knee_gait_reward_coef: float = 0.0,
     natural_gait_reward_coef: float = 0.0,
     mirror_reward_coef: float = 0.0,
@@ -60,10 +62,11 @@ def sensor_stability_task_reward(
     stance_slip_penalty_coef: float = 0.0,
     sync_forward_penalty_coef: float = 0.0,
     velocity_excess_penalty_coef: float = 0.0,
+    symmetry_reward_coef: float = 0.0,
 ) -> np.ndarray | torch.Tensor:
     """Return a sensor-deployable reward without hidden reference phase terms.
 
-    The full-state reward includes joint, foot and tendon targets sampled from
+    The full-state reward includes joint and foot targets sampled from
     ``motion_phase``.  Those targets are intentionally absent from the
     IMU+tendon actor input, so using them as the dominant student objective
     creates contradictory labels after random resets.  This reward keeps only
@@ -110,9 +113,8 @@ def sensor_stability_task_reward(
     )
     gait_quality = 6.0 / sum(1.0 / clip(term, 0.05, 1.0) for term in quality_terms)
     control_cost = (
-        0.04 * info["ctrl_penalty"]
+        float(torque_penalty_coef) * info["torque_penalty"]
         + 0.10 * info["action_rate"]
-        + 0.03 * info["distal_action"]
         + 0.12 * info["distal_action_rate"]
     )
     # Natural walking is a joint condition rather than a sum of independently
@@ -140,6 +142,8 @@ def sensor_stability_task_reward(
             - float(sync_forward_penalty_coef) * gait_score("sensor_synchronous_forward", 0.0, 2.0)
         )
     ) - control_cost
+    if symmetry_reward_coef:
+        reward = reward + float(symmetry_reward_coef) * info["symmetry"]
     insufficient_progress = info.get("insufficient_progress")
     if insufficient_progress is not None:
         stall_value = (
@@ -204,6 +208,8 @@ class SensorHistoryEnv:
             observation_cfg if base_env.cfg.sensor_gait_command_enabled
             else replace(observation_cfg, gait_command_enabled=False)
         )
+        if base_env.cfg.command_walking and not self.sensor_observation_cfg.gait_command_enabled:
+            raise ValueError("Command walking requires speed/yaw commands in the Student observation.")
         self.is_torch_env = bool(getattr(base_env, "is_torch_env", False))
         if self.is_torch_env:
             # The wrapper supplies the actor observation; avoid assembling the
@@ -220,6 +226,10 @@ class SensorHistoryEnv:
             self.base_motion,
             frame_count=observation_cfg.frame_count,
             policy_dt=base_env.dt,
+            cadence_range=(
+                tuple(speed / base_env.cfg.target_velocity for speed in base_env.cfg.velocity_range)
+                if base_env.cfg.command_walking else None
+            ),
         )
         self._bind_sensor_tensors()
         # Initialize shared sensor state independently of history allocation:
@@ -256,6 +266,7 @@ class SensorHistoryEnv:
             self.base_env.action_dim,
             self.sensor_observation_cfg.gait_lookahead_seconds,
             trajectory_feedback=bool(self.base_env.cfg.trajectory_feedback),
+            command_walking=bool(self.base_env.cfg.command_walking),
         )
 
     @property
@@ -286,6 +297,7 @@ class SensorHistoryEnv:
             "actor_input": False,
             "training_only": True,
             "root_velocity_normalizer": ROOT_VELOCITY_NORMALIZER,
+            **({"root_velocity_frame": "heading"} if self.base_env.cfg.command_walking else {}),
             "joint_velocity_normalizer": JOINT_VELOCITY_NORMALIZER,
             "loss_weights": (
                 (2.0,) * len(ROOT_CONTEXT_FIELDS)
@@ -304,6 +316,7 @@ class SensorHistoryEnv:
                 for seconds in self.sensor_observation_cfg.gait_lookahead_seconds
             )
             + (("trajectory_error_x", "trajectory_error_y") if self.base_env.cfg.trajectory_feedback else ())
+            + (("target_yaw_rate",) if self.base_env.cfg.command_walking else ())
             if self.sensor_observation_cfg.gait_command_enabled
             else ()
         )
@@ -413,6 +426,12 @@ class SensorHistoryEnv:
             ),
             "trajectory_feedback": bool(self.base_env.cfg.trajectory_feedback),
             "use_reference_velocity": bool(self.base_env.cfg.use_reference_velocity),
+            **({"command_walking": True,
+                "velocity_range": list(self.base_env.cfg.velocity_range),
+                "yaw_rate_range": list(self.base_env.cfg.yaw_rate_range),
+                "target_yaw_rate_unit": "rad/s",
+                "cadence": "command_speed / target_velocity"}
+               if self.base_env.cfg.command_walking else {}),
             "reference_root_xy_tables": root_xy_tables if self.base_env.cfg.trajectory_feedback else [],
             "stand_root_xy": self._numpy(self.base_env.stand_root_xy)[0].tolist(),
             "reference_root_velocity_tables": root_velocity_tables if self.base_env.cfg.use_reference_velocity else [],
@@ -459,6 +478,7 @@ class SensorHistoryEnv:
                     for seconds in self.sensor_observation_cfg.gait_lookahead_seconds
                 ),
                 *(("trajectory_error_xy[2]",) if self.base_env.cfg.trajectory_feedback else ()),
+                *(("target_yaw_rate",) if self.base_env.cfg.command_walking else ()),
             ],
         }
 
@@ -555,7 +575,7 @@ class SensorHistoryEnv:
 
         if self.is_torch_env:
             velocity = torch.clamp(
-                self.base_env.qvel[:, :3] / ROOT_VELOCITY_NORMALIZER,
+                self._root_linear_velocity() / ROOT_VELOCITY_NORMALIZER,
                 -1.0,
                 1.0,
             )
@@ -571,10 +591,7 @@ class SensorHistoryEnv:
                 dim=1,
             )
 
-        velocity = np.stack(
-            [np.asarray(data.qvel[:3], dtype=np.float32) for data in self.base_env.datas],
-            axis=0,
-        )
+        velocity = self._root_linear_velocity()
         velocity = np.clip(
             velocity / ROOT_VELOCITY_NORMALIZER,
             -1.0,
@@ -611,7 +628,18 @@ class SensorHistoryEnv:
                 'scales': {name: STATE_SCALES[name] for name in layout},
                 'training_only': True, 'contact_order': ['right', 'left'],
                 'joint_order': list(self.base_motion.common_joint_names),
-                'root_velocity_frame': 'world', 'foot_position_frame': 'pelvis_local'}
+                'root_velocity_frame': 'heading' if self.base_env.cfg.command_walking else 'world',
+                'foot_position_frame': 'pelvis_local'}
+
+    def _root_linear_velocity(self):
+        base = self.base_env
+        if self.is_torch_env:
+            velocity = base.qvel[:, :3]
+            return heading_velocity(base.qpos[:, 3:7], velocity) if base.cfg.command_walking else velocity
+        velocity = np.stack([data.qvel[:3] for data in base.datas]).astype(np.float32)
+        if base.cfg.command_walking:
+            velocity = heading_velocity(np.stack([data.qpos[3:7] for data in base.datas]), velocity)
+        return velocity
 
     def configure_state_supervision(self, include_foot):
         self._state_include_foot_position = bool(include_foot)
@@ -625,13 +653,13 @@ class SensorHistoryEnv:
             raise ValueError('State estimation requires the 14-joint robot layout.')
         if self.is_torch_env:
             values = [base.qpos[:, base.robot_qpos_adrs], base.qvel[:, base.robot_qvel_adrs],
-                      base.qvel[:, :3], base._foot_contacts()]
+                      self._root_linear_velocity(), base._foot_contacts()]
             if include_foot:
                 values.append(base._foot_positions_local().reshape(self.num_envs, 12))
             return torch.cat(values, dim=-1)
         values = [np.stack([data.qpos[self.base_motion.robot_qpos_adrs] for data in base.datas]),
                   np.stack([data.qvel[self.base_motion.robot_qvel_adrs] for data in base.datas]),
-                  np.stack([data.qvel[:3] for data in base.datas]),
+                  self._root_linear_velocity(),
                   np.stack([base._foot_contacts(data) for data in base.datas])]
         if include_foot:
             values.append(np.stack([base._foot_positions_local(data).reshape(12) for data in base.datas]))
@@ -800,6 +828,9 @@ class SensorHistoryEnv:
                 velocity = self.base_env._targets_at_phase(
                     phase, motion_ids
                 )["root_lin_vel"][:, 0] * progress
+            elif self.base_env.cfg.command_walking:
+                velocity = self.base_env.walking_commands.values[:, 0]
+                frequency = frequency * velocity / self.base_env.cfg.target_velocity
             else:
                 velocity = float(self.base_env.cfg.target_velocity) * progress
             scalar = torch.stack(
@@ -825,6 +856,8 @@ class SensorHistoryEnv:
                 target_xy = self.base_env._targets_at_current_phase()["root_xy"]
                 error = target_xy - self.base_env.qpos[:, :2]
                 parts = (*parts, error)
+            if self.base_env.cfg.command_walking:
+                parts = (*parts, self.base_env.walking_commands.values[:, 1:2])
             return torch.cat(parts, dim=1)
 
         phase = np.asarray(self.base_env.motion_phase, dtype=np.float32)
@@ -849,6 +882,9 @@ class SensorHistoryEnv:
             if self.base_env.cfg.use_reference_velocity
             else float(self.base_env.cfg.target_velocity) * progress
         )
+        if self.base_env.cfg.command_walking:
+            velocity = self.base_env.walking_commands.values[:, 0].numpy()
+            frequency = frequency * velocity / self.base_env.cfg.target_velocity
         stand = np.repeat(
             np.asarray(self.base_env.stand_tendon_ctrl, dtype=np.float32),
             self.num_envs,
@@ -870,6 +906,10 @@ class SensorHistoryEnv:
                 self.base_env._targets_at_current_phase().root_xy
                 - np.stack([data.qpos[:2] for data in self.base_env.datas]).astype(np.float32)
                 if self.base_env.cfg.trajectory_feedback else None
+            ),
+            target_yaw_rate=(
+                self.base_env.walking_commands.values[:, 1].numpy()
+                if self.base_env.cfg.command_walking else None
             ),
         )
 
@@ -920,6 +960,11 @@ class SensorHistoryEnv:
     def observe(self) -> np.ndarray | torch.Tensor:
         return self._actor_history.reshape(self.num_envs, self.obs_dim)
 
+    def refresh_walking_command_observation(self) -> np.ndarray | torch.Tensor:
+        """Update the current command without advancing sensor time or history."""
+        self._actor_history[:, -1, -self.gait_command_dim:] = self._gait_command_frame()
+        return self.observe()
+
     def amp_observe(self) -> np.ndarray | torch.Tensor:
         return self._amp_history.reshape(self.num_envs, self.amp_obs_dim)
 
@@ -963,6 +1008,7 @@ class SensorHistoryEnv:
                 info,
                 fall_penalty=float(self.base_env.cfg.sensor_fall_penalty),
                 stall_penalty=float(self.base_env.cfg.forward_progress_termination_penalty),
+                torque_penalty_coef=float(self.base_env.cfg.torque_penalty_coef),
                 knee_gait_reward_coef=float(
                     self.base_env.cfg.sensor_knee_gait_reward_coef
                 ),
@@ -978,6 +1024,7 @@ class SensorHistoryEnv:
                 stance_slip_penalty_coef=float(self.base_env.cfg.sensor_stance_slip_penalty_coef),
                 sync_forward_penalty_coef=float(self.base_env.cfg.sensor_sync_forward_penalty_coef),
                 velocity_excess_penalty_coef=float(self.base_env.cfg.sensor_velocity_excess_penalty_coef),
+                symmetry_reward_coef=float(self.base_env.cfg.symmetry_reward_coef),
             )
             info["sensor_stability_reward"] = reward
         if not self._sensor_tick_advanced:

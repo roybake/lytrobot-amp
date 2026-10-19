@@ -47,7 +47,7 @@ def test_entry_uses_sensor_trainer_and_explicit_imitation() -> None:
     assert "--sensor-phase-observation" in args
     assert args[args.index("--task-reward-lerp") + 1] == "1.0"
     assert args[args.index("--motion-files") + 1].endswith("stairs_supported.npz")
-    assert args[args.index("--model-xml") + 1].endswith("robot/terrains/stairs.xml")
+    assert args[args.index("--model-xml") + 1].endswith("robot/MJCFmodel_stair.xml")
     assert args[args.index("--reference-root-x-offset") + 1] == "-0.39"
     assert args[args.index("--log-root") + 1] == str(REPO_ROOT / "logs")
     assert args[args.index("--log-group") + 1] == "stairs"
@@ -100,7 +100,7 @@ def test_stair_best_checkpoint_prioritizes_full_route_success(tmp_path: Path) ->
 
 
 def test_exact_stair_scene_and_motion_cpu_smoke() -> None:
-    model_xml = REPO_ROOT / "robot" / "terrains" / "stairs.xml"
+    model_xml = REPO_ROOT / "robot" / "MJCFmodel_stair.xml"
     motion_file = REPO_ROOT / "robot" / "reference_data" / "multimotion" / "stairs.npz"
     compiled = mujoco.MjModel.from_xml_path(str(model_xml))
     assert sum(
@@ -227,7 +227,7 @@ def test_root_xy_error_reduces_deepmimic_reward() -> None:
 
 def test_stair_actor_observes_sensors_previous_action_and_deepmimic_phase() -> None:
     cfg = LytRobotEnvCfg(
-        model_xml=str(REPO_ROOT / "robot" / "terrains" / "stairs.xml"),
+        model_xml=str(REPO_ROOT / "robot" / "MJCFmodel_stair.xml"),
         motion_files=(str(REPO_ROOT / "robot" / "reference_data" / "multimotion" / "stairs.npz"),),
         motion_names=("stairs",), motion_loop=(False,),
         stair_terrain=True, terrain_embedded_in_model=True,

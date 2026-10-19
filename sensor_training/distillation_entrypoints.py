@@ -1,4 +1,4 @@
-"""Shared CLI setup for the two serial sensor-distillation phases."""
+"""Student training defaults; rewards are inherited from the Teacher checkpoint."""
 
 from __future__ import annotations
 
@@ -12,8 +12,11 @@ from .training_defaults import distillation_cli_defaults
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 DISTILLATION_LOG_ROOT = REPO_ROOT / "logs" / "distillation"
-DEFAULT_GAIT_REFERENCE = (
+STAGE1_GAIT_REFERENCE = (
     REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf.npz"
+)
+STAGE2_GAIT_REFERENCE = (
+    REPO_ROOT / "robot" / "reference_data" / "walk1.npz"
 )
 
 
@@ -44,12 +47,13 @@ def _apply_defaults(defaults: dict[str, str]) -> None:
 
 
 def run_stage1() -> None:
-    """Distill a natural gait from a privileged stage1 teacher."""
+    """Use the 10-06 Student recipe with standing starts and continuous walking."""
 
     if not _has_arg("--teacher-checkpoint"):
         raise SystemExit(
             "Stage1 distillation requires --teacher-checkpoint PATH."
         )
+    _apply_defaults({"--num-steps": "96"})
     decimation, num_steps, num_envs = distillation_cli_defaults(sys.argv[1:])
     _apply_defaults(
         {
@@ -59,25 +63,16 @@ def run_stage1() -> None:
             "--num-envs": str(num_envs),
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
-            "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "false",
-            "--episode-steps": "2000",
+            "--motion-file": str(STAGE1_GAIT_REFERENCE),
+            "--termination-mode": "fall",
+            "--motion-loop": "true",
+            "--episode-steps": "0",
             "--episode-timeout-jitter-steps": "0",
-            "--task-reward-mode": "stage1_reference",
-            "--reference-gait-style-reward-coef": "4.0",
-            "--sensor-natural-gait-reward-coef": "2.0",
-            "--sensor-hop-penalty-coef": "1.0",
-            "--sensor-tiptoe-penalty-coef": "1.0",
-            "--sensor-stance-slip-penalty-coef": "0.5",
-            "--sensor-sync-forward-penalty-coef": "1.0",
-            "--forward-velocity-reward-coef": "2.0",
-            "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "1.28",
             # Teacher supervision adds another rollout graph.  Eight recurrent
             # steps per backward graph benchmarks faster than the generic
             # 16-step sensor default for this mixed Student/Teacher workload.
             "--compile-policy-chunk-steps": "8",
-            "--max-iterations": "50000",
+            "--max-iterations": "30000",
             "--reference-ctrl-blend": "1.0",
             "--teacher-action-loss-coef": "1.0",
             "--teacher-action-loss-final-coef": "0.30",
@@ -86,11 +81,8 @@ def run_stage1() -> None:
             "--teacher-action-probability": "0.80",
             "--teacher-action-probability-final": "0.0",
             "--teacher-action-probability-decay-iterations": "4000",
-            "--sensor-fall-penalty": "25.0",
-            "--sensor-knee-flexion-target": "0.25",
-            "--sensor-knee-gait-reward-coef": "1.0",
-            "--stand-start-prob": "0.70",
-            "--motion-reset-prob": "1.0",
+            "--stand-start-prob": "1.0",
+            "--motion-reset-prob": "0.0",
             "--stand-start-motion-phase": "0",
             "--stand-start-phase-delay-steps": "25",
             "--stand-start-transition-min-steps": "80",
@@ -101,9 +93,11 @@ def run_stage1() -> None:
             "--max-learning-rate": "1.0e-4",
             "--target-kl": "0.010",
             "--target-kl-stop-multiplier": "1.5",
-            "--task-reward-lerp": "0.75",
             "--save-interval": "500",
-            "--log-root": str(REPO_ROOT / "logs" / "sensor_policy" / "distillation"),
+            "--log-root": str(
+                REPO_ROOT / "logs" / "command_walking" if "--command-walking" in sys.argv
+                else REPO_ROOT / "logs" / "sensor_policy" / "distillation"
+            ),
             "--log-role": "student",
             "--wandb-tags": "lytrobot,sensor-only,distillation,stage1-gait,privileged-teacher",
         }
@@ -112,8 +106,6 @@ def run_stage1() -> None:
         sys.argv.append("--evaluate-gait")
     if not (_has_arg('--sensor-root-imu-only') or _has_arg('--no-sensor-root-imu-only')):
         sys.argv.append('--no-sensor-root-imu-only')
-    if not (_has_arg("--sensor-stability-reward") or _has_arg("--no-sensor-stability-reward")):
-        sys.argv.append("--no-sensor-stability-reward")
     if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):
         sys.argv.append("--no-domain-randomization")
     if not (_has_arg("--wandb") or _has_arg("--no-wandb")):
@@ -157,20 +149,11 @@ def run_stage2() -> None:
             "--num-envs": str(num_envs),
             "--num-steps": str(num_steps),
             "--decimation": str(decimation),
-            "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-            "--motion-loop": "false",
-            "--episode-steps": "2000",
+            "--motion-file": str(STAGE2_GAIT_REFERENCE),
+            "--termination-mode": "fall",
+            "--motion-loop": "true",
+            "--episode-steps": "0",
             "--episode-timeout-jitter-steps": "0",
-            "--task-reward-mode": "stage1_reference",
-            "--reference-gait-style-reward-coef": "4.0",
-            "--sensor-natural-gait-reward-coef": "2.0",
-            "--sensor-hop-penalty-coef": "1.0",
-            "--sensor-tiptoe-penalty-coef": "1.0",
-            "--sensor-stance-slip-penalty-coef": "0.5",
-            "--sensor-sync-forward-penalty-coef": "1.0",
-            "--forward-velocity-reward-coef": "2.0",
-            "--forward-velocity-deficit-penalty-coef": "2.5",
-            "--target-velocity": "1.28",
             "--compile-policy-chunk-steps": "8",
             "--max-iterations": "50000",
             "--reference-ctrl-blend": "1.0",
@@ -181,12 +164,9 @@ def run_stage2() -> None:
             "--teacher-action-probability-final": "0.0",
             "--teacher-action-probability-decay-iterations": "2000",
             "--teacher-action-loss-decay-iterations": "24000",
-            "--sensor-fall-penalty": "25.0",
-            "--sensor-knee-flexion-target": "0.25",
-            "--sensor-knee-gait-reward-coef": "1.0",
-            "--stand-start-prob": "0.75",
-            "--motion-reset-prob": "1.0",
-            "--stand-start-motion-phase": "0",
+            "--stand-start-prob": "1.0",
+            "--motion-reset-prob": "0.0",
+            "--stand-start-motion-phase": "31",
             "--stand-start-phase-delay-steps": "25",
             "--stand-start-transition-min-steps": "80",
             "--stand-start-transition-max-steps": "160",
@@ -196,7 +176,6 @@ def run_stage2() -> None:
             "--max-learning-rate": "1.0e-4",
             "--target-kl": "0.010",
             "--target-kl-stop-multiplier": "1.5",
-            "--task-reward-lerp": "0.75",
             "--save-interval": "500",
             "--log-root": str(DISTILLATION_LOG_ROOT),
             "--wandb-tags": "lytrobot,sensor-only,distillation,stage2-robust,privileged-teacher",
@@ -206,8 +185,6 @@ def run_stage2() -> None:
         sys.argv.append("--evaluate-gait")
     if not (_has_arg('--sensor-root-imu-only') or _has_arg('--no-sensor-root-imu-only')):
         sys.argv.append('--no-sensor-root-imu-only')
-    if not (_has_arg("--sensor-stability-reward") or _has_arg("--no-sensor-stability-reward")):
-        sys.argv.append("--no-sensor-stability-reward")
     if resume_checkpoint is None and not _has_arg("--distillation-reset-schedule"):
         sys.argv.append("--distillation-reset-schedule")
     if not (_has_arg("--domain-randomization") or _has_arg("--no-domain-randomization")):

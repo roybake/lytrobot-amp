@@ -9,6 +9,7 @@ from typing import Sequence
 
 import mujoco
 import numpy as np
+from .walking_commands import without_heading
 
 DEFAULT_COMMON_JOINTS: tuple[str, ...] = (
     "hip_flexion_r",
@@ -197,7 +198,10 @@ class MotionReference:
         zero_root_xy: bool = True,
         loop_override: bool | None = None,
         root_x_offset: float = 0.0,
+        symmetric_gait_velocity: float | None = None,
+        heading_invariant: bool = False,
     ) -> None:
+        self.heading_invariant = heading_invariant
         self.motion_file = Path(motion_file).expanduser().resolve()
         if not self.motion_file.exists():
             raise FileNotFoundError(f"Motion file not found: {self.motion_file}")
@@ -290,6 +294,16 @@ class MotionReference:
         self.feature_dim = int(1 + 4 + 2 * len(self.common_joint_names) + self.foot_pos_dim)
 
         self._precompute_robot_reference()
+        if symmetric_gait_velocity is not None:
+            if not self.source_loop:
+                raise ValueError("Symmetric gait construction requires a looping walking reference.")
+            from .symmetric_gait import symmetric_walking_cycle
+            qpos, qvel, contact, frequency = symmetric_walking_cycle(self, symmetric_gait_velocity)
+            self.frame_count = len(qpos)
+            self.frequency = frequency
+            self.source_foot_contact = contact
+            self.enforce_passive_joint_constraints = True
+            self._precompute_robot_reference((qpos, qvel))
 
     def _state_from_source(self, frame_index: int) -> tuple[np.ndarray, np.ndarray]:
         index = int(frame_index) % self.frame_count
@@ -341,7 +355,7 @@ class MotionReference:
             if (value < low and qvel[dadr] < 0.0) or (value > high and qvel[dadr] > 0.0):
                 qvel[dadr] = 0.0
 
-    def _precompute_robot_reference(self) -> None:
+    def _precompute_robot_reference(self, robot_states=None) -> None:
         data = mujoco.MjData(self.model)
         qpos = np.zeros((self.frame_count, self.model.nq), dtype=np.float32)
         qvel = np.zeros((self.frame_count, self.model.nv), dtype=np.float32)
@@ -350,7 +364,10 @@ class MotionReference:
         foot_world_z = np.zeros((self.frame_count, len(CONTACT_GEOM_NAMES)), dtype=np.float32)
 
         for frame_index in range(self.frame_count):
-            qpos[frame_index], qvel[frame_index] = self._state_from_source(frame_index)
+            if robot_states is None:
+                qpos[frame_index], qvel[frame_index] = self._state_from_source(frame_index)
+            else:
+                qpos[frame_index], qvel[frame_index] = (value[frame_index] for value in robot_states)
             data.qpos[:] = qpos[frame_index]
             data.qvel[:] = qvel[frame_index]
             mujoco.mj_forward(self.model, data)
@@ -477,6 +494,8 @@ class MotionReference:
         joint_vel: np.ndarray,
         foot_pos: np.ndarray,
     ) -> np.ndarray:
+        if self.heading_invariant:
+            root_quat = without_heading(root_quat)
         return np.concatenate(
             (
                 root_height,
@@ -838,6 +857,8 @@ def load_motion_library(
     motion_loop: Sequence[bool] | None = None,
     zero_root_xy: bool = True,
     root_x_offset: float = 0.0,
+    symmetric_gait_velocity: float | None = None,
+    heading_invariant: bool = False,
 ) -> MotionReference | MotionLibrary:
     files = tuple(motion_files)
     if len(files) == 1:
@@ -848,7 +869,11 @@ def load_motion_library(
             zero_root_xy=zero_root_xy,
             loop_override=bool(motion_loop[0]) if motion_loop is not None else None,
             root_x_offset=root_x_offset,
+            symmetric_gait_velocity=symmetric_gait_velocity,
+            heading_invariant=heading_invariant,
         )
+    if symmetric_gait_velocity is not None:
+        raise ValueError("Symmetric gait construction requires a single walking reference.")
     if root_x_offset != 0.0:
         raise ValueError("Reference root-X offset currently requires one motion file.")
     if not zero_root_xy:

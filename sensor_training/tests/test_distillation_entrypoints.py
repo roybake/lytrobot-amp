@@ -39,8 +39,11 @@ class DistillationEntrypointTests(unittest.TestCase):
         self.assertEqual(self.captured[self.captured.index("--log-role") + 1], "student")
         self.assertEqual(self.captured[self.captured.index("--max-iterations") + 1], "50000")
         self.assertEqual(self.captured[self.captured.index("--decimation") + 1], "2")
-        self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "2048")
-        self.assertEqual(self.captured[self.captured.index("--num-steps") + 1], "48")
+        self.assertEqual(self.captured[self.captured.index("--num-envs") + 1], "1024")
+        self.assertEqual(self.captured[self.captured.index("--num-steps") + 1], "96")
+        self.assertEqual(self.captured[self.captured.index("--stand-start-prob") + 1], "1.0")
+        self.assertEqual(self.captured[self.captured.index("--motion-reset-prob") + 1], "0.0")
+        self.assertEqual(self.captured[self.captured.index("--stand-start-motion-phase") + 1], "0")
         self.assertEqual(
             self.captured[self.captured.index("--compile-policy-chunk-steps") + 1],
             "8",
@@ -51,7 +54,7 @@ class DistillationEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             self.captured[self.captured.index("--motion-file") + 1].split("/")[-1],
-            "walk1_mjcf.npz",
+            "walk1_lyt_contact.npz",
         )
         self.assertEqual(
             self.captured[self.captured.index("--sensor-knee-gait-reward-coef") + 1],

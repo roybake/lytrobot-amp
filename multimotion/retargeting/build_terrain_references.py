@@ -34,7 +34,7 @@ from build_references import (  # noqa: E402
 from lytrobot_amp.terrain import terrain_height_from_model  # noqa: E402
 
 
-MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 TASK_CYCLES = {
     "rough_walk": 3,
@@ -382,7 +382,7 @@ def build_task(
         "source_url": source_metadata.get("source_url"),
         "derived_from": source.name,
         "terrain_source": "MoRE-discoRL",
-        "terrain_source_path": "robot/terrains/more_discolrl",
+        "terrain_source_path": "robot/terrains",
         "terrain_adaptation": (
             "unrolled OmniRetarget gait plus full-foot terrain raycast IK; "
             "support constraints retain heel -> sole -> toe roll"

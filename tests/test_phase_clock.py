@@ -1,8 +1,6 @@
 import numpy as np
-import torch
 
 from foot_sensor_training.phase_clock import DeployablePhaseClock
-from distillation_training.deployment_phase import phase_clock_from_metadata
 
 
 def make_clock(**kwargs):
@@ -29,9 +27,9 @@ def test_advance_formula_and_wraparound():
     np.testing.assert_allclose(clock.observe()[0],[np.sin(theta),np.cos(theta)],atol=1e-6)
 
 
-def test_cpu_torch_and_deployment_clocks_match_for_1000_steps():
+def test_numpy_and_torch_clocks_match_for_1000_steps():
     simulation=make_clock(num_envs=2)
-    deployment=phase_clock_from_metadata(simulation.metadata,num_envs=2,torch_device="cpu")
+    deployment=make_clock(num_envs=2,torch_device="cpu")
     for _ in range(1000):
         np.testing.assert_allclose(simulation.observe(),deployment.observe().numpy(),atol=2e-6)
         simulation.advance();deployment.advance()

@@ -26,7 +26,7 @@ from scripts.train_stairs import (  # noqa: E402
 
 EXACT_STAIR_SOURCE_REFERENCE = REFERENCE_DIR / "stairs.npz"
 EXACT_STAIR_REFERENCE = REFERENCE_DIR / "stairs_supported.npz"
-EXACT_STAIR_MODEL = REPO_ROOT / "robot" / "terrains" / "stairs.xml"
+EXACT_STAIR_MODEL = REPO_ROOT / "robot" / "MJCFmodel_stair.xml"
 # 912 frames at 40 Hz need 2,280 control steps at 100 Hz.  Leave enough room
 # for the fixed 30-step terminal hold used by the stair completion contract.
 EXACT_STAIR_EPISODE_STEPS = 2_400
@@ -235,7 +235,7 @@ def main() -> None:
     model_xml = (
         EXACT_STAIR_MODEL
         if options.direction == "exact"
-        else REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+        else REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
     )
     if options.direction == "exact" and EXACT_STAIR_SOURCE_REFERENCE.is_file():
         regenerate = not clip.is_file()

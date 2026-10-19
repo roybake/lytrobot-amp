@@ -91,6 +91,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         sensor_args = _default_entrypoint_argv(REPO_ROOT / "sensor_training" / "train_stage1.py")
 
         self.assertIn("--no-sensor-stability-reward", sensor_args)
+        self.assertEqual(_remove_option(sensor_args, "--task-reward-mode"), "stage1_reference")
         # A fixed 1e-5 rate (the old default) is 30x below the recipe that
         # produced the accepted gait and must not come back.
         self.assertNotIn("--no-adaptive-lr", sensor_args)
@@ -98,7 +99,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--reference-ctrl-blend"), "1.0")
         self.assertEqual(
             Path(_remove_option(sensor_args, "--motion-file")).name,
-            "walk1_mjcf.npz",
+            "walk1_mjcf_1p28_natural.npz",
         )
         self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "1.28")
         self.assertEqual(_remove_option(sensor_args, "--symmetry-reward-coef"), "1.2")
@@ -109,8 +110,8 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--decimation"), "2")
         self.assertEqual(_remove_option(sensor_args, "--num-envs"), "3072")
         self.assertEqual(_remove_option(sensor_args, "--num-steps"), "64")
-        self.assertEqual(_remove_option(sensor_args, "--stand-start-prob"), "0.5")
-        self.assertEqual(_remove_option(sensor_args, "--motion-reset-prob"), "0.5")
+        self.assertEqual(_remove_option(sensor_args, "--stand-start-prob"), "1.0")
+        self.assertEqual(_remove_option(sensor_args, "--motion-reset-prob"), "0.0")
         self.assertEqual(_remove_option(sensor_args, "--action-residual-scale"), "0.5")
         self.assertEqual(_remove_option(sensor_args, "--startup-action-ramp-steps"), "50")
         self.assertEqual(_remove_option(sensor_args, "--learning-rate"), "3.0e-4")
@@ -124,7 +125,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--task-reward-lerp"), "0.5")
         self.assertEqual(_remove_option(sensor_args, "--amp-reward-coef"), "1.2")
         self.assertEqual(_remove_option(sensor_args, "--fall-penalty"), "2.0")
-        self.assertEqual(_remove_option(sensor_args, "--episode-steps"), "1200")
+        self.assertEqual(_remove_option(sensor_args, "--episode-steps"), "0")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-phase-delay-steps"), "25")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-transition-min-steps"), "100")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-transition-max-steps"), "200")
@@ -145,7 +146,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--reference-ctrl-blend"), "1.0")
         self.assertEqual(
             Path(_remove_option(sensor_args, "--motion-file")).name,
-            "walk1_mjcf.npz",
+            "walk1_mjcf_1p28_natural.npz",
         )
         self.assertEqual(_remove_option(sensor_args, "--target-velocity"), "1.28")
         self.assertEqual(_remove_option(sensor_args, "--learning-rate"), "3.0e-4")
@@ -157,17 +158,15 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         self.assertEqual(_remove_option(sensor_args, "--max-iterations"), "30000")
         self.assertEqual(_remove_option(sensor_args, "--num-envs"), "3072")
         self.assertEqual(_remove_option(sensor_args, "--num-steps"), "64")
-        self.assertEqual(_remove_option(sensor_args, "--stand-start-prob"), "0.5")
-        self.assertEqual(_remove_option(sensor_args, "--motion-reset-prob"), "0.5")
+        self.assertEqual(_remove_option(sensor_args, "--stand-start-prob"), "1.0")
+        self.assertEqual(_remove_option(sensor_args, "--motion-reset-prob"), "0.0")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-phase-delay-steps"), "25")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-transition-min-steps"), "100")
         self.assertEqual(_remove_option(sensor_args, "--stand-start-transition-max-steps"), "200")
         self.assertIn("--domain-randomization", sensor_args)
 
-    def test_privileged_teacher_entrypoint_defaults_stay_untouched(self) -> None:
-        # Sensor and privileged Stage1 must share the same task profile so a
-        # comparison measures observation/network differences rather than a
-        # different motion prior, target speed or reward surface.
+    def test_privileged_and_sensor_stage1_share_reference_reward_defaults(self) -> None:
+        # The reference-tracking terms keep their historical weights.
         teacher_args = _default_entrypoint_argv(
             REPO_ROOT / "scripts" / "train_stage1.py"
         )
@@ -176,8 +175,11 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
         )
 
         shared_options = (
-            "--motion-file",
-            "--target-velocity",
+            "--task-reward-mode",
+            "--forward-progress-reward-coef",
+            "--forward-velocity-tracking-sigma",
+            "--fall-penalty",
+            "--task-reward-lerp",
             "--symmetry-reward-coef",
             "--symmetry-foot-pos-sigma",
             "--side-foot-pos-coef",
@@ -188,14 +190,7 @@ class SensorStage1RewardProfileTests(unittest.TestCase):
             with self.subTest(option=option):
                 teacher_value = _remove_option(teacher_args, option)
                 sensor_value = _remove_option(sensor_args, option)
-                if option == "--motion-file":
-                    teacher_value = Path(teacher_value).name
-                    sensor_value = Path(sensor_value).name
-                    self.assertEqual(sensor_value, teacher_value)
-                elif option == "--target-velocity":
-                    self.assertAlmostEqual(float(sensor_value), float(teacher_value), places=2)
-                else:
-                    self.assertEqual(sensor_value, teacher_value)
+                self.assertEqual(sensor_value, teacher_value)
 
     def test_sensor_entrypoints_require_100_hz(self) -> None:
         for entrypoint in ("train_stage1.py", "train_stage2.py"):

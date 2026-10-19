@@ -120,7 +120,7 @@ def simulate(model, qpos, qvel, frequency, start_frame, seconds):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--motion-file", type=Path, required=True)
-    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodelposition.xml")
+    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodelfinal.xml")
     parser.add_argument("--source", choices=("raw", "training"), default="training")
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--trials", type=int, default=8)

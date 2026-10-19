@@ -57,26 +57,25 @@ def apply_final_profile(args):
 def final_teacher_evaluation_flags():
     """Evaluation does not alter the basic scripts/train_stage1.py recipe."""
     return ['--evaluate-gait', '--gait-fidelity-selection',
-            '--gait-evaluation-seconds', '30', '--gait-evaluation-seeds', '42', '123', '2026',
+            '--gait-evaluation-seconds', '30',
             '--no-stop-on-gait-acceptance']
 
 
 def final_training_flags(*, student=False, robust=False, iterations=50000):
-    flags = ['--motion-file', str(REFERENCE), '--target-velocity', '1.28',
-             '--task-reward-mode', 'stage1_reference', '--action-residual-scale', '.5',
-             '--amp-reward-coef', '.3', '--task-reward-lerp', '.9',
-             '--sensor-natural-gait-reward-coef', '.5', '--reference-gait-style-reward-coef', '4.',
-             '--reference-joint-position-reward-coef', '4.',
-             '--reference-joint-velocity-reward-coef', '1.5',
-             '--reference-root-velocity-reward-coef', '1.5',
-             '--reference-foot-position-reward-coef', '2.5',
+    flags = ['--motion-file', str(REFERENCE), '--action-residual-scale', '.5',
              '--gait-fidelity-selection', '--gait-evaluation-seconds', '30',
-             '--gait-evaluation-seeds', '42', '123', '2026',
              '--no-stop-on-gait-acceptance', '--obs-noise-std', '0.0',
              '--no-trajectory-feedback', '--no-sensor-phase-observation', '--no-use-moe']
+    if not student:
+        flags += ['--target-velocity', '1.28', '--task-reward-mode', 'stage1_reference',
+                  '--amp-reward-coef', '.3', '--task-reward-lerp', '.9',
+                  '--sensor-natural-gait-reward-coef', '.5', '--reference-gait-style-reward-coef', '4.',
+                  '--reference-joint-position-reward-coef', '4.',
+                  '--reference-joint-velocity-reward-coef', '1.5',
+                  '--reference-root-velocity-reward-coef', '1.5',
+                  '--reference-foot-position-reward-coef', '2.5']
     if student:
-        flags += ['--no-sensor-stability-reward', '--sensor-knee-gait-reward-coef', '0.',
-                  '--teacher-action-loss-scale', '1.0',
+        flags += ['--teacher-action-loss-scale', '1.0',
                   '--teacher-action-loss-coef', '2.0' if robust else '5.0',
                   '--teacher-action-loss-final-coef', '.5' if robust else '1.0',
                   '--teacher-action-loss-decay-iterations', str(min(12000, max(1, iterations*3//4))),
@@ -134,7 +133,7 @@ def final_checkpoint_errors(checkpoint, *, require_no_takeover=True):
         if env.get(key, False if isinstance(value, bool) else None) != value:
             errors.append(f'env {key} must be {value}')
     if Path(env.get('motion_file', '')).resolve() != REFERENCE.resolve():
-        errors.append('checkpoint reference must be walk1_mjcf.npz')
+        errors.append(f'checkpoint reference must be {REFERENCE.name}')
     if require_no_takeover and checkpoint.get('distillation', {}).get('teacher_behavior_probability', 1.) != 0.:
         errors.append('Teacher takeover has not reached zero')
     return errors

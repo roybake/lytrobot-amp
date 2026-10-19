@@ -2,6 +2,7 @@
 <mujoco model="Standlet2">
   <compiler angle="radian"/>
   <include file="scene.xml"/>
+  <option integrator="implicitfast"/>
   <asset>
     <mesh name="pelvis" file="pelvis.STL"/>
     <mesh name="femur_r" file="femur_r.STL"/>
@@ -21,11 +22,8 @@
     <lengthrange inttotal="50" useexisting="true"></lengthrange>
   </compiler>
   <default>
-    <joint limited="true" damping="0.1" armature="0.01" stiffness="1.5"></joint>
-    <!-- Geoms are non-colliding by default. Foot and toe STL mesh geoms opt
-         into collision below so ground contact uses the detailed model. -->
-    <geom rgba="0.8 0.6 .4 1" margin="0.001" condim="1" group="0"
-          contype="0" conaffinity="0"></geom>
+    <joint limited="true" damping="1" armature="0.01" stiffness="1.5"></joint>
+    <geom rgba="0.8 0.6 .4 1" margin="0.001" condim="1" group="0"></geom>
     <site size="0.003" rgba="1 0 0 0.2"></site>
     <tendon width="0.003" rgba=".95 .3 .3 1" limited="false"></tendon>
     <motor ctrllimited="true" ctrlrange="-1.0 1.0"/>
@@ -39,9 +37,13 @@
   <worldbody>
     <body name="pelvis" pos="       0 0      0.875" >
       <geom type="mesh" rgba="1 1 1 1" mesh="pelvis" density="3325.68"/>
-      <light name="spotlight" mode="trackcom" pos="0 50 2" dir="0 -1 0" diffuse="0 0 0" specular="0 0 0"/>
+      <light name="spotlight" mode="trackcom" pos="0 50 2" dir="0 -1 0"/>
       <camera name="track" mode="trackcom" pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
       <site name="root" pos="0 0 0" size="0.003" rgba="1 0 0 1"/>
+      <!-- SMPL/AMASS motion-retargeting landmarks. -->
+      <site name="pelvis_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
+      <!-- This model has no independent torso body, so this is a virtual upper-body landmark. -->
+      <site name="upper_body_mimic" pos="0 0 0.35" size="0.015" rgba="0 0.7 1 1" group="1"/>
       <site name="rootIMU" pos="0 0 -0.081"/>
       <site name="l0" pos="0.04069601 0.111423496 -0.038410968"/>
       <site name="l2" pos="0.011689741 0.106131105 0.037416225"/>
@@ -83,9 +85,10 @@
       <joint name="root" type="free"/>
       <body name="femur_r" pos="0.012032 -0.082674 -0.074584">
         <!-- <inertial pos="0.0156247 -0.00487359 -0.189091" quat="0.993704 0.0428057 -0.0542725 -0.0881704" mass="0.427701" diaginertia="0.0067199 0.00667435 0.000132055"/> -->
-        <joint name="hip_flexion_r" stiffness="10" pos="0 0 0" axis="0 -1 0" range="-0.223402 0.422369"/>
-        <joint name="hip_adduction_r" damping="5" stiffness="10" type="hinge" pos="0 0 0" axis="       1        0        0" limited="true" range="-0.188496 0.036652" ref="0"></joint>
-        <joint name="hip_rotation_r" damping="5" stiffness="20" type="hinge" pos="0 0 0" axis="       0        0        1" limited="true" range="-0.148353 0.013963" ref="0"></joint>
+        <joint name="hip_flexion_r" damping="3" stiffness="10" pos="0 0 0" axis="0 -1 0" range="-1 1" ref="-0.08"/>
+        <joint name="hip_adduction_r" damping="3" stiffness="10" type="hinge" pos="0 0 0" axis="       1        0        0" limited="true" range=" -0.524   0.2" ref="0"></joint>
+        <joint name="hip_rotation_r" damping="3" stiffness="10" type="hinge" pos="0 0 0" axis="       0        0        1" limited="true" range=" -2.0944   2.0944" ref="0"></joint>
+        <site name="right_hip_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
         <geom type="mesh" rgba="1 1 1 1" mesh="femur_r" density="2718.16"/>
         <geom name="knee_r" type="cylinder" rgba="1 0 0 0"  size="0.02 0.001" fromto=" 0.038 0.01 -0.358 0.038 -0.01 -0.358 " density="0"/>
         <site name="femur_r_IMU" pos="0.02363458 -0.01066639 -0.18988659"/>
@@ -125,7 +128,8 @@
         <site name="r10" pos="-0.002964795 0.010378355 -0.310482445"/>
         <body name="tibia_r" pos="0.021988 0.0085393 -0.3638">
           <!-- <inertial pos="0.0182825 -0.00561623 -0.154954" quat="0.974418 -0.00394412 -0.00906098 0.224528" mass="0.92" diaginertia="0.00282482 0.00281814 3.5167e-05"/> -->
-          <joint name="knee_angle_r" pos="0 0 0" axis="-0.0270811 -0.997283 0.0685032" range="-1.047198 0.209440"/>
+          <joint name="knee_angle_r" pos="0 0 0" axis="-0.0270811 -0.997283 0.0685032" range="-2 0"/>
+          <site name="right_knee_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
           <geom type="mesh" rgba="1 1 1 1" mesh="tibia_r" density="3292.03"/>
           <site name="tibia_r_IMU" pos=" 0.01875673 -0.00702121 -0.19114679" />
           <site name="r12" pos="-0.001497374 -0.005591954 -0.047868267 "/>
@@ -155,34 +159,34 @@
             <geom type="mesh" rgba="1 1 1 1" mesh="patella_r" density="2732.66"/>
             <site name="r11" pos="0.039227663 -0.003129321 0.021813731"/>
           </body>
-          <body name="talus_r" pos="0.022557 -0.0061213 -0.38882">
+          <body name="talus_r" pos="0.022557 -0.0061213 -0.38882" >
             <!-- <inertial pos="0.000649184 0.00246958 0.00548373" quat="-0.00549531 0.743115 0.203239 0.637529" mass="0.0293879" diaginertia="6.62327e-06 6.09421e-06 3.53541e-06"/> -->
-            <joint name="ankle_angle_r" pos="0 0 0" axis="-0.051785 -0.99459 0.090048" range="-0.349066 0.785398"/>
+            <joint name="ankle_angle_r" pos="0 0 0" axis="-0.051785 -0.99459 0.090048" range="-0.5 0.7" damping="1.5" stiffness="2" ref="0.028"/>
+            <site name="right_foot_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
             <geom type="mesh" rgba="1 1 1 1" mesh="talus_r" density="2718.18"/>
             <body name="foot_r" pos="-0.0086471 0.00034291 -0.015818">
               <!-- <inertial pos="0.0240457 -0.00247806 -0.00449045" quat="-0.0993991 0.680621 -0.0671711 0.722747" mass="0.112355" diaginertia="0.000223132 0.000216083 2.78473e-05"/> -->
-              <joint name="subtalar_angle_r" pos="0 0 0" axis="0.762058 0.313439 0.566589" range="-0.261799 0.349066"/>
-              <geom name="foot_r" type="mesh" rgba="1 1 1 1" mesh="foot_r" density="2718.18"
-                    condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+              <joint name="subtalar_angle_r" pos="0 0 0" axis="0.762058 0.313439 0.566589" range="-1 1" />
+              <geom name="foot_geom_r" type="mesh" rgba="1 1 1 1" mesh="foot_r" density="2718.18"/>
               <site name="foot_r_IMU" pos="0.05889385 -0.00476238  0.008022"/>
               <site name="r13" pos="-0.042778129 -0.000869093 -0.013825398"/>
               <site name="r14" pos="0.062004826 0.01668013 0.014081972"/>
               <site name="r147" pos="-0.042778129 -0.000869093 -0.001" />
               <body name="toe_r" pos="0.11963 -0.012783 -0.01619">
                 <!-- <inertial pos="0.0172758 0.00821531 -0.00133844" quat="0.186455 0.726911 0.0994713 0.653407" mass="0.00196755" diaginertia="2.29527e-07 2.2752e-07 2.30713e-08"/> -->
-                <joint name="mtp_angle_r" pos="0 0 0" axis="-0.375959 -0.926408 -0.02056" range="-1 1"/>
-                <geom name="toe_r" type="mesh" rgba="0.698039 0.698039 0.698039 1" mesh="toe_r" density="2718.18"
-                      condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+                <joint name="mtp_angle_r" pos="0 0 0" axis="-0.375959 -0.926408 -0.02056" range="-1 1" />
+                <geom type="mesh" rgba="0.698039 0.698039 0.698039 1" mesh="toe_r" density="2718.18"/>
               </body>
             </body>
           </body>
         </body>
       </body>
-      <body name="femur_l" pos="0.012032 0.082674 -0.074584">
+      <body name="femur_l" pos="0.012032 0.082674 -0.074584" >
         <!-- <inertial pos="0.0156102 0.0048707 -0.189041" quat="0.993702 -0.0428048 -0.0542713 0.0881967" mass="0.427804" diaginertia="0.00671984 0.00667428 0.000132054"/> -->
-        <joint name="hip_flexion_l" damping="5" stiffness="10" type="hinge" pos="0 0 0" axis="       0        -1        0" limited="true" range="-0.223402 0.422369" ref="0"></joint>
-        <joint name="hip_adduction_l" damping="5" stiffness="10" type="hinge" pos="0 0 0" axis="      -1        0        0" limited="true" range="-0.188496 0.036652" ref="0"></joint>
-        <joint name="hip_rotation_l" damping="5" stiffness="20" type="hinge" pos="0 0 0" axis="       0       0        -1" limited="true" range="-0.148353 0.013963" ref="0"></joint>
+        <joint name="hip_flexion_l" damping="3" stiffness="10" type="hinge" pos="0 0 0" axis="       0        -1        0" limited="true" range=" -1   1" ref="-0.08"></joint>
+        <joint name="hip_adduction_l" damping="3" stiffness="10" type="hinge" pos="0 0 0" axis="      -1        0        0" limited="true" range=" -0.524   0.2" ref="0"></joint>
+        <joint name="hip_rotation_l" damping="3" stiffness="10" type="hinge" pos="0 0 0" axis="       0       0        -1" limited="true" range=" -2.0944   2.0944" ref="0"></joint>
+        <site name="left_hip_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
         <geom type="mesh" rgba="1 1 1 1" mesh="femur_l" density="2718.16"/>
         <body name="knee_l">
           <geom name="knee_l" type="cylinder" rgba="1 0 0 0"  size="0.02 0.001" fromto=" 0.038 0.01 -0.358 0.038 -0.01 -0.358 " density="0"/>
@@ -225,7 +229,8 @@
         <site name="l10" pos="-0.002964795 -0.010378355 -0.310482445"/>
         <body name="tibia_l" pos="0.021988 -0.0085393 -0.3638">
           <!-- <inertial pos="0.0182825 0.00561612 -0.154954" quat="0.974419 0.00394456 -0.00906044 -0.224523" mass="0.213229" diaginertia="0.0028248 0.00281812 3.5167e-05"/> -->
-          <joint name="knee_angle_l" pos="0 0 0" axis="0.0270811 -0.997283 -0.0685032" range="-1.047198 0.209440"/>
+          <joint name="knee_angle_l" pos="0 0 0" axis="0.0270811 -0.997283 -0.0685032" range="-2 0"/>
+          <site name="left_knee_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
           <geom type="mesh" rgba="1 1 1 1" mesh="tibia_l" density="3292.03"/>
           <site name="tibia_l_IMU" pos=" 0.01875673 0.00702121 -0.19114679" />
           <site name="l12" pos="-0.001497374 0.005591954 -0.047868267 "/>
@@ -257,13 +262,13 @@
           </body>
           <body name="talus_l" pos="0.022557 0.0061213 -0.38882">
             <!-- <inertial pos="0.000649896 -0.00246879 0.00548373" quat="0.00555935 0.743147 -0.203175 0.637512" mass="0.029389" diaginertia="6.62338e-06 6.09418e-06 3.53562e-06"/> -->
-            <joint name="ankle_angle_l" pos="0 0 0" axis="0.051785 -0.99459 -0.090048" range="-0.349066 0.785398"/>
+            <joint name="ankle_angle_l" pos="0 0 0" axis="0.051785 -0.99459 -0.090048" range="-0.5 0.7" damping="1.5" stiffness="2" ref="0.028"/>
+            <site name="left_foot_mimic" pos="0 0 0" size="0.015" rgba="0 0.7 1 1" group="1"/>
             <geom type="mesh" rgba="1 1 1 1" mesh="talus_l" density="2718.18"/>
             <body name="foot_l" pos="-0.0086471 -0.00034291 -0.015818">
               <!-- <inertial pos="0.0240471 0.00247979 -0.0044882" quat="0.0994478 0.680587 0.0672607 0.722764" mass="0.112365" diaginertia="0.000223101 0.000216049 2.78436e-05"/> -->
-              <joint name="subtalar_angle_l" pos="0 0 0" axis="-0.762058 0.313439 -0.566589" range="-0.261799 0.349066"/>
-              <geom name="foot_l" type="mesh" rgba="1 1 1 1" mesh="foot_l" density="2718.18"
-                    condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+              <joint name="subtalar_angle_l" pos="0 0 0" axis="-0.762058 0.313439 -0.566589" range="-1 1" />
+              <geom name="foot_geom_l" type="mesh" rgba="1 1 1 1" mesh="foot_l" density="2718.18"/>
               <site name="foot_l_IMU" pos="0.05889385 0.00476238  0.008022"/>
               <site name="l13" pos="-0.042778129 0.000869093 -0.013825398"/>
               <site name="l14" pos="0.062004826 -0.01668013 0.014081972"/>
@@ -271,8 +276,7 @@
               <body name="toe_l" pos="0.11963 0.012783 -0.01619">
                 <!-- <inertial pos="0.017277 -0.00821652 -0.00133839" quat="-0.186453 0.72691 -0.0994773 0.653408" mass="0.00196768" diaginertia="2.29553e-07 2.27545e-07 2.30729e-08"/> -->
                 <joint name="mtp_angle_l" pos="0 0 0" axis="0.375959 -0.926408 0.02056" range="-1 1"/>
-                <geom name="toe_l" type="mesh" rgba="1 1 1 1" mesh="toe_l" density="2718.18"
-                      condim="3" contype="1" conaffinity="1" friction="1 .1 .1"/>
+                <geom type="mesh" rgba="1 1 1 1" mesh="toe_l" density="2718.18"/>
               </body>
             </body>
           </body>
@@ -391,6 +395,7 @@
       <site site="r123"></site>
       <site site="r124"></site>
       <site site="r125"></site>
+       <!-- <site site="r10"></site> -->
       <site site="r12"></site>
     </spatial>
     <spatial name="knee_lb_tendon" range="0.380 0.405">
@@ -406,7 +411,8 @@
       <site site="l122"></site>
       <site site="l123"></site>
       <site site="l124"></site>
-      <site site="l125"></site>
+      <site site="l125"></site>\
+      <!-- <site site="l10"></site> -->
       <site site="l12"></site>
     </spatial>
 
@@ -486,20 +492,20 @@
     <muscle name="ankle_lb" tendon="ankle_lb_tendon" ctrlrange="0.0 1" force="2500"/>
     <muscle name="ankle_rf" tendon="ankle_rf_tendon" ctrlrange="0.0 1" force="2500"/>
     <muscle name="ankle_lf" tendon="ankle_lf_tendon" ctrlrange="0.0 1" force="2500"/> -->
-    <position name="hip_rm" tendon="hip_rm_tendon" kp="50000"  ctrlrange="0.15 0.21" forcerange="-450 0"/>
-    <position name="hip_lm" tendon="hip_lm_tendon" kp="50000"  ctrlrange="0.15 0.21" forcerange="-450 0"/>
-    <position name="hip_rb" tendon="hip_rb_tendon" ctrlrange="0.21 0.280" kp="50000" forcerange="-450 0"/>
-    <position name="hip_lb" tendon="hip_lb_tendon" ctrlrange="0.21 0.280" kp="50000" forcerange="-450 0"/>
-    <position name="hip_rf" tendon="hip_rf_tendon" ctrlrange="0.175 0.237" kp="50000" forcerange="-465 0"/>
-    <position name="hip_lf" tendon="hip_lf_tendon" ctrlrange="0.175 0.237" kp="50000" forcerange="-465 0"/>
-    <position name="knee_rb" tendon="knee_rb_tendon" ctrlrange="0.32 0.405" kp="50000" forcerange="-1000 0"/>
-    <position name="knee_lb" tendon="knee_lb_tendon" ctrlrange="0.32 0.405" kp="50000" forcerange="-1000 0"/>
-    <position name="knee_rf" tendon="knee_rf_tendon" ctrlrange="0.325 0.405" kp="50000" forcerange="-465 0"/>
-    <position name="knee_lf" tendon="knee_lf_tendon" ctrlrange="0.325 0.405" kp="50000" forcerange="-465 0"/>
-    <position name="ankle_rb" tendon="ankle_rb_tendon" ctrlrange="0.36 0.505" kp="50000" forcerange="-300 0"/>
-    <position name="ankle_lb" tendon="ankle_lb_tendon" ctrlrange="0.36 0.505" kp="50000" forcerange="-300 0"/>
-    <position name="ankle_rf" tendon="ankle_rf_tendon" ctrlrange="0.109 0.173" kp="50000" forcerange="-300 0"/>
-    <position name="ankle_lf" tendon="ankle_lf_tendon" ctrlrange="0.109 0.173" kp="50000" forcerange="-300 0"/>
+    <position name="hip_rm" tendon="hip_rm_tendon" kp="50000"  ctrlrange="0.15 0.21" forcerange="-450 0" />
+    <position name="hip_lm" tendon="hip_lm_tendon" kp="50000"  ctrlrange="0.15 0.21" forcerange="-450 0" />
+    <position name="hip_rb" tendon="hip_rb_tendon" ctrlrange="0.21 0.280" kp="50000" forcerange="-450 0" />
+    <position name="hip_lb" tendon="hip_lb_tendon" ctrlrange="0.21 0.280" kp="50000" forcerange="-450 0" />
+    <position name="hip_rf" tendon="hip_rf_tendon" ctrlrange="0.175 0.237" kp="50000" forcerange="-450 0" />
+    <position name="hip_lf" tendon="hip_lf_tendon" ctrlrange="0.175 0.237" kp="50000" forcerange="-450 0" />
+    <position name="knee_rb" tendon="knee_rb_tendon" ctrlrange="0.32 0.405" kp="50000" forcerange="-600 0" />
+    <position name="knee_lb" tendon="knee_lb_tendon" ctrlrange="0.32 0.405" kp="50000" forcerange="-600 0" />
+    <position name="knee_rf" tendon="knee_rf_tendon" ctrlrange="0.335 0.405" kp="50000" forcerange="-500 0" kv="70"/>
+    <position name="knee_lf" tendon="knee_lf_tendon" ctrlrange="0.335 0.405" kp="50000" forcerange="-500 0" kv="70"/>
+    <position name="ankle_rb" tendon="ankle_rb_tendon" ctrlrange="0.323 0.505" kp="5000" forcerange="-400 0" kv="250"/>
+    <position name="ankle_lb" tendon="ankle_lb_tendon" ctrlrange="0.323 0.505" kp="5000" forcerange="-400 0" kv="250"/>
+    <position name="ankle_rf" tendon="ankle_rf_tendon" ctrlrange="0.0885 0.173" kp="10000" forcerange="-400 0" kv="70"/>
+    <position name="ankle_lf" tendon="ankle_lf_tendon" ctrlrange="0.0885 0.173" kp="10000" forcerange="-400 0" kv="70"/>
   </actuator> 
   <sensor>
     <accelerometer name="rootacc" site="rootIMU"/>
@@ -516,5 +522,10 @@
     <gyro name="tibia_lgyro" site="tibia_l_IMU"/>
     <accelerometer name="foot_lacc" site="foot_l_IMU"/>
     <gyro name="foot_lgyro" site="foot_l_IMU"/>
+    <framepos name="lfootpos" objtype="body" objname="foot_l" reftype="site" refname = "root"/>
+    <framepos name="rfootpos" objtype="body" objname="foot_r" reftype="site" refname = "root"/>
+    <framelinvel name="lfootvel" objtype="body" objname="foot_l" reftype="site" refname = "root"/>
+    <framelinvel name="rfootvel" objtype="body" objname="foot_r" reftype="site" refname = "root"/>
+    <velocimeter name="rootvel" site="rootIMU"/>
   </sensor>
 </mujoco>

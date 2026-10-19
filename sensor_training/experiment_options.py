@@ -109,6 +109,8 @@ def install_training_options(base_train):
 
 def observation_config_from_metadata(metadata):
     saved = dict(metadata.get('sensor_observation', {}).get('config', {}))
+    # Checkpoints predating this feature used length/action history only.
+    saved.setdefault('include_tendon_velocity', False)
     if 'gait_lookahead_seconds' in saved:
         saved['gait_lookahead_seconds'] = tuple(saved['gait_lookahead_seconds'])
     allowed = {field.name for field in fields(SensorObservationConfig)}

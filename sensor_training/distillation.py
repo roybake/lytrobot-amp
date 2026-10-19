@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from lytrobot_amp.networks import ActorCritic
+from lytrobot_amp.env import LytRobotEnvCfg
 
 
 def linear_distillation_coefficient(
@@ -60,7 +61,7 @@ class PrivilegedTeacher:
         *,
         expected_observation_dim: int,
         expected_action_dim: int,
-        student_control_config: dict[str, float | str],
+        student_control_config: dict[str, Any],
         device: torch.device | str,
     ) -> None:
         path = Path(checkpoint_path).expanduser().resolve()
@@ -88,6 +89,18 @@ class PrivilegedTeacher:
         teacher_env = checkpoint.get("env_config")
         if not isinstance(teacher_env, dict):
             raise ValueError("Teacher checkpoint has no env_config metadata.")
+        teacher_cfg = LytRobotEnvCfg(**teacher_env)
+        if teacher_cfg.command_walking != student_control_config["command_walking"]:
+            raise ValueError("Teacher and Student must use the same walking command mode.")
+        if teacher_cfg.command_walking:
+            for name in ("velocity_range", "yaw_rate_range"):
+                if tuple(getattr(teacher_cfg, name)) != tuple(student_control_config[name]):
+                    raise ValueError(f"Teacher and Student must use the same {name}.")
+        if teacher_cfg.symmetric_gait_reference != student_control_config["symmetric_gait_reference"]:
+            raise ValueError("Teacher and Student must use the same symmetric walking reference.")
+        if (teacher_cfg.symmetric_gait_reference
+                and teacher_cfg.target_velocity != student_control_config["target_velocity"]):
+            raise ValueError("Teacher and Student must generate the symmetric reference at the same velocity.")
         teacher_blend = float(teacher_env.get("reference_ctrl_blend", 1.0))
         if not 0.0 <= teacher_blend <= 1.0:
             raise ValueError(f"Teacher reference_ctrl_blend is invalid: {teacher_blend}.")

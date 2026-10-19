@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run quality-gated 100 Hz privileged-teacher → sensor-student training.
+"""Run 100 Hz privileged-teacher → sensor-student training.
 
 One invocation trains natural gait; robustness is an optional later extension.
 Every phase uses the same reference tendon feedforward at 100 Hz, so teacher
@@ -14,6 +14,7 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import secrets
 import shlex
 import subprocess
 import sys
@@ -25,10 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from lytrobot_amp.training_paths import timestamp_name, validate_run_name
 
-from sensor_training.training_defaults import (
-    distillation_rollout_shape,
-    validate_sensor_decimation,
-)
+from sensor_training.training_defaults import validate_sensor_decimation
 
 
 def _run_name(value: str) -> str:
@@ -54,14 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--phase', choices=('all', 'stage1', 'stage2'), default='all',
                         help='Final workflow stage; stage2 requires a completed Student Stage1 checkpoint.')
     parser.add_argument("--num-envs", type=int, default=None,
-                        help="Teacher worlds: 1024 for the final baseline recipe; 4096 for legacy mode.")
+                        help="Teacher worlds: 1024 by default.")
     parser.add_argument(
         "--student-num-envs",
         type=int,
         default=None,
         help=(
-            "Parallel environments for sensor-student phases. By default this is "
-            "derived to preserve the teacher's 24-step rollout sample count."
+            "Parallel environments for sensor-student phases. Default: 1024."
         ),
     )
     parser.add_argument(
@@ -70,16 +67,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Recurrent rollout/BPTT steps for sensor-student phases. "
-            "Default: 48 at the required 100 Hz control rate."
+            "Default: 96 at the required 100 Hz control rate."
         ),
     )
-    parser.add_argument("--stage1-iterations", type=int, default=50000)
+    parser.add_argument("--stage1-iterations", type=int, default=30000)
     parser.add_argument("--stage2-iterations", type=int, default=50000)
-    parser.add_argument("--teacher-stage1-iterations", type=int, default=None)
+    parser.add_argument("--teacher-stage1-iterations", type=int, default=30000)
     parser.add_argument("--teacher-stage2-iterations", type=int, default=None)
     parser.add_argument("--teacher-stage1-checkpoint", type=Path, default=None)
     parser.add_argument("--student-stage1-checkpoint", type=Path, default=None)
-    parser.add_argument("--teacher-quality-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--teacher-quality-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--include-robust-stage", action="store_true")
     parser.add_argument("--student-root-imu-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", default="cuda", choices=("cuda",))
@@ -101,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         from sensor_training.final_profile import apply_final_profile
         apply_final_profile(args)
     elif args.num_envs is None:
-        args.num_envs = 4096
+        args.num_envs = 1024
     return args
 
 
@@ -129,7 +126,8 @@ def select_teacher_handoff(directory: Path):
                   if (directory/name).is_file() and (directory/name).with_suffix('.onnx').is_file()]
     if not candidates:
         raise FileNotFoundError(f'No exported Teacher checkpoint in {directory}.')
-    results = [(path, evaluate_gait_suite(path, seconds=30.)) for path in candidates]
+    seeds = tuple(secrets.randbits(32) for _ in range(3))
+    results = [(path, evaluate_gait_suite(path, seconds=30., seeds=seeds)) for path in candidates]
     return max(results, key=lambda item: gait_checkpoint_quality(item[1], fidelity=True))
 
 
@@ -172,15 +170,14 @@ def _student_num_steps(args: argparse.Namespace) -> int:
     explicit = getattr(args, "student_num_steps", None)
     if explicit is not None:
         return int(explicit)
-    return distillation_rollout_shape(int(args.decimation))[0]
+    return 96
 
 
 def _student_num_envs(args: argparse.Namespace) -> int:
     explicit = getattr(args, "student_num_envs", None)
     if explicit is not None:
         return int(explicit)
-    student_steps = _student_num_steps(args)
-    return max(1, round(int(args.num_envs) * 24 / student_steps))
+    return 1024
 
 
 def _common_train_args(
@@ -200,27 +197,6 @@ def _common_train_args(
         "--max-iterations", str(iterations),
         "--save-interval", "500",
         "--wandb-log-interval", str(getattr(args, 'wandb_log_interval', 10)),
-        "--motion-loop", "false",
-        "--episode-steps", "2000",
-        "--episode-timeout-jitter-steps", "0",
-        "--stand-start-prob", "0.70" if sensor_student else "0.50",
-        "--motion-reset-prob", "1.0",
-        "--stand-start-motion-phase", "0",
-        "--stand-start-phase-delay-steps", "25",
-        "--stand-start-transition-min-steps", "80",
-        "--stand-start-transition-max-steps", "160",
-        "--reference-gait-style-reward-coef", "4.0",
-        "--sensor-natural-gait-reward-coef", "2.0",
-        "--sensor-hop-penalty-coef", "1.0",
-        "--sensor-tiptoe-penalty-coef", "1.0",
-        "--sensor-stance-slip-penalty-coef", "0.5",
-        "--sensor-sync-forward-penalty-coef", "1.0",
-        "--forward-velocity-reward-coef", "2.0",
-        "--forward-velocity-deficit-penalty-coef", "2.5",
-        "--fall-penalty", "10.0",
-        "--learning-rate", "1e-4",
-        "--max-learning-rate", "1e-4",
-        "--target-kl", "0.015",
         "--evaluate-gait",
         "--log-dir", str(log_dir),
         wandb_flag,
@@ -253,7 +229,8 @@ def _phase_command(
 ) -> list[str]:
     final = bool(getattr(args, 'final_sensor_gait', False))
     teacher_stage1 = (args.teacher_stage1_checkpoint if final and args.teacher_stage1_checkpoint
-                      else _handoff_checkpoint(paths['teacher_stage1']))
+                      else _handoff_checkpoint(paths['teacher_stage1']) if final
+                      else paths['teacher_stage1'] / 'model_final.pt')
     teacher_stage2 = _handoff_checkpoint(paths["teacher_stage2"])
     student_stage1 = (args.student_stage1_checkpoint if final and args.student_stage1_checkpoint
                       else paths['student_stage1']/'model_final.pt' if final
@@ -276,7 +253,6 @@ def _phase_command(
             command.extend(final_teacher_evaluation_flags())
         else:
             command = [sys.executable, str(script)] + _common_train_args(args, paths[name], iterations)
-            command.append('--stop-on-gait-acceptance')
         if resume_checkpoint is not None:
             command.extend(("--resume-checkpoint", str(resume_checkpoint)))
         elif getattr(args, 'teacher_stage1_checkpoint', None) is not None:
@@ -305,8 +281,6 @@ def _phase_command(
         if final:
             from sensor_training.final_profile import final_training_flags
             command.extend(final_training_flags(student=True, iterations=args.stage1_iterations))
-        else:
-            command.append('--stop-on-gait-acceptance')
         if resume_checkpoint is not None:
             command.extend(("--resume-checkpoint", str(resume_checkpoint)))
         elif getattr(args, 'student_stage1_checkpoint', None) is not None:

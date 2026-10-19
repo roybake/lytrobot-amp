@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 
@@ -32,7 +33,7 @@ def training_command(experiment, seed, bptt, iterations, teacher=None, device='c
                '--task-reward-mode', 'stage1_reference', '--no-sensor-stability-reward',
                '--no-domain-randomization', '--sensor-root-imu-only',
                '--episode-steps', '2000', '--episode-timeout-jitter-steps', '0',
-               '--stand-start-prob', '.7', '--motion-reset-prob', '1.0',
+               '--stand-start-prob', '1.0', '--motion-reset-prob', '0.0',
                '--stand-start-motion-phase', '0', '--stand-start-phase-delay-steps', '25',
                '--stand-start-transition-min-steps', '80', '--stand-start-transition-max-steps', '160',
                '--startup-action-ramp-steps', '20', '--fall-penalty', '10',
@@ -43,7 +44,7 @@ def training_command(experiment, seed, bptt, iterations, teacher=None, device='c
                '--sensor-stance-slip-penalty-coef', '.5', '--sensor-sync-forward-penalty-coef', '1',
                '--sensor-knee-gait-reward-coef', '0',
                '--forward-velocity-reward-coef', '2', '--forward-velocity-deficit-penalty-coef', '2.5',
-               '--symmetry-reward-coef', '1.2', '--symmetry-foot-pos-sigma', '.08',
+               '--symmetry-reward-coef', '1.2', '--symmetry-step-length-sigma', '.08',
                '--side-foot-pos-coef', '0', '--step-gap-coef', '0', '--swing-advance-coef', '0',
                '--amp-reward-coef', '1.2', '--task-reward-lerp', '.75',
                '--learning-rate', '1e-4', '--min-learning-rate', '1e-5', '--max-learning-rate', '1e-4',
@@ -74,7 +75,8 @@ def training_command(experiment, seed, bptt, iterations, teacher=None, device='c
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--experiment', choices=list('ABCDEFG'), default='F')
-    parser.add_argument('--seeds', type=int, nargs='+', default=[42, 123, 2026])
+    parser.add_argument('--seeds', type=int, nargs='+',
+                        default=[secrets.randbits(32) for _ in range(3)])
     parser.add_argument('--bptt', type=int, choices=[64, 96, 128], default=96)
     parser.add_argument('--iterations', type=int, default=10000)
     parser.add_argument('--teacher-checkpoint')

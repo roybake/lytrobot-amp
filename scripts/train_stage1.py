@@ -27,24 +27,60 @@ if __name__ == "__main__":
     if not _has_arg("--sim-backend"):
         sys.argv.extend(["--sim-backend", "warp"])
 
-    # Train the privileged gait teacher against the shared walking reference.
+    command_walking = "--command-walking" in sys.argv
+
+    # Use the 10-06 Teacher recipe with standing starts and continuous walking.
     stage1_defaults = {
         "--log-root": str(REPO_ROOT / "logs" / "sensor_policy" / "distillation"),
         "--log-role": "teacher",
-        "--num-envs": "4096",
+        "--num-envs": "1024",
+        "--max-iterations": "30000",
+        "--num-steps": "24",
+        "--decimation": "2",
         "--task-reward-mode": "stage1_reference",
         "--motion-file": str(DEFAULT_GAIT_REFERENCE),
-        "--motion-loop": "false",
+        "--termination-mode": "fall",
+        "--motion-loop": "true",
+        "--episode-steps": "0",
+        "--episode-timeout-jitter-steps": "0",
         "--target-velocity": "1.28",
+        "--forward-velocity-reward-coef": "2.0",
+        "--forward-progress-reward-coef": "0.0",
+        "--forward-velocity-deficit-penalty-coef": "0.0",
+        "--forward-velocity-tracking-sigma": "0.25",
+        "--fall-penalty": "2.0",
+        "--task-reward-lerp": "0.5",
+        "--motion-reset-prob": "0.0",
+        "--stand-start-prob": "1.0",
+        "--stand-start-motion-phase": "0",
+        "--stand-start-phase-delay-steps": "25",
+        "--stand-start-transition-min-steps": "80",
+        "--stand-start-transition-max-steps": "160",
         "--symmetry-reward-coef": "1.2",
         "--symmetry-foot-pos-sigma": "0.08",
         "--side-foot-pos-coef": "0.0",
         "--step-gap-coef": "0.0",
         "--swing-advance-coef": "0.0",
         "--save-interval": "500",
+        "--gait-evaluation-seconds": "30",
     }
+    if command_walking:
+        stage1_defaults["--log-root"] = str(REPO_ROOT / "logs" / "command_walking")
+        # The fixed-speed gait evaluator measures world-X progress and is not
+        # a checkpoint selector for a policy that is commanded to turn.
+        for name in ("--evaluate-gait", "--gait-fidelity-selection"):
+            if not (_has_arg(name) or _has_arg(f"--no-{name[2:]}")):
+                sys.argv.append(f"--no-{name[2:]}")
+        if not _has_arg("--velocity-range"):
+            sys.argv.extend(["--velocity-range", "0.6", "1.28"])
     for name, value in stage1_defaults.items():
         if not _has_arg(name):
             sys.argv.extend([name, value])
+
+    for name in ("--evaluate-gait", "--gait-fidelity-selection", "--symmetric-gait-reference"):
+        if not (_has_arg(name) or _has_arg(f"--no-{name[2:]}")):
+            sys.argv.append(name)
+    if not (_has_arg("--stop-on-gait-acceptance") or _has_arg("--no-stop-on-gait-acceptance")):
+        sys.argv.append("--no-stop-on-gait-acceptance")
 
     runpy.run_path(str(Path(__file__).resolve().parent / "train.py"), run_name="__main__")

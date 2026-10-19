@@ -16,10 +16,8 @@ from scripts.train_multimotion import (
     default_train_args as base_multimotion_args,
     split_reference_set_args,
 )
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-)
+from lytrobot_amp.benchmark import MAX_SLOPE_DEG
+from lytrobot_amp.terrain import MAX_ROUGH_HEIGHT_DIFFERENCE_M
 from sensor_training.training_defaults import (
     DEFAULT_SENSOR_DECIMATION,
     cli_int,

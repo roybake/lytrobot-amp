@@ -10,10 +10,8 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from lytrobot_amp.benchmark import (
-    MAX_ROUGH_HEIGHT_DIFFERENCE_M,
-    MAX_SLOPE_DEG,
-)
+from lytrobot_amp.benchmark import MAX_SLOPE_DEG
+from lytrobot_amp.terrain import MAX_ROUGH_HEIGHT_DIFFERENCE_M
 
 REFERENCE_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 PARALLEL_ENVS = 4096

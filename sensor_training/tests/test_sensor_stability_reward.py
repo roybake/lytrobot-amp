@@ -31,9 +31,8 @@ def _info(
         "forward_velocity_deficit": np.asarray([deficit], dtype=np.float32),
         "gait_progress": np.ones(1, dtype=np.float32),
         "knee_flexion_track": np.asarray([knee_flexion], dtype=np.float32),
-        "ctrl_penalty": np.zeros(1, dtype=np.float32),
+        "torque_penalty": np.zeros(1, dtype=np.float32),
         "action_rate": np.zeros(1, dtype=np.float32),
-        "distal_action": np.zeros(1, dtype=np.float32),
         "distal_action_rate": np.zeros(1, dtype=np.float32),
         "termination": np.asarray([termination], dtype=np.float32),
     }
@@ -44,7 +43,7 @@ class SensorStabilityRewardTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[2]
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
-                model_xml=str(repo_root / "robot" / "MJCFmodelposition.xml"),
+                model_xml=str(repo_root / "robot" / "MJCFmodelfinal.xml"),
                 motion_file=str(
                     repo_root / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),
@@ -219,6 +218,7 @@ class SensorStabilityRewardTests(unittest.TestCase):
         env.episode_timeout_step = torch.full((2,), 100, dtype=torch.long)
         env.cfg = SimpleNamespace(
             forward_velocity_tracking_sigma=0.25,
+            episode_steps=100,
             target_velocity=0.87,
             fall_height=0.45,
             max_height=1.55,
@@ -272,6 +272,7 @@ class SensorStabilityRewardTests(unittest.TestCase):
         env.episode_timeout_step = torch.full((1,), 100, dtype=torch.long)
         env.cfg = SimpleNamespace(
             forward_velocity_tracking_sigma=0.25,
+            episode_steps=100,
             target_velocity=0.87,
             fall_height=0.45,
             max_height=1.55,

@@ -1,0 +1,240 @@
+{
+  "task": "walk",
+  "source": "/home/yeah/code/lytrobot-amp/robot/reference_data/walk1.npz",
+  "source_frequency_hz": 40.0,
+  "frequency_hz": 117.6470588235294,
+  "minimum_knee_flexion_rad": null,
+  "source_sha256": "37bf7ec8801c1b5842c497faca7fcedebac617f89ae67c5c21c4b2fd9a25d215",
+  "source_frames": [
+    18431,
+    18475
+  ],
+  "method": "Accepted reference pose tracking with periodic second-difference regularization, bounded per-frame deviations, actual contact transforms and contact-point velocity constraints",
+  "model_xml": "/home/yeah/code/lytrobot-amp/robot/MJCFmodelposition.xml",
+  "root_convention": "World XY translates; velocities differentiate qpos; unique cycle samples with cycle_translation",
+  "cycle_translation": [
+    0.979200005531311,
+    0.0
+  ],
+  "cycle_duration_s": 0.765,
+  "mean_forward_velocity": 1.28,
+  "enforce_passive_joint_constraints": true,
+  "reconstructed_motion": [
+    "foot_contact",
+    "mtp_angle_r",
+    "mtp_angle_l",
+    "subtalar_angle_r",
+    "subtalar_angle_l",
+    "pelvis_orientation",
+    "support_world_positions",
+    "swing_world_positions"
+  ],
+  "dynamic_stability": "Not asserted; see separate dynamics report",
+  "cycle_refinement": {
+    "optimizer_success": true,
+    "message": "Both `ftol` and `xtol` termination conditions are satisfied.",
+    "function_evaluations": 790,
+    "cost": 1109.9852853384907
+  },
+  "velocity_method": "Current-pose bidirectional MuJoCo differences",
+  "reference_kind": "One source-derived LYT walking cycle, 90 unique frames, translating and looping",
+  "optimization_seed": "/home/yeah/code/lytrobot-amp/logs/data_audit/forward_leg_revision/warm_seed_1p39.npz",
+  "optimization_seed_sha256": "1f48547a518e53cee3652e7c6d5bb123c066b6ffac6c96a3969a8fd5084cdc9d",
+  "cadence_steps_per_minute": 156.86274509803923,
+  "target_stance_clearance_m": 0.0005,
+  "knee_extension": {
+    "stance_phase_start": 0.35,
+    "stance_phase_end": 0.7,
+    "target_joint_angle_rad": 0.0,
+    "maximum_error_rad": 1e-06,
+    "entry_phase_start": 0.15,
+    "exit_phase_end": 0.9
+  },
+  "revision": "Bounded smoothing of the accepted parallel-leg, straight-knee walking motion; unchanged timing and contacts; regenerated pose-derived velocities",
+  "superseded_motion_backup": "/home/yeah/code/lytrobot-amp/logs/data_audit/smoothness_revision/walk1_lyt_contact.npz",
+  "superseded_motion_sha256": "3abaa800a398449ffe45373dfbbd00fd06b2958892eb315d8c8036739bcf10ff",
+  "forward_leg_alignment": {
+    "foot_and_toe_heading_target_rad": 0.0,
+    "foot_lane_y_m": [
+      -0.07991308999999999,
+      0.07991308999999999
+    ],
+    "knee_lateral_offset_from_hip_m": [
+      0.0085393,
+      -0.0085393
+    ],
+    "ankle_lateral_offset_from_hip_m": [
+      0.0024180000000000035,
+      -0.0024180000000000035
+    ]
+  },
+  "cycle_frame_count": 90,
+  "original_archive_sha256": {
+    "walk1.npz": "37bf7ec8801c1b5842c497faca7fcedebac617f89ae67c5c21c4b2fd9a25d215",
+    "walk1_mjcf.npz": "561ee7638dacd71f979e264c5e6314986929db5bf42a25a7e0eebfdc4c5c6b76"
+  },
+  "smoothness_revision": {
+    "accepted_reference": "/home/yeah/code/lytrobot-amp/logs/data_audit/smoothness_revision/walk1_lyt_contact.npz",
+    "accepted_reference_sha256": "3abaa800a398449ffe45373dfbbd00fd06b2958892eb315d8c8036739bcf10ff",
+    "strength": 1.0,
+    "max_joint_deviation_deg": 2.0,
+    "max_root_deviation_mm": 3.0,
+    "max_root_angle_deviation_deg": 0.2,
+    "root_angle_limit_definition": "Maximum absolute change of each xyz Euler angle",
+    "optimizer_success": true,
+    "message": "`ftol` termination condition is satisfied.",
+    "evaluations": 27,
+    "cost": 1151.2600706117453,
+    "stance_gap_penalty_threshold_m": 0.0008
+  },
+  "kinematic_audit": {
+    "joint_limit_max_excess": 0.0,
+    "minimum_foot_clearance_m": 0.0004550303730443614,
+    "maximum_support_gap_m": 0.0008036579937488256,
+    "frames_without_support_label": 0,
+    "frames_without_foot_within_2mm": 0,
+    "contact_horizontal_velocity_rms_m_s": 0.011835437409227165,
+    "stance_interior_velocity_rms_m_s": 0.007903619531649904,
+    "swing_interior_contact_count": 0,
+    "cycle_translation_m": [
+      0.979200005531311,
+      0.0
+    ],
+    "last_to_next_joint_step_max_deg": 4.311340055064401,
+    "near_straight_knee_fraction": 0.4388888888888889,
+    "central_difference_velocity_comparison_rmse": 0.00029710100420684584,
+    "stored_velocity_max_error": 4.628125349626089e-07,
+    "mean_forward_speed_m_s": 1.2800000064074992,
+    "cycle_duration_s": 0.765,
+    "cadence_steps_per_minute": 156.86274509803923,
+    "maximum_joint_step_deg": 6.999308068956852,
+    "interpolated_minimum_clearance_m": 0.00040140108118047815,
+    "interpolated_maximum_lowest_foot_gap_m": 0.0015108903002469514,
+    "interpolated_stance_gap_maximum_m": [
+      0.0015108903002469514,
+      0.0012789115904593175
+    ],
+    "r_knee_range_deg": [
+      -50.17569320903213,
+      -4.872726377821447e-15
+    ],
+    "r_stance_knee_range_deg": [
+      -26.444245334052436,
+      -4.872726377821447e-15
+    ],
+    "r_ankle_range_deg": [
+      -6.450815704074501,
+      28.399714833048748
+    ],
+    "r_stance_clearance_range_m": [
+      0.0004594968066122876,
+      0.0008032778749278505
+    ],
+    "r_stance_slip_rms_m_s": 0.007080018249537141,
+    "r_stance_slip_p99_m_s": 0.02249065214769102,
+    "l_knee_range_deg": [
+      -53.71534312374286,
+      -3.9576265380721654e-17
+    ],
+    "l_stance_knee_range_deg": [
+      -35.14606684609418,
+      -3.9576265380721654e-17
+    ],
+    "l_ankle_range_deg": [
+      -6.179477901559283,
+      33.131413757939704
+    ],
+    "l_stance_clearance_range_m": [
+      0.0004550303730443614,
+      0.0008036579937488256
+    ],
+    "l_stance_slip_rms_m_s": 0.008549490080871405,
+    "l_stance_slip_p99_m_s": 0.031100133622541895,
+    "foot_heading_max_abs_deg": [
+      0.338747610079445,
+      0.31427039511523536
+    ],
+    "toe_heading_max_abs_deg": [
+      0.9598331325103635,
+      0.8913084872677213
+    ],
+    "knee_lateral_deviation_max_m": [
+      0.00854249453558234,
+      0.010958485541799817
+    ],
+    "ankle_lateral_deviation_max_m": [
+      0.0035941753428832407,
+      0.0035461960786812574
+    ],
+    "foot_lane_width_min_max_m": [
+      0.15615959756320733,
+      0.16026045631189023
+    ],
+    "neutral_foot_lane_width_m": 0.15982617999999998,
+    "r_extension_max_abs_deg": 5.7295779368424384e-05,
+    "r_extension_duration_s": 0.1615,
+    "l_extension_max_abs_deg": 5.7295779368424384e-05,
+    "l_extension_duration_s": 0.1615
+  },
+  "smoothness_comparison": {
+    "before": {
+      "joint_step_peak_deg": 7.831929046235739,
+      "joint_velocity_peak_deg_s": 843.5406021955674,
+      "joint_acceleration_peak_deg_s2": 113171.2101335166,
+      "joint_acceleration_rms_deg_s2": 10126.694171630457,
+      "joint_velocity_target_change_peak_deg_s2": 59362.807697119955,
+      "joint_jerk_peak_deg_s3": 25776635.27029494,
+      "joint_jerk_rms_deg_s3": 1779608.8669647481,
+      "linear_pose_vs_interpolated_velocity_mismatch_rms_rad_s": 0.5610218636445113,
+      "root_forward_velocity_range_m_s": [
+        -0.21923990547657013,
+        2.8120875358581543
+      ],
+      "root_acceleration_peak_m_s2": 145.97197139964385,
+      "root_acceleration_rms_m_s2": 19.382740373116413
+    },
+    "after": {
+      "joint_step_peak_deg": 6.999308068956852,
+      "joint_velocity_peak_deg_s": 710.1568431776232,
+      "joint_acceleration_peak_deg_s2": 48698.15571558498,
+      "joint_acceleration_rms_deg_s2": 5890.376390204706,
+      "joint_velocity_target_change_peak_deg_s2": 33741.66484396325,
+      "joint_jerk_peak_deg_s3": 10006893.922076143,
+      "joint_jerk_rms_deg_s3": 733612.3730298008,
+      "linear_pose_vs_interpolated_velocity_mismatch_rms_rad_s": 0.23127137541230813,
+      "root_forward_velocity_range_m_s": [
+        -0.23201633989810944,
+        2.5307536125183105
+      ],
+      "root_acceleration_peak_m_s2": 101.65789548088522,
+      "root_acceleration_rms_m_s2": 15.749024706983562
+    },
+    "max_joint_pose_change_deg": 2.0000000378681193,
+    "rms_joint_pose_change_deg": 0.20053731311284803,
+    "max_root_position_component_change_mm": 3.000020980834961,
+    "max_root_position_norm_change_mm": 3.2597584107086064,
+    "max_root_orientation_change_deg": 0.31482025758592824,
+    "max_foot_body_position_change_mm": 2.135557479494834,
+    "unchanged_contact_labels": true,
+    "unchanged_contact_phase": true,
+    "unchanged_frequency": true,
+    "unchanged_cycle_translation": true,
+    "joint_acceleration_peak_deg_s2_reduction_percent": 56.9694839719995,
+    "joint_acceleration_rms_deg_s2_reduction_percent": 41.833175858056734,
+    "joint_velocity_target_change_peak_deg_s2_reduction_percent": 43.16026119229489,
+    "joint_jerk_peak_deg_s3_reduction_percent": 61.17843226183941,
+    "joint_jerk_rms_deg_s3_reduction_percent": 58.77676344234957,
+    "linear_pose_vs_interpolated_velocity_mismatch_rms_rad_s_reduction_percent": 58.77676247590021
+  },
+  "loader_validation": {
+    "frames": 90,
+    "frequency": 117.6470588235294,
+    "loop": true,
+    "qpos_max_error": 5.960464477539063e-08,
+    "qvel_max_error": 4.842877388000488e-08,
+    "sustained_knee_extension_at_interpolated_targets": true,
+    "tendon_target_dimension": 14,
+    "linear_interpolation_velocity_mismatch_reduced_not_eliminated": true
+  },
+  "generation_command": ".venv/bin/python scripts/smooth_walk_reference.py --input logs/data_audit/smoothness_revision/walk1_lyt_contact.npz --output logs/data_audit/walk1_lyt_smooth_1p28_candidate.npz --strength 1.0 --max-evaluations 1000"
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import mujoco
 import numpy as np
 import torch
 
@@ -17,10 +18,9 @@ class SquatRewardMixin:
     """Task-specific reward composition for a planted, symmetric squat.
 
     The shared environments expose useful tracking features, but their default
-    reward is designed for locomotion.  In particular, swing-foot velocity is a
-    constant for an all-contact squat reference and the gait phase-symmetry term
-    expects the feet to alternate front/back.  This mixin keeps the shared
-    feature calculation while composing only squat-relevant terms.
+    reward is designed for locomotion. Swing-foot velocity is constant for an
+    all-contact squat reference, and alternating steps do not apply to planted
+    feet. This mixin owns the squat symmetry state and composes squat terms.
     """
 
     squat_termination_penalty = 10.0
@@ -39,44 +39,104 @@ class SquatRewardMixin:
         phase = float(np.asarray(self.motion_phase)[env_id])
         return float(np.remainder(phase, frame_count) / float(frame_count))
 
-    def _symmetry_track(self, *args, **kwargs):
-        (
-            _locomotion_symmetry,
-            _locomotion_foot_symmetry,
-            stride_symmetry,
-            phase_symmetry,
-            lateral_symmetry,
-            contact_balance,
-            action_balance,
-        ) = super()._symmetry_track(*args, **kwargs)
+    def reset(self, env_ids=None):
+        observation = super().reset(env_ids)
+        is_torch = torch.is_tensor(self.last_foot_pos)
+        if not hasattr(self, "_squat_range_ema"):
+            zeros_like = torch.zeros_like if is_torch else np.zeros_like
+            template = self.last_foot_pos[:, :2, 0]
+            self._squat_x_low = zeros_like(template)
+            self._squat_x_high = zeros_like(template)
+            self._squat_range_ema = zeros_like(template)
+            self._squat_duty_ema = zeros_like(template)
+            self._squat_effort_ema = zeros_like(template)
+            sides = ([], [])
+            actuator_ids = self.position_actuator_ids_np if is_torch else self.position_actuator_ids
+            for index, actuator_id in enumerate(actuator_ids):
+                tendon_id = int(self.model.actuator_trnid[actuator_id, 0])
+                actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, int(actuator_id)) or ""
+                tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id) or ""
+                name = f"{actuator_name} {tendon_name}"
+                if "_r" in name:
+                    sides[0].append(index)
+                elif "_l" in name:
+                    sides[1].append(index)
+            self._squat_action_sides = sides
+        ids = slice(None) if env_ids is None else env_ids
+        feet = self.last_foot_pos.reshape(self.num_envs, 2, 2, 3)
+        side_x = feet.mean(dim=2)[:, :, 0] if is_torch else feet.mean(axis=2)[:, :, 0]
+        self._squat_x_low[ids] = side_x[ids]
+        self._squat_x_high[ids] = side_x[ids]
+        self._squat_range_ema[ids] = 0.0
+        self._squat_duty_ema[ids] = 0.0
+        self._squat_effort_ema[ids] = 0.0
+        return observation
 
-        # During a squat both planted feet should travel equally relative to the
-        # pelvis and remain laterally mirrored.  Front/back gait phase symmetry
-        # is deliberately retained only as a diagnostic and is not rewarded.
-        foot_symmetry = 0.65 * stride_symmetry + 0.35 * lateral_symmetry
-        foot_weight = max(float(self.cfg.symmetry_foot_weight), 0.0)
-        contact_weight = max(float(self.cfg.symmetry_contact_weight), 0.0)
-        action_weight = max(float(self.cfg.symmetry_action_weight), 0.0)
-        weight_sum = max(foot_weight + contact_weight + action_weight, 1.0e-6)
-        symmetry = (
-            foot_weight * foot_symmetry
-            + contact_weight * contact_balance
-            + action_weight * action_balance
-        ) / weight_sum
-        return (
-            symmetry,
-            foot_symmetry,
-            stride_symmetry,
-            phase_symmetry,
-            lateral_symmetry,
-            contact_balance,
-            action_balance,
+    def _squat_symmetry(self, foot_pos, foot_contact, action, env_id):
+        """Keep the planted-squat symmetry objective local to this task."""
+        is_torch = torch.is_tensor(foot_pos)
+        selection = slice(None) if is_torch else slice(env_id, env_id + 1)
+        feet = foot_pos.reshape(-1, 2, 2, 3)
+        center = feet.mean(dim=2) if is_torch else feet.mean(axis=2)
+        minimum = torch.minimum if is_torch else np.minimum
+        maximum = torch.maximum if is_torch else np.maximum
+        exp = torch.exp if is_torch else np.exp
+        stack = torch.stack if is_torch else np.stack
+        side_x = center[:, :, 0]
+        self._squat_x_low[selection] = minimum(self._squat_x_low[selection], side_x)
+        self._squat_x_high[selection] = maximum(self._squat_x_high[selection], side_x)
+        ranges = self._squat_x_high[selection] - self._squat_x_low[selection]
+        self._squat_range_ema[selection] = 0.99 * self._squat_range_ema[selection] + 0.01 * ranges
+        difference = self._squat_range_ema[selection, 0] - self._squat_range_ema[selection, 1]
+        range_match = exp(-(difference / 0.08) ** 2)
+        lateral_match = exp(-((center[:, 0, 1] + center[:, 1, 1]) / 0.25) ** 2)
+        self._squat_duty_ema[selection] = (
+            0.99 * self._squat_duty_ema[selection] + 0.01 * foot_contact.reshape(-1, 2)
         )
+        duty_difference = self._squat_duty_ema[selection, 0] - self._squat_duty_ema[selection, 1]
+        duty_match = exp(-(duty_difference / 0.25) ** 2)
+        right, left = self._squat_action_sides
+        if right and left:
+            bounded_action = action.clamp(-1.0, 1.0) if is_torch else np.clip(action, -1.0, 1.0)
+            bounded_action = bounded_action.reshape(-1, self.action_dim)
+            side_activity = tuple(
+                (bounded_action[:, side] ** 2).mean(dim=1) if is_torch
+                else (bounded_action[:, side] ** 2).mean(axis=1)
+                for side in (right, left)
+            )
+            activity = stack(side_activity, 1)
+            self._squat_effort_ema[selection] = 0.99 * self._squat_effort_ema[selection] + 0.01 * activity
+            effort_difference = self._squat_effort_ema[selection, 0] - self._squat_effort_ema[selection, 1]
+            effort_match = exp(-(effort_difference / 0.25) ** 2)
+        else:
+            effort_match = duty_match * 0.0 + 1.0
+        symmetry = (
+            0.60 * (0.65 * range_match + 0.35 * lateral_match)
+            + 0.25 * duty_match + 0.15 * effort_match
+        )
+        return symmetry if is_torch else float(symmetry[0])
 
     def _compute_reward_done(self, *args, **kwargs):
         _locomotion_reward, done, timed_out, parts = super()._compute_reward_done(
             *args,
             **kwargs,
+        )
+
+        if torch.is_tensor(parts["height"]):
+            foot_pos = args[4] if len(args) > 4 else kwargs["foot_pos"]
+            foot_contact = args[8] if len(args) > 8 else kwargs["foot_contact"]
+            action = args[0] if args else kwargs["action"]
+            env_id = 0
+        else:
+            foot_pos = args[6] if len(args) > 6 else kwargs["foot_pos"]
+            foot_contact = args[10] if len(args) > 10 else kwargs["foot_contact"]
+            action = args[1] if len(args) > 1 else kwargs["action"]
+            env_id = int(args[3] if len(args) > 3 else kwargs["env_id"])
+        squat_symmetry = self._squat_symmetry(foot_pos, foot_contact, action, env_id)
+        parts["symmetry"] = (
+            torch.where(parts["invalid_state"] > 0.5, 0.0, squat_symmetry)
+            if torch.is_tensor(squat_symmetry)
+            else 0.0 if parts["invalid_state"] > 0.5 else squat_symmetry
         )
 
         # Track the complete stand -> squat -> stand reference.  Pose and pelvis
@@ -194,16 +254,14 @@ class SquatRewardMixin:
             + 5.50 * squat_track
             + 2.20 * support_track * motion_gate
             + self.cfg.symmetry_reward_coef * parts["symmetry"] * motion_gate
-            + 0.35 * parts["ctrl_track"]
             + 2.50 * stand_track
             - 2.50 * missed_stand
             + 4.00 * ascent_progress_track
             - 6.00 * ascent_height_lag
             + 3.00 * bottom_depth_track
             - 5.00 * bottom_depth_deficit
-            - self.cfg.ctrl_penalty_coef * parts["ctrl_penalty"]
+            - self.cfg.torque_penalty_coef * parts["torque_penalty"]
             - self.cfg.action_rate_penalty_coef * parts["action_rate"]
-            - self.cfg.distal_action_penalty_coef * parts["distal_action"]
             - self.cfg.distal_action_rate_penalty_coef * parts["distal_action_rate"]
             - self.cfg.missed_contact_penalty_coef * parts["missed_contact"]
             - self.squat_termination_penalty * parts["termination"]

@@ -1,6 +1,6 @@
 """Continuous evaluation supports long non-looping references without resets."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest import mock
 
@@ -29,7 +29,12 @@ def checkpoint_environment(monkeypatch):
     def track_environment(factory):
         def create(*args):
             env = factory(*args)
-            env.close = mock.Mock(wraps=env.close)
+            original_close = env.close
+            def capture_close():
+                base = env.base_env if hasattr(env, 'base_env') else env
+                env.evaluated_qpos = [data.qpos.copy() for data in base.datas]
+                original_close()
+            env.close = mock.Mock(wraps=capture_close)
             environments.append(env)
             return env
         return create
@@ -102,3 +107,32 @@ def test_non_looping_teacher_student_suite(checkpoint_environment, tmp_path):
     for env in environments:
         assert not env.motion.source_loop
         env.close.assert_called_once()
+
+
+def test_evaluation_fixes_randomness_before_environment_construction(checkpoint_environment):
+    metadata, environments = checkpoint_environment
+    metadata['env_config'].update(
+        num_envs=32, seed=2026, randomize_episode_seed=True,
+        reset_noise_scale=.013, action_noise_std=.04, domain_randomization_scale=.25,
+        episode_steps=900, episode_timeout_jitter_steps=17,
+    )
+    evaluation.evaluate_gait_checkpoint('unused.onnx', seconds=.1, seed=123)
+    expected = replace(LytRobotEnvCfg(**metadata['env_config']), num_envs=1, seed=123,
+        randomize_episode_seed=False, reset_noise_scale=0., action_noise_std=0., obs_noise_std=0.,
+        domain_randomization=False, domain_randomization_scale=0.)
+    assert asdict(environments[0].cfg) == asdict(expected)
+
+
+def test_nominal_evaluation_repeats_with_random_training_metadata(checkpoint_environment):
+    metadata, environments = checkpoint_environment
+    metadata['env_config'].update(randomize_episode_seed=True, reset_noise_scale=.02,
+        action_noise_std=.04, obs_noise_std=.03, motion_loop=(True,),
+        stand_start_phase_delay_steps=25, stand_start_transition_min_steps=80,
+        stand_start_transition_max_steps=160)
+    first = evaluation.evaluate_gait_checkpoint('unused.onnx', seconds=2., seed=42)
+    second = evaluation.evaluate_gait_checkpoint('unused.onnx', seconds=2., seed=42)
+    assert first == second
+    np.testing.assert_array_equal(environments[0].stand_start_transition_steps,
+                                  environments[1].stand_start_transition_steps)
+    np.testing.assert_array_equal(environments[0].evaluated_qpos[0],
+                                  environments[1].evaluated_qpos[0])

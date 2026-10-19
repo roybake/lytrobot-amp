@@ -19,8 +19,8 @@ from scipy.optimize import least_squares
 from scipy.spatial import ConvexHull
 
 REPO = Path(__file__).resolve().parents[3]
-MODEL = REPO / "robot/MJCFmodelposition.xml"
-TERRAIN = REPO / "robot/terrains/more_discolrl/stairs.xml"
+MODEL = REPO / "robot/MJCFmodelfinal.xml"
+TERRAIN = REPO / "robot/terrains/stairs.xml"
 DEFAULT_REPORT = Path(__file__).with_name("stairs_xml_20cm_feasibility.json")
 FOOT_NAMES = ("foot_r", "toe_r", "foot_l", "toe_l")
 JOINT_NAMES = tuple(f"{joint}_{side}" for side in ("r", "l") for joint in (

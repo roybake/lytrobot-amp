@@ -37,6 +37,11 @@ class SensorDistillationPPOAMPTrainer(SensorHistoryPPOAMPTrainer):
                 "distal_action_scale": float(env.cfg.distal_action_scale),
                 "decimation": float(env.cfg.decimation),
                 "motion_file": str(env.cfg.motion_file),
+                "symmetric_gait_reference": bool(env.cfg.symmetric_gait_reference),
+                "target_velocity": float(env.cfg.target_velocity),
+                "command_walking": bool(env.cfg.command_walking),
+                "velocity_range": env.cfg.velocity_range,
+                "yaw_rate_range": env.cfg.yaw_rate_range,
             },
             device=self.device,
         )

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_repaired_walk_matches_model_and_periodic_velocities():
-    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelposition.xml"))
+    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelfinal.xml"))
     with np.load(ROOT / "robot/reference_data/walk1_mjcf_repaired.npz") as archive:
         qpos, qvel = archive["qpos"].astype(float), archive["qvel"].astype(float)
         translation, hz = archive["cycle_translation"], float(archive["frequency"])
@@ -37,7 +37,7 @@ def test_repaired_walk_matches_model_and_periodic_velocities():
 
 
 def test_training_loader_preserves_repaired_pose_and_passive_constraints():
-    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelposition.xml"))
+    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelfinal.xml"))
     path = ROOT / "robot/reference_data/walk1_mjcf_repaired.npz"
     reference = MotionReference(path, model, zero_root_xy=False)
     with np.load(path) as archive:
@@ -57,7 +57,7 @@ def test_training_loader_preserves_repaired_pose_and_passive_constraints():
 
 
 def test_legacy_none_metadata_still_loads(tmp_path):
-    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelposition.xml"))
+    model = mujoco.MjModel.from_xml_path(str(ROOT / "robot/MJCFmodelfinal.xml"))
     with np.load(ROOT / "robot/reference_data/walk1_mjcf_repaired.npz") as archive:
         fields = {key: archive[key] for key in archive.files}
     fields["metadata"] = np.asarray(None, dtype=object)

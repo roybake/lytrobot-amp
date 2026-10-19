@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay the retargeted human stair clip on the exact stair terrain scene.
 
-`robot/terrains/stairs.xml` already embeds both the tendon-driven LYT robot and
+`robot/MJCFmodel_stair.xml` already embeds both the tendon-driven LYT robot and
 the three-up / platform / three-down treads, so one compiled model drives this
 visualization and the DeepMimic stair entry point alike.  The clip itself is
 `robot/reference_data/multimotion/stairs.npz`: 912 frames at 40 Hz.
@@ -39,7 +39,7 @@ for path in (REPO_ROOT, SRC_ROOT):
 import mujoco
 import numpy as np
 
-DEFAULT_MODEL = REPO_ROOT / "robot" / "terrains" / "stairs.xml"
+DEFAULT_MODEL = REPO_ROOT / "robot" / "MJCFmodel_stair.xml"
 DEFAULT_REFERENCE = (
     REPO_ROOT / "robot" / "reference_data" / "multimotion" / "stairs.npz"
 )

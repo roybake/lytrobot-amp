@@ -29,8 +29,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.speed <= 0:
         parser.error("--speed must be positive")
-    model = load_stairs_scene(ROOT / "robot/MJCFmodelposition.xml",
-                              ROOT / "robot/terrains/more_discolrl/stairs.xml")
+    model = load_stairs_scene(ROOT / "robot/MJCFmodel_stair.xml",
+                              ROOT / "robot/terrains/stairs.xml")
     with np.load(args.reference, allow_pickle=False) as archive:
         qpos = np.asarray(archive["qpos"], dtype=float)
         fps = float(archive["fps"])

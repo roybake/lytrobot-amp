@@ -35,7 +35,7 @@ def main() -> None:
     if not _has_arg("--teacher-checkpoint"):
         raise SystemExit("Distillation requires --teacher-checkpoint PATH.")
     if not _has_arg("--max-iterations"):
-        sys.argv.extend(["--max-iterations", "50000"])
+        sys.argv.extend(["--max-iterations", "30000"])
     validate_sensor_decimation(
         cli_int(sys.argv[1:], "--decimation", DEFAULT_SENSOR_DECIMATION)
     )
@@ -55,6 +55,8 @@ def main() -> None:
     base_train.DISTILLATION_CLI_ENABLED = True
     from sensor_training.experiment_options import install_training_options
     install_training_options(base_train)
+    from sensor_training.teacher_reward import install_teacher_reward_config
+    install_teacher_reward_config(base_train)
     base_train.main()
 
 

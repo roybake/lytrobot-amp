@@ -19,6 +19,7 @@ import mujoco
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
+from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +47,7 @@ def periodic_fit(values, harmonics=5):
     return basis @ np.linalg.lstsq(basis, values, rcond=None)[0]
 
 
-def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
+def refine_cycle(model, poses, frequency, speed, contact, phases, modes, *, max_nfev=100, min_knee_flexion=0.25):
     """Solve the whole loop together: planted support, swing and periodic smoothness.
 
     A linear inverted pendulum ZMP residual is a planning approximation. It
@@ -55,9 +56,21 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
     count = len(poses)
     floor, geom_ids = foot_geom_ids(model)
     body_ids, points = sole_landmarks(model, geom_ids)
+    mesh_vertices = []
+    for geom in geom_ids:
+        mesh = int(model.geom_dataid[geom])
+        if model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_MESH:
+            raise ValueError("Walking contact refinement requires mesh foot colliders.")
+        first, count_vertices = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
+        vertices = np.asarray(model.mesh_vert[first:first+count_vertices], dtype=np.float64)
+        mesh_vertices.append(vertices[ConvexHull(vertices).vertices])
     data = mujoco.MjData(model)
     travel = count * speed / frequency
     root_x = np.arange(count) * speed / frequency
+    boundary = max(1, int(np.ceil(0.05*frequency)))
+    swing_interior = np.logical_and.reduce([
+        np.roll(contact < 0.5, shift, axis=0) for shift in range(-boundary, boundary+1)
+    ])
     poses = poses.copy()
     poses[:, 0] = root_x
     world_points = np.empty((count, 4, 3))
@@ -98,7 +111,12 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
                 desired[i, heel, 2] = 0.0005 + lift + 0.012*(1-u)
                 desired[i, toe, 2] = 0.0005 + lift + 0.012*u
     for i in range(count):
-        centers = [desired[i, 2*s:2*s+2, :2].mean(0) for s in range(2) if contact[i, s] > 0.5]
+        centers = []
+        for side in range(2):
+            if contact[i, side] > 0.5:
+                sole = desired[i, 2*side:2*side+2]
+                loaded = sole[:, 2] <= sole[:, 2].min() + 0.0015
+                centers.append(sole[loaded, :2].mean(0))
         support_centers[i] = np.mean(centers, axis=0)
     # Columns: periodic root X offset, root Y/Z, roll/pitch, 14 hinge joints.
     variables = np.column_stack((np.zeros(count), poses[:, 1:3], np.zeros((count, 2)), poses[:, MAIN_JOINT_QPOS]))
@@ -107,7 +125,7 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
     upper = np.r_[[0.065, 0.085, 0.94, 0.14, 0.18], model.jnt_range[joint_ids, 1] - 0.002]
     for column, address in enumerate(MAIN_JOINT_QPOS, 5):
         if address in (10, 18):
-            upper[column] = -0.025
+            upper[column] = -min_knee_flexion
     variables = np.clip(variables, lower+1e-7, upper-1e-7)
     nominal = variables.copy()
     fromto = np.zeros(6)
@@ -127,18 +145,63 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
         x = flat.reshape(count, -1)
         output = decode(x)
         com = np.empty((count, 3))
+        actual_landmarks = np.empty((count, 4, 3))
+        velocities = np.empty((count, model.nv))
+        for i in range(count):
+            previous, following = output[(i-1) % count].copy(), output[(i+1) % count].copy()
+            if i == 0:
+                previous[0] -= travel
+            if i == count-1:
+                following[0] += travel
+            mujoco.mj_differentiatePos(model, velocities[i], 2/frequency, previous, following)
+        object_velocity = np.empty(6)
         local = []
         for i, pose in enumerate(output):
             data.qpos[:] = pose
+            data.qvel[:] = velocities[i]
             mujoco.mj_forward(model, data)
             landmarks = np.array([data.xpos[b] + data.xmat[b].reshape(3, 3) @ p for b, p in zip(body_ids, points)])
+            actual_landmarks[i] = landmarks
             com[i] = data.subtree_com[model.body('pelvis').id]
-            distances = np.array([mujoco.mj_geomDistance(model, data, floor, int(g), 0.5, fromto) for g in geom_ids])
-            foot_weights = np.repeat(np.where(contact[i] > 0.5, 1.5, 0.4), 2)
+            distances, surface_residuals = [], []
+            for geom, vertices in zip(geom_ids, mesh_vertices):
+                distances.append(mujoco.mj_geomDistance(model, data, floor, int(geom), 0.5, fromto))
+                rotation = data.geom_xmat[geom].reshape(3, 3)
+                offsets = vertices @ rotation.T
+                heights = offsets[:, 2] + data.geom_xpos[geom, 2]
+                surface_weights = np.exp(-(heights-heights.min())/0.003)
+                surface_weights /= surface_weights.sum()
+                center = surface_weights @ offsets
+                centered = offsets-center
+                covariance = (centered.T * surface_weights) @ centered
+                eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+                square_root = (eigenvectors * np.sqrt(np.maximum(eigenvalues, 0))) @ eigenvectors.T
+                mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_GEOM,
+                                        int(geom), object_velocity, 0)
+                omega = object_velocity[:3]
+                cross = np.array([[0., -omega[2], omega[1]],
+                                  [omega[2], 0., -omega[0]],
+                                  [-omega[1], omega[0], 0.]])
+                mean_velocity = object_velocity[3:] + cross @ center
+                # Exact weighted velocity energy of the near-ground mesh
+                # patch: a mean plus covariance, without a discontinuous
+                # choice of one closest vertex or cancellation of foot spin.
+                surface_residuals.append(np.r_[mean_velocity[:2],
+                                               (cross @ square_root)[:2].ravel()])
+            distances = np.asarray(distances)
+            side_distances = distances.reshape(2, 2)
+            # Constrain the lowest material point even just above contact;
+            # raising a foot cannot turn off the no-slip objective.
+            load_weights = np.exp(-(side_distances-side_distances.min(axis=1, keepdims=True))/0.005).ravel()
+            load_weights *= np.repeat(contact[i], 2)
+            no_slip = np.asarray(surface_residuals) * load_weights[:, None]
+            foot_weights = np.repeat(np.where(contact[i] > 0.5, 10.0, 0.4), 2)
             position_error = landmarks - desired[i]
             position_error[:, :2] *= foot_weights[:, None]
             position_error[:, 2] *= np.repeat(np.where(contact[i] > 0.5, 12.0, 1.5), 2)
-            local.append(np.r_[position_error.ravel(), 25*np.minimum(distances, 0), weights*(x[i]-nominal[i])])
+            local.append(np.r_[position_error.ravel(), 100*np.minimum(distances, 0),
+                               100*np.minimum(distances-0.01, 0)*np.repeat(swing_interior[i], 2),
+                               weights*(x[i]-nominal[i]), 0.5*no_slip.ravel()])
         before, after = np.roll(com, 1, axis=0), np.roll(com, -1, axis=0)
         before[0, 0] -= travel
         after[-1, 0] += travel
@@ -148,7 +211,15 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
         # added in dynamics tests. Conservative acceleration regularization
         # keeps the IK's contact-feature switches from making velocity spikes.
         curvature = np.roll(x, 1, axis=0) - 2*x + np.roll(x, -1, axis=0)
-        rows = np.column_stack((np.asarray(local), 0.15*(zmp-support_centers), 0.60*curvature))
+        def horizontal_velocity(points):
+            previous, following = np.roll(points, 1, axis=0), np.roll(points, -1, axis=0)
+            previous[0, :, 0] -= travel
+            following[-1, :, 0] += travel
+            return (following[:, :, :2] - previous[:, :, :2]) * (frequency / 2)
+        stance_velocity_error = horizontal_velocity(actual_landmarks) - horizontal_velocity(desired)
+        stance_velocity_error *= np.repeat(contact, 2, axis=1)[:, :, None]
+        rows = np.column_stack((np.asarray(local), 0.15*stance_velocity_error.reshape(count, -1),
+                                1.0*(zmp-support_centers), 0.60*curvature))
         return rows.ravel()
 
     rows = len(residual(variables.ravel())) // count
@@ -158,9 +229,10 @@ def refine_cycle(model, poses, frequency, speed, contact, phases, modes):
         for neighbor in ((i-1) % count, i, (i+1) % count):
             sparsity[i*rows:(i+1)*rows, neighbor*columns:(neighbor+1)*columns] = 1
     solution = least_squares(residual, variables.ravel(), bounds=(np.tile(lower, count), np.tile(upper, count)),
-                             jac_sparsity=sparsity.tocsr(), max_nfev=100, ftol=1e-6, xtol=1e-6, gtol=1e-6)
+                             jac_sparsity=sparsity.tocsr(), max_nfev=max_nfev, ftol=1e-6, xtol=1e-6, gtol=1e-6)
     print(f"Whole-cycle contact refinement: {solution.message}; cost={solution.cost:.6f}", flush=True)
-    return decode(solution.x.reshape(count, -1)), {"least_squares_cost": float(solution.cost), "optimizer_success": bool(solution.success)}
+    return decode(solution.x.reshape(count, -1)), {"least_squares_cost": float(solution.cost),
+        "optimizer_success": bool(solution.success), "function_evaluations": int(solution.nfev)}
 
 
 def choose_cycle(qpos, model):
@@ -190,6 +262,18 @@ def audit(model, qpos, qvel, frequency, contact, translation):
             values = qpos[:, int(model.jnt_qposadr[j])]
             excess.append(np.maximum(model.jnt_range[j, 0] - values, values - model.jnt_range[j, 1]).clip(0))
     fd = np.empty_like(qvel)
+    contact_velocities = []
+    interior_velocities = []
+    swing_contact_frames = set()
+    boundary = max(1, int(np.ceil(0.05*frequency)))
+    stance_interior = np.logical_and.reduce([
+        np.roll(contact > 0.5, shift, axis=0) for shift in range(-boundary, boundary+1)
+    ])
+    swing_interior = np.logical_and.reduce([
+        np.roll(contact < 0.5, shift, axis=0) for shift in range(-boundary, boundary+1)
+    ])
+    jacobian = np.empty((3, model.nv))
+    foot_ids = set(int(geom) for geom in geom_ids)
     for i in range(len(qpos)):
         before, after = qpos[(i-1) % len(qpos)].copy(), qpos[(i+1) % len(qpos)].copy()
         if i == 0:
@@ -197,6 +281,22 @@ def audit(model, qpos, qvel, frequency, contact, translation):
         if i == len(qpos)-1:
             after[:2] += translation
         mujoco.mj_differentiatePos(model, fd[i], 2/frequency, before, after)
+        data.qpos[:], data.qvel[:] = qpos[i], qvel[i]
+        mujoco.mj_forward(model, data)
+        for point in data.contact:
+            if point.dist > 0.002:
+                continue
+            geom = (int(point.geom1) if point.geom1 in foot_ids and point.geom2 == floor
+                    else int(point.geom2) if point.geom2 in foot_ids and point.geom1 == floor else None)
+            if geom is not None:
+                mujoco.mj_jac(model, data, jacobian, None, point.pos, int(model.geom_bodyid[geom]))
+                velocity = (jacobian @ qvel[i])[:2]
+                contact_velocities.append(velocity)
+                side = int(np.flatnonzero(geom_ids == geom)[0]) // 2
+                if stance_interior[i, side]:
+                    interior_velocities.append(velocity)
+                if swing_interior[i, side]:
+                    swing_contact_frames.add((i, side))
     return {
         "joint_limit_max_excess": float(np.max(excess)),
         "minimum_foot_clearance_m": float(distances.min()),
@@ -204,6 +304,10 @@ def audit(model, qpos, qvel, frequency, contact, translation):
         "frames_without_support_label": int(np.count_nonzero(contact.sum(1) < 0.5)),
         "frames_without_foot_within_2mm": int(np.count_nonzero(distances.min(1) > 0.002)),
         "qvel_differentiation_rmse": float(np.sqrt(np.mean((qvel-fd)**2))),
+        "contact_horizontal_velocity_rms_m_s": float(np.sqrt(np.mean(np.sum(np.square(contact_velocities), axis=1)))) if contact_velocities else float('inf'),
+        "stance_interior_velocity_rms_m_s": float(np.sqrt(np.mean(np.sum(np.square(interior_velocities), axis=1)))) if interior_velocities else float('inf'),
+        "swing_interior_contact_count": len(swing_contact_frames),
+        "knee_lock_fraction": float(np.mean(np.abs(qpos[:, [10, 18]]) < 0.12)),
         "cycle_translation_m": translation.tolist(),
         "last_to_next_joint_step_max_deg": float(np.rad2deg(np.abs(qpos[0, MAIN_JOINT_QPOS] - qpos[-1, MAIN_JOINT_QPOS])).max()),
     }
@@ -213,20 +317,35 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=ROOT / "robot/reference_data/walk1_mjcf.npz")
     parser.add_argument("--output", type=Path, default=ROOT / "robot/reference_data/walk1_mjcf_repaired.npz")
-    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodelposition.xml")
+    parser.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodelfinal.xml")
     parser.add_argument("--forward-speed", type=float, default=0.87)
+    parser.add_argument("--cycle-duration", type=float,
+                        help="Robot gait period in seconds; source timing is used when omitted.")
+    parser.add_argument("--min-knee-flexion", type=float, default=0.25,
+                        help="Minimum knee flexion in radians throughout the walking cycle.")
+    parser.add_argument("--refinement-max-evaluations", type=int, default=100,
+                        help="Maximum whole-cycle contact refinement evaluations.")
     parser.add_argument("--test-dynamics", action="store_true", help="Also run eight 10-second free-base trials and record their result.")
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve():
         parser.error("Output must differ from the original reference")
     if args.forward_speed <= 0:
         parser.error("forward-speed must be positive")
+    if args.cycle_duration is not None and args.cycle_duration <= 0:
+        parser.error("cycle-duration must be positive")
+    if args.min_knee_flexion < 0.12:
+        parser.error("min-knee-flexion must be at least 0.12 rad to exclude knee locking")
+    if args.refinement_max_evaluations <= 0:
+        parser.error("refinement-max-evaluations must be positive")
     model = mujoco.MjModel.from_xml_path(str(args.model_xml))
     with np.load(args.input, allow_pickle=True) as archive:
         source = archive["qpos"].astype(float)
         frequency = float(archive["frequency"])
         names = archive["joint_names"].astype(str)
     cycle, start, period = choose_cycle(source, model)
+    source_frequency = frequency
+    if args.cycle_duration is not None:
+        frequency = period / args.cycle_duration
     print(f"Selected source frames {start}:{start+period}, period {period/frequency:.3f}s", flush=True)
     cycle = periodic_fit(cycle)
     cycle[:, 3:7] = normalize_quaternions(cycle[:, 3:7])
@@ -239,7 +358,7 @@ def main():
         address = int(model.jnt_qposadr[j])
         low, high = model.jnt_range[j] + np.array([0.002, -0.002])
         if names[j].startswith("knee_angle"):
-            high = min(high, -0.025)
+            high = min(high, -args.min_knee_flexion)
         values = cycle[:, address]
         if values.min() < low or values.max() > high:
             span = values.max() - values.min()
@@ -260,7 +379,8 @@ def main():
         target_clearance=0.0005, ground_sigma=2.0, temporal_weight=0.025)
     corrected = corrected[:-1]
     contact, phases, modes = contact[:-1], phases[:-1], modes[:-1]
-    corrected, refinement = refine_cycle(model, corrected, frequency, args.forward_speed, contact, phases, modes)
+    corrected, refinement = refine_cycle(model, corrected, frequency, args.forward_speed, contact, phases, modes,
+                                        max_nfev=args.refinement_max_evaluations, min_knee_flexion=args.min_knee_flexion)
     enforce_passive(model, corrected)
     corrected[:, :2] -= corrected[0, :2]
     qvel = np.empty((period, model.nv))
@@ -280,10 +400,18 @@ def main():
             or statistics["minimum_foot_clearance_m"] < -0.0005
             or statistics["maximum_support_gap_m"] > 0.003
             or statistics["frames_without_foot_within_2mm"]
-            or statistics["qvel_differentiation_rmse"] > 1e-5):
+            or statistics["qvel_differentiation_rmse"] > 1e-5
+            # A discrete velocity at touchdown contains the impact boundary;
+            # test sustained support with the same 50 ms boundary convention
+            # used by gait evaluation, while retaining the full contact RMS.
+            or statistics["stance_interior_velocity_rms_m_s"] > 0.15
+            or statistics["swing_interior_contact_count"] > 0
+            or statistics["knee_lock_fraction"] > 0.10):
         raise RuntimeError(f"Repaired cycle failed its kinematic quality gates: {statistics}")
     metadata = {
         "task": "walk", "source": str(args.input.resolve()),
+        "source_frequency_hz": source_frequency, "frequency_hz": frequency,
+        "minimum_knee_flexion_rad": args.min_knee_flexion,
         "source_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
         "source_frames": [start, start+period-1],
         "method": "Dominant-period selection, periodic Fourier smoothing, amplitude fit to model limits, full STL heel/flat/toe contact IK, whole-cycle planted-foot and swing-path refinement with periodic smoothness and approximate ZMP planning, joint equality repair, root translation and differentiated velocities",

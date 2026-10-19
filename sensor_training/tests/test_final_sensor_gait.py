@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 import torch
 
-from lytrobot_amp.env import LytRobotEnvCfg
+from lytrobot_amp.env import LytRobotEnvCfg, LytRobotAmpEnv
+from lytrobot_amp.ppo_amp import PPOAMPConfig, PPOAMPTrainer
 from sensor_training.config import SensorObservationConfig
 from sensor_training.measurement import CausalMeasurement, MeasurementSpec
 from sensor_training.envs import SensorHistoryCpuAmpEnv
@@ -36,12 +37,28 @@ def observation_config(**overrides):
 
 
 def base_config(**overrides):
-    values = dict(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
-                  motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
+    values = dict(model_xml=str(ROOT/'robot/MJCFmodelfinal.xml'),
+                  motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_1p28_natural.npz'),
+                  target_velocity=1.28, stand_start_motion_phase=31.,
                   motion_loop=(True,), num_envs=2, reset_noise_scale=0.,
                   action_noise_std=0., obs_noise_std=0., domain_randomization=False,
                   sensor_root_imu_only=False, episode_steps=12, episode_timeout_jitter_steps=0)
     return LytRobotEnvCfg(**{**values, **overrides})
+
+
+@pytest.fixture(scope='module')
+def matching_teacher(tmp_path_factory):
+    directory = tmp_path_factory.mktemp('natural_reference_teacher')
+    env = LytRobotAmpEnv(base_config())
+    try:
+        trainer = PPOAMPTrainer(env, PPOAMPConfig(num_steps=4, update_epochs=1,
+            num_minibatches=1, amp_enabled=False, actor_hidden_dims=(16,),
+            critic_hidden_dims=(16,)), 'cpu', directory)
+        trainer.train_iteration()
+        checkpoint, _ = trainer.save(directory/'teacher.pt', 0)
+        return checkpoint
+    finally:
+        env.close()
 
 
 def policy_config(config_class=SensorPPOAMPConfig, **overrides):
@@ -214,15 +231,15 @@ def test_teacher_quality_rejects_good_speed_but_bad_reference():
     assert any('joint_position_rmse' in failure for failure in gait_quality_failures(metrics))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or not TEACHER.exists(), reason='CUDA/local Teacher fixture required')
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize('backend', ['warp', 'mjlab'])
-def test_backend_measured_signals_teacher_zero_single_forward_and_dr_resume(tmp_path, backend):
+def test_backend_measured_signals_teacher_zero_single_forward_and_dr_resume(tmp_path, backend, matching_teacher):
     from sensor_training.distillation_env import SensorDistillationWarpAmpEnv, SensorDistillationMjlabAmpEnv
     cls = SensorDistillationWarpAmpEnv if backend == 'warp' else SensorDistillationMjlabAmpEnv
     cfg = base_config(num_envs=2)
     env = cls(cfg, device='cuda', observation_cfg=observation_config())
     try:
-        ppo = policy_config(SensorDistillationPPOAMPConfig, teacher_checkpoint=str(TEACHER),
+        ppo = policy_config(SensorDistillationPPOAMPConfig, teacher_checkpoint=str(matching_teacher),
                             teacher_action_probability=0., teacher_action_probability_final=0.,
                             teacher_action_loss_coef=1., amp_enabled=False)
         trainer = SensorDistillationPPOAMPTrainer(env, ppo, 'cuda', tmp_path)
@@ -289,7 +306,7 @@ def test_compiled_shared_chunk_outputs_and_gradients(tmp_path):
 def test_final_pipeline_blocks_bad_teacher_before_student_execution(tmp_path, monkeypatch):
     from sensor_training import train_serial_distillation as serial
     teacher = tmp_path/'teacher.pt'
-    torch.save({'env_config': dict(motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
+    torch.save({'env_config': dict(motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_1p28_natural.npz'),
                                   decimation=2, reference_ctrl_blend=1.)}, teacher)
     with mock.patch('sys.argv', ['final', '--final-sensor-gait', '--phase', 'stage1',
                                 '--teacher-stage1-checkpoint', str(teacher), '--no-wandb']):

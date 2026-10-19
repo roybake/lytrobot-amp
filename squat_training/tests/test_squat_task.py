@@ -11,7 +11,7 @@ from squat_training.envs import SquatCpuAmpEnv, SquatRewardMixin, SquatSensorHis
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODEL = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 REFERENCE = REPO_ROOT / "squat_training" / "reference_data" / "squat_cmu_22_14_omniretarget.npz"
 RAW_REFERENCE = REPO_ROOT / "squat_training" / "retargeting" / "results" / "cmu_22_14_squat_lyt_raw.npz"
 RETARGET_MODEL = REPO_ROOT / "squat_training" / "retargeting" / "models" / "lyt" / "lyt_14dof.xml"
@@ -155,10 +155,8 @@ class SquatTaskTests(unittest.TestCase):
             "stance_foot": 1.0,
             "contact": 1.0,
             "symmetry": 1.0,
-            "ctrl_track": 1.0,
-            "ctrl_penalty": 0.0,
+            "torque_penalty": 0.0,
             "action_rate": 0.0,
-            "distal_action": 0.0,
             "distal_action_rate": 0.0,
             "missed_contact": 0.0,
             "termination": 0.0,
@@ -208,10 +206,8 @@ class SquatTaskTests(unittest.TestCase):
             "stance_foot": 1.0,
             "contact": 1.0,
             "symmetry": 1.0,
-            "ctrl_track": 0.0,
-            "ctrl_penalty": 0.0,
+            "torque_penalty": 0.0,
             "action_rate": 0.0,
-            "distal_action": 0.0,
             "distal_action_rate": 0.0,
             "missed_contact": 0.0,
             "termination": 0.0,
@@ -260,10 +256,8 @@ class SquatTaskTests(unittest.TestCase):
             "stance_foot": 1.0,
             "contact": 1.0,
             "symmetry": 1.0,
-            "ctrl_track": 0.0,
-            "ctrl_penalty": 0.0,
+            "torque_penalty": 0.0,
             "action_rate": 0.0,
-            "distal_action": 0.0,
             "distal_action_rate": 0.0,
             "missed_contact": 0.0,
             "termination": 0.0,
@@ -313,10 +307,8 @@ class SquatTaskTests(unittest.TestCase):
             "stance_foot": 1.0,
             "contact": 1.0,
             "symmetry": 1.0,
-            "ctrl_track": 0.0,
-            "ctrl_penalty": 0.0,
+            "torque_penalty": 0.0,
             "action_rate": 0.0,
-            "distal_action": 0.0,
             "distal_action_rate": 0.0,
             "missed_contact": 0.0,
             "termination": 0.0,

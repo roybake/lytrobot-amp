@@ -147,8 +147,8 @@ def qvel_from_poses(model, poses, fps):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", type=Path, default=HERE / "prepared/stairs_xml_human.npz")
-    p.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodelposition.xml")
-    p.add_argument("--terrain-xml", type=Path, default=ROOT / "robot/terrains/more_discolrl/stairs.xml")
+    p.add_argument("--model-xml", type=Path, default=ROOT / "robot/MJCFmodel_stair.xml")
+    p.add_argument("--terrain-xml", type=Path, default=ROOT / "robot/terrains/stairs.xml")
     p.add_argument("--output-dir", type=Path, default=HERE / "results/stairs_xml")
     p.add_argument("--max-frames", type=int, default=0)
     p.add_argument("--reuse-seed", action="store_true")

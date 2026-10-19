@@ -89,7 +89,7 @@ class SensorObservationTests(unittest.TestCase):
         self.assertEqual(cfg.frame_count, 6)
 
     def test_imu_layout_contains_seven_accelerometers_and_seven_gyros(self) -> None:
-        model = mujoco.MjModel.from_xml_path(str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"))
+        model = mujoco.MjModel.from_xml_path(str(REPO_ROOT / "robot" / "MJCFmodelfinal.xml"))
         layout = resolve_imu_sensor_layout(model, accelerometer_scale=9.81, gyroscope_scale=10.0)
         self.assertEqual(layout.dim, 42)
         self.assertEqual(len(layout.names), 14)
@@ -126,7 +126,7 @@ class SensorObservationTests(unittest.TestCase):
     def test_actor_observation_contains_deployable_sensor_and_action_history(self) -> None:
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
-                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
+                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelfinal.xml"),
                 motion_file=str(
                     REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),
@@ -256,7 +256,7 @@ class SensorObservationTests(unittest.TestCase):
     def test_random_phase_reset_uses_the_matching_reference_state(self) -> None:
         env = SensorHistoryCpuAmpEnv(
             LytRobotEnvCfg(
-                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelposition.xml"),
+                model_xml=str(REPO_ROOT / "robot" / "MJCFmodelfinal.xml"),
                 motion_file=str(
                     REPO_ROOT / "robot" / "reference_data" / "walk1_mjcf_repaired.npz"
                 ),

@@ -17,7 +17,7 @@ class SensorObservationConfig:
     gait_lookahead_seconds: tuple[float, ...] = (0.0, 0.1, 0.2)
     target_velocity_normalizer: float = 3.0
 
-    include_tendon_velocity: bool = False
+    include_tendon_velocity: bool = True
     include_tendon_tracking_error: bool = False
     tendon_velocity_scale: float = 1.0  # m/s, before clipping
     tendon_velocity_filter_alpha: float = 1.0  # causal one-pole filter

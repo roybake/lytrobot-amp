@@ -82,6 +82,8 @@ class _SensorDistillationMixin:
         if base.more_terrain_cfg.serial_course:
             return base._targets_at_current_phase()["tendon_ctrl"]
         phase_scale = base._stand_start_progress()
+        if base.cfg.command_walking:
+            phase_scale = phase_scale * base.walking_commands.values[:, 0] / base.cfg.target_velocity
         frame_counts = base.motion_frame_counts[base.motion_ids].to(torch.float32)
         next_phase = (
             base.motion_phase

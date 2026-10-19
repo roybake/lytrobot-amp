@@ -40,7 +40,7 @@ from lytrobot_amp.terrain import load_model, terrain_height_at  # noqa: E402
 from prepare_walk1 import ROLL_FLAT  # noqa: E402
 
 
-MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 OUTPUT = MOTION_DIR / "stair_up_down_omniretarget.npz"
 FRAMES_PER_STEP = 32

@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def make_env(features=False, **overrides):
-    cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
+    cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelfinal.xml'),
         motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
         motion_loop=(True,), num_envs=2, sensor_root_imu_only=True,
         episode_steps=12, episode_timeout_jitter_steps=0, reset_noise_scale=0.,
@@ -241,7 +241,7 @@ class WarpStateEstimationTests(unittest.TestCase):
         teacher = ROOT/'logs/teachers/stage1_gait/20260930_sensor_walk_v3/model_best.pt'
         if not teacher.is_file():
             self.skipTest('Local teacher integration fixture unavailable')
-        cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelposition.xml'),
+        cfg = LytRobotEnvCfg(model_xml=str(ROOT/'robot/MJCFmodelfinal.xml'),
             motion_file=str(ROOT/'robot/reference_data/walk1_mjcf_repaired.npz'),
             motion_loop=(True,), num_envs=4, sensor_root_imu_only=True,
             stand_start_prob=1., motion_reset_prob=0., reset_noise_scale=0.,
@@ -291,7 +291,10 @@ class ReferenceQualityTests(unittest.TestCase):
         rows = [dict(joint_error_squared=.04, joint_velocity_error_squared=4.,
                      foot_error_squared=.0025, root_velocity_error_squared=.09,
                      right_contact=r, left_contact=l,
-                     reference_right_contact=r, reference_left_contact=l)
+                     reference_right_contact=r, reference_left_contact=l,
+                     reference_right_swing_interior=1-r,
+                     reference_left_swing_interior=1-l,
+                     right_swing_contact=0., left_swing_contact=0.)
                 for r, l in ((0, 1), (1, 0), (0, 1), (1, 0))]
         metrics = reference_quality_metrics(rows, .1, False, True)
         self.assertAlmostEqual(metrics['eval/joint_position_rmse_rad'], .2)

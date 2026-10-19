@@ -27,38 +27,19 @@ def audit_reference(
     data = mujoco.MjData(model)
     foot_visual_geoms: dict[int, tuple[int, int]] = {}
     for side in ("r", "l"):
-        collider_ids = [
-            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-            for name in (f"foot_{side}", f"toe_{side}")
-        ]
-        collider_ids = [
-            geom_id for geom_id in collider_ids
-            if geom_id >= 0 and (
-                int(model.geom_contype[geom_id]) != 0
-                or int(model.geom_conaffinity[geom_id]) != 0
-            )
-        ]
-        # Backward compatibility for audit reports produced before the single
-        # foot box was split into named foot/toe DeepMimic colliders.
-        if min(collider_ids) < 0:
-            collider_ids = [
-                mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, f"foot_box_{side}"
-                )
-            ]
-        foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"foot_geom_{side}")
-        toe_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"toe_{side}")
-        toe_ids = [
-            geom_id for geom_id in range(model.ngeom)
-            if model.geom_bodyid[geom_id] == toe_body
-            and model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH
-        ]
-        if not collider_ids or min(*collider_ids, foot_id, toe_body) < 0 or len(toe_ids) != 1:
+        mesh_ids = tuple(
+            model.geom(name).id for name in (f"foot_{side}", f"toe_{side}")
+        )
+        if any(
+            model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_MESH
+            or not (model.geom_contype[geom_id] or model.geom_conaffinity[geom_id])
+            for geom_id in mesh_ids
+        ):
             raise ValueError(
-                f"Stair audit requires foot/toe colliders, foot mesh and toe mesh for {side}."
+                f"Stair audit requires the LYT foot/toe collision meshes for {side}."
             )
-        for collider_id in collider_ids:
-            foot_visual_geoms[collider_id] = (foot_id, toe_ids[0])
+        for geom_id in mesh_ids:
+            foot_visual_geoms[geom_id] = mesh_ids
     foot_ids = set(foot_visual_geoms)
     visual_foot_ids = {
         geom_id for geom_ids in foot_visual_geoms.values() for geom_id in geom_ids
@@ -90,7 +71,7 @@ def audit_reference(
     longest_unsupported_start = 0
     unsupported_run = 0
     minimum_visual_tread_margin = float("inf")
-    minimum_box_tread_margin = float("inf")
+    minimum_collision_tread_margin = float("inf")
     tread_contact_frames: set[int] = set()
     tread_overhang_frames: set[int] = set()
     for frame in range(reference.frame_count):
@@ -100,10 +81,8 @@ def audit_reference(
         mujoco.mj_forward(model, data)
         for foot_id in visual_foot_ids:
             for terrain_id in terrain_ids:
-                # The STL geoms are visual only (contype=0), so mj_forward
-                # does not put these pairs into data.contact.  Query their
-                # signed separation directly to distinguish an inaccurate
-                # contact box from an incompatible foot pose.
+                # Query every foot mesh, including pairs that are separated
+                # and therefore absent from data.contact.
                 distance = float(mujoco.mj_geomDistance(
                     model, data, foot_id, terrain_id, 0.25, None
                 ))
@@ -152,15 +131,17 @@ def audit_reference(
                 min(limit[0] for limit in visual_limits) - left,
                 right - max(limit[1] for limit in visual_limits),
             )
-            box_rotation = data.geom_xmat[foot_id].reshape(3, 3)
-            box_radius_x = float(np.dot(np.abs(box_rotation[0]), model.geom_size[foot_id]))
-            box_margin = min(
-                float(data.geom_xpos[foot_id, 0]) - box_radius_x - left,
-                right - float(data.geom_xpos[foot_id, 0]) - box_radius_x,
+            collision_rotation = data.geom_xmat[foot_id].reshape(3, 3)
+            collision_x = (
+                data.geom_xpos[foot_id, 0] + mesh_vertices[foot_id] @ collision_rotation[0]
+            )
+            collision_margin = min(
+                float(collision_x.min()) - left,
+                right - float(collision_x.max()),
             )
             minimum_visual_tread_margin = min(minimum_visual_tread_margin, visual_margin)
-            minimum_box_tread_margin = min(minimum_box_tread_margin, box_margin)
-            if min(visual_margin, box_margin) < -0.001:
+            minimum_collision_tread_margin = min(minimum_collision_tread_margin, collision_margin)
+            if min(visual_margin, collision_margin) < -0.001:
                 tread_overhang_frames.add(frame)
         penetrating_frames += frame_deepest < -0.02
         if has_support:
@@ -192,8 +173,8 @@ def audit_reference(
         "minimum_visual_tread_edge_margin_m": (
             minimum_visual_tread_margin if tread_contact_frames else None
         ),
-        "minimum_box_tread_edge_margin_m": (
-            minimum_box_tread_margin if tread_contact_frames else None
+        "minimum_collision_tread_edge_margin_m": (
+            minimum_collision_tread_margin if tread_contact_frames else None
         ),
         "unsupported_frames": unsupported_frames,
         "longest_unsupported_run_s": longest_unsupported_run / reference.frequency,
@@ -214,7 +195,7 @@ def audit_reference(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-xml", default=str(ROOT / "robot/terrains/stairs.xml"))
+    parser.add_argument("--model-xml", default=str(ROOT / "robot/MJCFmodel_stair.xml"))
     parser.add_argument("--motion-file", default=str(ROOT / "robot/reference_data/multimotion/stairs.npz"))
     parser.add_argument("--root-x-offset", type=float, default=0.0)
     parser.add_argument("--json-out", type=Path)

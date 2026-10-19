@@ -60,7 +60,7 @@ def train_better_teacher():
         "--contact-reward-coef", "0.2",
 
         # 控制平滑
-        "--ctrl-penalty-coef", "0.04",
+        "--torque-penalty-coef", "0.0004",
         "--action-rate-penalty-coef", "0.10",
 
         # 训练配置

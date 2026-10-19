@@ -32,7 +32,7 @@ def _sensor_metadata_compatible(saved: dict, current: dict) -> bool:
     for metadata in (saved_normalized, current_normalized):
         config = metadata.get('config')
         if isinstance(config, dict):
-            defaults = SensorObservationConfig()
+            defaults = SensorObservationConfig(include_tendon_velocity=False)
             for key in ('include_tendon_velocity', 'include_tendon_tracking_error',
                         'tendon_velocity_scale', 'tendon_velocity_filter_alpha',
                         'tendon_tracking_error_scale',

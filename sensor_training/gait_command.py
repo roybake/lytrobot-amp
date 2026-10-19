@@ -24,7 +24,7 @@ GAIT_COMMAND_SCALAR_FIELDS = (
 
 def gait_command_dim(
     action_dim: int, lookahead_seconds: Sequence[float],
-    *, trajectory_feedback: bool = False,
+    *, trajectory_feedback: bool = False, command_walking: bool = False,
 ) -> int:
     """Return scalar clock fields plus one tendon target per lookahead."""
 
@@ -32,6 +32,7 @@ def gait_command_dim(
         len(GAIT_COMMAND_SCALAR_FIELDS)
         + int(action_dim) * len(tuple(lookahead_seconds))
         + (2 if trajectory_feedback else 0)
+        + int(command_walking)
     )
 
 
@@ -78,6 +79,7 @@ def assemble_gait_command(
     target_velocity: np.ndarray,
     reference_tendon_targets: Sequence[np.ndarray],
     trajectory_error: np.ndarray | None = None,
+    target_yaw_rate: np.ndarray | None = None,
 ) -> np.ndarray:
     """Assemble batched commands in the exact Actor input order."""
 
@@ -106,6 +108,11 @@ def assemble_gait_command(
         if error.shape != (phase_arr.shape[0], 2):
             raise ValueError("trajectory_error must have shape [batch, 2].")
         parts = (*parts, error)
+    if target_yaw_rate is not None:
+        yaw = np.asarray(target_yaw_rate, dtype=np.float32).reshape(-1, 1)
+        if yaw.shape[0] != phase_arr.shape[0]:
+            raise ValueError("target_yaw_rate must match the command batch size.")
+        parts = (*parts, yaw)
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
@@ -139,6 +146,9 @@ class DeployableGaitCommandGenerator:
     stand_root_xy: np.ndarray | None = None
     reference_velocity_table: np.ndarray | None = None
     start_in_motion: bool = False
+    command_walking: bool = False
+    velocity_range: tuple[float, float] | None = None
+    yaw_rate_range: tuple[float, float] = (-0.8, 0.8)
 
     def __post_init__(self) -> None:
         self.reference_tendon_table = np.asarray(self.reference_tendon_table, dtype=np.float32)
@@ -175,6 +185,16 @@ class DeployableGaitCommandGenerator:
                 raise ValueError("ctrl_half_range must be positive.")
         if not 0.0 <= self.reference_ctrl_blend <= 1.0:
             raise ValueError("reference_ctrl_blend must be in [0, 1].")
+        if self.command_walking:
+            if (self.velocity_range is None or len(self.velocity_range) != 2
+                    or not np.isfinite(self.velocity_range).all()
+                    or not 0 < self.velocity_range[0] <= self.target_velocity <= self.velocity_range[1]):
+                raise ValueError("Command walking requires positive velocity bounds containing the nominal velocity.")
+            if (len(self.yaw_rate_range) != 2 or not np.isfinite(self.yaw_rate_range).all()
+                    or not self.yaw_rate_range[0] < 0 < self.yaw_rate_range[1]):
+                raise ValueError("Command walking requires yaw-rate bounds MIN < 0 < MAX.")
+        self.command_speed = self.target_velocity
+        self.command_yaw_rate = 0.0
         self.reset()
 
     @classmethod
@@ -229,6 +249,9 @@ class DeployableGaitCommandGenerator:
                 if gait.get("use_reference_velocity") else None
             ),
             start_in_motion=float(gait.get("stand_start_prob", 1.0)) <= 0.0,
+            command_walking=bool(gait.get("command_walking", False)),
+            velocity_range=tuple(gait["velocity_range"]) if gait.get("command_walking") else None,
+            yaw_rate_range=tuple(gait.get("yaw_rate_range", (-0.8, 0.8))),
         )
 
     @property
@@ -248,6 +271,19 @@ class DeployableGaitCommandGenerator:
         if self.action_ramp_steps <= 0:
             return 1.0
         return float(np.clip((self.step + 1) / self.action_ramp_steps, 0.0, 1.0))
+
+    @property
+    def cadence_scale(self) -> float:
+        return self.command_speed / self.target_velocity if self.command_walking else 1.0
+
+    def set_walking_command(self, speed: float, yaw_rate: float) -> None:
+        """Set the bounded external command before generating the next observation."""
+        if not self.command_walking:
+            raise ValueError("This model was not trained with walking commands.")
+        if not np.isfinite((speed, yaw_rate)).all():
+            raise ValueError("Walking commands must be finite.")
+        self.command_speed = float(np.clip(speed, *self.velocity_range))
+        self.command_yaw_rate = float(np.clip(yaw_rate, *self.yaw_rate_range))
 
     def tendon_control_target(
         self,
@@ -269,7 +305,7 @@ class DeployableGaitCommandGenerator:
         if action.shape != self.stand_tendon_target.shape:
             raise ValueError("action dimension does not match tendon reference.")
         progress = self.progress
-        next_phase = self.phase + self.frequency * self.control_dt * progress
+        next_phase = self.phase + self.frequency * self.cadence_scale * self.control_dt * progress
         walk = interpolate_reference_table(
             self.reference_tendon_table, next_phase, loop=self.loop
         ).reshape(-1)
@@ -303,12 +339,17 @@ class DeployableGaitCommandGenerator:
         self.step = 0
 
     def command(
-        self, target_velocity: float | None = None, *, root_xy: np.ndarray | None = None
+        self, target_velocity: float | None = None, *, root_xy: np.ndarray | None = None,
+        target_yaw_rate: float | None = None,
     ) -> np.ndarray:
+        if self.command_walking and (target_velocity is not None or target_yaw_rate is not None):
+            self.set_walking_command(
+                self.command_speed if target_velocity is None else target_velocity,
+                self.command_yaw_rate if target_yaw_rate is None else target_yaw_rate)
         progress = self.progress
         targets: list[np.ndarray] = []
         for lookahead in self.lookahead_seconds:
-            future_phase = self.phase + self.frequency * float(lookahead) * progress
+            future_phase = self.phase + self.frequency * self.cadence_scale * float(lookahead) * progress
             walk = interpolate_reference_table(
                 self.reference_tendon_table,
                 future_phase,
@@ -322,6 +363,8 @@ class DeployableGaitCommandGenerator:
             velocity = float(interpolate_reference_table(
                 self.reference_velocity_table[:, None], self.phase, loop=self.loop
             ).item())
+        if self.command_walking:
+            velocity = self.command_speed
         trajectory_error = None
         if self.reference_root_xy_table is not None:
             if root_xy is None:
@@ -338,15 +381,18 @@ class DeployableGaitCommandGenerator:
             frame_count=np.asarray([self.frame_count], dtype=np.float32),
             progress=np.asarray([progress], dtype=np.float32),
             target_velocity=np.asarray(
-                [velocity * progress / self.target_velocity_normalizer],
+                [velocity * (1.0 if self.command_walking else progress) / self.target_velocity_normalizer],
                 dtype=np.float32,
             ),
             reference_tendon_targets=targets,
             trajectory_error=trajectory_error,
+            target_yaw_rate=(
+                np.asarray([self.command_yaw_rate], dtype=np.float32) if self.command_walking else None
+            ),
         )[0]
 
     def advance(self) -> None:
-        self.phase += self.frequency * self.control_dt * self.progress
+        self.phase += self.frequency * self.cadence_scale * self.control_dt * self.progress
         if self.loop:
             self.phase = float(np.remainder(self.phase, self.frame_count))
         else:

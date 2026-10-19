@@ -20,7 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 from lytrobot_amp.motion import MotionReference
 
 DEFAULT_MOTION = REPO_ROOT / "squat_training" / "reference_data" / "squat_cmu_22_14_omniretarget.npz"
-DEFAULT_MODEL = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+DEFAULT_MODEL = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 
 
 def parse_args() -> argparse.Namespace:

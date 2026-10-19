@@ -538,7 +538,7 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--model-xml", type=Path, default=REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+        "--model-xml", type=Path, default=REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
     )
     parser.add_argument("--frequency", type=float, default=40.0)
     parser.add_argument("--blend-frames", type=int, default=6)

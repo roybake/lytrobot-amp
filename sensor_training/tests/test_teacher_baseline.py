@@ -30,14 +30,20 @@ def test_final_teacher_training_arguments_match_basic_stage1():
                 '--num-envs', '1024', '--max-iterations', '50000']
     actual, expected = effective_args(command), effective_args(baseline)
     evaluation_logging = {'log_dir', 'wandb_log_interval', 'evaluate_gait', 'gait_fidelity_selection',
-                          'gait_evaluation_seconds', 'gait_evaluation_seeds'}
+                          'gait_evaluation_seconds', 'gait_evaluation_seeds', 'stop_on_gait_acceptance'}
     for key in expected.keys() - evaluation_logging:
         assert actual[key] == expected[key], key
     assert actual['amp_reward_coef'] == 1.2
     assert actual['task_reward_lerp'] == .5
     assert actual['reference_joint_position_reward_coef'] == 1.4
     assert actual['reference_joint_velocity_reward_coef'] == .45
-    assert actual['episode_steps'] == 1000
+    assert actual['termination_mode'] == 'fall'
+    assert actual['episode_steps'] == 0
+    assert actual['motion_loop'] == ['true']
+    assert actual['stand_start_prob'] == 1.
+    assert actual['motion_reset_prob'] == 0.
+    assert actual['forward_velocity_reward_coef'] == 2.
+    assert actual['forward_velocity_deficit_penalty_coef'] == 2.5
     assert actual['learning_rate'] == expected['learning_rate']
     assert '--teacher-action-loss-coef' not in command
     assert actual['gait_fidelity_selection'] and actual['gait_evaluation_seconds'] == 30
@@ -53,7 +59,8 @@ def test_failed_checkpoint_quality_does_not_freeze_at_first_saved_model():
     assert gait_checkpoint_quality(walking, fidelity=True) < gait_checkpoint_quality(survived, fidelity=True)
     assert gait_checkpoint_quality(survived, fidelity=True) < gait_checkpoint_quality(accepted, fidelity=True)
     metrics = {key: maximum*.5 for key, maximum in FIDELITY_LIMITS.items()}
-    metrics.update({'eval/gait_accepted': 0., 'eval/episode_completion': 0.})
+    metrics.update({'eval/gait_accepted': 0., 'eval/episode_completion': 0.,
+                    'eval/swing_contact_fraction': 0.})
     score = reference_fidelity_metrics(metrics)
     assert score['eval/reference_fidelity_accepted'] == 0.
     assert score['eval/reference_fidelity_score'] > 0.

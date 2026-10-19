@@ -16,7 +16,7 @@ from scripts.view_stairs_reference import Playback, read_archive_states, joint_l
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--motion-file', type=Path, default=ROOT / 'robot/reference_data/walk1_mjcf_repaired.npz')
-    parser.add_argument('--model-xml', type=Path, default=ROOT / 'robot/MJCFmodelposition.xml')
+    parser.add_argument('--model-xml', type=Path, default=ROOT / 'robot/MJCFmodelfinal.xml')
     parser.add_argument('--record', action='store_true')
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--output', type=Path, default=ROOT / 'recording/reference/walk1_mjcf_repaired.mp4')

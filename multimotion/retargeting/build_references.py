@@ -41,7 +41,7 @@ from prepare_walk1 import (  # noqa: E402
     TOE_PHASE_START,
 )
 
-MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 OUTPUT_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 
 JOINT_NAMES = (

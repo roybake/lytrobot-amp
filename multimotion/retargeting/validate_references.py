@@ -23,7 +23,7 @@ from lytrobot_amp.benchmark import (  # noqa: E402
     TRAINING_TARGET_SPEED_MPS,
 )
 
-MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelposition.xml"
+MODEL_XML = REPO_ROOT / "robot" / "MJCFmodelfinal.xml"
 MOTION_DIR = REPO_ROOT / "robot" / "reference_data" / "multimotion"
 DEFAULT_REPORT = (
     REPO_ROOT / "recording" / "reference" / "multimotion_validation.json"
